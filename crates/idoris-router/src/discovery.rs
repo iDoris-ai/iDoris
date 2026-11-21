@@ -126,6 +126,31 @@ pub enum RemoveOutcome {
     Failed,
 }
 
+/// [`DiscoveryTarget::inspect`] 的结果：接口规范 §2.7.3「自愈」要求的核对（目标是否还在、`instance_id` 是否还是自己）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectOutcome {
+    /// 属主正确的普通文件，里面的 `instance_id` 等于自己。
+    Intact,
+    /// 文件不在了。
+    Missing,
+    /// 文件在，但不是自己的：`instance_id` 不同、内容读不懂，或者不是属主正确的普通文件。
+    Foreign,
+    /// 核对本身出错（打开、`fstat`、读取失败）。
+    Failed,
+}
+
+/// [`heal_once`] 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealOutcome {
+    /// 文件还是自己的，什么也没做。
+    Intact,
+    /// 文件缺失或不一致，已按原子发布重写。
+    Rewritten,
+    /// 需要重写，但发布失败（原因码同启动时的发布，例如目标被换成了符号链接、目录：`target_not_regular`，
+    /// 这时不删除、不覆盖它，只报错）。
+    Failed(DiscoveryError),
+}
+
 /// `launch.engines[]` 的元素：启动时从组件卡读到的引擎型上游的静态清单（不含状态、不含默认引擎）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EngineEntry {
@@ -223,6 +248,27 @@ fn state_dir_from(
         .filter(|path| path.is_absolute())
 }
 
+/// 一次自愈（接口规范 §2.7.3「自愈」）：核对目标，缺失或不一致（别的实例的文件、读不懂的内容）就按原子发布重写，
+/// 所以 `rm -rf` 误删可以恢复。目标是符号链接、目录等非普通文件时发布本身会拒绝（`target_not_regular`）：
+/// 不删除、不覆盖，只把错误带出去。阻塞调用（文件系统 I/O，等旁路锁至多 5 秒），异步调用方放进 `spawn_blocking`。
+///
+/// **父目录被整个删除之后不恢复**（删掉的是目录，不只是里面的文件）：目标持有的是启动时就以 `O_DIRECTORY|O_NOFOLLOW` 打开的
+/// 父目录 fd（模块文档），目录删掉之后那个 fd 指向一个已经没有路径的目录，此后每一次自愈都因为建不了临时文件而失败
+/// （`temp_create_failed`，只记日志，不重建目录）。这是有意的取舍：按路径重新解析父目录再重建，就把「校验过的就是写进去的
+/// 那个目录」换回了校验与使用之间的 TOCTOU（路径被换成符号链接，或被别人抢先建成同名目录）。目录没了，恢复要重启 iDoris
+/// （新实例重新校验并打开父目录）。
+pub fn heal_once(target: &DiscoveryTarget, record: &DiscoveryRecord) -> HealOutcome {
+    match target.inspect(&record.instance_id) {
+        InspectOutcome::Intact => HealOutcome::Intact,
+        InspectOutcome::Missing | InspectOutcome::Foreign | InspectOutcome::Failed => {
+            match target.publish(record) {
+                Ok(()) => HealOutcome::Rewritten,
+                Err(error) => HealOutcome::Failed(error),
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 pub use unix_impl::DiscoveryTarget;
 
@@ -231,7 +277,7 @@ pub use fallback_impl::DiscoveryTarget;
 
 #[cfg(not(unix))]
 mod fallback_impl {
-    use super::{DiscoveryError, DiscoveryRecord, RemoveOutcome};
+    use super::{DiscoveryError, DiscoveryRecord, InspectOutcome, RemoveOutcome};
     use std::path::Path;
 
     /// 非 unix 平台没有 fd 相对的目录操作：launcher 要求发现文件时直接启动失败，不退化成按路径写。
@@ -249,6 +295,10 @@ mod fallback_impl {
 
         pub fn remove_if_owner(&self, _instance_id: &str) -> RemoveOutcome {
             RemoveOutcome::Failed
+        }
+
+        pub fn inspect(&self, _instance_id: &str) -> InspectOutcome {
+            InspectOutcome::Failed
         }
     }
 }
@@ -269,7 +319,9 @@ mod unix_impl {
     use nix::unistd::{self, UnlinkatFlags};
     use ring::rand::{SecureRandom, SystemRandom};
 
-    use super::{DiscoveryError, DiscoveryRecord, MAX_BYTES, MAX_PATH_BYTES, RemoveOutcome};
+    use super::{
+        DiscoveryError, DiscoveryRecord, InspectOutcome, MAX_BYTES, MAX_PATH_BYTES, RemoveOutcome,
+    };
     use crate::instance_nonce::hex_lower;
 
     /// 文件名上限（`NAME_MAX`）。
@@ -547,12 +599,9 @@ mod unix_impl {
             }
         }
 
-        /// 优雅退出时调用：**仅当文件里的 `instance_id` 等于自己**才删；读、比对、unlink 都在旁路锁下完成。
-        /// SIGKILL、panic、掉电不会走到这里（崩溃残留，由下一个拿到实例锁的实例覆盖）。
-        pub fn remove_if_owner(&self, instance_id: &str) -> RemoveOutcome {
-            let Ok(_lock) = self.lock_sidecar(REMOVE_LOCK_WAIT) else {
-                return RemoveOutcome::LockUnavailable;
-            };
+        /// 目标文件现在的状态：不跟随符号链接地打开、`fstat`、读（≤ [`MAX_BYTES`]）、比对 `instance_id`。
+        /// 退出时的删除（[`Self::remove_if_owner`]，持旁路锁）与运行期的自愈核对（[`Self::inspect`]，不持锁）共用它。
+        fn probe(&self, instance_id: &str) -> FileState {
             // `O_NONBLOCK`：目标若被换成 FIFO，打开也不会卡住（随后按「不是普通文件」处理）。
             let fd = match fcntl::openat(
                 &self.parent,
@@ -561,16 +610,16 @@ mod unix_impl {
                 Mode::empty(),
             ) {
                 Ok(fd) => fd,
-                Err(Errno::ENOENT) => return RemoveOutcome::Absent,
-                Err(Errno::ELOOP) => return RemoveOutcome::NotOwned,
-                Err(_) => return RemoveOutcome::Failed,
+                Err(Errno::ENOENT) => return FileState::Missing,
+                Err(Errno::ELOOP) => return FileState::Foreign,
+                Err(_) => return FileState::Failed,
             };
             let Ok(file_stat) = stat::fstat(&fd) else {
-                return RemoveOutcome::Failed;
+                return FileState::Failed;
             };
             if file_type(file_stat.st_mode) != libc::S_IFREG || file_stat.st_uid != effective_uid()
             {
-                return RemoveOutcome::NotOwned;
+                return FileState::Foreign;
             }
             let mut content = Vec::new();
             if std::fs::File::from(fd)
@@ -578,7 +627,7 @@ mod unix_impl {
                 .read_to_end(&mut content)
                 .is_err()
             {
-                return RemoveOutcome::Failed;
+                return FileState::Failed;
             }
             let owned = content.len() <= MAX_BYTES
                 && serde_json::from_slice::<serde_json::Value>(&content)
@@ -590,8 +639,36 @@ mod unix_impl {
                             .map(|found| found == instance_id)
                     })
                     .unwrap_or(false);
-            if !owned {
-                return RemoveOutcome::NotOwned;
+            if owned {
+                FileState::Ours
+            } else {
+                FileState::Foreign
+            }
+        }
+
+        /// 运行期自愈的核对（接口规范 §2.7.3「自愈」）：目标不在、不是自己的，还是仍然是自己的。只读、不持旁路锁：
+        /// 发布是 `rename` 原子替换，读到的要么是旧文件、要么是完整的新文件；消费者持锁清理陈旧文件时这里最多
+        /// 读到「不在」，下一轮核对会再看。
+        pub fn inspect(&self, instance_id: &str) -> InspectOutcome {
+            match self.probe(instance_id) {
+                FileState::Ours => InspectOutcome::Intact,
+                FileState::Missing => InspectOutcome::Missing,
+                FileState::Foreign => InspectOutcome::Foreign,
+                FileState::Failed => InspectOutcome::Failed,
+            }
+        }
+
+        /// 优雅退出时调用：**仅当文件里的 `instance_id` 等于自己**才删；读、比对、unlink 都在旁路锁下完成。
+        /// SIGKILL、panic、掉电不会走到这里（崩溃残留，由下一个拿到实例锁的实例覆盖）。
+        pub fn remove_if_owner(&self, instance_id: &str) -> RemoveOutcome {
+            let Ok(_lock) = self.lock_sidecar(REMOVE_LOCK_WAIT) else {
+                return RemoveOutcome::LockUnavailable;
+            };
+            match self.probe(instance_id) {
+                FileState::Missing => return RemoveOutcome::Absent,
+                FileState::Foreign => return RemoveOutcome::NotOwned,
+                FileState::Failed => return RemoveOutcome::Failed,
+                FileState::Ours => {}
             }
             match unistd::unlinkat(
                 &self.parent,
@@ -603,6 +680,16 @@ mod unix_impl {
                 Err(_) => RemoveOutcome::Failed,
             }
         }
+    }
+
+    /// [`DiscoveryTarget::probe`] 的结论。
+    enum FileState {
+        /// 属主正确的普通文件，`instance_id` 等于自己。
+        Ours,
+        Missing,
+        /// 在，但不是自己的（别的 `instance_id`、读不懂的内容、非普通文件、属主不对、符号链接）。
+        Foreign,
+        Failed,
     }
 }
 
@@ -653,6 +740,22 @@ mod tests {
                 ],
             }),
         }
+    }
+
+    /// 在另一个线程里跑 `work`；`limit` 内没有返回就让测试失败，而不是无限期挂起（FIFO 上不带 `O_NONBLOCK` 的 `open` 就是这样
+    /// 卡死的）。卡住的线程留到进程结束；测试已经失败，进程很快就退出。
+    fn finishes_within<T: Send + 'static>(
+        limit: Duration,
+        what: &str,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver.recv_timeout(limit).unwrap_or_else(|_| {
+            panic!("{what} did not return within {limit:?}: it is blocked on a FIFO")
+        })
     }
 
     /// 一个属主为当前用户、0700 的 canonical 目录（macOS 的临时目录在 `/var` 下，实为 `/private/var`）。
@@ -1067,7 +1170,7 @@ mod tests {
     fn remove_if_owner_never_follows_a_symlink_or_opens_a_fifo() {
         let (_temp, dir) = private_dir();
         let path = dir.join("idoris.json");
-        let target = DiscoveryTarget::open(&path).unwrap();
+        let target = std::sync::Arc::new(DiscoveryTarget::open(&path).unwrap());
 
         // 校验之后，目标被换成指向「自己 instance_id 文件」的符号链接：不跟随、不删除、不删链接指向的文件。
         let elsewhere = dir.join("elsewhere.json");
@@ -1083,9 +1186,15 @@ mod tests {
         );
         std::fs::remove_file(&path).unwrap();
 
-        // 换成 FIFO：打开不会卡住，按「不是普通文件」处理。
+        // 换成 FIFO：打开不会卡住，按「不是普通文件」处理。卡住会让测试失败（限时），而不是无限期挂起。
         nix::unistd::mkfifo(&path, stat_mode(0o600)).unwrap();
-        assert_eq!(target.remove_if_owner(INSTANCE_ID), RemoveOutcome::NotOwned);
+        let outcome = {
+            let target = std::sync::Arc::clone(&target);
+            finishes_within(Duration::from_secs(10), "remove_if_owner", move || {
+                target.remove_if_owner(INSTANCE_ID)
+            })
+        };
+        assert_eq!(outcome, RemoveOutcome::NotOwned);
         assert!(path.exists());
     }
 
@@ -1430,5 +1539,181 @@ mod tests {
         assert_eq!(state_dir_from(abs("relative/state"), abs("/Users/x")), None);
         assert_eq!(state_dir_from(None, abs("relative-home")), None);
         assert_eq!(state_dir_from(None, None), None);
+    }
+
+    // ---- IDORIS-CORE S2：运行期自愈的核对（`inspect`）与重写（`heal_once`） ----
+
+    #[test]
+    fn inspect_tells_our_file_from_a_missing_one_and_from_anything_that_is_not_ours() {
+        let (_temp, dir) = private_dir();
+        let path = dir.join("idoris.json");
+        let target = DiscoveryTarget::open(&path).unwrap();
+        assert_eq!(target.inspect(INSTANCE_ID), InspectOutcome::Missing);
+
+        target.publish(&record()).unwrap();
+        assert_eq!(target.inspect(INSTANCE_ID), InspectOutcome::Intact);
+        // 同一个文件对另一个 instance_id 来说就是「别人的」。
+        assert_eq!(
+            target.inspect("11111111-2222-4333-8444-555555555555"),
+            InspectOutcome::Foreign
+        );
+
+        // 内容读不懂（不是 JSON、没有 instance_id、instance_id 不是字符串、超过 4096 字节）都算别人的。
+        for content in [
+            b"not json".to_vec(),
+            b"{}".to_vec(),
+            b"{\"instance_id\":7}".to_vec(),
+            Vec::new(),
+            format!(
+                "{{\"instance_id\":\"{INSTANCE_ID}\",\"pad\":\"{}\"}}",
+                "x".repeat(MAX_BYTES)
+            )
+            .into_bytes(),
+        ] {
+            std::fs::write(&path, &content).unwrap();
+            assert_eq!(
+                target.inspect(INSTANCE_ID),
+                InspectOutcome::Foreign,
+                "{} bytes",
+                content.len()
+            );
+        }
+    }
+
+    /// 符号链接、目录、FIFO 都不是「自己的普通文件」：核对既不跟随链接、也不会卡在 FIFO 上。
+    #[test]
+    fn inspect_never_follows_a_symlink_and_never_blocks_on_a_fifo() {
+        let (_temp, dir) = private_dir();
+        let path = dir.join("idoris.json");
+        let target = std::sync::Arc::new(DiscoveryTarget::open(&path).unwrap());
+        target.publish(&record()).unwrap();
+        let copy = dir.join("copy.json");
+        std::fs::copy(&path, &copy).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        symlink(&copy, &path).unwrap();
+        // 链接指向的文件里有我们的 instance_id，但目标本身是链接：不是。
+        assert_eq!(target.inspect(INSTANCE_ID), InspectOutcome::Foreign);
+        std::fs::remove_file(&path).unwrap();
+
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(target.inspect(INSTANCE_ID), InspectOutcome::Foreign);
+        std::fs::remove_dir(&path).unwrap();
+
+        // 卡在 FIFO 上会让测试失败（限时），而不是无限期挂起。
+        nix::unistd::mkfifo(&path, stat_mode(0o600)).unwrap();
+        let outcome = {
+            let target = std::sync::Arc::clone(&target);
+            finishes_within(Duration::from_secs(10), "inspect", move || {
+                target.inspect(INSTANCE_ID)
+            })
+        };
+        assert_eq!(outcome, InspectOutcome::Foreign);
+    }
+
+    #[test]
+    fn heal_once_rewrites_a_missing_or_foreign_file_and_leaves_an_intact_one_alone() {
+        let (_temp, dir) = private_dir();
+        let path = dir.join("idoris.json");
+        let target = DiscoveryTarget::open(&path).unwrap();
+        let record = record();
+        // 还没有任何文件：写出来。
+        assert_eq!(heal_once(&target, &record), HealOutcome::Rewritten);
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(written, record.to_line().unwrap());
+
+        // 完好的文件：一个字节也不动（inode 与 mtime 都不变，所以连一次重写都没有发生）。
+        let before = std::fs::metadata(&path).unwrap();
+        assert_eq!(heal_once(&target, &record), HealOutcome::Intact);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (before.ino(), before.mtime(), before.mtime_nsec()),
+            (after.ino(), after.mtime(), after.mtime_nsec())
+        );
+
+        // `rm -rf` 误删。
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(heal_once(&target, &record), HealOutcome::Rewritten);
+        assert_eq!(std::fs::read(&path).unwrap(), written);
+
+        // 被换成别的实例的文件（规范：不一致就重写；两个实例共用一个路径时各自的自愈会互相覆盖）。
+        let mut foreign = record.clone();
+        foreign.instance_id = "11111111-2222-4333-8444-555555555555".to_string();
+        std::fs::write(&path, foreign.to_line().unwrap()).unwrap();
+        assert_eq!(heal_once(&target, &record), HealOutcome::Rewritten);
+        assert_eq!(std::fs::read(&path).unwrap(), written);
+
+        // 被改成读不懂的内容。
+        std::fs::write(&path, b"{\"truncated\":").unwrap();
+        assert_eq!(heal_once(&target, &record), HealOutcome::Rewritten);
+        assert_eq!(std::fs::read(&path).unwrap(), written);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!has_temp_file(&dir), "the heal must not leave temp files");
+    }
+
+    /// 目标被换成符号链接、目录：自愈只报错，不删除、不覆盖（与启动时的规则一致：不是属主正确的普通文件就不碰）。
+    #[test]
+    fn heal_once_never_replaces_or_deletes_a_target_that_is_not_a_regular_file() {
+        let (_temp, dir) = private_dir();
+        let path = dir.join("idoris.json");
+        let target = DiscoveryTarget::open(&path).unwrap();
+        let record = record();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, b"precious").unwrap();
+
+        symlink(&outside, &path).unwrap();
+        assert_eq!(
+            heal_once(&target, &record),
+            HealOutcome::Failed(DiscoveryError::TargetNotRegular)
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"precious");
+        std::fs::remove_file(&path).unwrap();
+
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("inner"), b"keep").unwrap();
+        assert_eq!(
+            heal_once(&target, &record),
+            HealOutcome::Failed(DiscoveryError::TargetNotRegular)
+        );
+        assert_eq!(std::fs::read(path.join("inner")).unwrap(), b"keep");
+        assert!(
+            !has_temp_file(&dir),
+            "a refused heal must not leave temp files"
+        );
+    }
+
+    /// 整个父目录被删掉（不只是里面的文件）：自愈恢复不了，每次都以 `temp_create_failed` 失败，而且不按路径把目录建回来
+    /// （`heal_once` 的文档说明了取舍：按路径重新解析会带回 TOCTOU）。对照：只删文件时自愈能恢复（上面的测试）。
+    #[test]
+    fn heal_once_does_not_bring_back_a_parent_directory_that_was_removed() {
+        let (_temp, dir) = private_dir();
+        let run = dir.join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = run.join("idoris.json");
+        let target = DiscoveryTarget::open(&path).unwrap();
+        let record = record();
+        assert_eq!(heal_once(&target, &record), HealOutcome::Rewritten);
+
+        std::fs::remove_dir_all(&run).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                heal_once(&target, &record),
+                HealOutcome::Failed(DiscoveryError::TempCreateFailed)
+            );
+            assert!(
+                !run.exists(),
+                "the directory is not re-created by path (that would bring back the TOCTOU)"
+            );
+        }
     }
 }

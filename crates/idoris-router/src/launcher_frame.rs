@@ -9,9 +9,9 @@
 //! 解析库的默认错误信息会带输入片段（里面有 Admin token），所以这里不把任何 `serde_json::Error` 带出去，
 //! 一律映射成下面的 [`FrameErrorCode`]。
 //!
-//! S1 只负责读、校验、存进配置结构：`register_socket`、`orphan_timeout_s`、`engine.*` 要等 S2/S3/S5 才使用，
-//! 但规范要求的跨字段校验（`register_socket` 出现则 `discovery_path` 必填、`orphan_timeout_s` 非 0 则
-//! `register_socket` 必填）现在就做。
+//! 这个模块只负责读、校验、存进配置结构：`register_socket`、`orphan_timeout_s` 由 `register`（S2，向 agent24d 登记、
+//! 孤儿计时）使用，`engine.*` 要等 S3/S5 才使用。规范要求的跨字段校验（`register_socket` 出现则 `discovery_path`
+//! 必填、`orphan_timeout_s` 非 0 则 `register_socket` 必填）在读帧时就做，所以登记与孤儿计时只会在发现文件存在时启动。
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -157,9 +157,9 @@ pub struct LauncherFrame {
     pub admin_token: AdminSessionToken,
     /// 缺省则不写发现文件。
     pub discovery_path: Option<PathBuf>,
-    /// S2 使用。
+    /// 登记用的 UDS 路径（`register` 使用）；缺省则不登记。
     pub register_socket: Option<PathBuf>,
-    /// 0 = 不因「无登记会话」退出。S2 使用。
+    /// 0 = 不因「无登记会话」退出；非 0 则超过这么多秒没有已 `ack` 的登记会话就以退出码 4 优雅停止（`register` 使用）。
     pub orphan_timeout_s: u32,
     /// 规范约定只给确定性测试用（生产不给这个字段，代码不拒绝）；缺省由 iDoris 自己生成。
     pub instance_nonce: Option<InstanceNonce>,

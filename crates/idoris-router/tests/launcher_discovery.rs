@@ -12,6 +12,13 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// 起的真二进制都用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+// 测试进程整个被 SIGKILL 时 `Drop` 不会跑；`register_uds.rs` 在帧里加了孤儿计时兜底，这个文件没有：这里的帧不带
+// `register_socket`，要加 `orphan_timeout_s` 就得连 `register_socket` 一起加，每条测试都会带着登记客户端跑，
+// 改变它们测的东西（日志、`/health`、退出路径）。
+#[path = "support/child_guard.rs"]
+mod child_guard;
+
 use std::{
     fs,
     io::{Read, Write},
@@ -25,6 +32,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use child_guard::{ChildGuard, SpawnGuarded};
 use idoris_router::{
     discovery::{DiscoveryError, DiscoveryRecord, DiscoveryTarget, RemoveOutcome},
     instance_nonce::InstanceNonce,
@@ -181,15 +189,15 @@ impl Env {
     }
 
     /// 以 `--launcher-stdin` 起一个实例（两个端口都是 0），写一帧并关闭 stdin（launcher 的预期行为）。
-    fn spawn_launcher(&self, frame: &Value) -> Child {
+    fn spawn_launcher(&self, frame: &Value) -> ChildGuard {
         self.spawn_launcher_bytes("0", "0", format!("{frame}\n").as_bytes())
     }
 
-    fn spawn_launcher_bytes(&self, port: &str, admin_port: &str, bytes: &[u8]) -> Child {
+    fn spawn_launcher_bytes(&self, port: &str, admin_port: &str, bytes: &[u8]) -> ChildGuard {
         let mut child = self
             .command(port, admin_port)
             .args(["serve", "--launcher-stdin"])
-            .spawn()
+            .spawn_guarded()
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
         // 子进程可能已经因为别的原因退出（例如第二实例），写失败不是这里要测的东西。
@@ -427,7 +435,10 @@ async fn discovery_file_has_the_specified_fields_permissions_and_launch_snapshot
     let env = Env::new();
     let mut command = env.command("0", "0");
     command.env("IDORIS_ALLOCATED_BUDGET_BYTES", "17179869184");
-    let mut child = command.args(["serve", "--launcher-stdin"]).spawn().unwrap();
+    let mut child = command
+        .args(["serve", "--launcher-stdin"])
+        .spawn_guarded()
+        .unwrap();
     child
         .stdin
         .take()
@@ -631,7 +642,10 @@ async fn health_reports_auth_required_and_auth_failed_and_stays_degraded_without
 
     let mut command = env.command("0", "0");
     command.env("IDORIS_OMLX_API_KEY", "a-wrong-key");
-    let mut child = command.args(["serve", "--launcher-stdin"]).spawn().unwrap();
+    let mut child = command
+        .args(["serve", "--launcher-stdin"])
+        .spawn_guarded()
+        .unwrap();
     child
         .stdin
         .take()
@@ -757,8 +771,12 @@ async fn a_managed_declaration_is_reported_as_managed_but_never_owned_in_s1() {
     assert_eq!(status.code(), Some(0), "{stderr}");
 }
 
+/// `register_socket` 与 `orphan_timeout_s` 从 S2 起由 `register` 使用（登记客户端、孤儿计时），它们的行为由
+/// `register_uds.rs` 覆盖；本测试只钉住「没有任何 agent24d 在监听」这一种情形：照常服务、登记不上，
+/// iDoris 是 UDS 客户端、不会自己创建这个 socket。`engine.*` 要等 S3/S5 才使用，这里只是被解析、被接受。
 #[tokio::test]
-async fn frame_fields_for_later_slices_are_parsed_and_accepted_but_do_not_change_s1_behaviour() {
+async fn a_register_socket_nobody_listens_on_leaves_serving_unchanged_and_the_instance_unregistered()
+ {
     let env = Env::new();
     let socket = env.run_dir.join("idoris-register.sock");
     let frame = env.frame(json!({
@@ -772,7 +790,7 @@ async fn frame_fields_for_later_slices_are_parsed_and_accepted_but_do_not_change
     let mut child = env.spawn_launcher(&frame);
     let (file, _) = wait_discovery(&env.discovery_path(), &mut child);
     let body = health(&http(), file["data_port"].as_u64().unwrap()).await;
-    // S1 没有登记：registered 恒为 false；iDoris 是 UDS 客户端，不会自己创建这个 socket。
+    // 没有 agent24d 在监听，登记不上：registered 为 false；iDoris 是 UDS 客户端，不会自己创建这个 socket。
     assert_eq!(body["registered"], false);
     assert!(!socket.exists());
     let (status, _, stderr) = sigterm_and_collect(&mut child);
@@ -813,7 +831,7 @@ async fn the_legacy_admin_token_flag_writes_no_discovery_file_and_has_the_new_he
     let mut child = env
         .command(&port.to_string(), &admin.to_string())
         .args(["serve", "--admin-token-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     child
         .stdin
@@ -837,7 +855,7 @@ fn the_two_stdin_flags_together_are_a_usage_error_with_exit_code_1() {
         ["serve", "--launcher-stdin", "--admin-token-stdin"],
         ["serve", "--admin-token-stdin", "--launcher-stdin"],
     ] {
-        let mut child = env.command("0", "0").args(args).spawn().unwrap();
+        let mut child = env.command("0", "0").args(args).spawn_guarded().unwrap();
         drop(child.stdin.take());
         let status = wait_exit(&mut child, Duration::from_secs(10));
         let (stdout, stderr) = output_of(&mut child);
@@ -853,7 +871,7 @@ fn the_admin_cli_refuses_to_connect_to_the_dynamic_port_request_value() {
     let mut child = env
         .command("0", "0")
         .args(["admin", "status", "--token-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     child
         .stdin
@@ -1114,7 +1132,7 @@ async fn kill_9_leaves_a_recognizable_stale_file_and_a_new_instance_overwrites_i
     impostor.env("IDORIS_DB_PATH", other_state.path().join("other.sqlite3"));
     let mut impostor = impostor
         .args(["serve", "--admin-token-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     impostor
         .stdin
@@ -1187,7 +1205,7 @@ async fn second_instance_exits_3_before_reading_the_frame_and_never_touches_the_
     let mut second = env
         .command("0", "0")
         .args(["serve", "--launcher-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let held_open = second.stdin.take().unwrap();
     let status = wait_exit(&mut second, Duration::from_secs(30));
@@ -1263,7 +1281,9 @@ async fn a_file_that_belongs_to_another_instance_is_left_alone_on_shutdown() {
     let (file, _) = wait_discovery(&path, &mut child);
     health(&http(), file["data_port"].as_u64().unwrap()).await;
 
-    // 别的实例（比如被接管之后的新实例）已经把文件换成了它自己的。
+    // 别的实例（比如被接管之后的新实例）已经把文件换成了它自己的。注意 S2 起运行中的实例每 10 秒自愈一次
+    // （缺失或 `instance_id` 不一致就重写，接口规范 §2.7.3），所以「别人的文件原样保留」只对退出时的删除成立：
+    // 这里换文件之后立刻 SIGTERM，远在第一轮自愈（发布之后 10 秒）之前。
     let mut foreign = file.clone();
     foreign["instance_id"] = json!("11111111-2222-4333-8444-555555555555");
     foreign["pid"] = json!(1);
@@ -1324,6 +1344,34 @@ fn a_sidecar_lock_held_at_shutdown_keeps_the_file_and_logs_one_fixed_line() {
 
 /// 退出时 unlink 失败（目录对属主也不可写）：文件读得到、旁路锁文件早已存在也打得开，只有 unlink 得到 `EACCES`。
 /// 文件保留、原样，日志是一行固定文案，退出码仍是 0。
+/// 同上，但管道的读端没了（launcher 先走一步）：「发现文件未删除」那一行、`已停止` 那一行都写不出去，退出码仍是 0
+/// （用 `eprintln!` 写的时候这里 panic，退出码是 101）。
+#[test]
+fn a_sidecar_lock_held_at_shutdown_still_exits_0_when_nobody_reads_its_stdout_and_stderr() {
+    let env = Env::new();
+    let path = env.discovery_path();
+    let mut child = env.spawn_launcher(&env.frame(json!({})));
+    let (_, bytes) = wait_discovery(&path, &mut child);
+    let consumer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(env.run_dir.join("idoris.json.lock"))
+        .unwrap();
+    consumer.lock().unwrap();
+
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    send("-TERM", &child);
+    let status = wait_exit(&mut child, Duration::from_secs(20));
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "the file must be kept as is"
+    );
+    consumer.unlock().unwrap();
+}
+
 #[test]
 fn a_file_that_cannot_be_unlinked_at_shutdown_is_kept_and_one_fixed_line_is_logged() {
     // root 不受目录权限限制，没有这个前提：跳过。
@@ -1500,7 +1548,7 @@ async fn nothing_is_served_while_waiting_for_the_frame_and_nothing_after_a_bad_o
     let mut child = env
         .command(&port.to_string(), &admin.to_string())
         .args(["serve", "--launcher-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let client = http();
@@ -1541,7 +1589,7 @@ fn a_launcher_that_never_writes_the_frame_times_out_after_10_seconds_with_exit_1
     let mut child = env
         .command("0", "0")
         .args(["serve", "--launcher-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     // 保持 stdin 开着、一个字节也不写。
     let held_open = child.stdin.take().unwrap();

@@ -19,7 +19,10 @@
 use futures_util::StreamExt;
 use idoris_router::{
     AppState, BIND_HOST,
-    admin::{ADMIN_PORT_ENV, AdminBindConfig, AdminSessionToken, build_admin_app},
+    admin::{
+        ADMIN_PORT_ENV, AdminBindConfig, AdminSessionToken, SharedAdminToken,
+        build_admin_app_with_token,
+    },
     auth::VirtualKeyAuthenticator,
     build_app,
     capabilities::{CapabilitiesProvider, LiveCapabilitiesProvider},
@@ -35,7 +38,9 @@ use idoris_router::{
     discovery, host_facts,
     instance_nonce::InstanceNonce,
     launcher_frame::{self, LauncherConfig},
-    parse_port, profile, readiness, routing_policy,
+    parse_port, profile, readiness,
+    register::{self, Registration, RegistrationConfig, SelfHeal, StopCause},
+    routing_policy,
     runtime::RuntimeRegistry,
     runtime_launch_config,
     startup_form::StartupForm,
@@ -48,18 +53,19 @@ use idoris_router::{
 };
 use std::{
     future::{Future, IntoFuture},
-    io::Read,
+    io::{Read, Write},
     net::IpAddr,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, PoisonError},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio_util::sync::CancellationToken;
 
 /// Exit code when another `idoris serve` already holds the database lock.
-/// Other failures (including a shutdown that exceeds `SHUTDOWN_GRACE`) exit 1.
+/// Other failures (including a signal stop whose shutdown exceeds `SHUTDOWN_GRACE`) end with code 1; a stop whose cause is
+/// already known to be an `instance_conflict` or an orphan timeout keeps its own exit code (see `stop_report`).
 const EXIT_ALREADY_RUNNING: i32 = 3;
 /// Upper bound for graceful shutdown after SIGTERM/SIGINT; if in-flight
-/// requests or subscriptions do not finish in time we exit with code 1.
+/// requests or subscriptions do not finish in time a signal stop exits with code 1 (`stop_report` for the other causes).
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Resolves on SIGINT or (unix) SIGTERM; both take the same graceful path.
@@ -100,6 +106,74 @@ fn serve_failure_label(message: &str) -> &'static str {
     }
 }
 
+/// 往 stdout 或 stderr 写一行，写不出去就算了。launcher 先走一步、管道的另一头没人读时，`println!`、`eprintln!` 会 panic：
+/// 停止路径上退出码就成了 101，不是 0、3、4（launcher 把 3、4 当预期停止，把 101 当崩溃、退避重启）。
+fn say(mut out: impl Write, text: &str) {
+    let _ = writeln!(out, "{text}");
+}
+
+/// 一行停止日志，以及它写到哪里。
+#[derive(Debug, PartialEq, Eq)]
+enum StopLine {
+    Stdout(String),
+    Stderr(String),
+}
+
+/// 停止收尾要做的事：按顺序写这些行，再以 `result` 结束（`Ok` 是退出码；`Err` 由 `real_main` 打印并以退出码 1 退出）。
+#[derive(Debug, PartialEq, Eq)]
+struct StopReport {
+    lines: Vec<StopLine>,
+    result: Result<u8, String>,
+}
+
+/// HTTP 排空结束之后怎么收尾（接口规范 §2.7.5）。`cause` 是记下来的停止原因，`served` 是排空的结果：
+///
+/// - 排空成功：照原因退出（0、3、4），写原因对应的那一行。
+/// - 排空失败（超过 `SHUTDOWN_GRACE`，或订阅停不下来），而原因是信号，或没有记下原因（服务自己倒了）：这是「停止失败」，
+///   带着错误以退出码 1 退出（§2.7.5 退出码 1），不写原因行。
+/// - 排空失败，而原因已经确定是 `instance_conflict`（3）或孤儿超时（4）：退出码与原因行都不变，另加一行说明排空失败。
+///   不把 3、4 变成 1：launcher 把退出码 1 当崩溃退避重启，对 `instance_conflict` 就是让后来者再撞一次冲突；而 3（不要重启）
+///   与 4（按预期停止，不计入崩溃熔断）正是这两种停止要告诉 launcher 的。
+fn stop_report(
+    cause: Option<StopCause>,
+    served: Result<(), String>,
+    orphan_timeout_s: u32,
+) -> StopReport {
+    let drain_failure = match (served, cause) {
+        (Err(message), None | Some(StopCause::Signal)) => {
+            return StopReport {
+                lines: Vec::new(),
+                result: Err(message),
+            };
+        }
+        (Err(message), Some(_)) => Some(message),
+        (Ok(()), _) => None,
+    };
+    let cause = cause.unwrap_or(StopCause::Signal);
+    let mut lines = vec![match cause {
+        StopCause::Signal => StopLine::Stdout("idoris: 已停止".to_string()),
+        // 接口规范 §2.10.4：agent24d 已有另一个健康实例，后来者没有候补价值，优雅停止并以退出码 3 退出。
+        StopCause::InstanceConflict => StopLine::Stderr(
+            "idoris: 登记被 agent24d 以 instance_conflict 拒绝（已有另一个健康实例），已停止"
+                .to_string(),
+        ),
+        // 接口规范 §2.10.8：从「没有已 ack 的登记会话」起超过 `orphan_timeout_s`。
+        StopCause::OrphanTimeout => StopLine::Stderr(format!(
+            "idoris: 无启动器登记超过 {orphan_timeout_s} 秒，已停止"
+        )),
+    }];
+    if let Some(message) = drain_failure {
+        lines.push(StopLine::Stderr(format!(
+            "[idoris] 停止失败：{message}（停止原因已确定，退出码仍为 {}）",
+            cause.exit_code()
+        )));
+    }
+    StopReport {
+        lines,
+        result: Ok(cause.exit_code()),
+    }
+}
+
 fn main() -> std::process::ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -128,12 +202,14 @@ async fn real_main() -> u8 {
         }
     };
     match command {
-        cli::Command::Serve(options) => {
-            if let Err(message) = run(options).await {
+        cli::Command::Serve(options) => match run(options).await {
+            // 优雅停止的退出码：0（信号）、3（agent24d 以 `instance_conflict` 拒绝）、4（孤儿超时）。
+            Ok(code) => return code,
+            Err(message) => {
                 eprintln!("[idoris] {}：{message}", serve_failure_label(&message));
                 return 1;
             }
-        }
+        },
         cli::Command::Admin(cli::AdminCommand::Read(resource, options)) => {
             if let Err(message) = admin_read(resource, options).await {
                 eprintln!("[idoris] Admin 操作失败：{message}");
@@ -371,7 +447,8 @@ fn validate_bind_authority(
     Ok(())
 }
 
-async fn run(options: cli::ServeOptions) -> Result<(), String> {
+/// 返回优雅停止的退出码（接口规范 §2.7.5）：信号 0，`instance_conflict` 3，孤儿超时 4；启动或停止失败是 `Err`（退出码 1）。
+async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     // 接口规范 §2.7.3：`started_at_ms` 是 iDoris 开始 `run()` 时的 Unix 毫秒（墙钟），发现文件与 `/health` 用同一个值。
     let started_at_ms = readiness::unix_millis_now();
     // 接口规范 §2.1：`instance_nonce` 每次启动一个，CSPRNG 取 256 位。秘密：只在这个进程的内存和发现文件里，
@@ -750,29 +827,63 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         None => None,
     };
     let instance_id = state.instance_id.clone();
-    let serving_hook: Option<ServingHook> = match &discovery_target {
-        Some(target) => {
-            let record = discovery::DiscoveryRecord {
-                instance_id: instance_id.clone(),
-                instance_nonce,
-                pid: std::process::id(),
-                data_port,
-                admin_port: admin_actual_port,
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                contract_version: idoris_contracts::CONTRACT_VERSION.to_string(),
-                started_at_ms,
-                launch: Some(launch_snapshot(
-                    &components_dir,
-                    allocated_budget_bytes,
-                    &upstream_plans,
-                )?),
-            };
-            let target = target.clone();
+    // Admin token 放进一个共享的槽：登记会话里 agent24d 可以用 `set_admin_token` 原子替换它（接口规范 §2.10.6）。
+    let admin_token = SharedAdminToken::new(admin_token);
+    // 发现文件的内容只组装一次：启动时的发布、运行期的自愈、`register` 帧里的实例标识用的是同一份，所以永远一致。
+    let discovery_record: Option<Arc<discovery::DiscoveryRecord>> = match &discovery_target {
+        Some(_) => Some(Arc::new(discovery::DiscoveryRecord {
+            instance_id: instance_id.clone(),
+            instance_nonce,
+            pid: std::process::id(),
+            data_port,
+            admin_port: admin_actual_port,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            contract_version: idoris_contracts::CONTRACT_VERSION.to_string(),
+            started_at_ms,
+            launch: Some(launch_snapshot(
+                &components_dir,
+                allocated_budget_bytes,
+                &upstream_plans,
+            )?),
+        })),
+        None => None,
+    };
+    // 登记（接口规范 §2.10）、发现文件自愈（§2.7.3）与孤儿计时（§2.10.8）。有发现文件才有这一整块：
+    // 帧里的 `register_socket` 出现则 `discovery_path` 必填（帧校验已经保证）。任务在这里就启动，但都等发现文件首次
+    // 发布成功（发布钩子里开闸）之后才开始工作。
+    let registration = match (&discovery_target, &discovery_record) {
+        (Some(target), Some(record)) => Some(Registration::start(RegistrationConfig {
+            socket: launcher.register_socket.clone(),
+            orphan_timeout: (launcher.orphan_timeout_s != 0)
+                .then(|| Duration::from_secs(u64::from(launcher.orphan_timeout_s))),
+            identity: register::Identity::from_record(record),
+            nonce: record.instance_nonce.clone(),
+            health: health_state.clone(),
+            admin_token: admin_token.clone(),
+            discovery: Some(SelfHeal {
+                target: target.clone(),
+                record: record.clone(),
+            }),
+            timings: register::Timings::default(),
+            observer: None,
+            log: register::stderr_log(),
+        })),
+        _ => None,
+    };
+    let serving_hook: Option<ServingHook> = match (&discovery_target, &discovery_record) {
+        (Some(target), Some(record)) => {
+            let (target, record) = (target.clone(), record.clone());
+            let gate = registration.as_ref().map(Registration::publish_gate);
             Some(Box::new(move || {
-                target.publish(&record).map_err(|error| error.to_string())
+                target.publish(&record).map_err(|error| error.to_string())?;
+                // 发现文件已经发布：登记与自愈可以开始了（登记在写文件之后）。
+                if let Some(gate) = gate {
+                    gate.open();
+                }
+                Ok(())
             }))
         }
-        None => None,
+        _ => None,
     };
 
     if dev_no_key_enabled {
@@ -807,12 +918,40 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         },
         prober_cancel.clone(),
     );
+    // 停止的原因：SIGTERM、SIGINT，或登记客户端要求停止（`instance_conflict`、孤儿超时）。三者走同一条停止路径
+    // （接口规范 §2.7.5），原因在这里记下来，决定退出码、日志与是否发 `bye`。
+    let stop_cause: Arc<Mutex<Option<StopCause>>> = Arc::new(Mutex::new(None));
+    let shutdown_signal = {
+        let registration = registration.clone();
+        let stop_cause = stop_cause.clone();
+        async move {
+            let cause = match &registration {
+                Some(registration) => {
+                    tokio::select! {
+                        _ = termination_signal() => StopCause::Signal,
+                        cause = registration.wants_stop() => cause,
+                    }
+                }
+                None => {
+                    termination_signal().await;
+                    StopCause::Signal
+                }
+            };
+            if let Some(registration) = &registration {
+                // 立即返回：自愈马上停止；信号停止时 `bye`（至多 0.5 秒）与下面的 HTTP 排空并行。
+                registration.begin_stop(cause);
+            }
+            // S3、S5 接入引擎之后，引擎的停止也在这里并行启动，由 `cause.stops_owned_engines(launcher.engine.stop_on_exit)`
+            // 决定停不停（`stop_on_exit:"never"` 只对退出码 0 有效）。S2 还没有引擎，这里什么也不停。
+            *stop_cause.lock().unwrap_or_else(PoisonError::into_inner) = Some(cause);
+        }
+    };
     let served = serve_bound_with_hooks(
         data_listener,
         admin_listener,
         state,
         admin_token,
-        termination_signal(),
+        shutdown_signal,
         ServeHooks {
             on_serving: serving_hook,
         },
@@ -820,14 +959,28 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     .await;
     prober_cancel.cancel();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), prober).await;
+    // 登记客户端与自愈先收尾（`bye` 已在排空期间并行发出），之后才删发现文件：否则自愈可能在删除之后又把它写回来。
+    if let Some(registration) = &registration {
+        registration.finish().await;
+    }
     // 接口规范 §2.7.3「何时删」：监听关闭之后、实例锁释放之前（`_instance_lock` 在本函数返回时才释放），
     // 仅当文件里的 `instance_id` 等于自己。SIGKILL、panic、掉电走不到这里：那是「崩溃残留」。
     if let Some(target) = discovery_target {
         remove_discovery_file(target, instance_id).await;
     }
-    served?;
-    println!("idoris: 已停止");
-    Ok(())
+    let cause = stop_cause
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    // 排空失败不能盖掉已经确定的停止原因（3、4）：决定在 `stop_report` 里，那里有测试。
+    let report = stop_report(cause, served, launcher.orphan_timeout_s);
+    for line in report.lines {
+        match line {
+            StopLine::Stdout(text) => say(std::io::stdout(), &text),
+            StopLine::Stderr(text) => say(std::io::stderr(), &text),
+        }
+    }
+    report.result
 }
 
 /// 退出时删发现文件：只在文件属于自己时删；删不掉（旁路锁不可用或等锁超时、IO 失败）只留一行日志，文件成为崩溃残留，
@@ -841,12 +994,16 @@ async fn remove_discovery_file(target: Arc<discovery::DiscoveryTarget>, instance
             | discovery::RemoveOutcome::NotOwned,
         ) => {}
         Ok(discovery::RemoveOutcome::LockUnavailable) => {
-            eprintln!(
-                "[idoris] 发现文件未删除：旁路锁不可用或等待超时（文件保留，下一个实例会覆盖）"
+            say(
+                std::io::stderr(),
+                "[idoris] 发现文件未删除：旁路锁不可用或等待超时（文件保留，下一个实例会覆盖）",
             );
         }
         Ok(discovery::RemoveOutcome::Failed) | Err(_) => {
-            eprintln!("[idoris] 发现文件未删除：删除失败（文件保留，下一个实例会覆盖）");
+            say(
+                std::io::stderr(),
+                "[idoris] 发现文件未删除：删除失败（文件保留，下一个实例会覆盖）",
+            );
         }
     }
 }
@@ -1051,7 +1208,7 @@ async fn serve_bound_with_hooks<S>(
     data_listener: tokio::net::TcpListener,
     admin_listener: tokio::net::TcpListener,
     state: AppState,
-    admin_token: AdminSessionToken,
+    admin_token: impl Into<SharedAdminToken>,
     shutdown_signal: S,
     hooks: ServeHooks,
 ) -> Result<(), String>
@@ -1066,7 +1223,7 @@ where
         .map_err(|err| format!("无法读取 Admin listener 地址：{err}"))?;
     let subscriptions = state.subscriptions.clone();
     let data_app = build_app(state.clone());
-    let admin_app = build_admin_app(state, admin_token);
+    let admin_app = build_admin_app_with_token(state, admin_token.into());
     let shutdown = CancellationToken::new();
     let data_listener = WriteTimeoutListener::new(
         ConnectionListener::new(data_listener, shutdown.clone())
@@ -1183,6 +1340,120 @@ mod tests {
         assert_eq!(shutdown_timeout_message(), "优雅停机超过 10s，强制退出");
         assert_eq!(serve_failure_label(&shutdown_timeout_message()), "停止失败");
         assert_eq!(serve_failure_label("无法绑定 127.0.0.1:1"), "启动失败");
+    }
+
+    const CONFLICT_LINE: &str =
+        "idoris: 登记被 agent24d 以 instance_conflict 拒绝（已有另一个健康实例），已停止";
+
+    fn stderr(text: &str) -> StopLine {
+        StopLine::Stderr(text.to_string())
+    }
+
+    /// 排空成功：每种原因都照原因退出，只写原因对应的那一行（信号写 stdout，另两种写 stderr）。没有记下原因而排空成功只可能是
+    /// 信号停止，按信号处理。
+    #[test]
+    fn a_clean_drain_exits_with_the_cause_code_and_writes_only_the_cause_line() {
+        for cause in [Some(StopCause::Signal), None] {
+            assert_eq!(
+                stop_report(cause, Ok(()), 0),
+                StopReport {
+                    lines: vec![StopLine::Stdout("idoris: 已停止".to_string())],
+                    result: Ok(0),
+                }
+            );
+        }
+        assert_eq!(
+            stop_report(Some(StopCause::InstanceConflict), Ok(()), 0),
+            StopReport {
+                lines: vec![stderr(CONFLICT_LINE)],
+                result: Ok(3),
+            }
+        );
+        assert_eq!(
+            stop_report(Some(StopCause::OrphanTimeout), Ok(()), 900),
+            StopReport {
+                lines: vec![stderr("idoris: 无启动器登记超过 900 秒，已停止")],
+                result: Ok(4),
+            }
+        );
+    }
+
+    /// 信号停止（或没有记下原因）而排空失败：仍是「停止失败」，退出码 1（`real_main` 打印并退出），错误原样带出去，不写原因行。
+    /// 这是 §2.7.5 原本的行为，加上已知原因的例外之后它必须不变。
+    #[test]
+    fn a_failed_drain_after_a_signal_stop_is_still_a_stop_failure_that_exits_1() {
+        for cause in [Some(StopCause::Signal), None] {
+            let report = stop_report(cause, Err(shutdown_timeout_message()), 0);
+            assert_eq!(
+                report,
+                StopReport {
+                    lines: Vec::new(),
+                    result: Err(shutdown_timeout_message()),
+                }
+            );
+        }
+        assert_eq!(
+            stop_report(None, Err("data server exited unexpectedly".to_string()), 0).result,
+            Err("data server exited unexpectedly".to_string())
+        );
+    }
+
+    /// 已知原因（`instance_conflict`、孤儿超时）而排空超时：退出码仍是 3、4，原因行照写，另有一行说明排空超时。
+    /// launcher 把 1 当崩溃重启：3 变成 1，就是让后来者再撞一次冲突。
+    #[test]
+    fn a_drain_timeout_does_not_turn_a_known_stop_cause_into_exit_code_1() {
+        assert_eq!(
+            stop_report(
+                Some(StopCause::InstanceConflict),
+                Err(shutdown_timeout_message()),
+                0
+            ),
+            StopReport {
+                lines: vec![
+                    stderr(CONFLICT_LINE),
+                    stderr(
+                        "[idoris] 停止失败：优雅停机超过 10s，强制退出（停止原因已确定，退出码仍为 3）"
+                    ),
+                ],
+                result: Ok(3),
+            }
+        );
+        assert_eq!(
+            stop_report(
+                Some(StopCause::OrphanTimeout),
+                Err(shutdown_timeout_message()),
+                900
+            ),
+            StopReport {
+                lines: vec![
+                    stderr("idoris: 无启动器登记超过 900 秒，已停止"),
+                    stderr(
+                        "[idoris] 停止失败：优雅停机超过 10s，强制退出（停止原因已确定，退出码仍为 4）"
+                    ),
+                ],
+                result: Ok(4),
+            }
+        );
+    }
+
+    /// 排空失败也可能不是超时（订阅停不下来、服务报错）：同样不盖掉已知的原因；说明里是原来的错误文本。
+    #[test]
+    fn any_drain_failure_is_reported_next_to_a_known_cause_instead_of_replacing_it() {
+        let report = stop_report(
+            Some(StopCause::InstanceConflict),
+            Err("subscription shutdown failed: closed".to_string()),
+            0,
+        );
+        assert_eq!(report.result, Ok(3));
+        assert_eq!(
+            report.lines,
+            vec![
+                stderr(CONFLICT_LINE),
+                stderr(
+                    "[idoris] 停止失败：subscription shutdown failed: closed（停止原因已确定，退出码仍为 3）"
+                ),
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -1566,6 +1837,61 @@ mod tests {
             finished.load(std::sync::atomic::Ordering::SeqCst),
             "serve_bound_with_hooks returned while the hook was still running"
         );
+    }
+
+    /// 接口规范 §2.10.6：Admin 监听器用的是共享的 token 槽。另一个任务（登记会话里的 `set_admin_token`）替换它之后，
+    /// 同一个监听器（没有重建）上旧 token 立即 401、新 token 200。
+    #[tokio::test]
+    async fn the_admin_listener_follows_a_replaced_shared_token() {
+        let (data, admin, _data_port, admin_port) = bind_pair().await;
+        let old = AdminSessionToken::mint();
+        let old_secret = old.expose_secret().to_string();
+        let shared = SharedAdminToken::new(old);
+        let signal = CancellationToken::new();
+        let signal_wait = signal.clone();
+        let task = tokio::spawn(serve_bound_with_hooks(
+            data,
+            admin,
+            AppState::default(),
+            shared.clone(),
+            async move { signal_wait.cancelled().await },
+            ServeHooks::default(),
+        ));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let status_with = |secret: String| {
+            let client = client.clone();
+            async move {
+                client
+                    .get(format!("http://127.0.0.1:{admin_port}/admin/api/v1/status"))
+                    .header("authorization", format!("Bearer {secret}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        let new = AdminSessionToken::mint();
+        let new_secret = new.expose_secret().to_string();
+        assert!(status_with(old_secret.clone()).await.is_success());
+        assert_eq!(
+            status_with(new_secret.clone()).await,
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+
+        shared.replace(new);
+
+        assert_eq!(
+            status_with(old_secret).await,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "the old token is dead the moment the slot is replaced"
+        );
+        assert!(status_with(new_secret).await.is_success());
+        signal.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     /// 没有钩子时和以前完全一样：信号之前一直服务，信号之后干净退出。

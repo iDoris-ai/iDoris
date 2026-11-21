@@ -2,8 +2,8 @@
 //! The Admin router is separate from the data plane and callers must bind it
 //! through [`AdminBindConfig`], which is fixed to IPv4 loopback.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use axum::{
     Json, Router,
@@ -165,19 +165,73 @@ impl std::fmt::Display for AdminSessionToken {
     }
 }
 
+/// 进程里唯一的 Admin session token，运行期可以**原子替换**（接口规范 §2.10.6，修订 1.6）：登记会话里
+/// agent24d 用 `set_admin_token` 设一个新 token，之后任何带旧 token 的 Admin 请求得到 401；已经通过认证、
+/// 正在处理的请求不受影响（认证只在请求开始时取一份快照，见 [`Self::current`]）。
+///
+/// 克隆很便宜（一个 `Arc`），所有克隆共享同一个槽。`Debug` 不渲染 token。
+#[derive(Clone)]
+pub struct SharedAdminToken(Arc<RwLock<Arc<AdminSessionToken>>>);
+
+impl SharedAdminToken {
+    pub fn new(token: AdminSessionToken) -> Self {
+        Self(Arc::new(RwLock::new(Arc::new(token))))
+    }
+
+    /// 取当前 token 的快照。认证一次请求只取一次：之后即使 token 被替换，这个快照仍然只认旧值，
+    /// 而下一次请求会看到新值。
+    pub fn current(&self) -> Arc<AdminSessionToken> {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 原子替换：返回之后，任何新的 [`Self::current`]、[`Self::matches`] 都只认 `token`，旧 token 立即失效。
+    pub fn replace(&self, token: AdminSessionToken) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(token);
+    }
+
+    /// 与当前 token 常量时间比较。
+    pub fn matches(&self, candidate: &str) -> bool {
+        self.current().matches(candidate)
+    }
+}
+
+impl From<AdminSessionToken> for SharedAdminToken {
+    fn from(token: AdminSessionToken) -> Self {
+        Self::new(token)
+    }
+}
+
+impl std::fmt::Debug for SharedAdminToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedAdminToken([REDACTED])")
+    }
+}
+
 #[derive(Clone)]
 struct AdminHttpState {
     app: Arc<AppState>,
-    token: Arc<AdminSessionToken>,
+    token: SharedAdminToken,
 }
 
 /// Build the Admin listener router. Its static console shell carries no privileged
 /// data; every `/admin/api/v1/*` resource remains bearer-authenticated. The caller
 /// owns the separate loopback listener; this router is never mounted on [`crate::build_app`].
+///
+/// The token is fixed for the router's lifetime; use [`build_admin_app_with_token`] when it must be
+/// replaceable at run time (the launcher-hosted path, `set_admin_token`).
 pub fn build_admin_app(state: AppState, token: AdminSessionToken) -> Router {
+    build_admin_app_with_token(state, SharedAdminToken::new(token))
+}
+
+/// Like [`build_admin_app`], but the token lives in a shared slot another task can replace
+/// (接口规范 §2.10.6): every request is authenticated against the token current at the time it starts.
+pub fn build_admin_app_with_token(state: AppState, token: SharedAdminToken) -> Router {
     let state = AdminHttpState {
         app: Arc::new(state),
-        token: Arc::new(token),
+        token,
     };
     let api = Router::new()
         .route("/status", get(admin_status))
@@ -273,7 +327,9 @@ async fn require_admin_auth(
     request: Request,
     next: Next,
 ) -> Response {
-    if !authorized(request.headers(), &state.token) {
+    // 一次请求只取一次快照：认证通过之后 token 被替换，不影响这个已经在处理的请求。
+    let token = state.token.current();
+    if !authorized(request.headers(), &token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     next.run(request).await
@@ -1633,5 +1689,134 @@ mod tests {
         assert!(!first.matches("short"));
         assert_eq!(format!("{first}"), "[REDACTED]");
         assert_eq!(format!("{first:?}"), "AdminSessionToken([REDACTED])");
+    }
+
+    /// 接口规范 §2.10.6：替换是原子的，之后旧 token 立即失效；替换之前取到的快照仍只认旧值
+    /// （「已经在处理的请求不受影响」靠的就是每个请求只取一次快照）。
+    #[test]
+    fn a_shared_token_replacement_invalidates_the_old_value_but_not_snapshots_already_taken() {
+        let old = AdminSessionToken::mint();
+        let (old_secret, new) = (old.expose_secret().to_string(), AdminSessionToken::mint());
+        let new_secret = new.expose_secret().to_string();
+        let shared = SharedAdminToken::new(old);
+        let clone = shared.clone();
+        let snapshot = shared.current();
+        assert!(shared.matches(&old_secret));
+        assert!(!shared.matches(&new_secret));
+
+        clone.replace(new);
+
+        // 所有克隆共享同一个槽：旧值立即失效，新值立即生效。
+        for handle in [&shared, &clone] {
+            assert!(!handle.matches(&old_secret));
+            assert!(handle.matches(&new_secret));
+        }
+        // 替换之前取到的快照只认旧值。
+        assert!(snapshot.matches(&old_secret));
+        assert!(!snapshot.matches(&new_secret));
+        assert_eq!(format!("{shared:?}"), "SharedAdminToken([REDACTED])");
+    }
+
+    /// 同一个 Admin router 在 token 被替换前后：旧 token 先是 200、之后是 401，新 token 先是 401、之后是 200。
+    #[tokio::test]
+    async fn the_admin_router_follows_a_replaced_token_without_being_rebuilt() {
+        let old = AdminSessionToken::mint();
+        let old_secret = old.expose_secret().to_string();
+        let new = AdminSessionToken::mint();
+        let new_secret = new.expose_secret().to_string();
+        let shared = SharedAdminToken::new(old);
+        let app = build_admin_app_with_token(AppState::default(), shared.clone());
+        let status_of = |secret: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(admin_request("/admin/api/v1/status", "Bearer", &secret))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        assert_eq!(status_of(old_secret.clone()).await, StatusCode::OK);
+        assert_eq!(
+            status_of(new_secret.clone()).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        shared.replace(new);
+
+        assert_eq!(
+            status_of(old_secret.clone()).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(status_of(new_secret.clone()).await, StatusCode::OK);
+    }
+
+    /// 接口规范 §2.10.6：替换是原子的，之后任何带旧 token 的 Admin 请求得到 401，「已经在处理的请求不受影响」。
+    /// 带认证中间件的路由上，一个处理函数被信号卡住：请求在它里面时（已经通过认证）换 token；这个请求照常完成（200），
+    /// 换了之后新来的请求按新值认证（旧 token 401、新 token 200）。
+    #[tokio::test]
+    async fn a_request_already_past_authentication_survives_the_replacement_and_new_requests_follow_it()
+     {
+        let old = AdminSessionToken::mint();
+        let old_secret = old.expose_secret().to_string();
+        let new = AdminSessionToken::mint();
+        let new_secret = new.expose_secret().to_string();
+        let shared = SharedAdminToken::new(old);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let slow = {
+            let (entered, release) = (entered.clone(), release.clone());
+            move || {
+                let (entered, release) = (entered.clone(), release.clone());
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    StatusCode::OK
+                }
+            }
+        };
+        let state = AdminHttpState {
+            app: Arc::new(AppState::default()),
+            token: shared.clone(),
+        };
+        let app = Router::new()
+            .route("/slow", get(slow))
+            .route("/fast", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(state, require_admin_auth));
+
+        let in_flight = tokio::spawn({
+            let (app, secret) = (app.clone(), old_secret.clone());
+            async move {
+                app.oneshot(admin_request("/slow", "Bearer", &secret))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        });
+        // 请求已经在处理函数里（认证早就通过了）。
+        entered.notified().await;
+        shared.replace(new);
+
+        let status_of = |secret: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(admin_request("/fast", "Bearer", &secret))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(status_of(old_secret).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_of(new_secret).await, StatusCode::OK);
+
+        release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), in_flight)
+                .await
+                .unwrap_or_else(|_| panic!("the request in flight must finish"))
+                .unwrap(),
+            StatusCode::OK,
+            "a request that already passed authentication is not affected by the replacement"
+        );
     }
 }
