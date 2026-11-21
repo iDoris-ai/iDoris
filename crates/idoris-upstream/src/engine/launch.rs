@@ -81,10 +81,12 @@ pub enum LaunchError {
 }
 
 impl LaunchError {
-    /// 稳定的原因码（对应 `/health.upstreams[].reason`；非 `budget_zero` 的都是调用方或配方的编程错误）。
+    /// 稳定的原因码（对应 `/health.upstreams[].reason`）：`BudgetZero` 是 `budget_zero`；`Invalid("base_path")`（引擎的
+    /// 私有数据目录没配或核对不过，oMLX 配方，规范 §2.7.6）是 `base_unavailable`；其余是调用方或配方的编程错误。
     pub fn reason_code(&self) -> &'static str {
         match self {
             Self::BudgetZero => "budget_zero",
+            Self::Invalid("base_path") => "base_unavailable",
             _ => "invalid_launch",
         }
     }
@@ -460,6 +462,18 @@ mod tests {
         let error = EngineLaunch::new(&inst, spec(), env(&[])).unwrap_err();
         assert_eq!(error, LaunchError::Invalid("model_dir"));
         assert_eq!(error.reason_code(), "invalid_launch");
+    }
+
+    #[test]
+    fn an_unavailable_base_has_its_own_reason_code() {
+        assert_eq!(
+            LaunchError::Invalid("base_path").reason_code(),
+            "base_unavailable"
+        );
+        assert_eq!(
+            LaunchError::Invalid("model_dir").reason_code(),
+            "invalid_launch"
+        );
     }
 
     #[test]
