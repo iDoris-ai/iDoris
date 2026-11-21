@@ -330,6 +330,31 @@ pub trait SetupEngine: Sync {
     fn check_requested_bindings(&self, _bindings: &[(String, String)]) -> Result<(), SetupError> {
         Ok(())
     }
+
+    /// 伴生卡（IDORIS-CORE S7）可能写出的文件名。它们和 [`SetupEngine::card_file`]、[`SetupEngine::static_files`]
+    /// 一样属于 `--force` 的整体替换范围：这次没生成伴生卡、上次生成过的，`--force` 会把它删掉，不留指向旧模型的残卡。
+    /// 缺省没有伴生卡。
+    fn companion_files(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// 由伴生卡承载的角色：`--bind` 里出现这些角色时，这些绑定从主卡挪到伴生卡（只有一张卡带着这个角色，
+    /// 选卡没有歧义）。缺省没有。
+    fn companion_roles(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// 生成伴生卡：`main` 是已经填好的主卡（同 endpoint），`bindings` 是 [`SetupEngine::companion_roles`] 里的那些
+    /// 绑定（只在它们非空时才被调用）。返回 `(文件名, 卡)`；文件名必须在 [`SetupEngine::companion_files`] 里。
+    /// 落盘、整体校验（目录里所有卡一起过服务启动时的加载器）、`--force` 的范围由通用的 [`run_setup`] 负责，
+    /// 引擎这边不写任何文件。缺省不生成。
+    fn companion_card(
+        &self,
+        _main: &ComponentCard,
+        _bindings: &[(String, String)],
+    ) -> Result<Option<(String, ComponentCard)>, SetupError> {
+        Ok(None)
+    }
 }
 
 /// 引擎有 [`idoris_upstream::engine::EngineRecipe`]（规范 §2.12.1）时，[`SetupEngine`] 两个可执行文件方法的通用实现：
@@ -417,15 +442,64 @@ pub async fn run_setup<E: SetupEngine>(
     } else {
         presence(engine).await
     };
-    let card = build_card(engine, &resolved, options)?;
+    let (main_bindings, companion_bindings): (Vec<_>, Vec<_>) = if options
+        .bindings
+        .iter()
+        .any(|(role, _)| is_companion_role(engine, role))
+    {
+        options
+            .bindings
+            .iter()
+            .cloned()
+            .partition(|(role, _)| !is_companion_role(engine, role))
+    } else {
+        (options.bindings.clone(), Vec::new())
+    };
+    let card = build_card(engine, &resolved, options.load_mode, &main_bindings)?;
     check_identity(engine, &card, resolved.managed)?;
     let yaml = serde_yaml::to_string(&card)
         .map_err(|e| SetupError::new("validation_failed", format!("生成组件卡失败：{e}")))?;
+    let companion = if companion_bindings.is_empty() {
+        None
+    } else {
+        engine.companion_card(&card, &companion_bindings)?
+    };
+    let companion = match companion {
+        Some((file, companion_card)) => {
+            if !engine.companion_files().contains(&file.as_str()) {
+                return Err(SetupError::new(
+                    "validation_failed",
+                    format!("伴生卡的文件名 {file:?} 不在引擎声明的 companion_files 里"),
+                ));
+            }
+            // 伴生卡共用主卡的引擎，自己没有生命周期：不带托管声明，种类与主卡一致。
+            check_identity(engine, &companion_card, false)?;
+            let companion_yaml = serde_yaml::to_string(&companion_card).map_err(|e| {
+                SetupError::new("validation_failed", format!("生成组件卡失败：{e}"))
+            })?;
+            Some((file, companion_yaml))
+        }
+        None => None,
+    };
     let dir = match engine.out_dir_use() {
         OutDirUse::Owned => {
             let mut files = vec![(engine.card_file(), yaml.as_str())];
             files.extend(engine.static_files().iter().copied());
-            write_validated(&options.out_dir, options.force, &files)?
+            if let Some((file, companion_yaml)) = &companion {
+                files.push((file.as_str(), companion_yaml.as_str()));
+            }
+            write_validated_with(
+                &options.out_dir,
+                options.force,
+                &files,
+                engine.companion_files(),
+            )?
+        }
+        OutDirUse::AddCard if companion.is_some() => {
+            return Err(SetupError::new(
+                "validation_failed",
+                "引擎要生成伴生卡，却又要往已有目录里只加一张卡：两者不能同时用",
+            ));
         }
         OutDirUse::AddCard => write_added(
             &options.out_dir,
@@ -451,6 +525,7 @@ pub async fn run_setup<E: SetupEngine>(
         Some(p) => p.models,
         None => Vec::new(),
     };
+    let companion_file = companion.map(|(file, _)| file);
     let mut next = json!({"env": {"IDORIS_COMPONENTS_DIR": dir.display().to_string()}});
     if auth_required {
         next["needs_env"] = json!([engine.key_env()]);
@@ -463,7 +538,7 @@ pub async fn run_setup<E: SetupEngine>(
     if let Some(version) = report.version {
         engine_json["version"] = json!(version);
     }
-    Ok(json!({
+    let mut output = json!({
         "status": "ok",
         "mode": if resolved.managed { "managed" } else { "adopt" },
         "endpoint": resolved.endpoint,
@@ -473,12 +548,22 @@ pub async fn run_setup<E: SetupEngine>(
         "engine": engine_json,
         "components_dir": dir.display().to_string(),
         "next": next,
-    }))
+    });
+    // 只增不改：这次生成了伴生卡才有这个字段，没生成时输出与以前逐字节一致。
+    if let Some(file) = companion_file {
+        output["companion_card_file"] = json!(file);
+    }
+    Ok(output)
+}
+
+fn is_companion_role<E: SetupEngine>(engine: &E, role: &str) -> bool {
+    engine.companion_roles().contains(&role)
 }
 
 fn managed_file_names<E: SetupEngine>(engine: &E) -> Vec<&str> {
     std::iter::once(engine.card_file())
         .chain(engine.static_files().iter().map(|(name, _)| *name))
+        .chain(engine.companion_files().iter().copied())
         .collect()
 }
 
@@ -739,13 +824,14 @@ async fn presence<E: SetupEngine>(engine: &E) -> EngineReport {
 fn build_card<E: SetupEngine>(
     engine: &E,
     resolved: &Resolved,
-    options: &SetupOptions,
+    load_mode: LoadMode,
+    bindings: &[(String, String)],
 ) -> Result<ComponentCard, SetupError> {
     let mut card = engine.card_template()?;
     card.endpoint = resolved.endpoint.clone();
     if let Some(policy) = card.load_policy.as_mut() {
-        policy.mode = options.load_mode;
-        if options.load_mode == LoadMode::Resident {
+        policy.mode = load_mode;
+        if load_mode == LoadMode::Resident {
             // The card contract ties resident to pinned keepalive.
             policy.keepalive = Keepalive::Pinned { pinned: true };
             policy.admission = Admission::Coexist;
@@ -772,9 +858,8 @@ fn build_card<E: SetupEngine>(
             engine.display_name()
         ));
     }
-    if !options.bindings.is_empty() {
-        let models: Map<String, Value> = options
-            .bindings
+    if !bindings.is_empty() {
+        let models: Map<String, Value> = bindings
             .iter()
             .map(|(r, m)| (r.clone(), json!(m)))
             .collect();
@@ -872,8 +957,26 @@ pub fn write_validated(
     force: bool,
     files: &[(&str, &str)],
 ) -> Result<PathBuf, SetupError> {
+    write_validated_with(out_dir, force, files, &[])
+}
+
+/// [`write_validated`]，另有 `also_managed`：这次不写、但属于 `--force` 整体替换范围的文件名（伴生卡）。
+/// 它们在目标目录里已经有时一并清掉（和别的被替换的文件一样先挪开，失败时整体恢复），不留旧版本。
+pub fn write_validated_with(
+    out_dir: &Path,
+    force: bool,
+    files: &[(&str, &str)],
+    also_managed: &[&str],
+) -> Result<PathBuf, SetupError> {
     let io = |e: std::io::Error| SetupError::new("write_failed", format!("写入失败：{e}"));
     let names: Vec<&str> = files.iter().map(|(name, _)| *name).collect();
+    // 只清不写：属于整体替换范围、这次没有生成的文件（上次的伴生卡）。
+    let clear_only: Vec<&str> = also_managed
+        .iter()
+        .copied()
+        .filter(|name| !names.contains(name))
+        .collect();
+    let scope: Vec<&str> = names.iter().chain(clear_only.iter()).copied().collect();
     let stage = create_stage(out_dir)?;
     let result = (|| {
         for (name, content) in files {
@@ -886,9 +989,9 @@ pub fn write_validated(
                     .replace(&stage.display().to_string(), "<staging>"),
             )
         })?;
-        check_out_dir(out_dir, force, stage.file_name(), &names)?;
+        check_out_dir(out_dir, force, stage.file_name(), &scope)?;
         if out_dir.exists() {
-            replace_managed(&stage, out_dir, &names).map_err(io)?;
+            replace_managed(&stage, out_dir, &names, &clear_only).map_err(io)?;
         } else {
             std::fs::rename(&stage, out_dir).map_err(io)?;
         }
@@ -899,12 +1002,18 @@ pub fn write_validated(
 }
 
 /// Moves the staged managed files into an existing `out_dir`, all or nothing.
-fn replace_managed(stage: &Path, out_dir: &Path, names: &[&str]) -> std::io::Result<()> {
+/// `names` 必须都在暂存目录里；`clear_only` 只在目标目录里挪开（成功后删除），不从暂存目录放入。
+fn replace_managed(
+    stage: &Path,
+    out_dir: &Path,
+    names: &[&str],
+    clear_only: &[&str],
+) -> std::io::Result<()> {
     let tag = format!(".idoris-bak-{}", std::process::id());
     let mut backed_up: Vec<&str> = Vec::new();
     let mut placed: Vec<&str> = Vec::new();
     let attempt = (|| {
-        for name in names.iter().copied() {
+        for name in names.iter().chain(clear_only.iter()).copied() {
             let target = out_dir.join(name);
             if target.exists() {
                 std::fs::rename(&target, out_dir.join(format!("{name}{tag}")))?;
@@ -1160,7 +1269,7 @@ mod tests {
         std::fs::write(stage.join("omlx.yaml"), "new-omlx").unwrap();
         // subscription.yaml missing from the stage: the second move fails
         // after omlx.yaml was already replaced.
-        replace_managed(&stage, &out, &["omlx.yaml", "subscription.yaml"]).unwrap_err();
+        replace_managed(&stage, &out, &["omlx.yaml", "subscription.yaml"], &[]).unwrap_err();
         assert_eq!(
             std::fs::read_to_string(out.join("omlx.yaml")).unwrap(),
             "old-omlx"
@@ -1175,6 +1284,56 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["omlx.yaml", "subscription.yaml"]);
+    }
+
+    /// 只清不写的文件（上次的伴生卡）：成功时被删掉；替换中途失败时和别的文件一起恢复。
+    #[test]
+    fn clear_only_files_are_removed_on_success_and_restored_on_failure() {
+        let setup = || {
+            let tmp = tempfile::tempdir().unwrap();
+            let out = tmp.path().join("comp");
+            let stage = tmp.path().join("stage");
+            std::fs::create_dir(&out).unwrap();
+            std::fs::create_dir(&stage).unwrap();
+            std::fs::write(out.join("omlx.yaml"), "old-omlx").unwrap();
+            std::fs::write(out.join("omlx-embed.yaml"), "old-embed").unwrap();
+            std::fs::write(stage.join("omlx.yaml"), "new-omlx").unwrap();
+            (tmp, out, stage)
+        };
+        let listing = |out: &Path| {
+            let mut names: Vec<_> = std::fs::read_dir(out)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let (_tmp, out, stage) = setup();
+        replace_managed(&stage, &out, &["omlx.yaml"], &["omlx-embed.yaml"]).unwrap();
+        assert_eq!(listing(&out), ["omlx.yaml"]);
+        assert_eq!(
+            std::fs::read_to_string(out.join("omlx.yaml")).unwrap(),
+            "new-omlx"
+        );
+
+        let (_tmp, out, stage) = setup();
+        // 暂存目录里缺 subscription.yaml：放入阶段失败，两个旧文件都要回来。
+        replace_managed(
+            &stage,
+            &out,
+            &["omlx.yaml", "subscription.yaml"],
+            &["omlx-embed.yaml"],
+        )
+        .unwrap_err();
+        assert_eq!(listing(&out), ["omlx-embed.yaml", "omlx.yaml"]);
+        assert_eq!(
+            std::fs::read_to_string(out.join("omlx-embed.yaml")).unwrap(),
+            "old-embed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("omlx.yaml")).unwrap(),
+            "old-omlx"
+        );
     }
 
     #[test]

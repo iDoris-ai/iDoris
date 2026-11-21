@@ -36,6 +36,7 @@ async fn twice(tenant: Option<&str>, uncached: &[&str]) -> (usize, bool) {
             served_locality: Locality::Loopback,
             privacy: PrivacyClass::Any,
             require_openai_usage: false,
+            attach_omlx_key: false,
         };
         let outcome = proxy.forward_buffered(&endpoint, &body, &opts).await;
         assert_eq!(outcome.status, 200, "{record}");

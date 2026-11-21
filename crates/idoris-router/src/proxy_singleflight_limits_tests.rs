@@ -97,6 +97,7 @@ fn opts(id: &str) -> ForwardOpts<'_> {
         served_locality: Locality::Loopback,
         privacy: PrivacyClass::Any,
         require_openai_usage: false,
+        attach_omlx_key: false,
     }
 }
 

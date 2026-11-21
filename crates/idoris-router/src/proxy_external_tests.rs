@@ -56,6 +56,7 @@ async fn http_faults(p: &ChatProxy, id: &str, count: usize) {
                     served_locality: Locality::Loopback,
                     privacy: PrivacyClass::Any,
                     require_openai_usage: false,
+                    attach_omlx_key: false,
                 },
             )
             .await;

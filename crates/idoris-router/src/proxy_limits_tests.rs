@@ -162,5 +162,6 @@ fn buffered_opts<'a>() -> ForwardOpts<'a> {
         served_locality: Locality::Loopback,
         privacy: PrivacyClass::Any,
         require_openai_usage: false,
+        attach_omlx_key: false,
     }
 }
