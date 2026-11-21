@@ -137,6 +137,12 @@ enum Command {
         id: String,
         reply: LoadReply,
     },
+    /// The engine process behind this Supervisor was replaced: forget the ledger and rebuild it
+    /// for the new process — see [`SupervisorHandle::engine_replaced`] and [`handle_reset`].
+    Reset {
+        sample: bool,
+        reply: LoadReply,
+    },
 }
 
 /// What a background op reports to the single-writer loop; only the loop
@@ -357,6 +363,33 @@ impl SupervisorHandle {
             reply,
         }))
         .await?;
+        rx.await
+            .map_err(|_| BackendError::supervisor_unavailable())?
+    }
+
+    /// The engine **process** behind this Supervisor was replaced (restarted by whoever owns its
+    /// lifecycle, IDORIS-CORE S6): everything the ledger believed about the old process is stale. Rebuilds
+    /// it as if the Supervisor had just started — `sample = true` reads the new process's residency
+    /// (`adapter.status()`, the same single startup sample: models already in it become inherited slots,
+    /// their memory is the reserved aggregate); `sample = false` says the engine is gone (nothing loaded,
+    /// nothing reserved, no I/O). Either way the next request for a model finds it not loaded and loads it.
+    ///
+    /// The caller guarantees what only it can know: the old process is confirmed gone (so a load that was
+    /// left unconfirmed can no longer allocate: the [`BackendError::LoadUnconfirmed`] fence may be put
+    /// down), and no new work reaches the Supervisor meanwhile. The Supervisor checks what it can:
+    ///
+    /// - **Quiescent only**: while a load/unload is active or a chat is in flight it answers
+    ///   [`BackendError::Busy`] and changes nothing, so no completion of the old generation can ever land
+    ///   on the rebuilt ledger (there are no generation tags; waiting for quiet is the generation guard).
+    ///   Against a dead engine in-flight calls fail fast; retry shortly.
+    /// - **Fail closed**: if the new process cannot be sampled, or the durable load fence is present, the
+    ///   Supervisor latches the error exactly like a failed startup sample (every command answers it)
+    ///   until a later reset succeeds.
+    /// - A poisoned actor stays poisoned: the answer is its invariant violation.
+    pub async fn engine_replaced(&self, sample: bool) -> Result<(), BackendError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(ActorMsg::Cmd(Command::Reset { sample, reply }))
+            .await?;
         rx.await
             .map_err(|_| BackendError::supervisor_unavailable())?
     }
@@ -1731,6 +1764,144 @@ fn handle_unload(
     }
 }
 
+/// An engine-resident model the Supervisor did not load itself (it was already in the process when the
+/// ledger was last (re)built): `Error` until a `load` verifies it, pinned against eviction, its memory
+/// counted in the reserved aggregate rather than in the slot.
+fn inherited_slot() -> ModelSlot {
+    ModelSlot {
+        memory_gb: 0.0,
+        charge: CapacityCharge::default(),
+        state: ModelState::Error,
+        last_used_seq: 0,
+        policy: LoadPolicy {
+            mode: idoris_contracts::load_policy::LoadMode::OnDemand,
+            keepalive: idoris_contracts::load_policy::Keepalive::Pinned { pinned: true },
+            admission: idoris_contracts::load_policy::Admission::Coexist,
+        },
+        inflight: 0,
+        load_unconfirmed: false,
+        inherited: true,
+    }
+}
+
+/// A residency sample must carry a usable memory measurement: finite, non-negative, and non-zero when it
+/// names loaded models (the aggregate is the only accounting for them).
+fn validate_residency(status: BackendStatus) -> Result<BackendStatus, BackendError> {
+    if !status.used_gb.is_finite()
+        || status.used_gb < 0.0
+        || (status.used_gb == 0.0 && !status.loaded.is_empty())
+    {
+        Err(BackendError::internal(
+            "engine residency has no valid memory measurement",
+        ))
+    } else {
+        Ok(status)
+    }
+}
+
+/// Moves this runtime's claim in the shared capacity ledger to `observed.used_gb` — up or down, without
+/// admission policy: after an engine replacement the new process's residency is a fact, not a request
+/// (the same rule as the startup sample's `adopt_observed`). Compare-and-set against what this actor
+/// believes it holds, so a rewritten allocation is an error instead of silently overwritten accounting.
+fn rebaseline_runtime_capacity(
+    env: &mut Env<'_>,
+    observed: &BackendStatus,
+) -> Result<(), BackendError> {
+    let Some(tracking) = env.runtime_capacity.as_mut() else {
+        return Ok(());
+    };
+    match tracking.exact_claim {
+        Some(current) => {
+            let next = CapacityCharge::from_gb(observed.used_gb)?;
+            tracking
+                .ledger
+                .update_charge(&tracking.allocation_key, Some(current), next, false)?;
+            tracking.exact_claim = Some(next);
+        }
+        None => tracking.ledger.adopt_observed(
+            &tracking.allocation_key,
+            Some(tracking.claimed_gb),
+            observed.used_gb,
+        )?,
+    }
+    tracking.claimed_gb = observed.used_gb;
+    Ok(())
+}
+
+/// `Command::Reset` (see [`SupervisorHandle::engine_replaced`]): rebuild the ledger for a replaced
+/// engine process. Order matters: every check and the one adapter call come before the first mutation,
+/// so a failure leaves `models` untouched (the error latches instead — fail closed, like a failed
+/// startup sample) and only a complete success commits. `active_op_held` is whether a load/unload is
+/// active; with in-flight chats it is the quiescence condition that makes a late `OpDone`/`ChatDone`
+/// of the old generation impossible.
+async fn handle_reset(
+    sample: bool,
+    startup_probe: bool,
+    models: &mut HashMap<String, ModelSlot>,
+    active_op_held: bool,
+    env: &mut Env<'_>,
+) -> Result<(), BackendError> {
+    if active_op_held || models.values().any(|slot| slot.inflight != 0) {
+        return Err(BackendError::busy(
+            "the engine was replaced but operations of the old one are still in flight; retry shortly",
+            None,
+            None,
+        ));
+    }
+    let sample = sample && startup_probe;
+    let latch = |env: &mut Env<'_>, err: BackendError| {
+        env.startup_error = Some(err.clone());
+        err
+    };
+    if sample {
+        // The new process has nothing loaded, so a durable marker can only be a stale one.
+        let fence = match env.load_fence {
+            Some(fence) => fence.check_clear(),
+            None => Err(BackendError::internal("load fence is unavailable")),
+        };
+        if let Err(err) = fence {
+            return Err(latch(env, err));
+        }
+    }
+    let status = if sample {
+        let adapter = env.adapter.clone();
+        let ownership = env.load_fence.cloned();
+        let timeout = env.config.adapter_call_timeout;
+        // The same isolation as the startup sample: a panic in the adapter is a `JoinError` here, and the
+        // timeout bounds a hanging engine.
+        let sampled = tokio::spawn(async move {
+            let _ownership = ownership;
+            with_adapter_timeout(adapter.status(), timeout, "reset/status").await
+        })
+        .await
+        .map_err(|err| BackendError::adapter_panicked("reset/status", err.to_string()))
+        .and_then(|result| result)
+        .and_then(validate_residency);
+        match sampled {
+            Ok(status) => status,
+            Err(err) => return Err(latch(env, err)),
+        }
+    } else {
+        BackendStatus {
+            pressure: Pressure::Unknown,
+            used_gb: 0.0,
+            model_memory_max_gb: env.config.budget_gb,
+            loaded: Vec::new(),
+        }
+    };
+    if let Err(err) = rebaseline_runtime_capacity(env, &status) {
+        return Err(latch(env, err));
+    }
+    models.clear();
+    for id in &status.loaded {
+        models.insert(id.clone(), inherited_slot());
+    }
+    env.reserved_gb = status.used_gb;
+    env.aggregate_covered.clear();
+    env.startup_error = None;
+    Ok(())
+}
+
 async fn run_actor(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
@@ -1784,18 +1955,7 @@ async fn run_actor(
             loaded: Vec::new(),
         })
     };
-    let startup = startup.and_then(|status| {
-        if !status.used_gb.is_finite()
-            || status.used_gb < 0.0
-            || (status.used_gb == 0.0 && !status.loaded.is_empty())
-        {
-            Err(BackendError::internal(
-                "engine residency has no valid memory measurement",
-            ))
-        } else {
-            Ok(status)
-        }
-    });
+    let startup = startup.and_then(validate_residency);
     let initial_reserved_gb = startup
         .as_ref()
         .map(|status| status.used_gb)
@@ -1828,25 +1988,7 @@ async fn run_actor(
     };
     if let Ok(status) = &startup {
         for id in &status.loaded {
-            models.insert(
-                id.clone(),
-                ModelSlot {
-                    memory_gb: 0.0,
-                    charge: CapacityCharge::default(),
-                    state: ModelState::Error,
-                    last_used_seq: 0,
-                    policy: LoadPolicy {
-                        mode: idoris_contracts::load_policy::LoadMode::OnDemand,
-                        keepalive: idoris_contracts::load_policy::Keepalive::Pinned {
-                            pinned: true,
-                        },
-                        admission: idoris_contracts::load_policy::Admission::Coexist,
-                    },
-                    inflight: 0,
-                    load_unconfirmed: false,
-                    inherited: true,
-                },
-            );
+            models.insert(id.clone(), inherited_slot());
         }
     }
     let mut env = Env {
@@ -1883,6 +2025,9 @@ async fn run_actor(
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
                     }
                     Command::Unload { reply, .. } => {
+                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                    }
+                    Command::Reset { reply, .. } => {
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
                     }
                 }
@@ -2047,6 +2192,20 @@ async fn run_actor(
                     continue;
                 }
                 handle_unload(id, reply, &mut models, &mut active_op, &env);
+            }
+
+            // Not guarded by `startup_error`: a reset is how that latch is cleared (it answers the
+            // new sample's error itself, and a poisoned actor never reaches this arm).
+            ActorMsg::Cmd(Command::Reset { sample, reply }) => {
+                let result = handle_reset(
+                    sample,
+                    startup_probe,
+                    &mut models,
+                    active_op.is_some(),
+                    &mut env,
+                )
+                .await;
+                let _ = reply.send(result);
             }
 
             ActorMsg::OpDone { id, outcome } if poisoned.is_some() => {
@@ -4844,6 +5003,39 @@ mod tests {
             .status()
             .await
             .expect_err("status must also fail closed once poisoned");
+        assert_eq!(status_err.reason_code(), "state_invariant_violated");
+    }
+
+    /// IDORIS-CORE S6: an actor that detected corruption in its own ledger stays dead. A reset is not a way
+    /// out: rebuilding from the engine would paper over exactly the inconsistency the actor refused to guess
+    /// past, so the answer is the invariant violation, for both modes.
+    #[tokio::test]
+    async fn a_poisoned_actor_refuses_to_be_reset() {
+        let adapter: Arc<dyn RuntimeAdapter> = Arc::new(MockAdapter::new(catalog()));
+        let (tx, _join) = spawn_actor(adapter, SupervisorConfig::default());
+        let handle = SupervisorHandle { tx: tx.clone() };
+        tx.send(ActorMsg::OpDone {
+            id: "ghost".to_string(),
+            outcome: OpOutcome::Load {
+                result: Ok(()),
+                victim_results: Vec::new(),
+                aggregate_status: None,
+                aggregate_target_credit_gb: 0.0,
+                failure_outcome: LoadFailureOutcome::Settle(ModelState::Error),
+            },
+        })
+        .await
+        .expect("the internal channel should accept the message");
+
+        for sample in [true, false] {
+            let err = handle
+                .engine_replaced(sample)
+                .await
+                .expect_err("a poisoned actor must not be resettable");
+            assert_eq!(err.reason_code(), "state_invariant_violated");
+        }
+        // And it still answers as poisoned afterwards.
+        let status_err = handle.status().await.expect_err("still poisoned");
         assert_eq!(status_err.reason_code(), "state_invariant_violated");
     }
 
