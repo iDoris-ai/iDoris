@@ -355,13 +355,11 @@ async fn adopts_a_loopback_openai_server_and_writes_one_resident_card() {
         json!({"daily": MODEL, "deep": MODEL})
     );
     assert!(!extensions.contains_key("idoris_default"));
-    assert!(
-        !extensions["_degradation"]
-            .as_str()
-            .unwrap()
-            .trim()
-            .is_empty()
-    );
+    // `_degradation`：模板自带的那句（`idoris_upstream`、`idoris_default`）在前，通用流程加的（`idoris_role_models`）在后。
+    let degradation = extensions["_degradation"].as_str().unwrap();
+    let upstream_part = degradation.find("idoris_upstream").unwrap();
+    let bindings_part = degradation.find("role aliases").unwrap();
+    assert!(upstream_part < bindings_part, "{degradation}");
     // 与服务启动时同一个加载器。
     assert_eq!(load_components(&out, false).unwrap().len(), 1);
 
@@ -1068,6 +1066,7 @@ async fn a_same_named_card_needs_force_and_only_that_file_is_replaced() {
     .await);
     let first = files(&out);
 
+    let probes_before = requests(&server).await.len();
     let again = setup(
         &server.uri(),
         &out,
@@ -1077,6 +1076,11 @@ async fn a_same_named_card_needs_force_and_only_that_file_is_replaced() {
     assert_eq!(err_code(&again), "id_conflict");
     assert!(again.json["message"].as_str().unwrap().contains("--force"));
     assert_eq!(files(&out), first, "没有 --force：什么也不变");
+    assert_eq!(
+        requests(&server).await.len(),
+        probes_before,
+        "同名卡的冲突在探测之前就发现了"
+    );
 
     ok(&setup(
         &server.uri(),
