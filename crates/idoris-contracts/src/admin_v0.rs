@@ -484,6 +484,12 @@ pub struct AdminUpstream {
     pub last_failure_at_ms: Option<u64>,
 }
 
+/// The largest integer every consumer reads exactly: 2^53 - 1, JavaScript's `Number.MAX_SAFE_INTEGER`. The
+/// schema's `maximum` for `last_failure_at_ms` (a `u64` here), so a value the generated Zod/JS side would
+/// round is rejected by Rust, the schema and Zod alike (`pid` and `failure_count` are `u32`: their
+/// `maximum` is `4294967295`, which serde already enforces on this side).
+pub const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
 /// `^[a-z][a-z0-9_]{0,31}$` (interface spec §2.12.1): the engine kind grammar.
 fn is_engine_kind(value: &str) -> bool {
     let mut bytes = value.bytes();
@@ -507,6 +513,14 @@ impl Contract for AdminUpstream {
         }
         if self.pid == Some(0) {
             return Err(ContractError::new("admin upstream pid must be >= 1"));
+        }
+        if self
+            .last_failure_at_ms
+            .is_some_and(|millis| millis > JS_MAX_SAFE_INTEGER)
+        {
+            return Err(ContractError::new(
+                "admin upstream last_failure_at_ms must be <= 9007199254740991 (2^53 - 1)",
+            ));
         }
         Ok(())
     }

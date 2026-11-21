@@ -433,9 +433,15 @@ fn admin_v0_upstreams_corpus() {
         mutated("port", Value::Null),
         mutated("pid", json!(0)),
         mutated("pid", json!(-3)),
+        // The integer ranges are the Rust types' ranges: `pid` and `failure_count` are `u32`, the timestamp
+        // is pinned to JavaScript's safe-integer range (2^53 - 1) so no consumer rounds it.
+        mutated("pid", json!(4_294_967_296_u64)),
         mutated("failure_count", json!(-1)),
         mutated("failure_count", json!(2.5)),
+        mutated("failure_count", json!(4_294_967_296_u64)),
         mutated("last_failure_at_ms", json!(-1)),
+        mutated("last_failure_at_ms", json!(9_007_199_254_740_992_u64)),
+        mutated("last_failure_at_ms", json!(u64::MAX)),
         // No secret-bearing field has a place in the element (`deny_unknown_fields` / `additionalProperties:false`).
         mutated("api_key", json!("secret")),
         mutated("token", json!("secret")),
@@ -448,9 +454,15 @@ fn admin_v0_upstreams_corpus() {
     assert!(valid(&mutated("engine_kind", json!("unknown"))));
     assert!(valid(&mutated("engine_kind", json!("a".repeat(32)))));
     assert!(valid(&mutated("port", json!(65535))));
+    assert!(valid(&mutated("pid", json!(4_294_967_295_u64))));
+    assert!(valid(&mutated("failure_count", json!(4_294_967_295_u64))));
     assert!(valid(&mutated(
         "last_failure_at_ms",
         json!(1_763_625_330_123_u64)
+    )));
+    assert!(valid(&mutated(
+        "last_failure_at_ms",
+        json!(9_007_199_254_740_991_u64)
     )));
 
     // Then parity with the schema file, element by element and inside the collection.

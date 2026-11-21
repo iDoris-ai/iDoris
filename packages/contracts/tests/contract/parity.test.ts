@@ -154,10 +154,16 @@ function adminV0UpstreamCorpus(): Array<[Name, unknown]> {
     { ...managedUpstream, port: 1.5 },
     { ...managedUpstream, pid: 0 },
     { ...managedUpstream, pid: -3 },
+    { ...managedUpstream, pid: 4294967295 },
+    { ...managedUpstream, pid: 4294967296 },
     { ...managedUpstream, failure_count: -1 },
     { ...managedUpstream, failure_count: 2.5 },
+    { ...managedUpstream, failure_count: 4294967295 },
+    { ...managedUpstream, failure_count: 4294967296 },
     { ...managedUpstream, last_failure_at_ms: -1 },
     { ...managedUpstream, last_failure_at_ms: 1763625330123 },
+    { ...managedUpstream, last_failure_at_ms: 9007199254740991 },
+    { ...managedUpstream, last_failure_at_ms: 9007199254740992 },
     // 响应里不会有任何 key、token、nonce：多出来的字段一律被拒（严格模式）。
     { ...managedUpstream, api_key: "secret" },
     { ...managedUpstream, instance_nonce: "secret" },
@@ -318,6 +324,13 @@ const adminUpstreamCases: Array<[string, unknown, boolean]> = [
   ["no secret-bearing field is allowed: instance_nonce", { ...managedUpstream, instance_nonce: "n" }, false],
   ["port 0 is not a port", { ...managedUpstream, port: 0 }, false],
   ["a pid is a positive integer", { ...managedUpstream, pid: 0 }, false],
+  // The integer ranges are the Rust types' ranges (u32, and a timestamp pinned to 2^53 - 1): both sides agree on every edge.
+  ["the largest u32 pid", { ...managedUpstream, pid: 4294967295 }, true],
+  ["a pid beyond u32", { ...managedUpstream, pid: 4294967296 }, false],
+  ["the largest u32 failure_count", { ...managedUpstream, failure_count: 4294967295 }, true],
+  ["a failure_count beyond u32", { ...managedUpstream, failure_count: 4294967296 }, false],
+  ["the largest safe-integer timestamp", { ...managedUpstream, last_failure_at_ms: 9007199254740991 }, true],
+  ["a timestamp past the JS safe-integer range", { ...managedUpstream, last_failure_at_ms: 9007199254740992 }, false],
 ];
 
 describe("admin upstream independent expected verdicts", () => {
