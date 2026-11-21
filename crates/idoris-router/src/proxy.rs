@@ -193,6 +193,12 @@ fn is_upstream_auth_status(status: u16) -> bool {
 /// `/v1/embeddings` 的响应头超时缺省值：比聊天的 10 秒宽，容得下 embedding 模型的冷加载。
 pub(crate) const EMBEDDINGS_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// resident 预热（`POST /v1/models/warmup`，IDORIS-CORE S8）的最小请求自己的响应头期限。
+/// 调用方的 `timeout_ms` 只决定调用方等多久，不决定这个请求活多久：`timeout_ms` 到点之后请求继续跑（上游那一侧的冷加载不被
+/// 我们这边的放弃打断），直到上游答了或这个期限到点，由代理按既有规则收尾（成功，或 504 计入提供方熔断）。180 秒与引擎侧
+/// 的加载超时缺省（`DEFAULT_LOAD_TIMEOUT`）同一个量级，也是一个任务最多占着并发许可的时间（再加正文的 60 秒）。
+pub(crate) const WARMUP_HEADER_TIMEOUT: Duration = Duration::from_secs(180);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BufferedUpstreamPath {
     path: &'static str,
@@ -583,6 +589,8 @@ pub struct ChatProxy {
     pub(crate) header_timeout: Duration,
     /// `/v1/embeddings` 自己的响应头超时：冷加载 embedding 模型可能超过聊天路径的 10 秒（设计稿 §2.8.1）。
     pub(crate) embeddings_header_timeout: Duration,
+    /// resident 预热的最小请求的响应头期限（[`WARMUP_HEADER_TIMEOUT`]）；字段只为了让测试能把它缩短。
+    pub(crate) warmup_header_timeout: Duration,
     body_timeout: Duration,
     max_body_bytes: usize,
     max_cache_bytes: usize,
@@ -868,6 +876,7 @@ impl ChatProxy {
             max_entries: DEFAULT_MAX_ENTRIES,
             header_timeout: Duration::from_secs(10),
             embeddings_header_timeout: EMBEDDINGS_HEADER_TIMEOUT,
+            warmup_header_timeout: WARMUP_HEADER_TIMEOUT,
             body_timeout: Duration::from_secs(60),
             max_body_bytes: 8 * 1024 * 1024,
             max_cache_bytes: 32 * 1024 * 1024,
@@ -913,6 +922,13 @@ impl ChatProxy {
     fn cache_size_for_test(&self) -> usize {
         #[allow(clippy::unwrap_used)] // test-only, poisoning would already have failed the test
         self.cache.lock().unwrap().len()
+    }
+
+    /// Test-only: how many of the proxy's concurrency permits are free. A buffered call holds one from before it sends
+    /// until its outcome is dropped, so "all free again" means every in-flight call has finished and settled.
+    #[cfg(test)]
+    pub(crate) fn available_permits_for_test(&self) -> usize {
+        self.permits.available_permits()
     }
 
     /// Writes a cache entry, then prunes — mirrors `proxy.ts`'s own
@@ -1219,6 +1235,40 @@ impl ChatProxy {
         Fut: std::future::Future<Output = Result<(), E>>,
         Completed: std::future::Future<Output = Result<(), E>>,
     {
+        self.forward_buffered_path_finalized_within(
+            endpoint,
+            path,
+            body,
+            opts,
+            None,
+            success_gate,
+            observers,
+        )
+        .await
+    }
+
+    /// [`Self::forward_buffered_path_finalized`] with this one call's own response-header deadline
+    /// (`Some`) instead of the path's default ([`Self::header_timeout_for`]): `POST /v1/models/warmup`
+    /// bounds its minimal request by the caller's `timeout_ms`, not by the chat path's 10 seconds
+    /// (IDORIS-CORE S8). `None` is exactly the default behaviour.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn forward_buffered_path_finalized_within<F, O, C, Fut, Completed, E>(
+        &self,
+        endpoint: &str,
+        path: BufferedUpstreamPath,
+        body: &Value,
+        opts: &ForwardOpts<'_>,
+        header_timeout: Option<Duration>,
+        success_gate: F,
+        observers: (O, C),
+    ) -> Result<ForwardOutcome, E>
+    where
+        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
+        O: FnOnce() -> Fut,
+        C: FnOnce(ForwardOutcome) -> Completed,
+        Fut: std::future::Future<Output = Result<(), E>>,
+        Completed: std::future::Future<Output = Result<(), E>>,
+    {
         // The observer is intentionally later than every knowable preflight
         // exit and earlier than the first reqwest send attempt. It therefore
         // runs once across retries.
@@ -1230,18 +1280,28 @@ impl ChatProxy {
             Err(_) => return Ok(Self::failure(503, 0)),
         };
         let mut outcome = self
-            .forward_buffered_inner_finalized(endpoint, path, body, opts, success_gate, observers)
+            .forward_buffered_inner_finalized(
+                endpoint,
+                path,
+                body,
+                opts,
+                header_timeout,
+                success_gate,
+                observers,
+            )
             .await?;
         outcome.body = with_permit(outcome.body, Arc::new(permit));
         Ok(outcome)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn forward_buffered_inner_finalized<F, O, C, Fut, Completed, E>(
         &self,
         endpoint: &str,
         path: BufferedUpstreamPath,
         body: &Value,
         opts: &ForwardOpts<'_>,
+        header_timeout: Option<Duration>,
         success_gate: F,
         observers: (O, C),
     ) -> Result<ForwardOutcome, E>
@@ -1253,6 +1313,7 @@ impl ChatProxy {
         Completed: std::future::Future<Output = Result<(), E>>,
     {
         let (observer, completed) = observers;
+        let header_timeout = header_timeout.unwrap_or_else(|| self.header_timeout_for(path));
         let mut payload = body.clone();
         if path.force_non_stream
             && let Some(obj) = payload.as_object_mut()
@@ -1273,7 +1334,7 @@ impl ChatProxy {
                     &url,
                     &payload,
                     opts,
-                    self.header_timeout_for(path),
+                    header_timeout,
                     &fingerprint,
                     &mut uncertain,
                     observer,
@@ -1371,7 +1432,7 @@ impl ChatProxy {
                 &url,
                 &payload,
                 opts,
-                self.header_timeout_for(path),
+                header_timeout,
                 &fingerprint,
                 &mut uncertain,
                 observer,

@@ -98,6 +98,10 @@ pub mod storage;
 /// IDORIS-CORE S5（接口规范 §2.7.6）：可原子替换的服务体。启动门控期间服务「starting 体」，引擎落定（就绪，或终局的失败）之后换成完整的 Router。
 pub mod swap;
 mod usage;
+/// IDORIS-CORE S8（接口规范 §2.11.2，修订 1.6 勘误八）：`POST /v1/models/warmup`——让模型进入可用状态，不生成 token。
+mod warmup;
+#[cfg(test)]
+mod warmup_tests;
 
 mod event_identifier;
 mod feedback;
@@ -475,11 +479,16 @@ pub fn build_app(state: AppState) -> Router {
         post(chat_completions).fallback(not_found)
     };
     // S6：云形态打开时，这三条旧的推理路由没有儿童安全管线，对处理儿童数据的租户一律关闭（不然换个路径就绕过了）。
-    // 云形态没打开时一字不变：路由、顺序、层都和以前一样。
+    // S8：预热（`POST /v1/models/warmup`）同属本地流水线、不带儿童安全管线，与这三条同一道守卫；它不处理任何内容，
+    // 但处理儿童数据的租户本来就不该用本地流水线。云形态没打开时一字不变：路由、顺序、层都和以前一样。
     let legacy_inference_routes = Router::new()
         .route("/v1/embeddings", post(embeddings).fallback(not_found))
         .route("/v1/rerank", post(rerank).fallback(not_found))
-        .route("/v1/messages", post(messages).fallback(not_found));
+        .route("/v1/messages", post(messages).fallback(not_found))
+        .route(
+            warmup::WARMUP_PATH,
+            post(warmup::warmup).fallback(not_found),
+        );
     let legacy_inference_routes = if state.cloud.is_some() {
         legacy_inference_routes.route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -666,7 +675,11 @@ async fn remote_bind_auth_middleware(
     if tenant_mode
         && matches!(
             request.uri().path(),
-            "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
+            "/v1/chat/completions"
+                | "/v1/embeddings"
+                | "/v1/rerank"
+                | "/v1/messages"
+                | warmup::WARMUP_PATH
         )
         && query_scope_header(request.headers()).is_none()
     {
@@ -2127,17 +2140,27 @@ fn openai_chat_completion(
 /// interface spec §3.12) plus best-effort `X-iDoris-Reason`/`X-iDoris-Degraded`
 /// (observability, not yet a formal wire contract) on `response`.
 fn apply_decision_headers(response: &mut Response, outcome: &dispatch::ChatOutcome) {
+    apply_selected_headers(response, outcome.served_locality, &outcome.decision);
+}
+
+/// [`apply_decision_headers`] for callers that have a selected candidate but no [`dispatch::ChatOutcome`]
+/// (`POST /v1/models/warmup`).
+fn apply_selected_headers(
+    response: &mut Response,
+    served_locality: idoris_contracts::provider::Locality,
+    decision: &idoris_policy::Decision,
+) {
     let headers = response.headers_mut();
-    if let Ok(v) = HeaderValue::from_str(locality_str(outcome.served_locality)) {
+    if let Ok(v) = HeaderValue::from_str(locality_str(served_locality)) {
         headers.insert(HEADER_SERVED_LOCALITY, v);
     }
-    let reason = reason_header_value(&outcome.decision.reason_codes);
+    let reason = reason_header_value(&decision.reason_codes);
     if !reason.is_empty()
         && let Ok(v) = HeaderValue::from_str(&reason)
     {
         headers.insert(HEADER_REASON, v);
     }
-    if outcome.decision.is_degraded() {
+    if decision.is_degraded() {
         headers.insert(HEADER_DEGRADED, HeaderValue::from_static("true"));
     }
 }
@@ -3842,24 +3865,32 @@ async fn record_id_middleware(
     let audit_inference = req.method() == Method::POST
         && matches!(
             req.uri().path(),
-            "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
+            "/v1/chat/completions"
+                | "/v1/embeddings"
+                | "/v1/rerank"
+                | "/v1/messages"
+                | warmup::WARMUP_PATH
         );
     let requested_audit_tenant = audit_tenant_id(&state, req.headers());
     let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
     let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
-    let audit_intent = audit_header(req.headers(), "x-idoris-intent", None);
+    // 预热的审计事件（规范 §2.11.2「写一条 `warmup` 审计事件」）：`intent` 固定是 `warmup`，不取请求头——
+    // 预热不是对话，调用方声明的意图不该把它记成别的。它不带 `UsageFact`，所以不进用量记录。
+    let audit_intent = if req.method() == Method::POST && req.uri().path() == warmup::WARMUP_PATH {
+        Some(warmup::AUDIT_INTENT.to_string())
+    } else {
+        audit_header(req.headers(), "x-idoris-intent", None)
+    };
     req.extensions_mut()
         .insert(RequestRecordId(record_id.clone()));
     let mut response = next.run(req).await;
-    let audit_tenant = match state.deploy_mode {
-        idoris_contracts::DeployMode::Personal => requested_audit_tenant,
-        idoris_contracts::DeployMode::Tenant => response
+    let audit_tenant = audit_tenant_for(
+        state.deploy_mode,
+        requested_audit_tenant,
+        response
             .extensions()
-            .get::<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>()
-            .and_then(|identity| identity.scope.tenant_id.as_ref())
-            .filter(|tenant| Some(tenant.as_str()) == requested_audit_tenant.as_deref())
-            .cloned(),
-    };
+            .get::<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>(),
+    );
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
@@ -3958,6 +3989,24 @@ fn event_request_id(request_id: Option<&str>, record_id: &str) -> String {
         .filter(|value| !value.chars().any(char::is_control))
         .unwrap_or(record_id)
         .to_string()
+}
+
+/// The tenant an inference request's audit event is filed under: the personal tenant (personal deployments), or — in
+/// tenant mode — the authenticated key's tenant when it is the one the request asked for (`X-iDoris-Tenant`).
+/// `requested` is [`audit_tenant_id`]. Shared by the audit middleware (after the response) and the warmup's
+/// cancellation audit (before any response exists), so both file an event under the same tenant.
+fn audit_tenant_for(
+    deploy_mode: idoris_contracts::DeployMode,
+    requested: Option<String>,
+    identity: Option<&idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>,
+) -> Option<String> {
+    match deploy_mode {
+        idoris_contracts::DeployMode::Personal => requested,
+        idoris_contracts::DeployMode::Tenant => identity
+            .and_then(|identity| identity.scope.tenant_id.as_ref())
+            .filter(|tenant| Some(tenant.as_str()) == requested.as_deref())
+            .cloned(),
+    }
 }
 
 fn audit_tenant_id(state: &AppState, headers: &HeaderMap) -> Option<String> {

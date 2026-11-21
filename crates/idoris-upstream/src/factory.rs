@@ -10,8 +10,17 @@ pub fn create_adapter(card: &ComponentCard) -> Result<Arc<dyn RuntimeAdapter>, B
     match card.provider.id.as_str() {
         "omlx" => {
             let config = super::OmlxAdapterConfig::for_base_url(card.endpoint.clone());
+            // A load is not a management call (IDORIS-CORE S8): it gets its own, much longer deadline.
+            // An invalid override fails here, at construction (start-up), instead of silently using the default.
+            let load_timeout = super::omlx::load_timeout_from_env(
+                std::env::var_os(super::omlx::LOAD_TIMEOUT_ENV).as_deref(),
+            )?;
+            // The key is looked up on every request (IDORIS-CORE S6): the engine manager may replace the engine
+            // behind this endpoint at any time.
             Ok(Arc::new(
-                super::OmlxAdapter::new(config)?.with_per_request_key(),
+                super::OmlxAdapter::new(config)?
+                    .with_per_request_key()
+                    .with_load_timeout(load_timeout),
             ))
         }
         provider => Err(BackendError::invalid_request(format!(
