@@ -1383,3 +1383,74 @@ async fn b_g1_a_card_whose_port_changed_owner_is_a_503_at_run_time_and_nothing_i
     assert!(pid_alive(u64::from(external.pid())), "never signalled");
     full.stop().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// 拉起时的一行日志：引擎改写自己的进程标题，`ps` 里看不到这些值
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_launch_is_logged_in_one_line_with_the_values_ps_cannot_show_and_no_key() {
+    let world = World::start(Engine::Fake(Behavior::default()), fast()).await;
+    let launch_lines = |world: &World| -> Vec<String> {
+        world
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains("拉起引擎："))
+            .cloned()
+            .collect()
+    };
+    let lines = launch_lines(&world);
+    assert_eq!(lines.len(), 1, "one line per launch: {lines:?}");
+    let line = &lines[0];
+    assert!(
+        line.starts_with("[idoris] 引擎 omlx：拉起引擎：program="),
+        "{line}"
+    );
+    // 可执行文件是发现并校验之后的真实路径（`canonicalize`：macOS 的临时目录经符号链接）。
+    let program = std::fs::canonicalize(&world.rig.fake.executable).unwrap();
+    for expected in [
+        format!("program={:?}", program.display().to_string()),
+        format!(" port={} ", world.rig.port),
+        // 额度 16 GiB：传给引擎的内存护栏。
+        " memory_guard=16 GiB ".to_owned(),
+        format!(
+            "model_dir={:?}",
+            world.rig.work.path().join("models").display().to_string()
+        ),
+        format!(
+            "base={:?}",
+            world.rig.state_dir().join("omlx-base").display().to_string()
+        ),
+    ] {
+        assert!(line.contains(&expected), "{expected} missing from {line}");
+    }
+    // 没有 key，也没有长得像 key 的东西（私有 key 是 64 位十六进制）。
+    let key = world.rig.key(0);
+    assert!(!line.contains(&key), "{line}");
+    assert!(!line.contains("OMLX_API_KEY"), "{line}");
+    assert!(
+        !line
+            .as_bytes()
+            .windows(32)
+            .any(|window| window.iter().all(u8::is_ascii_hexdigit)),
+        "a key-shaped run in {line}"
+    );
+
+    // 每拉起一次写一行：重启之后是第二行（新的引擎，新的 key，同样不在里面）。
+    let first = world.rig.pid(0);
+    world.post("omlx", "restart").await;
+    world
+        .until("the replacement engine", |element| {
+            element["state"] == "ready" && element["pid"] != json!(first)
+        })
+        .await;
+    let lines = launch_lines(&world);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let second_key = world.rig.key(1);
+    for line in &lines {
+        assert!(!line.contains(&key) && !line.contains(&second_key), "{line}");
+    }
+    world.manager.shutdown(true).await;
+}

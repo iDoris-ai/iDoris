@@ -897,14 +897,17 @@ impl Actor {
                 std::env::vars_os(),
             )
         };
-        // 先构造一次，把配置性的失败（额度、base、模型目录）分清楚，再拉起。
-        if let Err(error) = launch_with() {
-            self.log(&format!("引擎的启动命令不合规（{}）", error.reason_code()));
-            return Attempt::Terminal {
-                state: UpstreamState::Failed,
-                reason: launch_reason(&error),
-            };
-        }
+        // 先构造一次，把配置性的失败（额度、base、模型目录）分清楚，再拉起；这一次的摘要写成一行日志（下面，拉起之前）。
+        let summary = match launch_with() {
+            Ok(launch) => backend.launch_summary(&launch),
+            Err(error) => {
+                self.log(&format!("引擎的启动命令不合规（{}）", error.reason_code()));
+                return Attempt::Terminal {
+                    state: UpstreamState::Failed,
+                    reason: launch_reason(&error),
+                };
+            }
+        };
         // 一个新拉起的引擎什么都没加载：之前的围栏说的是已经不存在的上一代。清不掉就不拉起（围栏会让每次加载都 fail-closed）。
         if self.clear_fence().is_err() {
             self.log("无法清除加载围栏");
@@ -913,6 +916,8 @@ impl Actor {
                 reason: Some(UpstreamReason::FencePending),
             };
         }
+        // 引擎会改写自己的进程标题（oMLX 就是），`ps` 里看不到端口、模型目录、内存护栏、base 目录：排查靠这一行。没有 key。
+        self.log(&format!("拉起引擎：{summary}"));
         let inspector = self.shared.config.inspector.clone();
         let launched_by = self.shared.config.launched_by.clone();
         let mut spawned = None;
