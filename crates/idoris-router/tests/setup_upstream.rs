@@ -202,6 +202,23 @@ async fn upstream_replying(models: &[&str], reply: &'static str) -> MockServer {
         })
         .mount(&server)
         .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let count = body["input"].as_array().map_or(1, Vec::len);
+            let data: Vec<Value> = (0..count)
+                .map(|index| json!({"object": "embedding", "index": index, "embedding": [0.1, 0.2, 0.3]}))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "model": body["model"],
+                "data": data,
+                "usage": {"prompt_tokens": 2, "total_tokens": 2}
+            }))
+        })
+        .mount(&server)
+        .await;
     server
 }
 
@@ -1490,6 +1507,33 @@ fn a_same_named_file_that_appears_after_the_checks_is_not_overwritten() {
     assert_eq!(std::fs::read_to_string(out.join("lm.yaml")).unwrap(), yaml);
 }
 
+/// 落在不是目录的路径上（普通文件、悬空符号链接）：前置核对本来就会先拦下，这里直接调 `write_added` 看落盘那一层自己
+/// 也站得住：报 `write_failed`，原有的文件、符号链接与它的目标都原样，暂存目录清掉，`force` 与否都一样。
+#[test]
+fn write_added_into_a_path_that_is_not_a_directory_fails_and_changes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("file");
+    std::fs::write(&file, "i am a file").unwrap();
+    let nowhere = tmp.path().join("nowhere");
+    let dangling = tmp.path().join("dangling");
+    symlink(&nowhere, &dangling).unwrap();
+    let yaml = card_yaml("lm");
+    for force in [false, true] {
+        for (label, target) in [("a file", &file), ("a dangling symlink", &dangling)] {
+            let error = write_added(target, force, "lm.yaml", &yaml, &card_of(&yaml)).unwrap_err();
+            assert_eq!(error.code, "write_failed", "{label} force={force}");
+        }
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "i am a file");
+    assert_eq!(std::fs::read_link(&dangling).unwrap(), nowhere);
+    assert!(!nowhere.exists());
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        2,
+        "只有 file 与 dangling：暂存目录清掉了"
+    );
+}
+
 /// 文件名要是纯文件名且带加载器会读的扩展名：路径分隔符、`..`、点开头、别的扩展名都拒绝，什么也不写。
 #[test]
 fn card_file_names_that_escape_or_would_not_be_loaded_are_refused() {
@@ -1971,6 +2015,80 @@ async fn serve_loads_the_generated_card_and_chat_through_idoris_daily_reaches_th
     // serve 的日志里没有 key。
     assert!(!serve.logs().contains(&key));
     // Drop 杀掉并回收；放在最后，断言失败也不留进程。
+    drop(serve);
+}
+
+/// Agent24 在 `lmstudio_embed_probe.py` 里手写的 chat 加 embedding 卡（能力 `[chat, embedding]`，`embed` 绑定）。最小版
+/// `setup upstream` 只生成 chat 卡，embedding 要靠这种手写卡；卡契约没变，所以它在这个二进制上照常加载、照常服务。
+const AGENT24_EMBED_CARD: &str = r#"provider:
+  id: lmstudio
+  family: local
+  tier: local
+  capabilities: [chat, embedding]
+  privacy_class: local_only
+  cost: { input_per_m: 0, output_per_m: 0 }
+  locality: loopback
+form: http_service
+endpoint: "http://127.0.0.1:{port}"
+version_pin: "lmstudio@0"
+privacy_class: local_only
+allowed_egress: [loopback]
+fallback_policy: fail_closed
+fail_closed: true
+load_policy: { mode: resident, keepalive: { pinned: true }, admission: coexist }
+extensions:
+  _degradation: "Removing these bindings disables role aliases on this backend."
+  idoris_role_models:
+    daily: qwen3-8b
+    deep: qwen3-8b
+    embed: text-embedding-bge-m3
+"#;
+
+/// 给 Agent24 的用法说明里写了「embedding 这个命令生成不了，手写的 `[chat, embedding]` 卡在 v0.6.0 上仍然能用」：
+/// 这条用真二进制验证后一半，并记下与生成的卡的差别：手写卡的 `version_pin` 是 `lmstudio@0`，所以 `engine_kind` 是
+/// `lmstudio`，不是 `openai_compat`。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hand_written_chat_and_embedding_card_still_serves_both_and_reports_its_own_engine_kind()
+{
+    let server = upstream(&[MODEL, "text-embedding-bge-m3"]).await;
+    let tmp = TempDir::new().unwrap();
+    let comp = tmp.path().join("components");
+    std::fs::create_dir_all(&comp).unwrap();
+    std::fs::write(
+        comp.join("lmstudio.yaml"),
+        AGENT24_EMBED_CARD.replace("{port}", &server.address().port().to_string()),
+    )
+    .unwrap();
+    let db = tmp.path().join("idoris.sqlite3");
+    let key = issue_key(&db, &["daily", "deep", "embed"]);
+    let (serve, health) = Serve::start(tmp.path(), &comp, &db).await;
+    assert_eq!(
+        health["upstreams"],
+        json!([{"id": "lmstudio", "engine_kind": "lmstudio", "state": "ready",
+                "managed": false, "owned": false}])
+    );
+    let response = serve.chat(&key, "idoris/daily").await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response = serve
+        .client
+        .post(format!("{}/v1/embeddings", serve.base))
+        .bearer_auth(&key)
+        .json(&json!({"model": "idoris/embed", "input": ["hello", "world"]}))
+        .timeout(startup_wait::startup_observe_limit())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["model"], "text-embedding-bge-m3");
+    let embeddings: Vec<_> = requests(&server)
+        .await
+        .into_iter()
+        .filter(|r| r.url.path() == "/v1/embeddings")
+        .collect();
+    assert_eq!(embeddings.len(), 1);
+    assert_anonymous(&embeddings);
     drop(serve);
 }
 
