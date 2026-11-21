@@ -251,6 +251,12 @@ fn state_dir_from(
 /// 一次自愈（接口规范 §2.7.3「自愈」）：核对目标，缺失或不一致（别的实例的文件、读不懂的内容）就按原子发布重写，
 /// 所以 `rm -rf` 误删可以恢复。目标是符号链接、目录等非普通文件时发布本身会拒绝（`target_not_regular`）：
 /// 不删除、不覆盖，只把错误带出去。阻塞调用（文件系统 I/O，等旁路锁至多 5 秒），异步调用方放进 `spawn_blocking`。
+///
+/// **父目录被整个删除之后不恢复**（删掉的是目录，不只是里面的文件）：目标持有的是启动时就以 `O_DIRECTORY|O_NOFOLLOW` 打开的
+/// 父目录 fd（模块文档），目录删掉之后那个 fd 指向一个已经没有路径的目录，此后每一次自愈都因为建不了临时文件而失败
+/// （`temp_create_failed`，只记日志，不重建目录）。这是有意的取舍：按路径重新解析父目录再重建，就把「校验过的就是写进去的
+/// 那个目录」换回了校验与使用之间的 TOCTOU（路径被换成符号链接，或被别人抢先建成同名目录）。目录没了，恢复要重启 iDoris
+/// （新实例重新校验并打开父目录）。
 pub fn heal_once(target: &DiscoveryTarget, record: &DiscoveryRecord) -> HealOutcome {
     match target.inspect(&record.instance_id) {
         InspectOutcome::Intact => HealOutcome::Intact,
@@ -1683,5 +1689,31 @@ mod tests {
             !has_temp_file(&dir),
             "a refused heal must not leave temp files"
         );
+    }
+
+    /// 整个父目录被删掉（不只是里面的文件）：自愈恢复不了，每次都以 `temp_create_failed` 失败，而且不按路径把目录建回来
+    /// （`heal_once` 的文档说明了取舍：按路径重新解析会带回 TOCTOU）。对照：只删文件时自愈能恢复（上面的测试）。
+    #[test]
+    fn heal_once_does_not_bring_back_a_parent_directory_that_was_removed() {
+        let (_temp, dir) = private_dir();
+        let run = dir.join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = run.join("idoris.json");
+        let target = DiscoveryTarget::open(&path).unwrap();
+        let record = record();
+        assert_eq!(heal_once(&target, &record), HealOutcome::Rewritten);
+
+        std::fs::remove_dir_all(&run).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                heal_once(&target, &record),
+                HealOutcome::Failed(DiscoveryError::TempCreateFailed)
+            );
+            assert!(
+                !run.exists(),
+                "the directory is not re-created by path (that would bring back the TOCTOU)"
+            );
+        }
     }
 }
