@@ -21,7 +21,7 @@ pub const MANAGED_EXTENSION: &str = "idoris_managed";
 /// v0.6.0 里只有 `setup upstream` 写它，serve 不读它：上游的引擎种类来自 `version_pin`（本模块的来源规则）。
 pub const UPSTREAM_EXTENSION: &str = "idoris_upstream";
 /// 卡的 `extensions` 里「默认上游」的静态指定（规范 §2.12.3）：值为 `true` 的卡是默认。选择语义仍是预留，
-/// v0.6.0 的选择不读它；`setup upstream --default` 写它，并在落盘前核对目录里至多一张卡带它。
+/// v0.6.0 的选择不读它；`setup upstream --default` 写它，并在落盘前核对：新卡要当默认时，目录里没有别的默认卡。
 pub const DEFAULT_EXTENSION: &str = "idoris_default";
 /// 本版本认识、能够托管的引擎种类。别的取值写进 `idoris_managed.engine` 就是卡校验失败。
 pub const SUPPORTED_MANAGED_ENGINES: &[&str] = &["omlx"];

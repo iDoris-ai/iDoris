@@ -38,7 +38,8 @@ const STDIN_KEY: &str = "stdin-key-canary-upstream-zzz";
 // 子进程守卫与命令行台架
 // ---------------------------------------------------------------------------------------------
 
-/// 子进程的守卫：不管测试怎么结束（包括断言失败、panic），Drop 时 SIGKILL 并回收，不会留下孤儿进程。
+/// 子进程的守卫：测试断言失败或 panic 时（栈展开会运行 Drop），Drop 里 SIGKILL 并 wait，不留孤儿进程；
+/// 测试进程自己被 SIGKILL 时 Drop 不会运行。
 struct Reaped(Option<Child>);
 
 impl Reaped {
@@ -1229,23 +1230,38 @@ async fn a_binding_the_card_loader_rejects_leaves_nothing_behind() {
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
 }
 
+/// `--out-dir` 不是目录：普通文件、路径中间有一个普通文件（读元数据得到 ENOTDIR，不是「不存在」）、指向不存在的目标的
+/// 符号链接（`is_dir()` 为假，但读元数据成功，再往下查同名卡得到「不存在」，只有「不是目录」那一档能拦住它，否则要等到
+/// 落盘时才以 `write_failed` 失败）。都在探测之前拒绝，什么也不创建、不改。
 #[tokio::test(flavor = "multi_thread")]
-async fn an_out_dir_that_is_a_file_is_refused_before_probing() {
+async fn an_out_dir_that_is_not_a_directory_is_refused_before_probing() {
     let server = upstream(&[MODEL]).await;
     let tmp = TempDir::new().unwrap();
-    let out = tmp.path().join("components");
-    std::fs::write(&out, "i am a file").unwrap();
-    let result = setup(&server.uri(), &out, &["--bind", "daily=qwen3-8b"]).await;
-    assert_eq!(err_code(&result), "out_dir_not_empty");
-    assert_eq!(std::fs::read_to_string(&out).unwrap(), "i am a file");
+    let file = tmp.path().join("file");
+    std::fs::write(&file, "i am a file").unwrap();
+    for (label, out) in [
+        ("a file", file.clone()),
+        ("below a file", file.join("sub").join("components")),
+    ] {
+        let result = setup(&server.uri(), &out, &["--bind", "daily=qwen3-8b"]).await;
+        assert_eq!(err_code(&result), "out_dir_not_empty", "{label}");
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "i am a file");
+
+    let nowhere = tmp.path().join("nowhere");
+    let dangling = tmp.path().join("dangling");
+    symlink(&nowhere, &dangling).unwrap();
+    let result = setup(&server.uri(), &dangling, &["--bind", "daily=qwen3-8b"]).await;
+    assert_eq!(err_code(&result), "out_dir_not_empty", "dangling symlink");
+    assert_eq!(std::fs::read_link(&dangling).unwrap(), nowhere);
+    assert!(!nowhere.exists());
+
     assert!(requests(&server).await.is_empty(), "拒绝在探测之前");
-    // 路径中间有一个普通文件（读元数据得到 ENOTDIR，不是「不存在」）：同样在探测之前拒绝，什么也不创建。
-    let below = out.join("sub").join("components");
-    let result = setup(&server.uri(), &below, &["--bind", "daily=qwen3-8b"]).await;
-    assert_eq!(err_code(&result), "out_dir_not_empty");
-    assert_eq!(std::fs::read_to_string(&out).unwrap(), "i am a file");
-    assert!(requests(&server).await.is_empty(), "拒绝在探测之前");
-    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        2,
+        "只有 file 与 dangling，什么也没有多出来"
+    );
 }
 
 /// `--default`：卡带 `extensions.idoris_default: true`，输出的 `default` 为真；至多一张默认卡。
@@ -1362,6 +1378,81 @@ fn only_a_boolean_true_makes_a_card_the_default() {
             "{value}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 与 `setup omlx` 的先后顺序
+// ---------------------------------------------------------------------------------------------
+
+/// 跑 `idoris setup omlx <args>`（不探测：`--no-probe`，所以不需要假的 oMLX）。
+async fn setup_omlx_no_probe(out: &Path, extra: &[&str]) -> Out {
+    let (out, extra) = (
+        out.to_owned(),
+        extra.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+    );
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = idoris();
+        cmd.args([
+            "setup",
+            "omlx",
+            "--endpoint",
+            "http://127.0.0.1:8000",
+            "--no-probe",
+            "--out-dir",
+        ])
+        .arg(&out)
+        .args(&extra)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let output = Reaped::spawn(&mut cmd).finish();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        Out {
+            code: output.status.code().unwrap(),
+            json: serde_json::from_str(&stdout).unwrap_or(Value::Null),
+            stdout,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    })
+    .await
+    .unwrap()
+}
+
+/// 顺序是先 `setup omlx`（它要求目录是空的），再对每个上游 `setup upstream` 往里加卡。反过来不行：`setup omlx` 的
+/// `--force` 只放行它自己的文件，目录里有 `setup upstream` 写的卡时报 `out_dir_not_empty`，卡原样不动。这条钉住
+/// 规范回填与给 Agent24 的用法说明里的「先 omlx、后 upstream」；以后若让 `setup omlx --force` 容忍别的卡，它要随之改。
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_omlx_comes_first_and_refuses_a_directory_that_already_holds_an_upstream_card() {
+    let server = upstream(&[MODEL]).await;
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("components");
+    // 先 `setup omlx`：空（不存在的）目录，得到 oMLX 卡与订阅卡。
+    let first = setup_omlx_no_probe(&out, &[]).await;
+    assert_eq!(first.code, 0, "{}{}", first.stdout, first.stderr);
+    assert_eq!(names(&out), ["omlx.yaml", "subscription.yaml"]);
+    // 再 `setup upstream` 往里加卡。
+    ok(&setup(
+        &server.uri(),
+        &out,
+        &["--bind", "daily=qwen3-8b", "--id", "lmstudio"],
+    )
+    .await);
+    assert_eq!(
+        names(&out),
+        ["lmstudio.yaml", "omlx.yaml", "subscription.yaml"]
+    );
+    let before = files(&out);
+    // 反过来：再跑 `setup omlx`，不管有没有 `--force`，都因为目录里有它不管的卡而拒绝，什么也不变。
+    for extra in [vec![], vec!["--force"]] {
+        let result = setup_omlx_no_probe(&out, &extra).await;
+        assert_eq!(err_code(&result), "out_dir_not_empty", "{extra:?}");
+        assert_eq!(files(&out), before, "{extra:?}");
+    }
+    // 对照：没有上游卡的目录，`setup omlx --force` 照常整体重新生成。
+    std::fs::remove_file(out.join("lmstudio.yaml")).unwrap();
+    let again = setup_omlx_no_probe(&out, &["--force"]).await;
+    assert_eq!(again.code, 0, "{}{}", again.stdout, again.stderr);
+    assert_eq!(names(&out), ["omlx.yaml", "subscription.yaml"]);
 }
 
 // ---------------------------------------------------------------------------------------------
