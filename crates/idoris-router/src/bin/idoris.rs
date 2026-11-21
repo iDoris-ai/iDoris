@@ -53,7 +53,7 @@ use idoris_router::{
 };
 use std::{
     future::{Future, IntoFuture},
-    io::Read,
+    io::{Read, Write},
     net::IpAddr,
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -104,6 +104,12 @@ fn serve_failure_label(message: &str) -> &'static str {
     } else {
         "启动失败"
     }
+}
+
+/// 往 stdout 或 stderr 写一行，写不出去就算了。launcher 先走一步、管道的另一头没人读时，`println!`、`eprintln!` 会 panic：
+/// 停止路径上退出码就成了 101，不是 0、3、4（launcher 把 3、4 当预期停止，把 101 当崩溃、退避重启）。
+fn say(mut out: impl Write, text: &str) {
+    let _ = writeln!(out, "{text}");
 }
 
 /// 一行停止日志，以及它写到哪里。
@@ -970,8 +976,8 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     let report = stop_report(cause, served, launcher.orphan_timeout_s);
     for line in report.lines {
         match line {
-            StopLine::Stdout(text) => println!("{text}"),
-            StopLine::Stderr(text) => eprintln!("{text}"),
+            StopLine::Stdout(text) => say(std::io::stdout(), &text),
+            StopLine::Stderr(text) => say(std::io::stderr(), &text),
         }
     }
     report.result
@@ -988,12 +994,16 @@ async fn remove_discovery_file(target: Arc<discovery::DiscoveryTarget>, instance
             | discovery::RemoveOutcome::NotOwned,
         ) => {}
         Ok(discovery::RemoveOutcome::LockUnavailable) => {
-            eprintln!(
-                "[idoris] 发现文件未删除：旁路锁不可用或等待超时（文件保留，下一个实例会覆盖）"
+            say(
+                std::io::stderr(),
+                "[idoris] 发现文件未删除：旁路锁不可用或等待超时（文件保留，下一个实例会覆盖）",
             );
         }
         Ok(discovery::RemoveOutcome::Failed) | Err(_) => {
-            eprintln!("[idoris] 发现文件未删除：删除失败（文件保留，下一个实例会覆盖）");
+            say(
+                std::io::stderr(),
+                "[idoris] 发现文件未删除：删除失败（文件保留，下一个实例会覆盖）",
+            );
         }
     }
 }

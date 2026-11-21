@@ -3657,6 +3657,57 @@ async fn the_binary_re_registers_with_resume_true_after_agent24d_restarts() {
     assert_eq!(status.code(), Some(0), "{stderr}");
 }
 
+/// 进程级：管道的读端（agent24d 或者起它的测试进程）先走了，stdout、stderr 没人读。会话断开那一行日志写不出去，不能让登记
+/// 客户端死掉：agent24d 重启之后它照常重连、重新握手（`resume` 为 true），SIGTERM 的退出码仍是 0（`已停止` 那一行也写不出去）。
+/// 日志用 `eprintln!` 写的时候，这里 panic，客户端任务悄悄死掉，再也不重连，退出码是 101。
+#[tokio::test]
+async fn the_binary_re_registers_and_exits_0_even_when_nobody_reads_its_stdout_and_stderr_any_more()
+{
+    let env = Env::new();
+    let server = FakeServer::bind(&env.socket_path());
+    let mut child = env.spawn(&env.frame(json!({})));
+    let (file, _) = wait_discovery(&env.discovery_path(), &mut child);
+    let nonce = file["instance_nonce"].as_str().unwrap().to_string();
+    let data_port = file["data_port"].as_u64().unwrap();
+    let client = http();
+
+    let mut first = server.accept().await;
+    let first_session = first.handshake(&nonce, Some(2_000)).await;
+    health_until(&client, data_port, |body| body["registered"] == true).await;
+
+    // 读端没了：之后它写 stdout、stderr 都是 EPIPE。
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    drop(first);
+    server.shut_down();
+    health_until(&client, data_port, |body| body["registered"] == false).await;
+    // 给客户端时间把「会话断开」那一行写出去（写不出去）。
+    tokio::time::sleep(ms(500)).await;
+    let restarted = FakeServer::bind(&env.socket_path());
+    let mut second = restarted.accept().await;
+    let second_session = second.handshake(&nonce, Some(2_000)).await;
+    assert_eq!(second_session.register["resume"], true);
+    assert_ne!(first_session.session_id, second_session.session_id);
+    health_until(&client, data_port, |body| body["registered"] == true).await;
+
+    send_signal("-TERM", &child);
+    let status = wait_exit(&mut child, secs(20));
+    assert_eq!(status.code(), Some(0));
+}
+
+/// 进程级：同上，孤儿超时的退出码也不受影响：启动之后读端没了，到时优雅停止，退出码是 4，不是 `eprintln!` panic 之后的 101。
+#[tokio::test]
+async fn the_binary_exits_4_on_the_orphan_timeout_even_when_nobody_reads_its_stdout_and_stderr() {
+    let env = Env::new();
+    // 登记 socket 路径上没有任何人监听。
+    let mut child = env.spawn(&env.frame(json!({"orphan_timeout_s": 3})));
+    wait_discovery(&env.discovery_path(), &mut child);
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    let status = wait_exit(&mut child, secs(30));
+    assert_eq!(status.code(), Some(4));
+}
+
 /// 进程级自愈（规范间隔 10 秒，真实等待）：运行期间发现文件被删（`rm -rf` 误删），十几秒内被原子重写，
 /// 内容与原来逐字节相同（同一个实例、同一个 nonce）；与是否登记无关（这里没有 `register_socket`）。
 #[tokio::test]

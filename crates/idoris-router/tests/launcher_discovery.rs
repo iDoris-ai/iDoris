@@ -1344,6 +1344,34 @@ fn a_sidecar_lock_held_at_shutdown_keeps_the_file_and_logs_one_fixed_line() {
 
 /// 退出时 unlink 失败（目录对属主也不可写）：文件读得到、旁路锁文件早已存在也打得开，只有 unlink 得到 `EACCES`。
 /// 文件保留、原样，日志是一行固定文案，退出码仍是 0。
+/// 同上，但管道的读端没了（launcher 先走一步）：「发现文件未删除」那一行、`已停止` 那一行都写不出去，退出码仍是 0
+/// （用 `eprintln!` 写的时候这里 panic，退出码是 101）。
+#[test]
+fn a_sidecar_lock_held_at_shutdown_still_exits_0_when_nobody_reads_its_stdout_and_stderr() {
+    let env = Env::new();
+    let path = env.discovery_path();
+    let mut child = env.spawn_launcher(&env.frame(json!({})));
+    let (_, bytes) = wait_discovery(&path, &mut child);
+    let consumer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(env.run_dir.join("idoris.json.lock"))
+        .unwrap();
+    consumer.lock().unwrap();
+
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    send("-TERM", &child);
+    let status = wait_exit(&mut child, Duration::from_secs(20));
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "the file must be kept as is"
+    );
+    consumer.unlock().unwrap();
+}
+
 #[test]
 fn a_file_that_cannot_be_unlinked_at_shutdown_is_kept_and_one_fixed_line_is_logged() {
     // root 不受目录权限限制，没有这个前提：跳过。

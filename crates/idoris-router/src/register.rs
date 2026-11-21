@@ -29,6 +29,7 @@
 //! 收到 `instance_conflict` 之后不再重写（§2.10.4，否则两个共用路径的实例会互相覆盖）。发布之前不核对（发现文件在
 //! `/health` 能答之后才出现，§2.7.3「何时写」），所以自愈任务与登记客户端一样等 [`PublishGate`]。
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -775,9 +776,12 @@ pub enum Event {
 pub type Observer = Arc<dyn Fn(&Event) + Send + Sync>;
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// 默认日志：写 stderr（agent24d 会把子进程输出管道读走）。
+/// 默认日志：写 stderr（agent24d 会把子进程输出管道读走）。写不出去就算了：agent24d 重启或退出之后，管道的另一头没人读，
+/// `eprintln!` 会 panic，登记客户端任务随之悄悄死掉：再也不重连，孤儿计时也跟着没了。
 pub fn stderr_log() -> LogSink {
-    Arc::new(|line| eprintln!("{line}"))
+    Arc::new(|line| {
+        let _ = writeln!(std::io::stderr(), "{line}");
+    })
 }
 
 /// 重复发生的事情的日志节流（规范 §2.10.7「日志」：只记状态变化，以及首次失败和之后每第 10 次失败，不刷屏）：
