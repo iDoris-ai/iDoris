@@ -19,8 +19,8 @@ use crate::cli::SetupOptions;
 #[cfg(unix)]
 use crate::setup_engine::recipe_backed;
 use crate::setup_engine::{
-    Accept, FindFailure, FoundExecutable, MANAGED_PORT_RANGE, Probed, Reply, SetupEngine, get_json,
-    probe_client, run_setup,
+    Accept, CommitHook, FindFailure, FoundExecutable, MANAGED_PORT_RANGE, Probed, Reply,
+    SetupEngine, get_json, probe_client, run_setup,
 };
 pub use crate::setup_engine::{SetupError, read_api_key};
 
@@ -126,6 +126,21 @@ pub struct OmlxSetup {
     explicit_executable: Option<PathBuf>,
     auto_ports: Vec<u16>,
     managed_ports: RangeInclusive<u16>,
+    commit_hook: HookSlot,
+}
+
+/// 挂钩是闭包，没有 Debug：这里只告诉有没有设。
+#[derive(Clone, Default)]
+struct HookSlot(Option<CommitHook>);
+
+impl std::fmt::Debug for HookSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CommitHook({})",
+            if self.0.is_some() { "set" } else { "none" }
+        )
+    }
 }
 
 impl OmlxSetup {
@@ -154,7 +169,14 @@ impl OmlxSetup {
             explicit_executable: None,
             auto_ports: AUTO_PORTS.to_vec(),
             managed_ports: MANAGED_PORT_RANGE,
+            commit_hook: HookSlot(None),
         }
+    }
+
+    /// 测试挂钩：在落盘事务的关键点（[`CommitPhase`](crate::setup_engine::CommitPhase)）被调用。生产路径不设。
+    pub fn with_commit_hook(mut self, hook: CommitHook) -> Self {
+        self.commit_hook = HookSlot(Some(hook));
+        self
     }
 
     /// 显式给定可执行文件（只看它，不回退；规范 §2.7.8 没有对应的命令行旗标）。
@@ -204,6 +226,16 @@ impl SetupEngine for OmlxSetup {
 
     fn key_env(&self) -> &'static str {
         KEY_ENV
+    }
+
+    fn commit_hook(&self) -> Option<CommitHook> {
+        self.commit_hook.0.clone()
+    }
+
+    fn key_note(&self) -> String {
+        format!(
+            "API key 可选：运行期按顺序取环境变量 {KEY_ENV}、再取 ~/.omlx/settings.json 的 auth.api_key（只发给 loopback 的 oMLX）、都没有就不带鉴权连接；引擎开了鉴权而三处都没有 key，请求会得到 401"
+        )
     }
 
     async fn locate_executable(&self) -> Option<PathBuf> {

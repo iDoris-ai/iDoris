@@ -18,7 +18,7 @@ pub const UNKNOWN_ENGINE_KIND: &str = "unknown";
 /// 卡的 `extensions` 里声明「该引擎由 iDoris 托管」的键（规范 §2.3）。
 pub const MANAGED_EXTENSION: &str = "idoris_managed";
 /// 卡的 `extensions` 里标注「自定义 OpenAI 兼容上游」的键（规范 §2.3）：`{kind: openai_compat, flavor: <引擎种类>}`。
-/// v0.6.0 里只有 `setup upstream` 写它，serve 不读它：上游的引擎种类来自 `version_pin`（本模块的来源规则）。
+/// 上游的引擎种类仍来自 `version_pin`（本模块的来源规则）；serve 只核对 `flavor` 与它一致（[`check_upstream_declaration`]，#626）。
 pub const UPSTREAM_EXTENSION: &str = "idoris_upstream";
 /// 卡的 `extensions` 里「默认上游」的静态指定（规范 §2.12.3）：值为 `true` 的卡是默认。选择语义仍是预留，
 /// v0.6.0 的选择不读它；`setup upstream --default` 写它，并在落盘前核对：新卡要当默认时，目录里没有别的默认卡。
@@ -43,6 +43,78 @@ pub fn is_valid_engine_kind(value: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+/// `extensions.idoris_upstream` 声明不合规。`code()` 是稳定的原因码，写进卡校验失败的说明里。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamDeclarationError {
+    /// `idoris_upstream` 不是对象，或没有字符串 `flavor`，或 `flavor` 不是合法的引擎种类格式。
+    FlavorInvalid,
+    /// `flavor` 与 `version_pin` 的产品名不一致（`version_pin` 没有合法产品名也算不一致）。
+    FlavorMismatch {
+        flavor: String,
+        version_pin_product: Option<String>,
+    },
+}
+
+impl UpstreamDeclarationError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::FlavorInvalid => "upstream_flavor_invalid",
+            Self::FlavorMismatch { .. } => "upstream_flavor_mismatch",
+        }
+    }
+}
+
+impl std::fmt::Display for UpstreamDeclarationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FlavorInvalid => write!(
+                f,
+                "extensions.{UPSTREAM_EXTENSION} 必须是对象，且带合法格式（小写字母开头，只含小写字母、数字、下划线，至多 32 个字符）的字符串 flavor"
+            ),
+            Self::FlavorMismatch {
+                flavor,
+                version_pin_product,
+            } => match version_pin_product {
+                Some(product) => write!(
+                    f,
+                    "extensions.{UPSTREAM_EXTENSION}.flavor \"{flavor}\" 与 version_pin 的产品名 \"{product}\" 不一致"
+                ),
+                None => write!(
+                    f,
+                    "extensions.{UPSTREAM_EXTENSION}.flavor \"{flavor}\" 在 version_pin 里找不到对应的产品名（要写成 <产品名>@<版本>）"
+                ),
+            },
+        }
+        .and_then(|()| write!(f, "（原因码 {}）", self.code()))
+    }
+}
+
+/// 卡带 `extensions.idoris_upstream` 时，`flavor` 要存在、格式合法，并与 `version_pin` 的产品名一致（规范 §2.3）。
+/// 不带这个键的卡不受影响，直接通过。
+pub fn check_upstream_declaration(card: &ComponentCard) -> Result<(), UpstreamDeclarationError> {
+    let Some(declaration) = card
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get(UPSTREAM_EXTENSION))
+    else {
+        return Ok(());
+    };
+    let flavor = declaration
+        .as_object()
+        .and_then(|object| object.get("flavor"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|flavor| is_valid_engine_kind(flavor))
+        .ok_or(UpstreamDeclarationError::FlavorInvalid)?;
+    let product = version_pin_product(&card.version_pin);
+    if product == Some(flavor) {
+        return Ok(());
+    }
+    Err(UpstreamDeclarationError::FlavorMismatch {
+        flavor: flavor.to_string(),
+        version_pin_product: product.map(str::to_string),
+    })
+}
+
 /// 一张引擎型卡的种类与托管声明。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineIdentity {
@@ -63,6 +135,11 @@ pub enum EngineKindError {
         provider_id: String,
         managed_engine: String,
         version_pin_product: String,
+    },
+    /// `idoris_upstream` 声明不合规（flavor 缺失、非法或与 `version_pin` 不一致）。
+    UpstreamDeclaration {
+        provider_id: String,
+        error: UpstreamDeclarationError,
     },
 }
 
@@ -89,6 +166,9 @@ impl std::fmt::Display for EngineKindError {
                 f,
                 "组件卡 \"{provider_id}\" 的 extensions.{MANAGED_EXTENSION}.engine \"{managed_engine}\" 与 version_pin 的产品名 \"{version_pin_product}\" 不一致"
             ),
+            Self::UpstreamDeclaration { provider_id, error } => {
+                write!(f, "组件卡 \"{provider_id}\" 的 {error}")
+            }
         }
     }
 }
@@ -104,6 +184,10 @@ fn version_pin_product(version_pin: &str) -> Option<&str> {
 /// 按上面的来源规则解析一张卡。
 pub fn engine_identity(card: &ComponentCard) -> Result<EngineIdentity, EngineKindError> {
     let provider_id = || card.provider.id.clone();
+    check_upstream_declaration(card).map_err(|error| EngineKindError::UpstreamDeclaration {
+        provider_id: provider_id(),
+        error,
+    })?;
     let product = version_pin_product(&card.version_pin);
     let Some(declaration) = card
         .extensions
@@ -287,5 +371,72 @@ mod tests {
         let identity = engine_identity(&card("omlx@0.6.4", extensions)).unwrap();
         assert!(!identity.managed);
         assert_eq!(identity.engine_kind, "omlx");
+    }
+
+    fn upstream(pin: &str, declaration: serde_json::Value) -> ComponentCard {
+        card(
+            pin,
+            Some(json!({"_degradation": "d", "idoris_upstream": declaration})),
+        )
+    }
+
+    #[test]
+    fn an_upstream_flavor_must_match_the_version_pin_product() {
+        for (pin, flavor) in [
+            ("lmstudio@0", "lmstudio"),
+            ("openai_compat@unknown", "openai_compat"),
+            ("omlx@0.6.4", "omlx"),
+        ] {
+            let c = upstream(pin, json!({"kind": "openai_compat", "flavor": flavor}));
+            check_upstream_declaration(&c).unwrap();
+            assert_eq!(engine_identity(&c).unwrap().engine_kind, flavor);
+        }
+        let mismatch = upstream(
+            "lmstudio@0",
+            json!({"kind": "openai_compat", "flavor": "vllm"}),
+        );
+        let error = check_upstream_declaration(&mismatch).unwrap_err();
+        assert_eq!(error.code(), "upstream_flavor_mismatch");
+        assert!(error.to_string().contains("upstream_flavor_mismatch"));
+        assert!(matches!(
+            engine_identity(&mismatch).unwrap_err(),
+            EngineKindError::UpstreamDeclaration { .. }
+        ));
+        // version_pin 没有合法产品名：也是不一致，不是放行。
+        for pin in ["lmstudio", "@1", "LM@1"] {
+            let c = upstream(pin, json!({"kind": "openai_compat", "flavor": "lmstudio"}));
+            assert_eq!(
+                check_upstream_declaration(&c).unwrap_err().code(),
+                "upstream_flavor_mismatch",
+                "{pin}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_or_malformed_flavor_is_invalid() {
+        for declaration in [
+            json!({"kind": "openai_compat"}),
+            json!({"flavor": 7}),
+            json!({"flavor": null}),
+            json!({"flavor": "LM-Studio"}),
+            json!({"flavor": ""}),
+            json!("lmstudio"),
+            json!(true),
+        ] {
+            let c = upstream("lmstudio@0", declaration.clone());
+            assert_eq!(
+                check_upstream_declaration(&c).unwrap_err().code(),
+                "upstream_flavor_invalid",
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_card_without_the_upstream_declaration_is_never_checked() {
+        for pin in ["lmstudio@0", "nonsense", "", "omlx@0.6.4"] {
+            check_upstream_declaration(&card(pin, None)).unwrap();
+        }
     }
 }

@@ -1342,13 +1342,29 @@ async fn default_is_written_to_the_card_and_at_most_one_card_may_be_the_default(
     )
     .await;
     assert_eq!(ok(&moved)["default"], true);
-    // 目录里本来就有两张默认卡（手写的）：不是这次加卡造成的，加一张不当默认的卡不受影响。
+    // 目录里本来就有两张默认卡（手写的）：最终的集合里默认卡超过一张，加一张不当默认的卡也不放行（#626），目录不变。
     let hand = std::fs::read_to_string(out.join("second.yaml")).unwrap();
     std::fs::write(
         out.join("second-copy.yaml"),
         hand.replace("id: second", "id: second-copy"),
     )
     .unwrap();
+    let before_two_defaults = files(&out);
+    let refused = setup(
+        &server.uri(),
+        &out,
+        &[&bind[..], &["--id", "fourth"]].concat(),
+    )
+    .await;
+    assert_eq!(err_code(&refused), "validation_failed");
+    let message = refused.json["message"].as_str().unwrap();
+    assert!(
+        message.contains("second") && message.contains("second-copy"),
+        "{message}"
+    );
+    assert_eq!(files(&out), before_two_defaults);
+    // 把多余的默认卡去掉之后，同样的命令照常成功。
+    std::fs::remove_file(out.join("second-copy.yaml")).unwrap();
     ok(&setup(
         &server.uri(),
         &out,
@@ -1422,11 +1438,10 @@ async fn setup_omlx_no_probe(out: &Path, extra: &[&str]) -> Out {
     .unwrap()
 }
 
-/// 顺序是先 `setup omlx`（它要求目录是空的），再对每个上游 `setup upstream` 往里加卡。反过来不行：`setup omlx` 的
-/// `--force` 只放行它自己的文件，目录里有 `setup upstream` 写的卡时报 `out_dir_not_empty`，卡原样不动。这条钉住
-/// 规范回填与给 Agent24 的用法说明里的「先 omlx、后 upstream」；以后若让 `setup omlx --force` 容忍别的卡，它要随之改。
+/// 先后顺序不再要紧（#626）：先 `setup omlx`、再 `setup upstream` 往里加卡；反过来，目录里已有上游卡时，不带 `--force`
+/// 的 `setup omlx` 仍报 `out_dir_not_empty`，带 `--force` 则只替换 oMLX 自己的文件，上游卡逐字节保留。
 #[tokio::test(flavor = "multi_thread")]
-async fn setup_omlx_comes_first_and_refuses_a_directory_that_already_holds_an_upstream_card() {
+async fn setup_omlx_force_keeps_an_upstream_card_and_without_force_still_refuses() {
     let server = upstream(&[MODEL]).await;
     let tmp = TempDir::new().unwrap();
     let out = tmp.path().join("components");
@@ -1446,17 +1461,23 @@ async fn setup_omlx_comes_first_and_refuses_a_directory_that_already_holds_an_up
         ["lmstudio.yaml", "omlx.yaml", "subscription.yaml"]
     );
     let before = files(&out);
-    // 反过来：再跑 `setup omlx`，不管有没有 `--force`，都因为目录里有它不管的卡而拒绝，什么也不变。
-    for extra in [vec![], vec!["--force"]] {
-        let result = setup_omlx_no_probe(&out, &extra).await;
-        assert_eq!(err_code(&result), "out_dir_not_empty", "{extra:?}");
-        assert_eq!(files(&out), before, "{extra:?}");
-    }
-    // 对照：没有上游卡的目录，`setup omlx --force` 照常整体重新生成。
-    std::fs::remove_file(out.join("lmstudio.yaml")).unwrap();
+    // 不带 `--force`：目录非空，拒绝，什么也不变。
+    let result = setup_omlx_no_probe(&out, &[]).await;
+    assert_eq!(err_code(&result), "out_dir_not_empty");
+    assert_eq!(files(&out), before);
+    // 带 `--force`：oMLX 的卡重新生成，上游卡逐字节保留，加载器放行整个目录。
     let again = setup_omlx_no_probe(&out, &["--force"]).await;
     assert_eq!(again.code, 0, "{}{}", again.stdout, again.stderr);
-    assert_eq!(names(&out), ["omlx.yaml", "subscription.yaml"]);
+    let after = files(&out);
+    assert_eq!(
+        names(&out),
+        ["lmstudio.yaml", "omlx.yaml", "subscription.yaml"]
+    );
+    let get = |all: &[(String, Vec<u8>)], name: &str| {
+        all.iter().find(|(n, _)| n == name).unwrap().1.clone()
+    };
+    assert_eq!(get(&after, "lmstudio.yaml"), get(&before, "lmstudio.yaml"));
+    load_components(&out, false).unwrap();
 }
 
 // ---------------------------------------------------------------------------------------------
