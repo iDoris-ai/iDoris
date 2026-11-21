@@ -273,8 +273,9 @@ struct ResidentRequest {
 }
 
 impl ResidentRequest {
-    /// 经聊天用的同一个代理发出去，一直等到它收尾（成功、上游的错误，或响应头期限到点的 504）。并发许可由代理在里面拿、在这个
-    /// 调用结束时放；熔断的准入也由代理在里面按既有规则结算（`claim.finish`）。不带幂等键。
+    /// 经聊天用的同一个代理发出去，一直等到它收尾（成功、上游的错误，或响应头期限到点的 504）。并发许可由代理在发送之前拿，随
+    /// 返回的结果一起带着，结果被丢掉时才还（等结果的 handler 用完了丢，handler 已经走了则在任务结束时丢）；熔断的准入由代理在
+    /// 结果产生之前按既有规则结算（`claim.finish`）。不带幂等键。
     async fn run(self) -> ForwardOutcome {
         let opts = ForwardOpts {
             request_id: None,

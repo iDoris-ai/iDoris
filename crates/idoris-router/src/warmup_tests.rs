@@ -233,6 +233,39 @@ async fn a_timed_out_resident_warmup_keeps_its_request_and_its_permit_until_the_
 }
 
 #[tokio::test]
+async fn concurrent_resident_warmups_each_send_their_own_request_and_give_their_permits_back() {
+    // 真并发：三个预热同时在途。resident 卡没有账本可以合并，各发各的最小请求、各占一个并发许可，全部成功、许可全部还回。
+    let upstream = slow_upstream(Duration::from_millis(700)).await;
+    let (app, proxy) = app_with_warmup_deadline(
+        vec![resident(
+            "lmstudio",
+            &upstream.uri(),
+            "chat",
+            "daily: \"up-model\"",
+        )],
+        Duration::from_secs(30),
+    );
+    let total = proxy.available_permits_for_test();
+    let body = json!({"model": "idoris/daily"});
+    let (first, second, third) = tokio::join!(
+        post(&app, warmup::WARMUP_PATH, body.clone()),
+        post(&app, warmup::WARMUP_PATH, body.clone()),
+        post(&app, warmup::WARMUP_PATH, body.clone()),
+    );
+    for (status, reply) in [&first, &second, &third] {
+        assert_eq!(*status, StatusCode::OK, "{reply}");
+        assert_eq!(reply["state"], "ready");
+        assert_eq!(reply["already_loaded"], false);
+    }
+    assert_eq!(
+        upstream.received_requests().await.unwrap().len(),
+        3,
+        "each warmup sent its own minimal request"
+    );
+    wait_for_all_permits(&proxy, total, Duration::from_secs(10)).await;
+}
+
+#[tokio::test]
 async fn the_requests_own_deadline_can_end_the_wait_before_timeout_ms_and_the_message_says_how_long_it_waited()
  {
     // 请求自己的期限比调用方愿意等的短：先到点的是它（代理的 504，翻成 `warmup_timeout`），不是 `timeout_ms`。
