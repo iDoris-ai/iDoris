@@ -45,7 +45,8 @@ pub struct SetupOptions {
 pub enum SetupTarget {
     /// `--endpoint <url>`：采纳这个端点上已有的引擎。`probe == false` 是 `--no-probe`：不连引擎。
     Endpoint { url: String, probe: bool },
-    /// `--auto`：探测候选端口，找到就采纳；`managed` 有值（同时给了 `--managed`）时，没找到才托管。
+    /// `--auto`：探测候选端口（只发匿名请求，不接受 `--api-key-stdin`），找到就采纳；`managed` 有值（同时给了
+    /// `--managed`）时，没找到才托管。
     Auto { managed: Option<ManagedOptions> },
     /// 只给了 `--managed`：由 iDoris 托管（不连引擎，`--no-probe` 隐含）。
     Managed(ManagedOptions),
@@ -236,7 +237,7 @@ pub enum KeyCommand {
     Revoke(String),
 }
 
-const USAGE: &str = "用法: idoris [serve [--admin-token-stdin | --launcher-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris control bootstrap --spec-stdin | idoris cloud pair [--label <设备名>] | idoris cloud status | idoris cloud unpair | idoris recommend --role chat --json [--allocated-budget-bytes <u64>] | idoris models local --json | idoris setup omlx --out-dir <dir> (--endpoint <url> | --auto | --managed) [--managed-port <n>] [--bind <role>=<model>]... [--load-mode on_demand|resident] [--api-key-stdin] [--force] [--no-probe]";
+const USAGE: &str = "用法: idoris [serve [--admin-token-stdin | --launcher-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris control bootstrap --spec-stdin | idoris cloud pair [--label <设备名>] | idoris cloud status | idoris cloud unpair | idoris recommend --role chat --json [--allocated-budget-bytes <u64>] | idoris models local --json | idoris setup omlx --out-dir <dir> (--endpoint <url> [--api-key-stdin] | --auto | --managed) [--managed-port <n>] [--bind <role>=<model>]... [--load-mode on_demand|resident] [--force] [--no-probe]";
 
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let args = args.into_iter().collect::<Vec<_>>();
