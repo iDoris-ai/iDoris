@@ -1058,10 +1058,8 @@ mod tests {
         let follower_waiting = follows(&registry, "m", Some("key-b"));
         lead.finish(answer(404));
         for waiting in [leader_waiting, follower_waiting] {
-            let got = waiting
-                .answer()
-                .await
-                .expect("the leader published an answer");
+            // The leader published an answer, so there is one.
+            let got = waiting.answer().await.unwrap();
             assert_eq!(got.status, 404);
             assert_eq!(got.content_type.as_deref(), Some("text/plain"));
             assert_eq!(&got.body[..], b"body");
@@ -1075,10 +1073,8 @@ mod tests {
         let (lead, _) = leads(&registry, "m", None);
         let late = follows(&registry, "m", None);
         lead.finish(answer(200));
-        let got = late
-            .answer()
-            .await
-            .expect("the answer is kept for those who joined");
+        // The answer is kept for those who joined before it was published.
+        let got = late.answer().await.unwrap();
         assert_eq!(got.status, 200);
     }
 

@@ -3,8 +3,9 @@
 //! 全部进程内、不启动任何真实模型进程：生命周期卡用 `MockAdapter`（外面套一个数 `chat` 调用的壳，证明预热不生成 token），
 //! resident 卡与假 oMLX 用 `wiremock`（要看客户端有没有半路挂断的用一个自己写的假上游）。状态码矩阵、余量确认、key 范围、
 //! 并发合并、`timeout_ms` 与客户端断开不取消、不留围栏、各写恰好一条审计（引擎侧的超时或 panic 保持既有的围栏保护，也有对照）、
-//! 门控与降级冻结都在这里；
-//! 需要 crate 内部旋钮的（代理的响应头超时）在 `src/warmup_tests.rs`。
+//! 门控与降级冻结、每把 key 自己发起的 resident 预热请求的在途上限（别的 key 与聊天不受影响）、`SpendGate::All` 下预热也过预算的
+//! 只读准入检查都在这里；
+//! 需要 crate 内部旋钮的（代理的响应头超时、并发许可的余量、合并表）在 `src/warmup_tests.rs`。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "support/child_guard.rs"]
