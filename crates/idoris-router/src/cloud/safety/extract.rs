@@ -94,6 +94,21 @@ impl CheckedInput {
             .map(|s| s.text.expose())
     }
 
+    /// 整个对话里**每一轮的文本**，按原顺序：孩子、工具、**客户端写的助手**。运营方登记的提示不在里面（它们复述要拒绝的话题）。
+    /// 给规则检查器的「跨轮拼接复查」用：把请求拆到相邻几轮里（含助手轮）的，每一轮单独看都无害，只有按顺序拼起来才看得出
+    /// （[`untrusted_texts`](Self::untrusted_texts) 只有孩子和工具，看不到助手轮里的字）。
+    pub fn conversation_texts(&self) -> impl Iterator<Item = &str> {
+        self.segments
+            .iter()
+            .filter(|s| !matches!(s.origin, Origin::Operator))
+            .map(|s| s.text.expose())
+    }
+
+    /// 有客户端写的 `assistant` 轮吗。
+    pub fn has_assistant_text(&self) -> bool {
+        self.segments.iter().any(|s| s.origin == Origin::Assistant)
+    }
+
     /// 最后一条用户消息（给 LLM 检查器当输出检查的上下文）。
     pub fn last_user_text(&self) -> Option<&str> {
         self.last_user_segment

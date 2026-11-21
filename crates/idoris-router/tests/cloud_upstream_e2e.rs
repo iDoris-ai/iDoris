@@ -1145,10 +1145,18 @@ async fn a_stream_that_goes_quiet_after_the_first_byte_ends_with_a_timeout_error
 
 #[tokio::test]
 async fn usage_that_arrived_before_the_connection_died_is_the_final_accounting() {
-    // 内容、最终 usage 都到了，只是没有 [DONE] 就结束了：完整；补一个 [DONE]；按实际用量付费
+    // 内容、结束块、最终 usage 都到了，只是没有 [DONE] 就结束了：完整；补一个 [DONE]；按实际用量付费。
+    // issue #603 N1：这条夹具原来没有结束块（内容 -> 单独的 usage 块 -> 连接结束）。没有任何 `finish_reason` 的流在 usage 之后断开，
+    // 生成可能还在继续（usage 可能只是中途的数字），现在是被截断的流（`stream_truncated`、按预留价）；补上结束块（OpenAI 规范流）才是完整。
+    let finish = format!(
+        "data: {}\n\n",
+        json!({"id": "c", "object": "chat.completion.chunk",
+               "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+    );
     let s = two_upstreams(
         vec![Behavior::sse(vec![
             SseStep::Send(content_event("c", "Hel")),
+            SseStep::Send(finish),
             SseStep::Send(usage_event("c", usage(12, 2))),
             SseStep::Finish,
         ])],

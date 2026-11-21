@@ -4,8 +4,8 @@
 //! - `id`：供应商请求号（OpenAI 兼容各家把它放在每个 chunk 的顶层 `id`），对账用；
 //! - `usage`：`stream_options.include_usage` 之后，最后一个 chunk（`choices` 为空数组）带的用量；
 //! - `error`：有些上游在 HTTP 200 之后用一个 `{"error": ...}` 事件报错；
-//! - `choices` 的形状、每个 choice 的 `index` / `finish_reason` / `delta` 的**类型**、有没有 `finish_reason`、`delta` 里有没有
-//!   **新的生成内容**（只看「有没有」，不读内容本身）：调用方据此判断一个 chunk 是不是合法的 completion chunk，
+//! - `choices` 的形状、每个 choice 的 `index` / `finish_reason` / `delta` 的**类型**、有没有 `finish_reason`、`delta`（以及 choice 自己的
+//!   `text`）里有没有**新的生成内容**（只看「有没有」，不读内容本身）：调用方据此判断一个 chunk 是不是合法的 completion chunk，
 //!   以及一个 usage 之后生成有没有继续、每个 choice 的结束标志是不是比它最近的新内容更晚（见 [`ChunkInfo`]）。
 
 use serde_json::Value;
@@ -57,10 +57,13 @@ pub struct ChunkInfo {
     /// 某个 choice 带了已结束的 `finish_reason`（**非空字符串**；`null`、空字符串——有的兼容实现在没结束的块里写 `""`——
     /// 和任何别的类型都不算）：这个 choice 的生成已经结束。
     pub has_finish_reason: bool,
-    /// 某个 choice 的 `delta` 带了**新的生成内容**：除顶层 `role` 之外的任何地方出现非空字符串（`content`、`refusal`、
-    /// `reasoning_content`、工具调用的名字和参数……）。`role: assistant`、`content: ""`、`null`、空数组、空对象、
+    /// 某个 choice 带了**新的生成内容**：`delta` 里除顶层 `role` 之外的任何地方出现非空字符串（`content`、`refusal`、
+    /// `reasoning_content`、工具调用的名字和参数……），**或者 choice 自己的 `text` 里有文字**（旧的 completions 接口的字段；
+    /// 有的兼容实现在 chat 的流式 chunk 里把内容在 `delta` 和 `text` 各写一份，那时两处一样；`delta` 为空、只有 `text` 的 chunk 同样会被转发给客户端，
+    /// 不能让它在计费上不算内容，issue #603 N1）。`role: assistant`、`content: ""`、`null`、空数组、空对象、
     /// 空 delta 的结束块都不算。故意不按字段名列白名单：不认识的新字段里有文字也当内容——误判的方向是「不信 usage」
-    /// （按预留价），不是「少收」。
+    /// （按预留价），不是「少收」。choice 里别的元数据字段（`native_finish_reason`、`content_filter_results`、`logprobs`）不算：
+    /// 它们几乎每个 chunk 都带着字符串，当内容会让所有这样的上游都按预留价收。
     pub has_content: bool,
 }
 
@@ -104,27 +107,30 @@ fn parse_choice(position: usize, choice: &Value) -> Option<(ChoiceFacts, bool)> 
     let facts = ChoiceFacts {
         index,
         finished,
-        has_content: delta.is_some_and(delta_carries_content),
+        has_content: delta.is_some_and(delta_carries_content)
+            || fields.get("text").is_some_and(carries_text),
     };
     // 像样：字段类型都对，并且带 `delta` 对象或已结束的 `finish_reason`
     let well_formed = finish_typed && delta_typed && index_typed && (delta.is_some() || finished);
     Some((facts, well_formed))
 }
 
+/// 这个值里任何地方有没有非空字符串。
+fn carries_text(value: &Value) -> bool {
+    match value {
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => items.iter().any(carries_text),
+        Value::Object(fields) => fields.values().any(carries_text),
+        _ => false,
+    }
+}
+
 /// `delta` 里有没有新的生成内容（见 [`ChunkInfo::has_content`]）。
 fn delta_carries_content(delta: &Value) -> bool {
-    fn has_text(value: &Value) -> bool {
-        match value {
-            Value::String(text) => !text.is_empty(),
-            Value::Array(items) => items.iter().any(has_text),
-            Value::Object(fields) => fields.values().any(has_text),
-            _ => false,
-        }
-    }
     delta.as_object().is_some_and(|fields| {
         fields
             .iter()
-            .any(|(key, value)| key != "role" && has_text(value))
+            .any(|(key, value)| key != "role" && carries_text(value))
     })
 }
 
@@ -467,6 +473,12 @@ mod tests {
             r#"{"choices":[{"delta":{"function_call":{"name":"","arguments":""}}}]}"#,
             // 没有 choices 的单独 usage 块
             r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+            // choice 自己的 `text` 为空 / `null`：不算
+            r#"{"choices":[{"delta":{},"text":""}]}"#,
+            r#"{"choices":[{"delta":{},"text":null}]}"#,
+            // 别的元数据字段里的字符串不算内容（OpenRouter 的 `native_finish_reason`、Azure 的 `content_filter_results`）
+            r#"{"choices":[{"delta":{},"finish_reason":"stop","native_finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"delta":{},"content_filter_results":{"hate":{"filtered":false,"severity":"safe"}}}]}"#,
         ] {
             assert!(!content(data), "{data}");
         }
@@ -488,6 +500,45 @@ mod tests {
         assert!(content(
             r#"{"choices":[{"delta":{"role":"assistant","content":"x"}}]}"#
         ));
+    }
+
+    /// issue #603 N1 的 Low：`choices[].text`（旧的 completions 接口的字段）里有文字是新内容。原来只看 `delta`，
+    /// `{"choices":[{"delta":{},"text":"…"}]}` 会被原样转发给客户端、却在计费上不算内容（不使前面的 usage 作废）。
+    /// 有的兼容实现在 chat 的流式 chunk 里 `delta` 和 `text` 各写一份：那时两处一样，结论不变。
+    #[test]
+    fn text_outside_the_delta_counts_as_new_content() {
+        let info = |data: &str| match classify(&event(data)) {
+            ChunkKind::Json(info) => info,
+            other => panic!("expected a JSON chunk, got {other:?}"),
+        };
+        for data in [
+            r#"{"choices":[{"index":0,"delta":{},"text":"SMUGGLED"}]}"#,
+            r#"{"choices":[{"delta":{"content":"hi"},"text":"hi"}]}"#,
+            // 带着结束标志、没有 delta，只有 text：合法的最后一块，里面有内容
+            r#"{"choices":[{"text":"tail","finish_reason":"stop"}]}"#,
+            // text 不是字符串（对象 / 数组）：里面有文字照样算，不认识的形状宁可不信 usage
+            r#"{"choices":[{"delta":{},"text":{"x":"y"}}]}"#,
+            r#"{"choices":[{"delta":{},"text":["y"]}]}"#,
+        ] {
+            let parsed = info(data);
+            assert!(parsed.has_content, "{data}");
+            assert!(
+                parsed.choices.iter().all(|choice| choice.has_content),
+                "{data}"
+            );
+        }
+        // 没有 `delta` 也没有结束标志的 `text` 块仍然不是合法的 completion chunk（不会被转发）
+        let bare = info(r#"{"choices":[{"text":"x"}]}"#);
+        assert!(!bare.choices_well_formed);
+        // 一个 choice 有内容、另一个没有：按 choice 分开记
+        let two = info(r#"{"choices":[{"delta":{}},{"index":1,"delta":{},"text":"x"}]}"#);
+        assert_eq!(
+            two.choices
+                .iter()
+                .map(|choice| choice.has_content)
+                .collect::<Vec<_>>(),
+            vec![false, true]
+        );
     }
 
     #[test]
