@@ -60,7 +60,7 @@ IDORIS_SUBSCRIPTION_CLI=claude \
 
 - **停止**：`SIGTERM` 与 `SIGINT` 走同一条优雅停机路径（停止接收新连接、收尾订阅运行时），成功时打印 `idoris: 已停止` 并以 0 退出；若 10 秒内未收尾则输出 `[idoris] 停止失败：优雅停机超过 10s，强制退出` 并以 1 退出；退出前会销毁异步运行时（最多再等 5 秒）以回收本地 runtime 子进程组，总停机时间上限约 15 秒。
 - **单实例**：`idoris serve` 启动时对 `<IDORIS_DB_PATH>.lock`（路径先经 canonicalize，符号链接别名共用同一把锁）加独占咨询锁（进程退出由操作系统自动释放，无陈旧锁）。同一数据库已有实例时，在绑定端口前输出 `[idoris] 启动失败：已有 iDoris 实例在使用同一数据库 <path>` 并以退出码 **3** 退出（其他启动失败为 1）。离线的 `idoris key issue` / `idoris admin` 不受该锁影响。
-- **托管引擎**（卡里有 `extensions.idoris_managed`，由 `idoris setup omlx --managed` 生成；没有这样的卡时下面都不适用，行为与以前一致）：iDoris 自己探测、拉起并监管本地 oMLX，不再要求「先起 oMLX 再起 iDoris」。引擎没就绪时 iDoris 照常答 `/health`（`phase:"starting"`，`upstreams[]` 带每个引擎的状态与原因码），数据面其余路径返回 503 `idoris_starting`，引擎就绪之后才切换到完整服务。端口上已有引擎时只探测、不发信号，也不会在退出时停它；iDoris 自己拉起的引擎用私有 key，崩溃循环有熔断，退出时一并停掉（`stop_on_exit:"never"` 的正常退出除外）。`kill -9` iDoris 之后重启会接管仍在跑的自有引擎；若上次在加载中被杀，对自有引擎会杀掉重拉并清除加载围栏，外部引擎的围栏仍须按上面的步骤人工处理。引擎在服务期间进程退出、进程内无法恢复时，iDoris 优雅停止并以退出码 **5** 退出，由启动器重启（孤儿超时是退出码 4）。
+- **托管引擎**（卡里有 `extensions.idoris_managed`，由 `idoris setup omlx --managed` 生成；没有这样的卡时下面都不适用，行为与以前一致）：iDoris 自己探测、拉起并监管本地 oMLX，不再要求「先起 oMLX 再起 iDoris」。引擎没就绪时 iDoris 照常答 `/health`（`phase:"starting"`，`upstreams[]` 带每个引擎的状态与原因码），数据面其余路径返回 503 `idoris_starting`，引擎就绪之后才切换到完整服务。端口上已有引擎时只探测、不发信号，也不会在退出时停它；iDoris 自己拉起的引擎用私有 key，崩溃循环有熔断，退出时一并停掉（`stop_on_exit:"never"` 的正常退出除外）。`kill -9` iDoris 之后重启会接管仍在跑的自有引擎；若上次在加载中被杀，对自有引擎会杀掉重拉并清除加载围栏，外部引擎的围栏原样保留、仍须按上面的步骤人工处理，处理之前该上游报 `unavailable`（`fence_pending`），数据面保持 503。引擎在服务期间进程退出、进程内无法恢复时，iDoris 优雅停止并以退出码 **5** 退出，由启动器重启（孤儿超时是退出码 4）。
 
 ## License
 

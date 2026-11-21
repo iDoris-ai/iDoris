@@ -101,6 +101,8 @@ struct Scripted {
     /// `signing_team(pid)`：没编排的 pid 没有团队。
     teams: Mutex<BTreeMap<u32, String>>,
     team_checks: AtomicUsize,
+    /// 端口 → 还剩几次「`listens_on` 为真」，用完之后一律为假：造「等就绪时监听它的是引擎，封印时端口已被别人占了」。
+    claim_budget: Mutex<BTreeMap<u16, usize>>,
 }
 
 impl Scripted {
@@ -111,7 +113,15 @@ impl Scripted {
             listeners: Mutex::new(BTreeMap::new()),
             teams: Mutex::new(BTreeMap::new()),
             team_checks: AtomicUsize::new(0),
+            claim_budget: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// 自有引擎的端口，但只有第一次问到 `listens_on` 时为真（等就绪那一次），之后为假（封印那一次）。
+    fn claiming_once(port: u16) -> Arc<Self> {
+        let scripted = Self::new();
+        scripted.claim_budget.lock().unwrap().insert(port, 1);
+        scripted
     }
 
     /// 自有引擎的端口：`listens_on` 一律是真。
@@ -151,6 +161,13 @@ impl ProcessInspector for Scripted {
     async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
         if self.claims.lock().unwrap().contains(&port) {
             return Ok(true);
+        }
+        if let Some(left) = self.claim_budget.lock().unwrap().get_mut(&port) {
+            if *left > 0 {
+                *left -= 1;
+                return Ok(true);
+            }
+            return Ok(false);
         }
         self.real.listens_on(pid, port).await
     }
@@ -1480,6 +1497,85 @@ async fn an_own_engine_that_is_alive_but_stops_answering_is_unavailable_never_ki
     let status = h.until_state(UpstreamState::Ready).await;
     assert!(status.owned);
     assert_eq!(rig.fake.launches(), 1);
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn an_engine_that_rejects_the_key_twice_while_starting_still_becomes_ready() {
+    let rig = Rig::new(&Behavior::default());
+    // 引擎一起来就对所有请求回 401（比如它的 key 还没生效）；只有前两次探测被拒，第三次之前就好了。
+    rig.fake.force_status(401);
+    let mut timings = fast();
+    timings.ready_initial_interval = Duration::from_millis(150);
+    timings.ready_max_interval = Duration::from_millis(300);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        timings,
+        StopOnExit::Owned,
+    );
+    wait_for("two rejected probes", || rig.fake.requests().len() >= 2).await;
+    rig.fake.answer_normally();
+    let status = h.until_state(UpstreamState::Ready).await;
+    assert!(status.owned);
+    assert_eq!(
+        rig.fake.launches(),
+        1,
+        "two rejections are not enough to give the engine up"
+    );
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn an_engine_that_keeps_rejecting_its_own_key_while_starting_is_given_up_with_auth_failed() {
+    let rig = Rig::new(&Behavior::default());
+    rig.fake.force_status(401);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    // 连续三次被拒才算：这个引擎不认自己的 key，停掉它，退避之后重来。
+    let status = h
+        .until("a restart that names the rejected key", |s| {
+            s.state == UpstreamState::Restarting && s.reason == Some(UpstreamReason::AuthFailed)
+        })
+        .await;
+    assert!(!status.owned);
+    wait_for("the engine to be stopped", || !pid_alive(rig.pid(0))).await;
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn an_engine_whose_port_turns_out_to_be_held_by_another_process_when_sealed_is_stopped() {
+    let rig = Rig::new(&Behavior::default());
+    // 等就绪的时候监听这个端口的是引擎（`listens_on` 为真），封印所有权记录时再看，端口已经是别人的了。
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming_once(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    let status = h
+        .until("a restart that names the port", |s| {
+            s.state == UpstreamState::Restarting && s.reason == Some(UpstreamReason::PortInUse)
+        })
+        .await;
+    assert!(!status.owned);
+    wait_for("the engine to be stopped", || !pid_alive(rig.pid(0))).await;
+    assert_eq!(
+        rig.records(),
+        0,
+        "no ownership record is left for an engine that was refused"
+    );
+    assert!(
+        governed_endpoint(&rig.endpoint()).is_none(),
+        "its private key was never registered"
+    );
     h.manager.shutdown(true).await;
 }
 

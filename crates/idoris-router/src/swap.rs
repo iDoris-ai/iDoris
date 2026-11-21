@@ -175,7 +175,7 @@ mod tests {
         assert_eq!(&bytes[..], b"peer-address");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn swapping_is_visible_to_every_clone_and_never_blocks_readers() {
         let swap = SwapApp::new(body("a"));
         let clone = swap.clone();

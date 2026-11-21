@@ -424,7 +424,7 @@ async fn a_missing_engine_is_spawned_and_the_health_answers_before_the_full_rout
         .await
         .unwrap();
     assert_eq!(response.status(), 503);
-    assert!(response.headers().contains_key("retry-after"));
+    assert_eq!(response.headers().get("retry-after").unwrap(), "2");
     assert!(response.headers().contains_key("x-idoris-record-id"));
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["error"]["type"], "idoris_starting");
@@ -438,7 +438,12 @@ async fn a_missing_engine_is_spawned_and_the_health_answers_before_the_full_rout
         request.send()
     };
     assert_eq!(admin("status", true).await.unwrap().status(), 200);
-    assert_eq!(admin("backends", true).await.unwrap().status(), 503);
+    let blocked = admin("backends", true).await.unwrap();
+    assert_eq!(blocked.status(), 503);
+    assert_eq!(blocked.headers().get("retry-after").unwrap(), "2");
+    let blocked: Value = blocked.json().await.unwrap();
+    assert_eq!(blocked["error"]["type"], "idoris_starting");
+    assert_eq!(blocked["error"]["reason_code"], "idoris_starting");
     assert_eq!(admin("backends", false).await.unwrap().status(), 401);
 
     // 引擎起来之后：切换。`phase:"ready"`，托管上游 `ready` 且 `owned:true`。

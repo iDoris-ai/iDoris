@@ -1069,7 +1069,8 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
         let engines_stopping = engines_stopping.clone();
         let gate_failure = gate_failure.clone();
         async move {
-            // 引擎失效只在门控完成之后才会有（之前走重启与熔断）。没有引擎管理器时永不返回。
+            // 引擎失效通常只在门控完成之后才会有（之前走重启与熔断；实例任务自己 panic 是例外，也报在这里）。
+            // 没有引擎管理器时永不返回。
             let engine_failed = async {
                 match &engines {
                     Some(engines) => engines.engine_failed().await,
