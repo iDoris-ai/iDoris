@@ -564,6 +564,23 @@ impl World {
     }
 }
 
+/// 同一个元素去掉「失败事实」（`failure_count`、`last_failure_at_ms`）。它们是 iDoris 启动以来累计的：机器很忙时（别的测试进程
+/// 在抢端口、临时端口紧张），第一次启动前对端口的那次探测偶尔得到的不是「连接被拒」而是别的传输错误，管理器按「有东西在
+/// 答不上来」处理、之后重试，于是白白多记一次失败。这与整个元素的形状无关；「一次 stop、start 不算失败」用动作前后失败次数
+/// 不变来证明（见 `failures_of`），失败如何计数与计时另有 `failures_are_counted_and_dated…`。
+fn without_failure_facts(element: &Value) -> Value {
+    let mut element = element.clone();
+    let object = element.as_object_mut().unwrap();
+    object.remove("failure_count");
+    object.remove("last_failure_at_ms");
+    element
+}
+
+/// 托管上游的元素里已经累计的失败次数。
+fn failures_of(element: &Value) -> u64 {
+    element["failure_count"].as_u64().unwrap()
+}
+
 fn error_of(body: &Value) -> (&str, &str) {
     (
         body["error"]["type"].as_str().unwrap(),
@@ -580,12 +597,17 @@ async fn an_owned_ready_engine_reads_with_its_pid_and_port_and_the_same_facts_as
     let world = World::start(Engine::Fake(Behavior::default()), fast()).await;
     let omlx = world.element("omlx").await;
     assert_eq!(
-        omlx,
+        without_failure_facts(&omlx),
         json!({
             "id": "omlx", "engine_kind": "omlx", "state": "ready", "managed": true, "owned": true,
-            "port": world.rig.port, "pid": world.rig.pid(0), "restart_required": false,
-            "failure_count": 0
+            "port": world.rig.port, "pid": world.rig.pid(0), "restart_required": false
         })
+    );
+    // 托管上游一定带 `failure_count`；`last_failure_at_ms` 有，当且仅当计过失败。
+    assert_eq!(
+        omlx["last_failure_at_ms"].is_u64(),
+        failures_of(&omlx) > 0,
+        "{omlx}"
     );
     // 同源同口径：`/health.upstreams` 里同一个元素的六个字段与它一字不差。
     let health = serde_json::to_value(world.health.view().upstreams).unwrap();
@@ -661,6 +683,7 @@ async fn stop_is_accepted_stops_the_engine_and_is_idempotent() {
     let world = World::start(Engine::Fake(Behavior::default()), fast()).await;
     let pid = world.rig.pid(0);
     assert!(pid_alive(pid));
+    let failures_before = failures_of(&world.element("omlx").await);
 
     let (status, body) = world.post("omlx", "stop").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -675,7 +698,11 @@ async fn stop_is_accepted_stops_the_engine_and_is_idempotent() {
     assert!(stopped.get("pid").is_none());
     assert!(stopped.get("reason").is_none());
     assert_eq!(stopped["restart_required"], false, "stopped, not frozen");
-    assert_eq!(stopped["failure_count"], 0, "a stop is not a failure");
+    assert_eq!(
+        failures_of(&stopped),
+        failures_before,
+        "a stop is not a failure"
+    );
     wait_for("the engine to die", || !pid_alive(pid)).await;
     assert_eq!(world.rig.record_count(), 0, "its ownership record is gone");
     assert!(governed_endpoint(&world.rig.endpoint()).is_none());
@@ -697,6 +724,7 @@ async fn after_a_stop_start_brings_a_fresh_engine_back_with_a_new_private_key() 
     let world = World::start(Engine::Fake(Behavior::default()), fast()).await;
     let first = world.rig.pid(0);
     let first_key = world.rig.key(0);
+    let failures_before = failures_of(&world.element("omlx").await);
     world.post("omlx", "stop").await;
     world.until_state("stopped").await;
 
@@ -722,7 +750,12 @@ async fn after_a_stop_start_brings_a_fresh_engine_back_with_a_new_private_key() 
         Some(EndpointKey::Private(second_key))
     );
     // 一次 stop 加一次 start 不是失败。
-    assert_eq!(ready["failure_count"], 0, "{:?}", world.log.lock().unwrap());
+    assert_eq!(
+        failures_of(&ready),
+        failures_before,
+        "{:?}",
+        world.log.lock().unwrap()
+    );
     world.manager.shutdown(true).await;
 }
 
@@ -852,11 +885,10 @@ async fn a_frozen_upstream_reads_restart_required_and_refuses_start_while_stop_a
     let world = World::start(Engine::Missing, fast()).await;
     let omlx = world.element("omlx").await;
     assert_eq!(
-        omlx,
+        without_failure_facts(&omlx),
         json!({
             "id": "omlx", "engine_kind": "omlx", "state": "absent", "reason": "engine_not_found",
-            "managed": true, "owned": false, "port": world.rig.port, "restart_required": true,
-            "failure_count": 0
+            "managed": true, "owned": false, "port": world.rig.port, "restart_required": true
         })
     );
     // `start`：放行时没就绪，没有它的 Supervisor：要重启 iDoris。

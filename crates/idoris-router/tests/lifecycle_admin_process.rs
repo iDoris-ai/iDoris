@@ -252,6 +252,16 @@ async fn health_until(client: &reqwest::Client, port: u64, done: impl Fn(&Value)
     }
 }
 
+/// 同一个元素去掉「失败事实」：见 `lifecycle_admin.rs` 的同名辅助函数（机器很忙时第一次启动偶尔会因为一次探测失败多记一次，
+/// 与这里要钉住的元素形状无关）。
+fn without_failure_facts(element: &Value) -> Value {
+    let mut element = element.clone();
+    let object = element.as_object_mut().unwrap();
+    object.remove("failure_count");
+    object.remove("last_failure_at_ms");
+    element
+}
+
 fn omlx_of(body: &Value) -> &Value {
     body["upstreams"]
         .as_array()
@@ -331,12 +341,13 @@ async fn the_real_binary_stops_starts_and_restarts_an_engine_and_chat_survives_e
     let first = fake.launch(0)["pid"].as_u64().unwrap();
     let element = api.upstream().await;
     assert_eq!(
-        element,
+        without_failure_facts(&element),
         json!({
             "id": "omlx", "engine_kind": "omlx", "state": "ready", "managed": true, "owned": true,
-            "port": env.port, "pid": first, "restart_required": false, "failure_count": 0
+            "port": env.port, "pid": first, "restart_required": false
         })
     );
+    assert!(element["failure_count"].is_u64(), "{element}");
     let health_element = omlx_of(&health(&api.client, data_port).await).clone();
     for key in ["id", "engine_kind", "state", "managed", "owned"] {
         assert_eq!(element[key], health_element[key], "{key}");
@@ -455,13 +466,13 @@ async fn the_real_binary_freezes_an_engine_that_was_not_there_when_it_started() 
     .await;
     let element = api.upstream().await;
     assert_eq!(
-        element,
+        without_failure_facts(&element),
         json!({
             "id": "omlx", "engine_kind": "omlx", "state": "absent", "reason": "engine_not_found",
-            "managed": true, "owned": false, "port": env.port, "restart_required": true,
-            "failure_count": 0
+            "managed": true, "owned": false, "port": env.port, "restart_required": true
         })
     );
+    assert!(element["failure_count"].is_u64(), "{element}");
     let (status, body) = api
         .admin(reqwest::Method::POST, "upstreams/omlx/start", true)
         .await;

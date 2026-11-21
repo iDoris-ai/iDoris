@@ -445,6 +445,9 @@ async fn residency_the_new_process_came_up_with_is_adopted_even_beyond_the_share
             "r",
         )
         .unwrap();
+        // 先等启动采样做完（它看到的是空引擎，占用 0）：不然 `preload` 可能赶在它前面，启动采样就把这 20 GB 当成自己的了，
+        // 复位那一步根本没有增长，测不到「观测不按准入拒绝」。
+        handle.status().await.unwrap();
         engine.mock.preload("big");
 
         handle.engine_replaced(true).await.unwrap();
