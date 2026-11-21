@@ -6,8 +6,9 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::Write,
+    net::{Ipv4Addr, TcpListener},
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
@@ -55,6 +56,33 @@ async fn fake(key: Option<&str>, models: &[&str]) -> MockServer {
     server
 }
 
+/// 子进程的守卫：不管测试怎么结束（包括断言失败、panic），Drop 时 SIGKILL 并回收，不会留下孤儿进程。
+struct Reaped(Option<Child>);
+
+impl Reaped {
+    fn spawn(cmd: &mut Command) -> Self {
+        Self(Some(cmd.spawn().unwrap()))
+    }
+
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().unwrap()
+    }
+
+    /// 正常等它跑完并取走输出（取走之后 Drop 不再杀）。
+    fn finish(mut self) -> std::process::Output {
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 struct Out {
     code: i32,
     stdout: String,
@@ -91,13 +119,13 @@ async fn setup_in(
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().unwrap();
-        let mut pipe = child.stdin.take().unwrap();
+        let mut child = Reaped::spawn(&mut cmd);
+        let mut pipe = child.child().stdin.take().unwrap();
         if let Some(s) = stdin {
             pipe.write_all(s.as_bytes()).unwrap();
         }
         drop(pipe);
-        let o = child.wait_with_output().unwrap();
+        let o = child.finish();
         let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
         Out {
             code: o.status.code().unwrap(),
@@ -189,19 +217,18 @@ async fn ok_with_auth_never_persists_key_and_server_starts() {
     for (k, _) in std::env::vars_os().filter(|(k, _)| k.to_string_lossy().starts_with("IDORIS_")) {
         cmd.env_remove(k);
     }
-    let mut child = cmd
-        .current_dir(tmp.path())
-        .env("IDORIS_PORT", port.to_string())
-        .env("IDORIS_ADMIN_PORT", admin_port.to_string())
-        .env("IDORIS_DB_PATH", tmp.path().join("t.sqlite3"))
-        .env("IDORIS_COMPONENTS_DIR", &out)
-        .env("IDORIS_ROUTING_POLICY", cfg.join("routing-policy.yaml"))
-        .env("IDORIS_CATALOG", cfg.join("catalog.yaml"))
-        .env("IDORIS_OMLX_API_KEY", KEY)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = Reaped::spawn(
+        cmd.current_dir(tmp.path())
+            .env("IDORIS_PORT", port.to_string())
+            .env("IDORIS_ADMIN_PORT", admin_port.to_string())
+            .env("IDORIS_DB_PATH", tmp.path().join("t.sqlite3"))
+            .env("IDORIS_COMPONENTS_DIR", &out)
+            .env("IDORIS_ROUTING_POLICY", cfg.join("routing-policy.yaml"))
+            .env("IDORIS_CATALOG", cfg.join("catalog.yaml"))
+            .env("IDORIS_OMLX_API_KEY", KEY)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let healthy = loop {
@@ -214,13 +241,13 @@ async fn ok_with_auth_never_persists_key_and_server_starts() {
         {
             break r.json::<Value>().await.unwrap()["status"] == "ok";
         }
-        if child.try_wait().unwrap().is_some() || Instant::now() > deadline {
+        if child.child().try_wait().unwrap().is_some() || Instant::now() > deadline {
             break false;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
-    let _ = child.kill();
-    let _ = child.wait();
+    // Drop 杀掉并回收；放在断言之前，断言失败也不留进程。
+    drop(child);
     assert!(
         healthy,
         "idoris serve did not become healthy from the generated dir"
@@ -431,4 +458,277 @@ async fn models_body_just_under_the_cap_is_accepted() {
     )
     .await;
     assert_eq!(o.code, 0, "{}", o.stdout);
+}
+
+// ---------------------------------------------------------------------------------------------
+// IDORIS-CORE S4：`--auto`、`--managed`、`--no-probe`（进程级）
+//
+// 这里只放不依赖这台机器上有没有真实 oMLX 的路径：用法错误、采纳模式的输出形状、`--no-probe`、以及托管模式里
+// 排在「引擎发现」之前就确定会失败的两种（端口被占、绑定的模型没装）。成功的托管路径与 `--auto` 要换候选端口、
+// 可执行文件与家目录，在 `setup_omlx_flows.rs` 里用库级注入测试。
+// ---------------------------------------------------------------------------------------------
+
+/// 任意参数跑 `idoris setup omlx …`；`home` 给了就把 `HOME` 设成它（没给就设成一个不存在的目录，不碰真实的家目录）。
+async fn cli(args: &[&str], home: Option<&Path>, stdin: Option<&str>) -> Out {
+    let (args, home, stdin) = (
+        args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        home.map(Path::to_owned),
+        stdin.map(str::to_string),
+    );
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_idoris"));
+        for (k, _) in
+            std::env::vars_os().filter(|(k, _)| k.to_string_lossy().starts_with("IDORIS_"))
+        {
+            cmd.env_remove(k);
+        }
+        cmd.env(
+            "HOME",
+            home.unwrap_or_else(|| "/nonexistent-home-for-tests".into()),
+        )
+        .args(["setup", "omlx"])
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let mut child = Reaped::spawn(&mut cmd);
+        let mut pipe = child.child().stdin.take().unwrap();
+        if let Some(s) = stdin {
+            pipe.write_all(s.as_bytes()).unwrap();
+        }
+        drop(pipe);
+        let o = child.finish();
+        let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+        Out {
+            code: o.status.code().unwrap(),
+            json: serde_json::from_str(&stdout).unwrap_or(Value::Null),
+            stdout,
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        }
+    })
+    .await
+    .unwrap()
+}
+
+fn install_model(home: &Path, id: &str) {
+    let dir = home.join(".omlx/models").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("config.json"), "{}").unwrap();
+    fs::write(dir.join("model.safetensors"), b"weights").unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_output_gains_mode_and_engine_and_keeps_every_existing_field() {
+    let server = fake(None, &["m1"]).await;
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("comp");
+    let o = setup(&server.uri(), &out, &["--bind", "daily=m1"], None).await;
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    // 既有字段（规范：「既有字段（含 endpoint）不变」）。
+    assert_eq!(o.json["status"], "ok");
+    assert_eq!(o.json["endpoint"], server.uri());
+    assert_eq!(o.json["auth"], "none");
+    assert_eq!(o.json["models"], json!(["m1"]));
+    assert_eq!(o.json["bindings"], json!({"daily": "m1"}));
+    assert_eq!(
+        o.json["components_dir"],
+        out.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert!(o.json["next"]["env"]["IDORIS_COMPONENTS_DIR"].is_string());
+    // 新增字段：mode 与 engine。有没有装 oMLX 取决于这台机器，所以只核对形状与一致性。
+    assert_eq!(o.json["mode"], "adopt");
+    let engine = &o.json["engine"];
+    assert_eq!(engine["engine_kind"], "omlx");
+    let installed = engine["installed"].as_bool().unwrap();
+    assert_eq!(installed, engine["executable"].is_string(), "{engine}");
+    assert!(
+        engine.get("version").is_none(),
+        "采纳模式不执行可执行文件，没有 version"
+    );
+    // 采纳的卡不带托管声明。
+    let card = fs::read_to_string(out.join("omlx.yaml")).unwrap();
+    assert!(!card.contains("idoris_managed"), "{card}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn contradictory_setup_flags_are_a_usage_error_before_anything_runs() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("comp");
+    let out_str = out.to_str().unwrap();
+    for args in [
+        vec![
+            "--out-dir",
+            out_str,
+            "--endpoint",
+            "http://127.0.0.1:1",
+            "--auto",
+        ],
+        vec![
+            "--out-dir",
+            out_str,
+            "--endpoint",
+            "http://127.0.0.1:1",
+            "--managed",
+        ],
+        vec!["--out-dir", out_str, "--auto", "--no-probe"],
+        vec!["--out-dir", out_str, "--managed-port", "19731"],
+        vec!["--out-dir", out_str, "--managed", "--managed-port", "0"],
+        vec!["--out-dir", out_str, "--managed", "--api-key-stdin"],
+        // `--auto` 探测的端口是猜的：端口属主校验（#619）落地之前不发 key，要鉴权的引擎用 `--endpoint`。
+        vec!["--out-dir", out_str, "--auto", "--api-key-stdin"],
+        vec![
+            "--out-dir",
+            out_str,
+            "--auto",
+            "--managed",
+            "--api-key-stdin",
+        ],
+    ] {
+        let o = cli(&args, None, Some(&format!("{KEY}\n"))).await;
+        assert_eq!(o.code, 1, "{args:?}");
+        assert!(o.stderr.contains("用法"), "{args:?}: {}", o.stderr);
+        assert!(o.stdout.is_empty(), "用法错误不输出 JSON：{}", o.stdout);
+        assert!(!o.stderr.contains(KEY));
+        assert!(!out.exists());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_probe_adopts_without_connecting_and_checks_bindings_against_the_homes_models() {
+    let server = fake(None, &["engine-only-model"]).await;
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    install_model(&home, "installed-model");
+    let out = tmp.path().join("comp");
+    let o = cli(
+        &[
+            "--out-dir",
+            out.to_str().unwrap(),
+            "--endpoint",
+            &server.uri(),
+            "--no-probe",
+            "--bind",
+            "daily=installed-model",
+        ],
+        Some(&home),
+        None,
+    )
+    .await;
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "--no-probe：引擎一个请求都没收到"
+    );
+    assert_eq!(o.json["mode"], "adopt");
+    assert_eq!(o.json["auth"], "unknown");
+    assert_eq!(o.json["models"], json!([]));
+    assert_eq!(o.json["bindings"], json!({"daily": "installed-model"}));
+    idoris_router::components::load_components(&out, false).unwrap();
+    // 引擎自己的模型不算数：对照的是本机已装的。
+    let o = cli(
+        &[
+            "--out-dir",
+            tmp.path().join("comp2").to_str().unwrap(),
+            "--endpoint",
+            &server.uri(),
+            "--no-probe",
+            "--bind",
+            "daily=engine-only-model",
+        ],
+        Some(&home),
+        None,
+    )
+    .await;
+    assert_eq!(err_code(&o), "model_not_installed");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// 托管模式里，绑定的模型没装、端口被占都排在「找引擎」之前失败：不依赖这台机器上有没有 oMLX，也不执行任何东西。
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_fails_on_an_uninstalled_model_or_a_busy_port_before_looking_for_the_engine() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let out = tmp.path().join("comp");
+    let o = cli(
+        &[
+            "--out-dir",
+            out.to_str().unwrap(),
+            "--managed",
+            "--bind",
+            "daily=nope",
+        ],
+        Some(&home),
+        None,
+    )
+    .await;
+    assert_eq!(err_code(&o), "model_not_installed");
+    assert!(!out.exists());
+
+    let held = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = held.local_addr().unwrap().port().to_string();
+    let o = cli(
+        &[
+            "--out-dir",
+            out.to_str().unwrap(),
+            "--managed",
+            "--managed-port",
+            &port,
+        ],
+        Some(&home),
+        None,
+    )
+    .await;
+    assert_eq!(err_code(&o), "port_in_use");
+    assert!(o.json["message"].as_str().unwrap().contains(&port));
+    assert!(!out.exists());
+    drop(held);
+}
+
+/// stdin 上的 key 行不合规（含空白）：只给固定的错误码与说明，key 的内容不出现在任何输出里；
+/// 这一步排在一切探测与写入之前。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_key_line_is_rejected_without_being_echoed() {
+    let server = fake(Some(KEY), &["m1"]).await;
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("comp");
+    let secretish = "not-a-key with spaces and secret-part-zzz";
+    let o = setup(
+        &server.uri(),
+        &out,
+        &["--api-key-stdin"],
+        Some(&format!("{secretish}\n")),
+    )
+    .await;
+    assert_eq!(err_code(&o), "invalid_api_key_input");
+    for part in ["not-a-key", "spaces", "secret-part-zzz"] {
+        assert!(
+            !o.stdout.contains(part) && !o.stderr.contains(part),
+            "{part}"
+        );
+    }
+    assert!(!out.exists());
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "key 行不合规：连探测都不发"
+    );
+}
+
+/// 托管引擎的模型目录（运行用户的 `~/.omlx/models`）路径含逗号：oMLX 会把 `--model-dir` 按逗号拆开，
+/// 托管在找端口、找引擎之前就失败（所以不依赖这台机器上有没有 oMLX，也不执行任何东西）。
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_with_a_comma_in_the_models_path_is_refused_before_looking_for_the_engine() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home,with,commas");
+    fs::create_dir_all(&home).unwrap();
+    let out = tmp.path().join("comp");
+    let o = cli(
+        &["--out-dir", out.to_str().unwrap(), "--managed"],
+        Some(&home),
+        None,
+    )
+    .await;
+    assert_eq!(err_code(&o), "validation_failed");
+    assert!(o.json["message"].as_str().unwrap().contains("逗号"));
+    assert!(!out.exists());
 }

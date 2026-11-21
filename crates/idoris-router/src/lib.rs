@@ -12,7 +12,10 @@ pub mod profile;
 /// Packaged binary command-line parsing.
 pub mod cli;
 
-/// `idoris setup omlx`: offline oMLX probe + validated components-dir writer.
+/// `idoris setup <engine>`: the engine-agnostic flow (adopt, auto-detect, managed) and its validated
+/// components-dir writer (IDORIS-CORE S4).
+pub mod setup_engine;
+/// `idoris setup omlx`: oMLX as the first `setup_engine::SetupEngine`.
 pub mod setup_omlx;
 
 /// Offline intent embedding primitives (B1 task 09).
