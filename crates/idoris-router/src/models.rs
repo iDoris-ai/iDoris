@@ -91,10 +91,20 @@ fn auth_failure(card: &ComponentCard, field: &str, value: Value) -> ModelsError 
     }
 }
 
+/// 这张卡能不能带 oMLX 的私有 key（`GET /v1/models` 与代理转发共用这一处判断；接口规范修订 1.6）。
+///
+/// 规则按卡识别：本地族、loopback、`version_pin` 的产品名是 `omlx`、端点是不带凭据的 loopback 主机，
+/// **且卡不带 `extensions.idoris_upstream`**。`omlx` 与伴生卡 `omlx-embed` 都满足；自定义 OpenAI 兼容上游
+/// （`setup upstream` 的卡必带 `idoris_upstream`）即使把 `flavor`、`version_pin` 写成 oMLX、端口写成 oMLX 的，
+/// 也不带 key。key 的来源不在这里（见 `idoris_upstream::omlx::key`），S5 换成私有 key 表时只改来源。
 pub(crate) fn is_loopback_omlx(card: &ComponentCard) -> bool {
     if card.provider.family != idoris_contracts::provider::Family::Local
         || card.provider.locality != Locality::Loopback
         || !card.version_pin.starts_with("omlx@")
+        || card
+            .extensions
+            .as_ref()
+            .is_some_and(|ext| ext.contains_key(crate::engine_kind::UPSTREAM_EXTENSION))
     {
         return false;
     }

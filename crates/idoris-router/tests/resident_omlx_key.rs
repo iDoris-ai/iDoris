@@ -41,6 +41,39 @@ fn card(id: &str, endpoint: &str, mode: LoadMode) -> ComponentCard {
     card
 }
 
+/// `setup omlx --bind embed=…` 生成的伴生卡的形状：id `omlx-embed`，只有 embedding 能力，resident，绑定 embed 角色。
+fn companion(endpoint: &str) -> ComponentCard {
+    let mut card = card("omlx-embed", endpoint, LoadMode::Resident);
+    card.provider.capabilities = vec![idoris_contracts::common::Capability::Embedding];
+    card.extensions = Some(
+        serde_json::from_value(json!({
+            "_degradation": "Removing these bindings disables aliases.",
+            "idoris_role_models": {"embed": "bge-m3-mlx-fp16"}
+        }))
+        .unwrap(),
+    );
+    card
+}
+
+/// 自定义 OpenAI 兼容上游（`setup upstream` 的形状：带 `idoris_upstream`），可以伪装 id、`flavor` 与 `version_pin`。
+fn custom_upstream(id: &str, endpoint: &str, flavor: &str, version_pin: &str) -> ComponentCard {
+    let mut card = card(id, endpoint, LoadMode::Resident);
+    card.version_pin = version_pin.to_string();
+    card.extensions = Some(
+        serde_json::from_value(json!({
+            "_degradation": "Removing these bindings disables aliases.",
+            "idoris_role_models": {"daily": "Qwen3-0.6B-4bit", "fast": "Qwen3-0.6B-4bit"},
+            "idoris_upstream": {"kind": "openai_compat", "flavor": flavor}
+        }))
+        .unwrap(),
+    );
+    card
+}
+
+fn embed(model: &str) -> Value {
+    json!({"model": model, "input": "hi"})
+}
+
 fn post(uri: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -200,8 +233,136 @@ async fn run_case(case: &str) {
         "non_omlx" => {
             // Same oMLX key in the env, but the card is not the oMLX provider.
             let upstream = auth_backend().await;
+            let mut other = card("other-local", &upstream.uri(), LoadMode::Resident);
+            other.version_pin = "lmstudio@unknown".to_string();
+            other
+                .provider
+                .capabilities
+                .push(idoris_contracts::common::Capability::Rerank);
             let app = build_app(AppState {
-                cards: vec![card("other-local", &upstream.uri(), LoadMode::Resident)],
+                cards: vec![other],
+                ..AppState::default()
+            });
+            let (status, body) = body_of(
+                app.clone()
+                    .oneshot(post("/v1/chat/completions", chat(false)))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_mapped_auth_error(status, &body);
+            // rerank 路径同样按卡判定：非 oMLX 卡不带 key（响应是什么不重要，要看的是线上有没有 Authorization）。
+            let _ = app
+                .oneshot(post(
+                    "/v1/rerank",
+                    json!({"model": "idoris/daily", "query": "q", "documents": ["a", "b"]}),
+                ))
+                .await
+                .unwrap();
+            let requests = upstream.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2, "chat 与 rerank 都要到达上游");
+            assert!(requests.iter().any(|r| r.url.path() == "/v1/rerank"));
+            for request in &requests {
+                assert!(
+                    request.headers.get("authorization").is_none(),
+                    "the oMLX key must not reach a non-oMLX card"
+                );
+            }
+        }
+        "companion_key" => {
+            // 伴生卡 omlx-embed 与主卡 omlx 同一个 endpoint：idoris/embed 路由到伴生卡，带同一个 key。
+            let upstream = auth_backend().await;
+            let app = build_app(AppState {
+                cards: vec![
+                    card("omlx", &upstream.uri(), LoadMode::OnDemand),
+                    companion(&upstream.uri()),
+                ],
+                ..AppState::default()
+            });
+            let (status, body) = body_of(
+                app.oneshot(post("/v1/embeddings", embed("idoris/embed")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let requests = upstream.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].url.path(), "/v1/embeddings");
+            let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(
+                sent["model"], "bge-m3-mlx-fp16",
+                "角色绑定把 idoris/embed 换成具体模型"
+            );
+            assert_no_caller_key(&requests);
+        }
+        "companion_nokey" => {
+            // 没有 key 时伴生卡与主卡一样，拿到上游的 401 并映射成结构化错误。
+            let upstream = auth_backend().await;
+            let app = build_app(AppState {
+                cards: vec![companion(&upstream.uri())],
+                ..AppState::default()
+            });
+            let (status, body) = body_of(
+                app.oneshot(post("/v1/embeddings", embed("idoris/embed")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_mapped_auth_error(status, &body);
+        }
+        "disguised_upstream" => {
+            // 自定义上游把 id、flavor、version_pin 都伪装成 oMLX、端点也是 loopback：仍然一个字节的 key 都不带。
+            for (id, flavor, pin) in [
+                ("omlx", "omlx", "omlx@0.6.4"),
+                ("omlx-embed", "omlx", "omlx@0.6.4"),
+                ("lmstudio-9", "omlx", "omlx@0.6.4"),
+                ("lmstudio-9", "openai_compat", "omlx@0.6.4"),
+            ] {
+                let upstream = auth_backend().await;
+                let mut c = custom_upstream(id, &upstream.uri(), flavor, pin);
+                c.provider.capabilities = vec![
+                    idoris_contracts::common::Capability::Chat,
+                    idoris_contracts::common::Capability::Embedding,
+                ];
+                let app = build_app(AppState {
+                    cards: vec![c],
+                    ..AppState::default()
+                });
+                for stream in [false, true] {
+                    let (status, body) = body_of(
+                        app.clone()
+                            .oneshot(post("/v1/chat/completions", chat(stream)))
+                            .await
+                            .unwrap(),
+                    )
+                    .await;
+                    assert_mapped_auth_error(status, &body);
+                }
+                let (status, body) = body_of(
+                    app.oneshot(post("/v1/embeddings", embed("Qwen3-0.6B-4bit")))
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                assert_mapped_auth_error(status, &body);
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 3, "{id}/{flavor}");
+                for request in &requests {
+                    assert!(
+                        request.headers.get("authorization").is_none(),
+                        "{id}/{flavor}/{pin}: a custom upstream must never get the oMLX key"
+                    );
+                }
+            }
+        }
+        "id_alone_is_not_enough" => {
+            // 只是叫 omlx：卡的引擎种类（version_pin）不是 omlx，就没有 key。
+            let upstream = auth_backend().await;
+            let mut c = card("omlx", &upstream.uri(), LoadMode::Resident);
+            c.version_pin = "lmstudio@unknown".to_string();
+            let app = build_app(AppState {
+                cards: vec![c],
                 ..AppState::default()
             });
             let (status, body) = body_of(
@@ -211,14 +372,24 @@ async fn run_case(case: &str) {
             )
             .await;
             assert_mapped_auth_error(status, &body);
-            let requests = upstream.received_requests().await.unwrap();
-            assert!(!requests.is_empty());
-            for request in &requests {
-                assert!(
-                    request.headers.get("authorization").is_none(),
-                    "the oMLX key must not reach a non-oMLX card"
-                );
+            for request in &upstream.received_requests().await.unwrap() {
+                assert!(request.headers.get("authorization").is_none());
             }
+        }
+        "other_id_omlx_card_gets_key" => {
+            // 按卡识别，不按 id：loopback、version_pin 是 omlx@ 的卡（比如手写的 omlx-secondary）带 key。
+            let upstream = auth_backend().await;
+            let app = build_app(AppState {
+                cards: vec![card("omlx-secondary", &upstream.uri(), LoadMode::Resident)],
+                ..AppState::default()
+            });
+            let (status, body) = body_of(
+                app.oneshot(post("/v1/chat/completions", chat(false)))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
         }
         "on_demand" => {
             let upstream = auth_backend().await;
@@ -331,6 +502,11 @@ async fn resident_omlx_key_attachment_and_auth_error_mapping() {
         ("resident_key", Some(KEY)),
         ("resident_nokey", None),
         ("non_omlx", Some(KEY)),
+        ("companion_key", Some(KEY)),
+        ("companion_nokey", None),
+        ("disguised_upstream", Some(KEY)),
+        ("id_alone_is_not_enough", Some(KEY)),
+        ("other_id_omlx_card_gets_key", Some(KEY)),
         ("on_demand", Some(KEY)),
         ("breaker_sequence", None),
         ("oversized_401", None),

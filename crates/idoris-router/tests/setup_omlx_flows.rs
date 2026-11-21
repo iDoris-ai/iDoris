@@ -773,13 +773,13 @@ async fn offline_bindings_are_checked_against_the_installed_models_not_the_engin
     let rig = Rig::new();
     rig.install_model("bge-m3-mlx-fp16");
     let mut options = rig.options(SetupTarget::Managed(managed(None)));
-    options.bindings = vec![("embed".into(), "bge-m3-mlx-fp16".into())];
+    options.bindings = vec![("daily".into(), "bge-m3-mlx-fp16".into())];
     let report = ok(run_setup(&rig.setup(&[]), &options, None).await);
-    assert_eq!(report["bindings"], json!({"embed": "bge-m3-mlx-fp16"}));
+    assert_eq!(report["bindings"], json!({"daily": "bge-m3-mlx-fp16"}));
     let card = rig.card();
     assert_eq!(
         card["extensions"]["idoris_role_models"],
-        json!({"embed": "bge-m3-mlx-fp16"})
+        json!({"daily": "bge-m3-mlx-fp16"})
     );
     // 托管声明和绑定共存，降级说明两样都交代了。
     assert_eq!(card["extensions"]["idoris_managed"]["engine"], "omlx");
@@ -1004,7 +1004,11 @@ async fn a_managed_setup_writes_nothing_but_the_out_dir() {
     assert_eq!(top, ["bin", "executed", "home", "out"], "暂存目录已清理");
     let mut written: Vec<String> = rig.tree(&rig.out()).into_iter().map(|(p, _)| p).collect();
     written.sort();
-    assert_eq!(written, ["omlx.yaml", "subscription.yaml"]);
+    // embed 绑定另有伴生卡（S7），也只写在 out-dir 里。
+    assert_eq!(
+        written,
+        ["omlx-embed.yaml", "omlx.yaml", "subscription.yaml"]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

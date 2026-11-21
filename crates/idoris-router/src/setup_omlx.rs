@@ -261,7 +261,57 @@ impl SetupEngine for OmlxSetup {
     fn static_files(&self) -> &'static [(&'static str, &'static str)] {
         &[("subscription.yaml", SUBSCRIPTION_CARD)]
     }
+
+    fn companion_files(&self) -> &'static [&'static str] {
+        &[EMBED_COMPANION_FILE]
+    }
+
+    fn companion_roles(&self) -> &'static [&'static str] {
+        &[EMBED_ROLE]
+    }
+
+    /// 伴生 embedding 卡（接口规范 §2.3、设计稿 §2.8.1）：与主卡同一个 endpoint、同一个引擎，所以按卡识别 oMLX key
+    /// 时（`models::is_loopback_omlx`）同样带 key；只声明 `embedding` 能力；resident 加 pinned 加 coexist，
+    /// 所以 `/v1/embeddings` 能选到它，而主卡可以继续是 on_demand。不带 `idoris_managed`：引擎的启停只经主卡。
+    fn companion_card(
+        &self,
+        main: &ComponentCard,
+        bindings: &[(String, String)],
+    ) -> Result<Option<(String, ComponentCard)>, SetupError> {
+        use idoris_contracts::common::Capability;
+        use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode};
+
+        let mut card = self.card_template()?;
+        card.provider.id = EMBED_COMPANION_ID.to_string();
+        card.provider.capabilities = vec![Capability::Embedding];
+        card.endpoint = main.endpoint.clone();
+        if let Some(policy) = card.load_policy.as_mut() {
+            policy.mode = LoadMode::Resident;
+            policy.keepalive = Keepalive::Pinned { pinned: true };
+            policy.admission = Admission::Coexist;
+        }
+        let models: serde_json::Map<String, Value> = bindings
+            .iter()
+            .map(|(role, model)| (role.clone(), Value::String(model.clone())))
+            .collect();
+        let mut extensions = serde_json::Map::new();
+        extensions.insert(
+            "_degradation".to_string(),
+            Value::String(
+                "伴生卡只承载 embedding：去掉它或它的 embed 绑定，/v1/embeddings 对它返回 503，其余能力不受影响。"
+                    .to_string(),
+            ),
+        );
+        extensions.insert("idoris_role_models".to_string(), Value::Object(models));
+        card.extensions = Some(extensions);
+        Ok(Some((EMBED_COMPANION_FILE.to_string(), card)))
+    }
 }
+
+/// 伴生 embedding 卡的 `provider.id`；`setup upstream` 把它列为保留 id。
+pub const EMBED_COMPANION_ID: &str = "omlx-embed";
+const EMBED_COMPANION_FILE: &str = "omlx-embed.yaml";
+const EMBED_ROLE: &str = "embed";
 
 /// Entry point. `api_key` is used only for probing.
 pub async fn run(options: &SetupOptions, api_key: Option<&str>) -> Result<Value, SetupError> {

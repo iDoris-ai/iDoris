@@ -145,11 +145,42 @@ pub struct ForwardOpts<'a> {
     /// Paid direct-proxy calls require trustworthy OpenAI usage evidence
     /// before a 2xx response may be retained or replayed.
     pub require_openai_usage: bool,
+    /// 这张卡是否带 oMLX 私有 key（按卡判定，见 [`ProviderRef`]）。缺省写 `false`。
+    pub attach_omlx_key: bool,
 }
 
-/// Provider id for which `create_adapter` (lifecycle path) builds the oMLX
-/// adapter, and therefore the only one that receives the oMLX key here.
-const OMLX_PROVIDER_ID: &str = "omlx";
+/// 上游卡在代理这一层的身份：`id` 是 `provider.id`；`omlx_key` 表示这张卡可以带 oMLX 私有 key
+/// （由 [`crate::models::is_loopback_omlx`] 按卡判定，`omlx` 与伴生卡 `omlx-embed` 都满足）。
+/// 从裸 `&str` 转换得到的永远是 `omlx_key: false`：不带 key 是缺省，要带必须由调用方拿着卡显式声明。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProviderRef<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) omlx_key: bool,
+}
+
+impl<'a> ProviderRef<'a> {
+    pub(crate) fn of_card(card: &'a idoris_contracts::ComponentCard) -> Self {
+        Self {
+            id: card.provider.id.as_str(),
+            omlx_key: crate::models::is_loopback_omlx(card),
+        }
+    }
+}
+
+impl<'a> From<&'a String> for ProviderRef<'a> {
+    fn from(id: &'a String) -> Self {
+        Self::from(id.as_str())
+    }
+}
+
+impl<'a> From<&'a str> for ProviderRef<'a> {
+    fn from(id: &'a str) -> Self {
+        Self {
+            id,
+            omlx_key: false,
+        }
+    }
+}
 
 /// Deliberate trade-off: every proxied provider's 401/403 maps to
 /// `upstream_auth_failed`. A remote provider's 403 can also mean a model,
@@ -158,6 +189,9 @@ const OMLX_PROVIDER_ID: &str = "omlx";
 fn is_upstream_auth_status(status: u16) -> bool {
     matches!(status, 401 | 403)
 }
+
+/// `/v1/embeddings` 的响应头超时缺省值：比聊天的 10 秒宽，容得下 embedding 模型的冷加载。
+pub(crate) const EMBEDDINGS_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BufferedUpstreamPath {
@@ -546,7 +580,9 @@ pub struct ChatProxy {
     test_clock_ms: std::sync::atomic::AtomicU64,
     pub(crate) window: Duration,
     max_entries: usize,
-    header_timeout: Duration,
+    pub(crate) header_timeout: Duration,
+    /// `/v1/embeddings` 自己的响应头超时：冷加载 embedding 模型可能超过聊天路径的 10 秒（设计稿 §2.8.1）。
+    pub(crate) embeddings_header_timeout: Duration,
     body_timeout: Duration,
     max_body_bytes: usize,
     max_cache_bytes: usize,
@@ -778,15 +814,13 @@ impl ChatProxy {
     ///
     /// The request is built from scratch, so no caller header (notably the
     /// iDoris virtual key in `Authorization`) can reach the upstream. The
-    /// oMLX inference key is attached only for the `omlx` provider — the same
-    /// selector the lifecycle path's `create_adapter` uses — from the
-    /// env var, or from `~/.omlx/settings.json` only when `url` is loopback,
-    /// and is never logged.
-    fn outbound(&self, url: &str, payload: &Value, provider_id: &str) -> reqwest::RequestBuilder {
+    /// oMLX inference key is attached only when the caller says the card is a
+    /// loopback oMLX card (`omlx_key`, decided per card by
+    /// [`crate::models::is_loopback_omlx`]) — from the env var, or from
+    /// `~/.omlx/settings.json` only when `url` is loopback, and is never logged.
+    fn outbound(&self, url: &str, payload: &Value, omlx_key: bool) -> reqwest::RequestBuilder {
         let mut request = self.client.post(url);
-        if provider_id == OMLX_PROVIDER_ID
-            && let Some(key) = idoris_upstream::omlx::key::resolve_omlx_api_key_for(url)
-        {
+        if omlx_key && let Some(key) = idoris_upstream::omlx::key::resolve_omlx_api_key_for(url) {
             request = request.bearer_auth(key);
         }
         // Keep local runtimes byte-for-byte compatible; remote providers get
@@ -813,6 +847,14 @@ impl ChatProxy {
     /// Creates a proxy. The injected `client` must have redirects disabled
     /// for connection-failure retries to be safe, since a redirect can obscure
     /// whether the upstream accepted the POST.
+    pub(crate) fn header_timeout_for(&self, path: BufferedUpstreamPath) -> Duration {
+        if path == BufferedUpstreamPath::EMBEDDINGS {
+            self.embeddings_header_timeout
+        } else {
+            self.header_timeout
+        }
+    }
+
     pub fn new(client: reqwest::Client) -> Self {
         Self {
             client,
@@ -825,6 +867,7 @@ impl ChatProxy {
             window: DEFAULT_WINDOW,
             max_entries: DEFAULT_MAX_ENTRIES,
             header_timeout: Duration::from_secs(10),
+            embeddings_header_timeout: EMBEDDINGS_HEADER_TIMEOUT,
             body_timeout: Duration::from_secs(60),
             max_body_bytes: 8 * 1024 * 1024,
             max_cache_bytes: 32 * 1024 * 1024,
@@ -1226,7 +1269,15 @@ impl ChatProxy {
         let Some(request_id) = opts.request_id.filter(|_| !cache_off) else {
             let mut uncertain = false;
             let outcome = self
-                .forward_once_observed(&url, &payload, opts, &fingerprint, &mut uncertain, observer)
+                .forward_once_observed(
+                    &url,
+                    &payload,
+                    opts,
+                    self.header_timeout_for(path),
+                    &fingerprint,
+                    &mut uncertain,
+                    observer,
+                )
                 .await?;
             let outcome = Self::finalize_success(outcome, success_gate).0;
             completed(outcome.clone()).await?;
@@ -1316,7 +1367,15 @@ impl ChatProxy {
         let mut cancellation_guard = FlightCancellationGuard::new(Arc::clone(&flight));
         let mut uncertain = false;
         let outcome = match self
-            .forward_once_observed(&url, &payload, opts, &fingerprint, &mut uncertain, observer)
+            .forward_once_observed(
+                &url,
+                &payload,
+                opts,
+                self.header_timeout_for(path),
+                &fingerprint,
+                &mut uncertain,
+                observer,
+            )
             .await
         {
             Ok(outcome) => outcome,
@@ -1485,11 +1544,13 @@ impl ChatProxy {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn forward_once_observed<F, Fut, E>(
         &self,
         url: &str,
         payload: &Value,
         opts: &ForwardOpts<'_>,
+        header_timeout: Duration,
         fingerprint: &[u8; 32],
         uncertain: &mut bool,
         observer: F,
@@ -1527,6 +1588,7 @@ impl ChatProxy {
                 url,
                 payload,
                 opts,
+                header_timeout,
                 uncertain,
                 &mut retry_after_ms,
                 &mut raw_auth_status,
@@ -1544,11 +1606,13 @@ impl ChatProxy {
     /// own answers and transport failures come out of here, which is what
     /// the provider breaker counts (cache hits and local preflight exits
     /// never reach it).
+    #[allow(clippy::too_many_arguments)]
     async fn send_buffered(
         &self,
         url: &str,
         payload: &Value,
         opts: &ForwardOpts<'_>,
+        header_timeout: Duration,
         uncertain: &mut bool,
         retry_after_ms: &mut Option<u64>,
         raw_auth_status: &mut Option<u16>,
@@ -1558,8 +1622,8 @@ impl ChatProxy {
             // Keep the transport error until retry classification: only a
             // connection failure proves that this POST was not executed.
             let sent = tokio::time::timeout(
-                self.header_timeout,
-                self.outbound(url, payload, opts.provider_id).send(),
+                header_timeout,
+                self.outbound(url, payload, opts.attach_omlx_key).send(),
             )
             .await;
             match sent {
@@ -1695,10 +1759,10 @@ impl ChatProxy {
         endpoint: &str,
         upstream_path: StreamingUpstreamPath,
         body: &Value,
-        provider_id: &str,
+        provider: impl Into<ProviderRef<'_>>,
     ) -> StreamOutcome {
         let result = self
-            .forward_stream_path_observed(endpoint, upstream_path, body, provider_id, || async {
+            .forward_stream_path_observed(endpoint, upstream_path, body, provider, || async {
                 Ok::<(), std::convert::Infallible>(())
             })
             .await;
@@ -1715,7 +1779,7 @@ impl ChatProxy {
         &self,
         endpoint: &str,
         body: &Value,
-        provider_id: &str,
+        provider: impl Into<ProviderRef<'_>>,
         observer: F,
     ) -> Result<StreamOutcome, E>
     where
@@ -1726,7 +1790,7 @@ impl ChatProxy {
             endpoint,
             StreamingUpstreamPath::CHAT_COMPLETIONS,
             body,
-            provider_id,
+            provider,
             observer,
         )
         .await
@@ -1738,13 +1802,15 @@ impl ChatProxy {
         endpoint: &str,
         upstream_path: StreamingUpstreamPath,
         body: &Value,
-        provider_id: &str,
+        provider: impl Into<ProviderRef<'_>>,
         observer: F,
     ) -> Result<StreamOutcome, E>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(), E>>,
     {
+        let provider = provider.into();
+        let provider_id = provider.id;
         // Streaming has one send attempt: observe after permit/payload
         // preflight and immediately before polling reqwest's send future.
         // Reject immediately rather than accumulate unbounded waiters.
@@ -1769,7 +1835,7 @@ impl ChatProxy {
         observer().await?;
         let sent = match tokio::time::timeout(
             self.header_timeout,
-            self.outbound(&url, &payload, provider_id).send(),
+            self.outbound(&url, &payload, provider.omlx_key).send(),
         )
         .await
         {
@@ -2066,6 +2132,15 @@ mod tests {
         }
     }
 
+    /// 裸的 provider id 永远不带 oMLX key：要带必须由调用方拿着卡声明（`ProviderRef::of_card`）。
+    #[test]
+    fn a_bare_provider_id_never_carries_the_omlx_key() {
+        for id in ["omlx", "omlx-embed", "other"] {
+            assert!(!ProviderRef::from(id).omlx_key, "{id}");
+            assert!(!ProviderRef::from(&id.to_string()).omlx_key, "{id}");
+        }
+    }
+
     /// 文件里的 oMLX key 只发给 loopback；环境变量的 key 照旧发。key 取自进程环境，
     /// 所以每个用例在子进程里跑。金丝雀值只在子进程内比对，不打印。
     #[test]
@@ -2077,9 +2152,9 @@ mod tests {
         const LOCAL: &str = "http://127.0.0.1:8088/v1/chat/completions";
         if let Ok(case) = std::env::var(CASE) {
             let proxy = ChatProxy::new(reqwest::Client::new());
-            let auth = |url: &str, provider: &str| {
+            let auth = |url: &str, omlx_key: bool| {
                 proxy
-                    .outbound(url, &serde_json::json!({"model": "m"}), provider)
+                    .outbound(url, &serde_json::json!({"model": "m"}), omlx_key)
                     .build()
                     .unwrap()
                     .headers()
@@ -2088,18 +2163,14 @@ mod tests {
             };
             match case.as_str() {
                 "file" => {
-                    assert_eq!(
-                        auth(REMOTE, "omlx"),
-                        None,
-                        "file key must not leave loopback"
-                    );
-                    assert_eq!(auth(LOCAL, "omlx"), Some(format!("Bearer {FILE_KEY}")));
-                    assert_eq!(auth(LOCAL, "other"), None);
+                    assert_eq!(auth(REMOTE, true), None, "file key must not leave loopback");
+                    assert_eq!(auth(LOCAL, true), Some(format!("Bearer {FILE_KEY}")));
+                    assert_eq!(auth(LOCAL, false), None);
                 }
                 "env" => {
                     let want = Some(format!("Bearer {ENV_KEY}"));
-                    assert_eq!(auth(REMOTE, "omlx"), want);
-                    assert_eq!(auth(LOCAL, "omlx"), want);
+                    assert_eq!(auth(REMOTE, true), want);
+                    assert_eq!(auth(LOCAL, true), want);
                 }
                 other => panic!("unknown case {other}"),
             }
@@ -2208,6 +2279,7 @@ mod tests {
             served_locality: Locality::Loopback,
             privacy: PrivacyClass::Any,
             require_openai_usage: false,
+            attach_omlx_key: true,
         }
     }
 

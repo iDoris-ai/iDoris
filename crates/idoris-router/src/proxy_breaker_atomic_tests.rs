@@ -11,6 +11,7 @@ fn opts(id: Option<&str>) -> ForwardOpts<'_> {
         served_locality: Locality::Loopback,
         privacy: PrivacyClass::Any,
         require_openai_usage: false,
+        attach_omlx_key: false,
     }
 }
 fn body() -> Value {

@@ -7,8 +7,11 @@
 //! - **loopback**：`--endpoint` 的主机取 `127.0.0.1`、`[::1]`、`localhost`（`setup_engine::normalize_endpoint`；与卡契约的
 //!   回环主机白名单相同，`127.0.0.2` 这样的写法在加载卡时会被拒，所以在这里就拒），不含路径、凭据、查询与片段。
 //! - **无 key**：没有密钥参数，探测不带凭据；上游要求鉴权（401 / 403）是 `auth_required`，不写卡。
-//! - **只 chat**：`--bind` 只接受 chat 类角色（[`is_chat_role`]），卡的能力只有 `chat`；embedding 由 `setup omlx` 的
-//!   伴生卡承载（规范 §2.3）。
+//! - **chat，可选 embedding**：`--bind` 接受 chat 类角色（[`is_chat_role`]）和 `embed`，至少要有一个 chat 角色
+//!   （只给 `embed` 是 `invalid_role`）；`rerank`、`vision` 仍然拒绝。给了 `embed` 绑定时卡的能力是
+//!   `[chat, embedding]`（单数 `embedding`），`idoris_role_models.embed` 绑定那个模型，**仍是一张卡**、仍是 resident，
+//!   和 Agent24 在 v0.5.0 上手写的 LM Studio 卡一致；没给时能力只有 `chat`。（`setup omlx` 的 embedding 走伴生卡，
+//!   那是因为主卡是 on_demand；这里的卡本来就是 resident，不需要伴生卡。）
 //! - **探测**：写卡之前 `GET <endpoint>/v1/models`，要恰好 200 加带 `data` 数组的 JSON（每一项有字符串 `id`）；每个 `--bind`
 //!   的模型要在这个列表里。
 //!
@@ -50,8 +53,8 @@ const DISPLAY_NAME: &str = "OpenAI 兼容上游";
 /// `version_pin` 里 `@` 之后的部分：上游的版本不知道，规范 §2.3 的写法是 `unknown`（如 `lmstudio@unknown`）。
 const VERSION_PIN_VERSION: &str = "unknown";
 const MAX_ID_LEN: usize = 48;
-/// 不能当 `--id` 的值：`omlx`、`omlx-embed` 是 `setup omlx` 的卡的 id（`proxy.rs` 现在按 `provider.id == "omlx"` 注入
-/// oMLX 的 key，自定义上游叫这个名字会拿到它）；`mock` 在加载时被跳过，`subscription` 有固定的卡边界，`idoris-cloud`
+/// 不能当 `--id` 的值：`omlx`、`omlx-embed` 是 `setup omlx` 的卡的 id（两张卡都带 oMLX 的 key；代理按卡识别，带 `idoris_upstream` 的
+/// 卡不会拿到 key，保留这两个 id 是为了不让一张自定义上游的卡冒充它们）；`mock` 在加载时被跳过，`subscription` 有固定的卡边界，`idoris-cloud`
 /// 是云端档合成卡的 id。
 pub const RESERVED_IDS: [&str; 5] = ["omlx", "omlx-embed", "mock", "subscription", "idoris-cloud"];
 
@@ -77,6 +80,9 @@ load_policy: { mode: resident, keepalive: { pinned: true }, admission: coexist }
 
 /// `_degradation` 里说明 `idoris_upstream`、`idoris_default` 的那一句；通用流程再接上 `idoris_role_models` 的说明。
 const DEGRADATION: &str = "去掉 idoris_upstream 或 idoris_default 只丢掉种类标注与默认偏好，这张卡仍是普通的 loopback resident http_service 卡。";
+
+/// 唯一允许在 chat 之外绑定的角色。
+const EMBED_ROLE: &str = "embed";
 
 /// chat 类角色：`--bind` 只接受它们（规范 §2.7.8）。用穷举的 `match`：以后加新角色，这里编译不过，逼着作一次决定。
 pub fn is_chat_role(role: Role) -> bool {
@@ -126,6 +132,8 @@ struct UpstreamSetup {
     /// `<id>.yaml`。
     file: String,
     default: bool,
+    /// `--bind` 里有 `embed`：卡的能力加上 `embedding`。
+    embed: bool,
 }
 
 impl UpstreamSetup {
@@ -140,6 +148,7 @@ impl UpstreamSetup {
             file: format!("{id}.yaml"),
             id,
             default: options.default,
+            embed: options.bindings.iter().any(|(role, _)| role == EMBED_ROLE),
         })
     }
 }
@@ -249,6 +258,11 @@ impl SetupEngine for UpstreamSetup {
             .map_err(|e| SetupError::new("validation_failed", format!("生成组件卡失败：{e}")))?;
         let kind = self.kind.as_str();
         card.provider.id = self.id.clone();
+        if self.embed {
+            card.provider
+                .capabilities
+                .push(idoris_contracts::common::Capability::Embedding);
+        }
         card.version_pin = format!("{kind}@{VERSION_PIN_VERSION}");
         let mut extensions = Map::new();
         extensions.insert("_degradation".to_string(), json!(DEGRADATION));
@@ -298,15 +312,25 @@ impl SetupEngine for UpstreamSetup {
                 .copied()
                 .find(|candidate| candidate.as_str() == role)
                 .is_some_and(is_chat_role);
-            if !chat {
+            if !chat && role != EMBED_ROLE {
                 return Err(SetupError::new(
                     "invalid_role",
                     format!(
-                        "角色 {role} 不是 chat 类角色：setup upstream 只接受 {}（embedding 由 setup omlx 的伴生卡承载）",
+                        "角色 {role} 不能绑定：setup upstream 只接受 chat 类角色（{}）和 {EMBED_ROLE}",
                         chat_roles()
                     ),
                 ));
             }
+        }
+        // 只绑 embed 不行：这张卡仍是 chat 上游，至少要有一个 chat 角色。
+        if bindings.iter().all(|(role, _)| role == EMBED_ROLE) {
+            return Err(SetupError::new(
+                "invalid_role",
+                format!(
+                    "至少要用 --bind 绑定一个 chat 角色（{}），不能只绑 {EMBED_ROLE}",
+                    chat_roles()
+                ),
+            ));
         }
         Ok(())
     }
@@ -455,15 +479,24 @@ mod tests {
             assert_eq!(error.code, "invalid_role", "{role}");
             assert!(error.message.contains("chat"), "{}", error.message);
         }
-        // 一个合格、一个不合格：整体拒绝。
-        let mixed = vec![
-            ("daily".to_string(), "m".to_string()),
-            ("embed".to_string(), "m".to_string()),
-        ];
-        assert_eq!(
-            engine.check_requested_bindings(&mixed).unwrap_err().code,
-            "invalid_role"
-        );
+        // chat 加 embed 是合法组合；chat 加 rerank / vision 整体拒绝。
+        let with = |extra: &str| {
+            vec![
+                ("daily".to_string(), "m".to_string()),
+                (extra.to_string(), "m".to_string()),
+            ]
+        };
+        assert!(engine.check_requested_bindings(&with("embed")).is_ok());
+        for extra in ["rerank", "vision"] {
+            assert_eq!(
+                engine
+                    .check_requested_bindings(&with(extra))
+                    .unwrap_err()
+                    .code,
+                "invalid_role",
+                "{extra}"
+            );
+        }
         assert_eq!(
             engine.check_requested_bindings(&[]).unwrap_err().code,
             "invalid_role"

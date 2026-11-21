@@ -854,7 +854,8 @@ async fn an_upstream_that_wants_a_key_is_refused_and_nothing_is_written() {
     }
 }
 
-/// 只 chat：`embed`、`rerank`、`vision` 不能绑，未知角色也不行；排在任何探测之前（上游一个请求也没收到），什么也不写。
+/// `--bind` 的角色：`rerank`、`vision` 不能绑，未知角色也不行，只绑 `embed` 也不行（至少要有一个 chat 角色）；
+/// 排在任何探测之前（上游一个请求也没收到），什么也不写。chat 加 `embed` 的合法组合见 `an_embed_binding_...`。
 #[tokio::test(flavor = "multi_thread")]
 async fn only_chat_roles_can_be_bound_and_the_refusal_comes_before_any_request() {
     let server = upstream(&[MODEL]).await;
@@ -876,7 +877,14 @@ async fn only_chat_roles_can_be_bound_and_the_refusal_comes_before_any_request()
     let result = setup(
         &server.uri(),
         &out,
-        &["--bind", "daily=qwen3-8b", "--bind", "embed=qwen3-8b"],
+        &["--bind", "daily=qwen3-8b", "--bind", "rerank=qwen3-8b"],
+    )
+    .await;
+    assert_eq!(err_code(&result), "invalid_role");
+    let result = setup(
+        &server.uri(),
+        &out,
+        &["--bind", "embed=qwen3-8b", "--bind", "vision=qwen3-8b"],
     )
     .await;
     assert_eq!(err_code(&result), "invalid_role");
@@ -1844,6 +1852,8 @@ impl Serve {
         cmd.arg("serve")
             .env("HOME", tmp.join("home"))
             .env("IDORIS_STATE_DIR", tmp.join("state"))
+            // serve 的环境里有 oMLX key：自定义上游的卡不论怎么写都不会拿到它（按卡识别，`idoris_upstream` 的卡排除）。
+            .env("IDORIS_OMLX_API_KEY", OMLX_KEY)
             .env("IDORIS_PORT", port.to_string())
             .env("IDORIS_ADMIN_PORT", admin_port.to_string())
             .env("IDORIS_DB_PATH", db)
@@ -2089,6 +2099,146 @@ async fn a_hand_written_chat_and_embedding_card_still_serves_both_and_reports_it
         .collect();
     assert_eq!(embeddings.len(), 1);
     assert_anonymous(&embeddings);
+    drop(serve);
+}
+
+/// `--bind daily=… --bind embed=…`：仍是**一张**卡，能力是 `[chat, embedding]`（单数），`embed` 绑定在卡上，resident。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_embed_binding_makes_one_chat_and_embedding_card_with_the_embed_role_bound() {
+    let server = upstream(&[MODEL, "bge-m3"]).await;
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("components");
+    let result = setup(
+        &server.uri(),
+        &out,
+        &[
+            "--bind",
+            "daily=qwen3-8b",
+            "--bind",
+            "embed=bge-m3",
+            "--id",
+            "lmstudio",
+        ],
+    )
+    .await;
+    let report = ok(&result);
+    assert_eq!(
+        report["bindings"],
+        json!({"daily": MODEL, "embed": "bge-m3"})
+    );
+    assert!(report.get("companion_card_file").is_none(), "不生成伴生卡");
+    assert_eq!(names(&out), ["lmstudio.yaml"], "仍是一张卡");
+    let card = read_card(&out, "lmstudio.yaml");
+    assert_eq!(
+        card.provider.capabilities,
+        [
+            idoris_contracts::common::Capability::Chat,
+            idoris_contracts::common::Capability::Embedding
+        ]
+    );
+    assert_eq!(
+        card.extensions.as_ref().unwrap()["idoris_role_models"],
+        json!({"daily": MODEL, "embed": "bge-m3"})
+    );
+    let policy = card.load_policy.as_ref().unwrap();
+    assert_eq!(
+        policy.mode,
+        idoris_contracts::load_policy::LoadMode::Resident
+    );
+    // 种类标注不变：engine_kind 是 openai_compat，仍带 idoris_upstream（所以不会拿到 oMLX key）。
+    assert_eq!(card.version_pin, "openai_compat@unknown");
+    assert!(
+        card.extensions
+            .as_ref()
+            .unwrap()
+            .contains_key("idoris_upstream")
+    );
+    // 没给 embed 时能力只有 chat。
+    let plain = tmp.path().join("plain");
+    ok(&setup(
+        &server.uri(),
+        &plain,
+        &["--bind", "daily=qwen3-8b", "--id", "p"],
+    )
+    .await);
+    assert_eq!(
+        read_card(&plain, "p.yaml").provider.capabilities,
+        [idoris_contracts::common::Capability::Chat]
+    );
+    // embed 模型也要在 /v1/models 的列表里。
+    let missing = tmp.path().join("missing");
+    let result = setup(
+        &server.uri(),
+        &missing,
+        &["--bind", "daily=qwen3-8b", "--bind", "embed=nope"],
+    )
+    .await;
+    assert_eq!(err_code(&result), "model_not_found");
+    assert!(!missing.exists());
+}
+
+/// 只绑 `embed`、没有 chat 角色：`invalid_role`，排在探测之前，什么也不写。
+#[tokio::test(flavor = "multi_thread")]
+async fn embed_alone_without_a_chat_role_is_invalid_role_before_any_request() {
+    let server = upstream(&[MODEL, "bge-m3"]).await;
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("components");
+    let result = setup(&server.uri(), &out, &["--bind", "embed=bge-m3"]).await;
+    assert_eq!(err_code(&result), "invalid_role");
+    assert!(requests(&server).await.is_empty());
+    assert!(!out.exists());
+}
+
+/// 端到端：`setup upstream --bind daily=… --bind embed=…`，serve 加载这张卡，`POST /v1/embeddings` 用 `idoris/embed`
+/// 经假上游返回 200，上游收到的是绑定的具体模型；oMLX key 在 serve 的环境里，但这张卡一个字节也不带。
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_routes_idoris_embed_to_the_generated_chat_and_embedding_card_without_any_key() {
+    let server = upstream(&[MODEL, "bge-m3"]).await;
+    let tmp = TempDir::new().unwrap();
+    let comp = tmp.path().join("components");
+    ok(&setup(
+        &server.uri(),
+        &comp,
+        &[
+            "--bind",
+            "daily=qwen3-8b",
+            "--bind",
+            "embed=bge-m3",
+            "--id",
+            "lmstudio",
+        ],
+    )
+    .await);
+    let db = tmp.path().join("idoris.sqlite3");
+    let key = issue_key(&db, &["daily", "deep", "embed"]);
+    let (serve, health) = Serve::start(tmp.path(), &comp, &db).await;
+    assert_eq!(health["components"], 1);
+    let response = serve
+        .client
+        .post(format!("{}/v1/embeddings", serve.base))
+        .bearer_auth(&key)
+        .json(&json!({"model": "idoris/embed", "input": ["hello", "world"]}))
+        .timeout(startup_wait::startup_observe_limit())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["model"], "bge-m3");
+    assert_eq!(
+        serve.chat(&key, "idoris/daily").await.status(),
+        reqwest::StatusCode::OK
+    );
+    let posts: Vec<_> = requests(&server)
+        .await
+        .into_iter()
+        .filter(|r| r.method == wiremock::http::Method::POST)
+        .collect();
+    assert_eq!(posts.len(), 2, "{posts:?}");
+    assert!(posts.iter().any(|r| r.url.path() == "/v1/embeddings"));
+    assert_anonymous(&posts);
+    assert!(!serve.logs().contains(&key));
     drop(serve);
 }
 

@@ -956,6 +956,7 @@ async fn embeddings(
         served_locality: selected.served_locality,
         privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         require_openai_usage: false,
+        attach_omlx_key: models::is_loopback_omlx(&selected.card),
     };
     let dispatched = AtomicBool::new(false);
     let dispatched_ref = &dispatched;
@@ -1201,6 +1202,7 @@ async fn rerank(
         served_locality: selected.served_locality,
         privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         require_openai_usage: false,
+        attach_omlx_key: models::is_loopback_omlx(&selected.card),
     };
     let dispatched = AtomicBool::new(false);
     let dispatched_ref = &dispatched;
@@ -1463,6 +1465,7 @@ async fn messages(
         served_locality: selected.served_locality,
         privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         require_openai_usage: false,
+        attach_omlx_key: models::is_loopback_omlx(&selected.card),
     };
     let dispatched = AtomicBool::new(false);
     let dispatched_ref = &dispatched;
@@ -1549,7 +1552,7 @@ async fn messages_stream(
             &selected.card.endpoint,
             proxy::StreamingUpstreamPath::MESSAGES,
             body_value,
-            selected.card.provider.id.as_str(),
+            proxy::ProviderRef::of_card(&selected.card),
             || async {
                 if let Some(events) = events {
                     events.dispatched(selected).await?;
@@ -3314,7 +3317,7 @@ async fn chat_via_proxy_stream(
         .forward_stream_observed(
             &selected.card.endpoint,
             body_value,
-            selected.card.provider.id.as_str(),
+            proxy::ProviderRef::of_card(&selected.card),
             || async {
                 if let Some(context) = events.dispatched {
                     append_dispatched(context, selected).await?;
@@ -3509,6 +3512,7 @@ async fn chat_via_proxy_buffered(
         served_locality: selected.served_locality,
         privacy,
         require_openai_usage: is_paid,
+        attach_omlx_key: models::is_loopback_omlx(&selected.card),
     };
     let completed_context = events.completed;
     let dispatched = AtomicBool::new(false);

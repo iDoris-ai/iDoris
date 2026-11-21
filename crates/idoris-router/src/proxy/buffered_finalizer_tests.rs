@@ -18,6 +18,7 @@ fn options(record_id: &str) -> ForwardOpts<'_> {
         served_locality: Locality::Loopback,
         privacy: PrivacyClass::LocalOnly,
         require_openai_usage: false,
+        attach_omlx_key: false,
     }
 }
 
