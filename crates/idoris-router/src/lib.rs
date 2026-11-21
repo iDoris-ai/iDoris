@@ -17,6 +17,8 @@ pub mod cli;
 pub mod setup_engine;
 /// `idoris setup omlx`: oMLX as the first `setup_engine::SetupEngine`.
 pub mod setup_omlx;
+/// `idoris setup upstream` (minimal form): an OpenAI-compatible loopback upstream as the second `SetupEngine`.
+pub mod setup_upstream;
 
 /// Offline intent embedding primitives (B1 task 09).
 pub mod intent;

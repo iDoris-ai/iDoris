@@ -17,8 +17,23 @@ use idoris_contracts::ComponentCard;
 pub const UNKNOWN_ENGINE_KIND: &str = "unknown";
 /// 卡的 `extensions` 里声明「该引擎由 iDoris 托管」的键（规范 §2.3）。
 pub const MANAGED_EXTENSION: &str = "idoris_managed";
+/// 卡的 `extensions` 里标注「自定义 OpenAI 兼容上游」的键（规范 §2.3）：`{kind: openai_compat, flavor: <引擎种类>}`。
+/// v0.6.0 里只有 `setup upstream` 写它，serve 不读它：上游的引擎种类来自 `version_pin`（本模块的来源规则）。
+pub const UPSTREAM_EXTENSION: &str = "idoris_upstream";
+/// 卡的 `extensions` 里「默认上游」的静态指定（规范 §2.12.3）：值为 `true` 的卡是默认。选择语义仍是预留，
+/// v0.6.0 的选择不读它；`setup upstream --default` 写它，并在落盘前核对目录里至多一张卡带它。
+pub const DEFAULT_EXTENSION: &str = "idoris_default";
 /// 本版本认识、能够托管的引擎种类。别的取值写进 `idoris_managed.engine` 就是卡校验失败。
 pub const SUPPORTED_MANAGED_ENGINES: &[&str] = &["omlx"];
+
+/// 卡带着 `extensions.idoris_default: true`（布尔真；字符串 `"true"`、数字 1 都不算）。
+pub fn declares_default(card: &ComponentCard) -> bool {
+    card.extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get(DEFAULT_EXTENSION))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
 
 /// `^[a-z][a-z0-9_]{0,31}$`，不引入正则依赖。
 pub fn is_valid_engine_kind(value: &str) -> bool {

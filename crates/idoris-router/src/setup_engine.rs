@@ -23,6 +23,16 @@
 //! - 托管引擎的模型目录是 [`SetupEngine::managed_models_dir`]（S5 拉起时显式传 `--model-dir`），离线核对 `--bind`
 //!   读的也是它。
 //!
+//! # `--out-dir` 的两种用法（[`OutDirUse`]）
+//!
+//! - **整个目录由这次 setup 生成**（`setup omlx`，缺省）：卡加引擎的固定文件，目录要是空的；`--force` 只允许整体替换
+//!   这些文件。
+//! - **往已有的组件目录里加一张卡**（`setup upstream`）：目录可以不存在（创建），也可以已经有别的卡。写的只有
+//!   [`SetupEngine::card_file`] 这一个文件，别的文件原样不动；同名卡已经在时要 `--force` 才替换，替换的也只是它。
+//!   落盘之前把「现有的卡加新卡」放进暂存目录，用服务启动时同一个加载器校验整个目录：`provider.id` 与别的文件重复是
+//!   `id_conflict`，现有的卡本身加载不了或别的校验不过是 `validation_failed`，两种情况下 `--out-dir` 都不变。新卡要当默认
+//!   （`idoris_default`）时，目录里不能已经有别的默认卡。
+//!
 //! # 副作用
 //!
 //! 写入的位置是 `--out-dir` 与它同级的 `.idoris-setup-*` 暂存目录（规范 §2.7「组件配置」行）；状态目录、引擎的
@@ -88,6 +98,62 @@ impl SetupError {
         }
         value
     }
+}
+
+/// 探测请求的总时限。
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 探测响应体的上限；超过就当作不是这种引擎。
+pub(crate) const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// 一次探测请求的回答：JSON，或者对端要求鉴权（401 / 403）。
+pub(crate) enum Reply {
+    Ok(Value),
+    Denied,
+}
+
+/// 探测用的 HTTP 客户端：不走代理，不跟随重定向（探测的对象是 `--endpoint` 本身，不是它指到的别处），有总时限。
+/// 各引擎的 [`SetupEngine::probe`] 共用它，边界只在这里定义一次。
+pub(crate) fn probe_client() -> Result<reqwest::Client, SetupError> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(PROBE_TIMEOUT)
+        .build()
+        .map_err(|_| SetupError::new("unreachable", "无法创建 HTTP 客户端"))
+}
+
+/// `GET <url>`，`key` 有值就带 Bearer。401 / 403 是 [`Reply::Denied`]；连不上是 `unreachable`（说明里带
+/// `engine_name`）；别的非 2xx、响应体超过 [`MAX_BODY_BYTES`]、不是 JSON，都是 `not_engine()` 给的错误。
+pub(crate) async fn get_json(
+    client: &reqwest::Client,
+    url: &str,
+    key: Option<&str>,
+    engine_name: &str,
+    not_engine: impl Fn() -> SetupError,
+) -> Result<Reply, SetupError> {
+    let unreachable = || SetupError::new("unreachable", format!("无法连接 {engine_name} endpoint"));
+    let mut request = client.get(url);
+    if let Some(key) = key {
+        request = request.bearer_auth(key);
+    }
+    let mut response = request.send().await.map_err(|_| unreachable())?;
+    let status = response.status();
+    if matches!(status.as_u16(), 401 | 403) {
+        return Ok(Reply::Denied);
+    }
+    if !status.is_success() {
+        return Err(not_engine());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| unreachable())? {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_BODY_BYTES {
+            return Err(not_engine());
+        }
+    }
+    serde_json::from_slice(&body)
+        .map(Reply::Ok)
+        .map_err(|_| not_engine())
 }
 
 /// Reads one bounded line (the API key). The key is never part of an error.
@@ -160,6 +226,18 @@ pub enum FindFailure {
     Unsupported,
 }
 
+/// `--out-dir` 的用法：整个目录由这次 setup 生成，还是往一个已有的组件目录里加一张卡。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutDirUse {
+    /// 整个目录由这次 setup 生成（卡加 [`SetupEngine::static_files`]，`setup omlx`）：目录要是空的，`--force` 只允许
+    /// 整体替换这些文件。
+    Owned,
+    /// 往一个已有的组件目录里加一张卡（`setup upstream`）：写 [`SetupEngine::card_file`] 这一个文件，目录里别的文件
+    /// 都不动，`--force` 替换的也是这一个文件。整个目录（现有的卡加新卡）过服务启动时的加载器之后才放进去。
+    /// 这种用法的引擎没有固定文件（[`SetupEngine::static_files`] 为空）。
+    AddCard,
+}
+
 /// 一种引擎在 `setup` 里的全部专属知识。流程见模块文档。
 pub trait SetupEngine: Sync {
     /// 引擎种类（`engine_kind`，规范 §2.12.1，如 `omlx`）：写进输出的 `engine.engine_kind` 与托管卡的
@@ -210,15 +288,27 @@ pub trait SetupEngine: Sync {
         lifecycle: bool,
     ) -> impl Future<Output = Result<Probed, SetupError>> + Send;
 
-    /// 引擎卡在 `--out-dir` 里的文件名（如 `omlx.yaml`）。
-    fn card_file(&self) -> &'static str;
+    /// 引擎卡在 `--out-dir` 里的文件名（如 `omlx.yaml`）。文件名由引擎实例决定（`setup upstream` 的取决于 `--id`），
+    /// 所以生命周期跟着 `&self`。
+    fn card_file(&self) -> &str;
 
-    /// 引擎卡的模板；端点、加载策略、绑定与托管声明由通用流程填。
+    /// 引擎卡的模板；端点、加载策略、绑定与托管声明由通用流程填。模板自带的 `extensions` 保留，模板自带的
+    /// `_degradation` 说明在合并时放在通用说明之前。
     fn card_template(&self) -> Result<ComponentCard, SetupError>;
 
     /// 与引擎卡一起写进 `--out-dir` 的固定文件（文件名，内容）。
     fn static_files(&self) -> &'static [(&'static str, &'static str)] {
         &[]
+    }
+
+    /// `--out-dir` 的用法（[`OutDirUse`]）。缺省是整个目录由这次 setup 生成。
+    fn out_dir_use(&self) -> OutDirUse {
+        OutDirUse::Owned
+    }
+
+    /// 对 `--bind` 的引擎专属核对：在任何探测与写入之前执行，排在通用的「角色名合法」之后。缺省不加限制。
+    fn check_requested_bindings(&self, _bindings: &[(String, String)]) -> Result<(), SetupError> {
+        Ok(())
     }
 }
 
@@ -311,9 +401,20 @@ pub async fn run_setup<E: SetupEngine>(
     check_identity(engine, &card, resolved.managed)?;
     let yaml = serde_yaml::to_string(&card)
         .map_err(|e| SetupError::new("validation_failed", format!("生成组件卡失败：{e}")))?;
-    let mut files = vec![(engine.card_file(), yaml.as_str())];
-    files.extend(engine.static_files().iter().copied());
-    let dir = write_validated(&options.out_dir, options.force, &files)?;
+    let dir = match engine.out_dir_use() {
+        OutDirUse::Owned => {
+            let mut files = vec![(engine.card_file(), yaml.as_str())];
+            files.extend(engine.static_files().iter().copied());
+            write_validated(&options.out_dir, options.force, &files)?
+        }
+        OutDirUse::AddCard => write_added(
+            &options.out_dir,
+            options.force,
+            engine.card_file(),
+            &yaml,
+            &card,
+        )?,
+    };
 
     let bindings: Map<String, Value> = options
         .bindings
@@ -355,13 +456,13 @@ pub async fn run_setup<E: SetupEngine>(
     }))
 }
 
-fn managed_file_names<E: SetupEngine>(engine: &E) -> Vec<&'static str> {
+fn managed_file_names<E: SetupEngine>(engine: &E) -> Vec<&str> {
     std::iter::once(engine.card_file())
         .chain(engine.static_files().iter().map(|(name, _)| *name))
         .collect()
 }
 
-/// 不碰网络与文件系统写入的前置检查：角色名、out-dir。
+/// 不碰网络与文件系统写入的前置检查：角色名、引擎对 `--bind` 的专属核对、out-dir。
 fn precheck<E: SetupEngine>(engine: &E, options: &SetupOptions) -> Result<(), SetupError> {
     for (role, _) in &options.bindings {
         if !idoris_policy::ROLES.iter().any(|r| r.as_str() == role) {
@@ -371,12 +472,25 @@ fn precheck<E: SetupEngine>(engine: &E, options: &SetupOptions) -> Result<(), Se
             ));
         }
     }
-    check_out_dir(
-        &options.out_dir,
-        options.force,
-        None,
-        &managed_file_names(engine),
-    )
+    engine.check_requested_bindings(&options.bindings)?;
+    match engine.out_dir_use() {
+        OutDirUse::Owned => check_out_dir(
+            &options.out_dir,
+            options.force,
+            None,
+            &managed_file_names(engine),
+        ),
+        OutDirUse::AddCard => {
+            // 加一张卡的用法只写一个文件：引擎若还声明了固定文件，它们在这条路径上不会被写出，拒绝而不是悄悄丢掉。
+            if !engine.static_files().is_empty() {
+                return Err(SetupError::new(
+                    "validation_failed",
+                    "引擎声明了固定文件，却又要往已有目录里只加一张卡：两者不能同时用",
+                ));
+            }
+            check_add_target(&options.out_dir, options.force, engine.card_file())
+        }
+    }
 }
 
 async fn resolve<E: SetupEngine>(
@@ -621,7 +735,13 @@ fn build_card<E: SetupEngine>(
         Some(existing) => existing,
         None => Map::new(),
     };
-    let mut degradation = Vec::new();
+    // 模板自带的降级说明放在最前面，通用流程加的接在后面（它们说明的是各自加进来的键）。
+    let mut degradation: Vec<String> = extensions
+        .get("_degradation")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .into_iter()
+        .collect();
     if resolved.managed {
         extensions.insert(
             "idoris_managed".to_string(),
@@ -703,6 +823,23 @@ fn check_out_dir(
     )))
 }
 
+/// 在 `out_dir` 同级建一个暂存目录（`out_dir` 的父目录不存在就先建）。与 `out_dir` 同级，所以之后的改名是同一个
+/// 文件系统内的操作。
+fn create_stage(out_dir: &Path) -> Result<PathBuf, SetupError> {
+    let io = |e: std::io::Error| SetupError::new("write_failed", format!("写入失败：{e}"));
+    let parent = match out_dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&parent).map_err(io)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let stage = parent.join(format!(".idoris-setup-{}-{nanos}", std::process::id()));
+    std::fs::create_dir(&stage).map_err(io)?;
+    Ok(stage)
+}
+
 /// Stage in a sibling dir, run the server's loader on it, then move into
 /// place. Nothing in `out_dir` changes unless validation passed, and replacing
 /// an existing dir is all-or-nothing: the old managed files are renamed aside
@@ -717,16 +854,7 @@ pub fn write_validated(
 ) -> Result<PathBuf, SetupError> {
     let io = |e: std::io::Error| SetupError::new("write_failed", format!("写入失败：{e}"));
     let names: Vec<&str> = files.iter().map(|(name, _)| *name).collect();
-    let parent = match out_dir.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    std::fs::create_dir_all(&parent).map_err(io)?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let stage = parent.join(format!(".idoris-setup-{}-{nanos}", std::process::id()));
-    std::fs::create_dir(&stage).map_err(io)?;
+    let stage = create_stage(out_dir)?;
     let result = (|| {
         for (name, content) in files {
             std::fs::write(stage.join(name), content).map_err(io)?;
@@ -792,6 +920,175 @@ fn replace_managed(stage: &Path, out_dir: &Path, names: &[&str]) -> std::io::Res
         "{err}；回滚未完成，旧文件保留为 {}",
         stranded.join("、")
     )))
+}
+
+/// 卡的文件名要是一个纯文件名（没有路径分隔符，不以 `.` 开头），并且带加载器会读的扩展名：不带的话卡写出去也不会被加载。
+fn check_card_file_name(file: &str) -> Result<(), SetupError> {
+    let plain = !file.is_empty()
+        && !file.starts_with('.')
+        && !file.contains(['/', '\\', '\0'])
+        && crate::components::is_card_file(Path::new(file));
+    if plain {
+        return Ok(());
+    }
+    Err(SetupError::new(
+        "validation_failed",
+        format!("卡的文件名 {file:?} 不合规：要是不带路径的 *.yaml / *.yml 文件名"),
+    ))
+}
+
+/// [`OutDirUse::AddCard`] 的前置核对（不碰文件系统写入）：`dir` 不存在，或是目录；目录里没有同名的卡，
+/// 有同名的卡时要 `force`，而且它得是普通文件（符号链接、目录都不替换）。
+fn check_add_target(dir: &Path, force: bool, file: &str) -> Result<(), SetupError> {
+    check_card_file_name(file)?;
+    let unreadable = || SetupError::new("out_dir_not_empty", "out-dir 不是可读目录");
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(unreadable()),
+        Ok(_) if !dir.is_dir() => return Err(unreadable()),
+        Ok(_) => {}
+    }
+    let conflict = |why: String| SetupError::new("id_conflict", why);
+    match std::fs::symlink_metadata(dir.join(file)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(unreadable()),
+        Ok(_) if !force => Err(conflict(format!(
+            "out-dir 里已经有 {file}：要替换它就加 --force，否则换一个 --id"
+        ))),
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err(conflict(format!(
+            "out-dir 里的 {file} 不是普通文件，不替换"
+        ))),
+    }
+}
+
+/// 往 `out_dir` 里加一张卡（[`OutDirUse::AddCard`]），目录里别的文件都不动。
+///
+/// 在与 `out_dir` 同级的暂存目录里放「`out_dir` 里现有的卡（加载器读的那些文件，除了要被替换的同名卡）加上新卡」，
+/// 用服务启动时同一个加载器校验这个整体：重复的 `provider.id`、现有的卡本身加载不了，都在这里失败，`out_dir` 一个字节
+/// 不变。新卡要当默认（`idoris_default: true`）时，还核对目录里没有别的默认卡（规范 §2.12.3：至多一张）。
+///
+/// 通过之后：`out_dir` 不存在就把暂存目录整个改名过去；存在的话，`force` 时用 `rename` 原子替换这一个文件，
+/// 否则用 `hard_link`（目标已存在就失败，不会盖掉刚出现的同名文件）。
+pub fn write_added(
+    out_dir: &Path,
+    force: bool,
+    file: &str,
+    content: &str,
+    card: &ComponentCard,
+) -> Result<PathBuf, SetupError> {
+    let io = |e: std::io::Error| SetupError::new("write_failed", format!("写入失败：{e}"));
+    check_card_file_name(file)?;
+    let stage = create_stage(out_dir)?;
+    let result = (|| {
+        if out_dir.is_dir() {
+            mirror_cards(out_dir, &stage, file)?;
+        }
+        std::fs::write(stage.join(file), content).map_err(io)?;
+        let cards = crate::components::load_components(&stage, false)
+            .map_err(|e| added_load_failure(e, &stage, out_dir, &card.provider.id))?;
+        check_single_default(&cards, card)?;
+        if !out_dir.exists() {
+            // 没有现有的卡可镜像，暂存目录里只有新卡。
+            std::fs::rename(&stage, out_dir).map_err(io)?;
+        } else if force {
+            std::fs::rename(stage.join(file), out_dir.join(file)).map_err(io)?;
+        } else {
+            std::fs::hard_link(stage.join(file), out_dir.join(file)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    SetupError::new(
+                        "id_conflict",
+                        format!(
+                            "out-dir 里刚刚出现了 {file}：要替换它就加 --force，否则换一个 --id"
+                        ),
+                    )
+                } else {
+                    io(e)
+                }
+            })?;
+        }
+        out_dir.canonicalize().map_err(io)
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    result
+}
+
+/// 把 `from` 里加载器会读的文件复制进暂存目录，`skip`（要被替换的同名卡）除外。
+fn mirror_cards(from: &Path, stage: &Path, skip: &str) -> Result<(), SetupError> {
+    let entries = std::fs::read_dir(from)
+        .map_err(|_| SetupError::new("out_dir_not_empty", "out-dir 不是可读目录"))?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name();
+        if !crate::components::is_card_file(&path) || name == skip {
+            continue;
+        }
+        std::fs::copy(&path, stage.join(&name)).map_err(|e| {
+            SetupError::new(
+                "validation_failed",
+                format!(
+                    "out-dir 里已有的 {} 读不了（{}）",
+                    name.to_string_lossy(),
+                    e.kind()
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// 整个目录加载失败：别的文件里已经有同一个 `provider.id` 是 `id_conflict`，其余是 `validation_failed`。
+/// 说明里的暂存目录路径换成 `out_dir`（暂存目录里的文件名与 `out_dir` 里的一一对应）。
+fn added_load_failure(
+    error: crate::components::LoadError,
+    stage: &Path,
+    out_dir: &Path,
+    id: &str,
+) -> SetupError {
+    use crate::components::LoadError;
+    if let LoadError::Registration(idoris_policy::RegistrationError::DuplicateProviderId {
+        id: duplicated,
+    }) = &error
+        && duplicated == id
+    {
+        return SetupError::new(
+            "id_conflict",
+            format!(
+                "out-dir 里另一个文件已经声明了 provider.id {id:?}：换一个 --id，或先移走那张卡"
+            ),
+        );
+    }
+    SetupError::new(
+        "validation_failed",
+        error
+            .to_string()
+            .replace(&stage.display().to_string(), &out_dir.display().to_string()),
+    )
+}
+
+/// 新卡要当默认时，目录里不能已经有别的默认卡（规范 §2.12.3：至多一张卡带 `idoris_default`）。新卡不当默认时不查：
+/// 目录里本来就有几张默认卡，不是这次加卡造成的。
+fn check_single_default(cards: &[ComponentCard], new: &ComponentCard) -> Result<(), SetupError> {
+    if !crate::engine_kind::declares_default(new) {
+        return Ok(());
+    }
+    let others: Vec<&str> = cards
+        .iter()
+        .filter(|card| {
+            card.provider.id != new.provider.id && crate::engine_kind::declares_default(card)
+        })
+        .map(|card| card.provider.id.as_str())
+        .collect();
+    if others.is_empty() {
+        return Ok(());
+    }
+    Err(SetupError::new(
+        "validation_failed",
+        format!(
+            "out-dir 里已经有默认上游 {}（extensions.idoris_default）：至多一张卡可以是默认，先把那张改掉，或者不加 --default",
+            others.join("、")
+        ),
+    ))
 }
 
 #[cfg(test)]
