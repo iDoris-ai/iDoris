@@ -34,7 +34,7 @@ pub type Finalize = Box<dyn FnOnce() -> Result<Finalized, String> + Send>;
 /// 门控任务的句柄。
 pub struct GateTask {
     pub handle: JoinHandle<()>,
-    /// 创建完整服务体失败时收到失败原因（之后任务结束）。门控完成或被取消时永远收不到。
+    /// 创建完整服务体失败（含创建时 panic）时收到失败原因（之后任务结束）。门控完成或被取消时永远收不到。
     pub failed: oneshot::Receiver<String>,
 }
 
@@ -50,6 +50,8 @@ pub fn spawn(
 ) -> GateTask {
     let (failure, failed) = oneshot::channel();
     let handle = tokio::spawn(async move {
+        // 创建完整服务体时 panic（一个 bug）：守卫把它当成启动失败报出去，否则数据面会一直 503 而没人知道为什么。
+        let mut report = FailureReport(Some(failure));
         loop {
             tokio::select! {
                 () = manager.wait_all_ready() => {}
@@ -71,10 +73,27 @@ pub fn spawn(
                 // 先替换，后设 `Open`：`/health` 读到 `Open` 时，数据面已经是完整的 Router。
                 health.set_gate(GateState::Open);
             }
-            Err(message) => {
-                let _ = failure.send(message);
-            }
+            Err(message) => report.send(message),
         }
     });
     GateTask { handle, failed }
+}
+
+/// 把失败原因交给 [`GateTask::failed`]；任务 panic 时（守卫在展开中被丢弃）报一条通用的原因。
+struct FailureReport(Option<oneshot::Sender<String>>);
+
+impl FailureReport {
+    fn send(&mut self, message: String) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(message);
+        }
+    }
+}
+
+impl Drop for FailureReport {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.send("启动门控任务 panic，无法创建完整的服务".to_owned());
+        }
+    }
 }

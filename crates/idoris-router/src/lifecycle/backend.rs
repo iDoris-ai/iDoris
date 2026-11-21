@@ -2,7 +2,8 @@
 //!
 //! S3 的 [`EngineRecipe`] 回答「怎么发现、怎么拼命令、怎么判就绪」；管理器还要知道：拉起之前怎么准备这种引擎自己的目录与
 //! 参数（oMLX：iDoris 自己的 base、模型目录）、它支不支持私有 key、外部的这种引擎怎么校验监听者、加载围栏在哪、
-//! key 在进程里登记到哪。v0.6.0 只有 oMLX；加一种引擎是写一个新的 [`EngineBackend`]，管理器与状态机一行不改。
+//! key 在进程里登记到哪。v0.6.0 只有 oMLX；加一种引擎是写一个新的 [`EngineBackend`]，再在 [`super::plan_managed`] 的
+//! 「引擎种类到 backend」的对应里加一行，状态机不改。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

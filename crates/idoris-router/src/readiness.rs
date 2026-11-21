@@ -172,8 +172,9 @@ pub enum GateState {
     Open,
 }
 
-/// 上游处于终态：不会自己变成就绪（`absent`、`failed`、`unavailable`、`stopped`），要等用户装好引擎、半开重试或
-/// 显式 `start`。门控未完成时，托管上游处于终态就意味着门控完不成，`phase` 是 `degraded`（规范 §2.11.1）。
+/// 上游处于终态（`absent`、`failed`、`unavailable`、`stopped`）：此刻没有在往就绪走，要等外部变化（用户装好引擎、外部
+/// 引擎自己恢复）、半开重试或显式 `start` 才会回到就绪。门控未完成时，托管上游处于终态就意味着门控暂时完不成，
+/// `phase` 是 `degraded`（规范 §2.11.1）。
 fn is_terminal(state: UpstreamState) -> bool {
     matches!(
         state,

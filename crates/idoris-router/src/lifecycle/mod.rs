@@ -2,7 +2,8 @@
 //!
 //! 一个**托管卡**（`extensions.idoris_managed`）对应一个引擎实例：种类（`engine_kind`）加 endpoint。管理器按实例建模，
 //! 每个实例一个任务，各自一台状态机；种类相关的一切（怎么探测、找可执行文件、拼命令、私有 key 怎么登记、围栏在哪）
-//! 都在 [`EngineBackend`] 后面，v0.6.0 只有 oMLX（[`OmlxBackend`]），加一种引擎是写一个新的 `EngineBackend`，状态机不改。
+//! 都在 [`EngineBackend`] 后面，v0.6.0 只有 oMLX（[`OmlxBackend`]）。加一种引擎是写一个新的 `EngineBackend`，再在 [`plan_managed`]
+//! 的「引擎种类到 backend」的对应里加一行；状态机不改。
 //! 引擎进程本身（拉起、所有权记录、认回孤儿、停止）是 S3 的原语（`idoris_upstream::engine`）。
 //!
 //! # 启动决策（adopt 优先，缺失才拉起）
@@ -14,7 +15,8 @@
 //!    `auth_required`（或 `auth_failed`），**不再拉起第二个**；形状不符 = `failed` + `port_in_use`；连接被拒 = 没有引擎。
 //! 3. 发现并校验可执行文件：找不到 = `absent` + `engine_not_found`，iDoris 本身继续服务。
 //! 4. 拉起并等就绪：每次拉起都准备 iDoris 自己的 base（`<状态目录>/omlx-base`，拿不到 = `base_unavailable`），**每次**重新取
-//!    S4 的 `managed_models_dir()`，并传 `--memory-guard-gb` 与 `--model-dir`（落盘设置不能沿用旧值）。
+//!    S4 的 `managed_models_dir()`，并传内存护栏（有额度 `--memory-guard-gb`，没有额度 `--memory-guard balanced`）与 `--model-dir`
+//!    （oMLX 把它们落盘，不传就沿用旧值）。
 //!
 //! # 端口属主校验（#619）
 //!

@@ -94,13 +94,21 @@ fn http() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
-/// 测试结束（含 panic）时清掉它登记的引擎进程：只杀命令行里带假引擎脚本名的（pid 被复用了就不碰）。
+/// 测试结束（含 panic）时清掉它登记的引擎进程：只杀命令行里带假引擎脚本名的（pid 被复用了就不碰）；再按这个测试自己的
+/// 工作目录扫一遍，登记不及的残留也清掉。
 #[derive(Default)]
-struct EngineReaper(Mutex<Vec<u64>>);
+struct EngineReaper {
+    pids: Mutex<Vec<u64>>,
+    work_dir: Mutex<Option<PathBuf>>,
+}
 
 impl EngineReaper {
     fn track(&self, pid: u64) {
-        self.0.lock().unwrap().push(pid);
+        self.pids.lock().unwrap().push(pid);
+    }
+
+    fn sweep_under(&self, dir: &Path) {
+        *self.work_dir.lock().unwrap() = Some(dir.to_owned());
     }
 }
 
@@ -114,13 +122,16 @@ fn command_of(pid: u64) -> String {
 
 impl Drop for EngineReaper {
     fn drop(&mut self) {
-        for pid in self.0.lock().unwrap().iter() {
+        for pid in self.pids.lock().unwrap().iter() {
             if command_of(*pid).contains("fake_omlx.py") {
                 let _ = Command::new("kill")
                     .args(["-KILL", &pid.to_string()])
                     .stderr(Stdio::null())
                     .status();
             }
+        }
+        if let Some(dir) = self.work_dir.lock().unwrap().as_deref() {
+            fake_omlx::kill_fake_engines_under(dir);
         }
     }
 }
@@ -160,6 +171,7 @@ impl Env {
             extra_env: Vec::new(),
         };
         env.write_card(&managed_card(env.port));
+        env.reaper.sweep_under(env.work.path());
         env
     }
 
@@ -253,8 +265,7 @@ impl Env {
     fn spawn(&self, frame: &Value) -> ChildGuard {
         let mut command = self.command();
         command.args(["serve", "--launcher-stdin"]);
-        let child = spawn_retrying(&mut command).unwrap();
-        let mut child = ChildGuard::new(child);
+        let mut child = spawn_retrying(&mut command).unwrap();
         let mut stdin = child.stdin.take().unwrap();
         let _ = stdin.write_all(format!("{frame}\n").as_bytes());
         drop(stdin);

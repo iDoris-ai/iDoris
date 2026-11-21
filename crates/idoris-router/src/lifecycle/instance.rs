@@ -92,6 +92,36 @@ struct External {
     verifier: ListenerVerifier,
 }
 
+/// 实例任务 panic（一个 bug）时，不能让它无声地冻结在最后一个状态上（门控永远完不成，或者一个 `ready` 的谎话一直挂着）：
+/// 守卫在展开中被丢弃时把它当成引擎失效报出去，`bin` 以退出码 5 停止，由启动器重启。
+struct PanicReport {
+    shared: Arc<Shared>,
+    id: String,
+}
+
+impl Drop for PanicReport {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        self.shared.log(&format!(
+            "[idoris] 引擎 {}：实例任务 panic，按引擎失效处理（iDoris 将以退出码 5 停止）",
+            self.id
+        ));
+        self.shared.publish(
+            &self.id,
+            Status {
+                state: UpstreamState::Failed,
+                reason: None,
+                owned: false,
+            },
+        );
+        self.shared.signal_failure(EngineFailure {
+            upstream_id: self.id.clone(),
+        });
+    }
+}
+
 pub(super) struct Actor {
     plan: ManagedPlan,
     shared: Arc<Shared>,
@@ -131,6 +161,10 @@ impl Actor {
     }
 
     pub(super) async fn run(mut self) {
+        let _panic_report = PanicReport {
+            shared: self.shared.clone(),
+            id: self.plan.id.clone(),
+        };
         let mut next = Step::Attempt;
         loop {
             // 等待期间收到的命令先处理：它可能改变下一步。

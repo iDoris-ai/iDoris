@@ -10,6 +10,8 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/child_guard.rs"]
+mod child_guard;
 #[path = "support/fake_omlx.rs"]
 mod fake_omlx;
 
@@ -119,6 +121,11 @@ impl Scripted {
         scripted
     }
 
+    /// 端口上不再有监听者（`lsof` 什么也看不到）。
+    fn forget_listener(&self, port: u16) {
+        self.listeners.lock().unwrap().remove(&port);
+    }
+
     fn external_listener(&self, port: u16, pid: u32, team: Option<&str>) {
         self.listeners.lock().unwrap().insert(port, vec![pid]);
         if let Some(team) = team {
@@ -218,6 +225,7 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
+        fake_omlx::kill_fake_engines_under(self.work.path());
         for launch in self.fake.all_launches() {
             let pid = launch["pid"].as_u64().unwrap();
             if command_of(pid).contains("fake_omlx.py") {
@@ -260,6 +268,8 @@ struct TestBackend {
     external_key: Mutex<Option<String>>,
     /// `launch_recipe` 是否失败（造一个起不来的实例）。
     refuse_launch: Mutex<bool>,
+    /// `launch_recipe` 是否 panic（造一个实例任务里的 bug）。
+    panic_on_launch: Mutex<bool>,
 }
 
 impl TestBackend {
@@ -268,6 +278,7 @@ impl TestBackend {
             inner,
             external_key: Mutex::new(None),
             refuse_launch: Mutex::new(false),
+            panic_on_launch: Mutex::new(false),
         })
     }
 }
@@ -280,6 +291,9 @@ impl EngineBackend for TestBackend {
         self.inner.probe_recipe()
     }
     fn launch_recipe(&self, state_dir: &Path) -> Result<Arc<dyn EngineRecipe>, PrepareFailure> {
+        if *self.panic_on_launch.lock().unwrap() {
+            panic!("test: the instance task panics");
+        }
         if *self.refuse_launch.lock().unwrap() {
             return Err(PrepareFailure {
                 reason: Some(UpstreamReason::BaseUnavailable),
@@ -648,6 +662,31 @@ async fn a_crash_loop_trips_after_more_than_the_limit_then_retries_half_open_and
 }
 
 #[tokio::test]
+async fn an_engine_that_exits_at_once_while_something_else_holds_its_port_says_port_in_use() {
+    // 探测的时候端口还是空的（连接被拒），引擎拉起来绑不上端口就退出了；这时 `lsof` 看到别人在监听：不是引擎自己的毛病。
+    let rig = Rig::new(&Behavior {
+        exit_immediately: Some(98),
+        ..Behavior::default()
+    });
+    let inspector = Scripted::claiming(rig.port);
+    inspector.external_listener(rig.port, std::process::id(), None);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector,
+        fast(),
+        StopOnExit::Owned,
+    );
+    let status = h
+        .until("a restart that names the port", |s| {
+            s.state == UpstreamState::Restarting && s.reason == Some(UpstreamReason::PortInUse)
+        })
+        .await;
+    assert!(!status.owned);
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
 async fn restarts_back_off_by_doubling_from_the_base() {
     // 熔断上限放宽到 5，看前四次重启的间隔：60、120、240、480 毫秒（封顶 500）。间隔是两次启动之间的时间，
     // 含 python 起动与退出的开销，所以只断言下界，并要求后面的间隔明显更长（不是每次都等一样久）。
@@ -717,12 +756,22 @@ async fn an_explicit_start_clears_the_failure_count_so_the_breaker_does_not_trip
     );
     h.until("another launch", |_| rig.fake.launches() > launches)
         .await;
+    // 那次启动也失败了：窗口被清过，所以它是新窗口里的第一次失败，`restarting`；没清的话（之前的三次还在）会立刻又 `failed`。
+    let after = h
+        .until("the first failure after the start", |s| {
+            matches!(s.state, UpstreamState::Restarting | UpstreamState::Failed)
+        })
+        .await;
+    assert_eq!(after.state, UpstreamState::Restarting, "{after:?}");
     h.manager.shutdown(true).await;
 }
 
 #[tokio::test]
 async fn a_start_command_while_ready_or_starting_changes_nothing() {
-    let rig = Rig::new(&Behavior::default());
+    let rig = Rig::new(&Behavior {
+        listen_delay_secs: 1.0,
+        ..Behavior::default()
+    });
     let h = Harness::start(
         &rig,
         default_backend(&rig),
@@ -730,8 +779,16 @@ async fn a_start_command_while_ready_or_starting_changes_nothing() {
         fast(),
         StopOnExit::Owned,
     );
+    // 引擎已经真的起来了（记录写下了）、但还没开始监听：这时的 `start` 不能把进行到一半的启动废掉重来。
+    wait_for("the engine to be launched", || rig.fake.launches() >= 1).await;
+    let first = rig.pid(0);
+    assert_eq!(h.view().state, UpstreamState::Starting);
     h.manager.start_upstream("omlx").await.unwrap(); // while starting
     h.until_state(UpstreamState::Ready).await;
+    assert!(
+        pid_alive(first),
+        "the engine that was being started is the one that became ready"
+    );
     h.manager.start_upstream("omlx").await.unwrap(); // idempotent when ready
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(h.view().state, UpstreamState::Ready);
@@ -819,7 +876,7 @@ async fn stop_restart_and_start_act_only_on_an_engine_idoris_owns() {
 
 /// 测试自己起的「外部引擎」：假引擎，不经 iDoris。`key` 有值就要求这个 key。
 struct External {
-    child: Option<std::process::Child>,
+    child: Option<child_guard::ChildGuard>,
     fake: FakeOmlx,
     port: u16,
 }
@@ -1384,6 +1441,221 @@ async fn the_model_dir_is_asked_for_again_on_every_launch_and_a_dir_omlx_would_s
 }
 
 // ---------------------------------------------------------------------------------------------
+// 监管：进程活着但引擎「不好用」只改状态，不杀、不退出、不重拉；好了就回来
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_own_engine_that_is_alive_but_stops_answering_is_unavailable_never_killed_and_comes_back()
+ {
+    let rig = Rig::new(&Behavior::default());
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    assert!(
+        h.manager.open_gate(),
+        "from here an engine exit is fatal; an unresponsive engine must not be"
+    );
+    let pid = rig.pid(0);
+    // oMLX 加载大模型时 `/v1/models` 可能很慢或回 503：那不是失效。
+    rig.fake.force_status(503);
+    let status = h.until_state(UpstreamState::Unavailable).await;
+    assert!(status.owned, "it is still ours");
+    assert_eq!(status.reason, None);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(h.view().state, UpstreamState::Unavailable);
+    assert!(pid_alive(pid), "never killed");
+    assert_eq!(rig.fake.launches(), 1, "never respawned");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), h.manager.engine_failed())
+            .await
+            .is_err(),
+        "an unresponsive engine is not an engine failure: no exit code 5"
+    );
+    rig.fake.answer_normally();
+    let status = h.until_state(UpstreamState::Ready).await;
+    assert!(status.owned);
+    assert_eq!(rig.fake.launches(), 1);
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn an_own_engine_that_rejects_its_own_key_is_unavailable_with_auth_failed_and_left_alone() {
+    let rig = Rig::new(&Behavior::default());
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    let pid = rig.pid(0);
+    rig.fake.force_status(401);
+    let status = h.until_state(UpstreamState::Unavailable).await;
+    assert_eq!(status.reason, Some(UpstreamReason::AuthFailed));
+    assert!(status.owned);
+    assert!(pid_alive(pid));
+    rig.fake.answer_normally();
+    let status = h.until_state(UpstreamState::Ready).await;
+    assert_eq!(status.reason, None);
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn an_external_engine_that_stops_answering_is_unavailable_never_signalled_and_comes_back() {
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start(work.path(), None);
+    let rig = rig_for(&external);
+    let inspector = Scripted::new();
+    inspector.external_listener(external.port, external.pid(), Some(TEAM));
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector,
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    external.fake.force_status(503);
+    let status = h.until_state(UpstreamState::Unavailable).await;
+    assert!(!status.owned);
+    assert_eq!(status.reason, None);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        pid_alive(u64::from(external.pid())),
+        "an engine iDoris does not own is never signalled"
+    );
+    assert_eq!(rig.fake.launches(), 0, "and nothing is started beside it");
+    assert_eq!(rig.records(), 0);
+    external.fake.answer_normally();
+    h.until_state(UpstreamState::Ready).await;
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn an_external_listener_that_turns_into_another_service_is_failed_with_port_in_use() {
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start(work.path(), None);
+    let rig = rig_for(&external);
+    let inspector = Scripted::new();
+    inspector.external_listener(external.port, external.pid(), Some(TEAM));
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector,
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    // 200，但答的不是模型列表：这个端口上现在是别的服务。
+    external.fake.force_status(200);
+    let status = h.until_state(UpstreamState::Failed).await;
+    assert_eq!(status.reason, Some(UpstreamReason::PortInUse));
+    assert!(!status.owned);
+    assert!(pid_alive(u64::from(external.pid())));
+    external.fake.answer_normally();
+    h.until_state(UpstreamState::Ready).await;
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn an_external_engine_whose_listener_is_gone_is_unavailable_and_nothing_is_spawned() {
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start(work.path(), None);
+    let rig = rig_for(&external);
+    let inspector = Scripted::new();
+    inspector.external_listener(external.port, external.pid(), Some(TEAM));
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    // 端口上不再有监听者（引擎被它自己的主人停了）：只报 `unavailable`，iDoris 不会在它旁边再拉起一个。
+    inspector.forget_listener(external.port);
+    let status = h.until_state(UpstreamState::Unavailable).await;
+    assert_eq!(status.reason, None);
+    assert!(!status.owned);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(rig.fake.launches(), 0);
+    inspector.external_listener(external.port, external.pid(), Some(TEAM));
+    h.until_state(UpstreamState::Ready).await;
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn a_ready_engine_whose_supervisor_latched_its_startup_error_is_unavailable_not_ready() {
+    use idoris_router::runtime::RuntimeRegistry;
+
+    let rig = Rig::new(&Behavior::default());
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    assert!(h.manager.open_gate());
+    // Supervisor 在创建时对引擎采样一次：此刻引擎回 503，启动错误就粘滞住，之后所有调用都失败。
+    rig.fake.force_status(503);
+    let registry = RuntimeRegistry::spawn(&[card("omlx", &rig.endpoint(), true)]).unwrap();
+    wait_for(
+        "the Supervisor's startup sample to reach the engine",
+        || {
+            rig.fake
+                .requests()
+                .iter()
+                .any(|(path, _)| path != "/v1/models")
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    h.manager.attach_runtimes(registry);
+    rig.fake.answer_normally();
+    // 引擎本身答得上来了，但聊天实际是 503：不能报 `ready`。
+    let status = h
+        .until("the latched Supervisor to show", |s| {
+            s.reason == Some(UpstreamReason::StartupLatched)
+        })
+        .await;
+    assert_eq!(status.state, UpstreamState::Unavailable);
+    assert!(status.owned);
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn an_instance_task_that_panics_is_an_engine_failure_and_never_a_silent_hang() {
+    let rig = Rig::new(&Behavior::default());
+    let backend = default_backend(&rig);
+    *backend.panic_on_launch.lock().unwrap() = true;
+    let h = Harness::start(
+        &rig,
+        backend,
+        Scripted::claiming(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    // 管理器把它当成引擎失效报出去（`bin` 以退出码 5 停止，由启动器重启），不是无声地冻结在 starting。
+    let failure = tokio::time::timeout(PATIENT, h.manager.engine_failed())
+        .await
+        .expect("the panic is reported");
+    assert_eq!(failure.upstream_id, "omlx");
+    let status = h.view();
+    assert_eq!(status.state, UpstreamState::Failed);
+    assert!(!status.owned);
+    assert!(h.logged("panic"));
+    h.manager.shutdown(true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
 // 计划：卡 → 实例
 // ---------------------------------------------------------------------------------------------
 
@@ -1617,6 +1889,44 @@ async fn a_failing_finalize_is_reported_as_a_startup_failure_and_nothing_is_swap
         .unwrap();
     assert_eq!(message, "runtime construction failed");
     assert_eq!(h.health.gate(), GateState::Pending, "never opened");
+    manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn a_panicking_finalize_is_reported_as_a_startup_failure_and_nothing_is_swapped() {
+    use axum::Router;
+    use axum::routing::get;
+    use idoris_router::lifecycle::gate::{self, Finalized};
+    use idoris_router::swap::SwapApp;
+
+    let rig = Rig::new(&Behavior::default());
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    let manager = Arc::new(h.manager);
+    let data = SwapApp::new(Router::new().route("/x", get(|| async { "starting" })));
+    let task = gate::spawn(
+        manager.clone(),
+        h.health.clone(),
+        data,
+        SwapApp::new(Router::new()),
+        Box::new(|| -> Result<Finalized, String> {
+            panic!("test: building the full router panicked")
+        }),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    // 任务 panic 也要当成启动失败报出去，否则数据面会一直 503 而没人知道为什么。
+    let message = tokio::time::timeout(PATIENT, task.failed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(message.contains("panic"), "{message}");
+    assert_eq!(h.health.gate(), GateState::Pending, "never opened");
+    assert!(task.handle.await.unwrap_err().is_panic());
     manager.shutdown(true).await;
 }
 

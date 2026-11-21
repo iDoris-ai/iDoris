@@ -11,8 +11,10 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::Duration;
+
+use super::child_guard::{ChildGuard, SpawnGuarded};
 
 /// 假引擎的行为。
 #[derive(Clone, Debug, Default)]
@@ -68,6 +70,17 @@ impl FakeOmlx {
         std::fs::rename(&temporary, &self.script).unwrap();
     }
 
+    /// 从现在起引擎对每个 GET 都回这个状态码（进程活着、端口在听，但「不好用」：503 = 忙，401 = 不认我们的 key，
+    /// 200 = 答的不是模型列表），直到 [`Self::answer_normally`]。运行期切换，不用重启引擎。
+    pub fn force_status(&self, code: u16) {
+        std::fs::write(self.record_dir.join("force-status"), code.to_string()).unwrap();
+    }
+
+    /// 取消 [`Self::force_status`]。
+    pub fn answer_normally(&self) {
+        let _ = std::fs::remove_file(self.record_dir.join("force-status"));
+    }
+
     /// 已经启动过几次（`launch-*.json` 的个数）。
     pub fn launches(&self) -> usize {
         self.launch_files().len()
@@ -120,11 +133,35 @@ impl FakeOmlx {
     }
 }
 
-/// 起一个普通子进程，对 `ETXTBSY` 重试（刚写好的脚本，Linux 上偶发）。
-pub fn spawn_retrying(command: &mut Command) -> std::io::Result<Child> {
+/// 命令行里带着 `dir`（这个测试自己的临时目录）与假引擎脚本名的进程，一律 SIGKILL：iDoris 被 SIGKILL 时来不及停的引擎、
+/// 或者还没来得及登记 pid 的，不会在测试结束后留下来占着端口。目录是每个测试独有的，所以不会碰到别的测试或别的东西。
+pub fn kill_fake_engines_under(dir: &Path) {
+    let needle = dir.to_string_lossy().into_owned();
+    let Ok(output) = Command::new("/bin/ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+    else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.contains("fake_omlx.py")
+            && line.contains(&needle)
+            && let Some(pid) = line.split_whitespace().next()
+        {
+            let _ = Command::new("kill")
+                .args(["-KILL", pid])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// 起一个普通子进程，对 `ETXTBSY` 重试（刚写好的脚本，Linux 上偶发）。返回的是被守卫的子进程（`spawn_guarded`）：测试失败、
+/// panic 展开时也会被杀掉并收尸，不会留下占着端口的假引擎。
+pub fn spawn_retrying(command: &mut Command) -> std::io::Result<ChildGuard> {
     let mut attempt = 0;
     loop {
-        match command.spawn() {
+        match command.spawn_guarded() {
             Err(error)
                 if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 100 =>
             {
@@ -198,6 +235,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with LOCK:
             with open(os.path.join(RECORDS, "requests.log"), "a") as f:
                 f.write("%s %s\n" % (self.path, auth))
+        forced = os.path.join(RECORDS, "force-status")
+        if os.path.exists(forced):
+            with open(forced) as f:
+                code = int(f.read().strip() or "503")
+            return self.reply(code, {{"error": {{"message": "forced by the test"}}}})
         if KEY is not None and auth != "ok":
             return self.reply(401, {{"error": {{"message": "invalid api key"}}}})
         if self.path == "/v1/models":
