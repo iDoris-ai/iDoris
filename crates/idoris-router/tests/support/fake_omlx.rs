@@ -40,6 +40,27 @@ pub struct Behavior {
     pub api_status_fails_from_launch: Option<usize>,
 }
 
+/// 引擎可以「收下请求、记进 `requests.log`，然后不回答」的几类请求（IDORIS-CORE S6，[`FakeOmlx::hold`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// `POST /v1/chat/completions`：一个在途的聊天。
+    Chat,
+    /// `POST /v1/models/<id>/load`：一个已经发给引擎、还在加载的模型。
+    Load,
+    /// `GET /api/status`：Supervisor 的复位采样（引擎起来之后对账本重建的那一次读）。
+    Status,
+}
+
+impl Hold {
+    fn file(self) -> &'static str {
+        match self {
+            Self::Chat => "hold-chat",
+            Self::Load => "hold-load",
+            Self::Status => "hold-status",
+        }
+    }
+}
+
 /// 一个生成好的假引擎。
 pub struct FakeOmlx {
     /// 交给 iDoris 的「`omlx-cli`」（shell 包装，`exec` 成 python，所以只有一个进程）。
@@ -90,6 +111,22 @@ impl FakeOmlx {
     /// 取消 [`Self::force_status`]。
     pub fn answer_normally(&self) {
         let _ = std::fs::remove_file(self.record_dir.join("force-status"));
+    }
+
+    /// 从现在起，引擎对 `what` 这一类请求**先收下并记进 `requests.log`，然后不回答**，直到 [`Self::release`]（运行期切换，对所有
+    /// 进程生效，包括之后拉起的）。测试靠 `requests.log` 里这条请求出现，知道它「已经在引擎里、还没做完」。
+    pub fn hold(&self, what: Hold) {
+        std::fs::write(self.record_dir.join(what.file()), "1").unwrap();
+    }
+
+    /// 放开 [`Self::hold`] 的那一类请求：被扣着的请求这就回答。
+    pub fn release(&self, what: Hold) {
+        let _ = std::fs::remove_file(self.record_dir.join(what.file()));
+    }
+
+    /// `requests.log` 里路径是 `path` 的请求有几条（`POST:` 前缀的是 POST）。
+    pub fn requests_of(&self, path: &str) -> usize {
+        self.requests().iter().filter(|(p, _)| p == path).count()
     }
 
     /// 已经启动过几次（`launch-*.json` 的个数）。
@@ -217,6 +254,12 @@ def arg(name):
     args = sys.argv[1:]
     return args[args.index(name) + 1] if name in args else None
 
+def hold(name):
+    # The test asked the engine to take a request and not answer it (until it removes the file).
+    path = os.path.join(RECORDS, name)
+    while os.path.exists(path):
+        time.sleep(0.02)
+
 # One record per launch: what the engine was started with. Numbered by the files already there.
 os.makedirs(RECORDS, exist_ok=True)
 index = len([n for n in os.listdir(RECORDS) if n.startswith("launch-")])
@@ -290,6 +333,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(200, {{"models": [{{"id": MODEL, "estimated_size": SIZE, "loaded": MODEL in LOADED, "pinned": False}}]}})
             return self.reply(200, {{"models": [{{"id": "fake-model", "estimated_size": 1000000000}}]}})
         if self.path == "/api/status":
+            hold("hold-status")
             if STATUS_FAILS_FROM is not None and index >= STATUS_FAILS_FROM:
                 return self.reply(500, {{"error": "status unavailable"}})
             if STATEFUL:
@@ -320,11 +364,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if parts[2] != MODEL:
                 return self.reply(404, {{"error": {{"message": "unknown model"}}}})
             if parts[3] == "load":
+                hold("hold-load")
                 LOADED.add(MODEL)
             else:
                 LOADED.discard(MODEL)
             return self.reply(200, {{}})
         if self.path == "/v1/chat/completions":
+            hold("hold-chat")
             if MODEL in LOADED:
                 return self.reply(200, {{"model": MODEL, "choices": [{{"message": {{"content": "hello from the fake engine"}}}}]}})
             return self.reply(404, {{"error": {{"message": "model not loaded"}}}})

@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use fake_omlx::{Behavior, FakeOmlx, spawn_retrying};
+use fake_omlx::{Behavior, FakeOmlx, Hold, spawn_retrying};
 use http_body_util::BodyExt;
 use idoris_contracts::{ComponentCard, load_policy::LoadMode};
 use idoris_router::admin::{AdminSessionToken, SharedAdminToken, build_admin_app_with_engines};
@@ -42,7 +42,7 @@ use idoris_upstream::engine::{
     CodesignPolicy, InspectError, ListenerPolicy, PidState, ProcessInspector, StopOnExit,
     SystemInspector,
 };
-use idoris_upstream::omlx::key::{EndpointKey, governed_endpoint};
+use idoris_upstream::omlx::key::{EndpointKey, endpoint_generation, governed_endpoint};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -175,10 +175,14 @@ struct External {
 
 impl External {
     fn start(work: &std::path::Path, behavior: &Behavior) -> Self {
-        let dir = work.join("external");
+        Self::start_on(work, "external", behavior, free_port())
+    }
+
+    /// 同 [`Self::start`]，目录名与端口由调用方给：同一个端口上先后起两个不同的外部引擎（A 退出、B 起来）。
+    fn start_on(work: &std::path::Path, name: &str, behavior: &Behavior, port: u16) -> Self {
+        let dir = work.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let fake = FakeOmlx::create(&dir, behavior);
-        let port = free_port();
         let mut command = Command::new(&fake.executable);
         command
             .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
@@ -205,6 +209,14 @@ impl External {
 
     fn pid(&self) -> u32 {
         self.child.as_ref().unwrap().id()
+    }
+
+    /// 引擎退出（用户把它关了）：杀掉并收尸，端口随即空出来。
+    fn kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -574,18 +586,6 @@ impl World {
     }
 }
 
-/// 同一个元素去掉「失败事实」（`failure_count`、`last_failure_at_ms`）。它们是 iDoris 启动以来累计的：机器很忙时（别的测试进程
-/// 在抢端口、临时端口紧张），第一次启动前对端口的那次探测偶尔得到的不是「连接被拒」而是别的传输错误，管理器按「有东西在
-/// 答不上来」处理、之后重试，于是白白多记一次失败。这与整个元素的形状无关；「一次 stop、start 不算失败」用动作前后失败次数
-/// 不变来证明（见 `failures_of`），失败如何计数与计时另有 `failures_are_counted_and_dated…`。
-fn without_failure_facts(element: &Value) -> Value {
-    let mut element = element.clone();
-    let object = element.as_object_mut().unwrap();
-    object.remove("failure_count");
-    object.remove("last_failure_at_ms");
-    element
-}
-
 /// 托管上游的元素里已经累计的失败次数。
 fn failures_of(element: &Value) -> u64 {
     element["failure_count"].as_u64().unwrap()
@@ -606,18 +606,15 @@ fn error_of(body: &Value) -> (&str, &str) {
 async fn an_owned_ready_engine_reads_with_its_pid_and_port_and_the_same_facts_as_health() {
     let world = World::start(Engine::Fake(Behavior::default()), fast()).await;
     let omlx = world.element("omlx").await;
+    // 精确的：一次顺利的首次启动没有任何失败（`failure_count` 为 0，没有 `last_failure_at_ms`）。启动前对端口的探测答不上来、
+    // 或者被拒绝，都不是引擎失败，不能算进来（Codex 预审 6；`startup_probe_*` 钉住了每一种探测序列）。
     assert_eq!(
-        without_failure_facts(&omlx),
+        omlx,
         json!({
             "id": "omlx", "engine_kind": "omlx", "state": "ready", "managed": true, "owned": true,
-            "port": world.rig.port, "pid": world.rig.pid(0), "restart_required": false
+            "port": world.rig.port, "pid": world.rig.pid(0), "restart_required": false,
+            "failure_count": 0
         })
-    );
-    // 托管上游一定带 `failure_count`；`last_failure_at_ms` 有，当且仅当计过失败。
-    assert_eq!(
-        omlx["last_failure_at_ms"].is_u64(),
-        failures_of(&omlx) > 0,
-        "{omlx}"
     );
     // 同源同口径：`/health.upstreams` 里同一个元素的六个字段与它一字不差。
     let health = serde_json::to_value(world.health.view().upstreams).unwrap();
@@ -693,7 +690,6 @@ async fn stop_is_accepted_stops_the_engine_and_is_idempotent() {
     let world = World::start(Engine::Fake(Behavior::default()), fast()).await;
     let pid = world.rig.pid(0);
     assert!(pid_alive(pid));
-    let failures_before = failures_of(&world.element("omlx").await);
 
     let (status, body) = world.post("omlx", "stop").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -710,11 +706,7 @@ async fn stop_is_accepted_stops_the_engine_and_is_idempotent() {
     assert!(stopped.get("pid").is_none());
     assert!(stopped.get("reason").is_none());
     assert_eq!(stopped["restart_required"], false, "stopped, not frozen");
-    assert_eq!(
-        failures_of(&stopped),
-        failures_before,
-        "a stop is not a failure"
-    );
+    assert_eq!(stopped["failure_count"], 0, "a stop is not a failure");
     wait_for("the engine to die", || !pid_alive(pid)).await;
     assert_eq!(world.rig.record_count(), 0, "its ownership record is gone");
     // 端点被封上（什么凭证都不发），不是撤销登记（Codex 预审 3）。
@@ -740,7 +732,6 @@ async fn after_a_stop_start_brings_a_fresh_engine_back_with_a_new_private_key() 
     let world = World::start(Engine::Fake(Behavior::default()), fast()).await;
     let first = world.rig.pid(0);
     let first_key = world.rig.key(0);
-    let failures_before = failures_of(&world.element("omlx").await);
     world.post("omlx", "stop").await;
     world.until_gone().await;
 
@@ -766,12 +757,7 @@ async fn after_a_stop_start_brings_a_fresh_engine_back_with_a_new_private_key() 
         Some(EndpointKey::Private(second_key))
     );
     // 一次 stop 加一次 start 不是失败。
-    assert_eq!(
-        failures_of(&ready),
-        failures_before,
-        "{:?}",
-        world.log.lock().unwrap()
-    );
+    assert_eq!(ready["failure_count"], 0, "{:?}", world.log.lock().unwrap());
     world.manager.shutdown(true).await;
 }
 
@@ -901,10 +887,11 @@ async fn a_frozen_upstream_reads_restart_required_and_refuses_start_while_stop_a
     let world = World::start(Engine::Missing, fast()).await;
     let omlx = world.element("omlx").await;
     assert_eq!(
-        without_failure_facts(&omlx),
+        omlx,
         json!({
             "id": "omlx", "engine_kind": "omlx", "state": "absent", "reason": "engine_not_found",
-            "managed": true, "owned": false, "port": world.rig.port, "restart_required": true
+            "managed": true, "owned": false, "port": world.rig.port, "restart_required": true,
+            "failure_count": 0
         })
     );
     // `start`：放行时没就绪，没有它的 Supervisor：要重启 iDoris。
@@ -1200,11 +1187,21 @@ struct Full {
     token: String,
     _task: gate::GateTask,
     rig: Rig,
+    log: Arc<Mutex<Vec<String>>>,
 }
 
 impl Full {
     async fn start(rig: Rig, inspector: Arc<dyn ProcessInspector>) -> Self {
+        Self::start_with(rig, inspector, fast()).await
+    }
+
+    async fn start_with(rig: Rig, inspector: Arc<dyn ProcessInspector>, timings: Timings) -> Self {
         let executable = rig.fake.executable.clone();
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink: LogSink = {
+            let log = log.clone();
+            Arc::new(move |line| log.lock().unwrap().push(line.to_owned()))
+        };
         let health = HealthState::with_upstreams(0, vec![upstream_status("omlx", "omlx", true)]);
         let manager = Arc::new(EngineManager::start(
             ManagerConfig {
@@ -1213,9 +1210,9 @@ impl Full {
                 stop_on_exit: StopOnExit::Owned,
                 executables: BTreeMap::from([("omlx".to_owned(), executable)]),
                 launched_by: "test-instance".to_owned(),
-                timings: fast(),
+                timings,
                 inspector,
-                log: Arc::new(|_| {}),
+                log: sink,
             },
             vec![ManagedPlan {
                 id: "omlx".to_owned(),
@@ -1226,6 +1223,7 @@ impl Full {
             health.clone(),
         ));
         let cards = vec![managed_card(&rig.endpoint())];
+        let state_dir = rig.state_dir();
         let token = AdminSessionToken::mint();
         let secret = token.expose_secret().to_owned();
         let shared = SharedAdminToken::new(token);
@@ -1248,13 +1246,28 @@ impl Full {
                         .filter(|card| !outcome.degraded.contains_key(&card.provider.id))
                         .cloned()
                         .collect();
-                    let runtimes =
-                        RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
-                            &runtime_cards,
-                            &BTreeMap::new(),
-                            Some(16 * GIB),
-                            false,
-                        )?;
+                    // The adapter's durable load fence must be the very file the engine manager clears when it
+                    // spawns a replacement (the production default resolves both from the same state root;
+                    // this world has a state root of its own, so the adapter is told where it is).
+                    let runtimes = RuntimeRegistry::spawn_with_factory_budget_and_kill_switch(
+                        &runtime_cards,
+                        Some(16 * GIB),
+                        false,
+                        |card| {
+                            let fence = idoris_upstream::omlx::load_fence_path_in(
+                                &state_dir,
+                                &card.endpoint,
+                            )?;
+                            let adapter = idoris_upstream::OmlxAdapter::new(
+                                idoris_upstream::OmlxAdapterConfig::for_base_url(
+                                    card.endpoint.clone(),
+                                ),
+                            )?
+                            .with_per_request_key()
+                            .with_load_fence_path(fence);
+                            Ok(Arc::new(adapter) as Arc<dyn idoris_backend::RuntimeAdapter>)
+                        },
+                    )?;
                     let state = AppState {
                         cards,
                         runtimes: runtimes.clone(),
@@ -1278,7 +1291,59 @@ impl Full {
             token: secret,
             _task: task,
             rig,
+            log,
         }
+    }
+
+    fn logged(&self, needle: &str) -> usize {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
+    /// Admin 的 `GET upstreams` 里的一个元素。
+    async fn element(&self, id: &str) -> Value {
+        let (status, body) = self.admin("GET", "/admin/api/v1/upstreams").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["upstreams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["id"] == id)
+            .unwrap_or_else(|| panic!("no upstream {id} in {body}"))
+            .clone()
+    }
+
+    /// 轮询 `omlx` 的元素直到 `done`（返回那一次的元素）。
+    async fn until(&self, what: &str, done: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + PATIENT;
+        loop {
+            let element = self.element("omlx").await;
+            if done(&element) {
+                return element;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}: {element}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// 停止做完了：`stopped` 而且 `owned: false`。
+    async fn until_gone(&self) -> Value {
+        self.until("the engine to be gone", |element| {
+            element["state"] == "stopped" && element["owned"] == false
+        })
+        .await
+    }
+
+    async fn until_unavailable(&self) -> Value {
+        self.until("unavailable", |element| element["state"] == "unavailable")
+            .await
     }
 
     async fn wait_open(&self) {
@@ -1852,4 +1917,485 @@ async fn g2_a_stop_that_cannot_confirm_the_process_is_gone_never_hands_the_endpo
         .unreadable
         .store(false, std::sync::atomic::Ordering::SeqCst);
     manager.shutdown(true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Codex 预审（IDORIS-CORE S6）：关门、排空、停进程、封上、复位、开门
+// ---------------------------------------------------------------------------------------------
+
+/// 有状态的假引擎，收到 SIGTERM 立刻退出但会留下标记（证明走的是优雅停止、什么时候停的）。
+fn stateful_with_term_marker() -> Behavior {
+    Behavior {
+        trap_sigterm_secs: Some(0.0),
+        ..stateful()
+    }
+}
+
+/// 此刻 Supervisor 的账本里有哪些模型（Admin `runtimes`）。
+async fn loaded_models(full: &Full) -> Value {
+    full.runtime().await["loaded"].clone()
+}
+
+#[tokio::test]
+async fn c1_a_restart_closes_the_door_then_waits_for_the_chat_in_flight_and_only_then_stops_the_old_engine()
+ {
+    let rig = Rig::new(&stateful_with_term_marker());
+    let port = rig.port;
+    let full = Arc::new(Full::start(rig, Scripted::claiming(port)).await);
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    let old = full.rig.pid(0);
+
+    // 一个聊天已经到了引擎、还没答。
+    full.rig.fake.hold(Hold::Chat);
+    let chats = full.rig.fake.requests_of("POST:/v1/chat/completions");
+    let in_flight = {
+        let full = full.clone();
+        tokio::spawn(async move { full.chat().await })
+    };
+    wait_for("the chat to reach the engine", || {
+        full.rig.fake.requests_of("POST:/v1/chat/completions") == chats + 1
+    })
+    .await;
+
+    let (status, body) = full
+        .admin("POST", "/admin/api/v1/upstreams/omlx/restart")
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    // 受理之后：不可服务（`restarting`），老引擎还握在手里（排空还没完）。
+    assert_eq!(body["state"], "restarting", "{body}");
+    assert_eq!(body["owned"], true, "{body}");
+    assert_eq!(body["pid"], json!(old), "{body}");
+
+    // 门关了：新的聊天立刻 503，没有一个字节到引擎。
+    let requests = full.rig.fake.requests().len();
+    let (status, _) = full.chat().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(full.rig.fake.requests().len(), requests);
+    // 排空期间：老引擎活着、没收到 SIGTERM，也没有第二个引擎。
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(pid_alive(old));
+    assert!(!full.rig.fake.got_sigterm(old), "stopped before it drained");
+    assert_eq!(full.rig.fake.launches(), 1);
+
+    // 放开：在途的聊天用它准入时的凭证在老引擎上做完，**成功**；老引擎这时才被停掉，新引擎换上。
+    full.rig.fake.release(Hold::Chat);
+    let (status, body) = in_flight.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    wait_for("the old engine to get SIGTERM", || {
+        full.rig.fake.got_sigterm(old)
+    })
+    .await;
+    wait_for("the replacement to be ready", || {
+        full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    assert_eq!(full.rig.fake.launches(), 2);
+    assert_eq!(
+        loaded_models(&full).await,
+        json!([]),
+        "the ledger was rebuilt"
+    );
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(full.rig.fake.model_loads(), 2, "reloaded on the new engine");
+    // 排空等的是真事：日志里没有「排空到点」。
+    assert_eq!(full.logged("排空的上限到了"), 0);
+}
+
+#[tokio::test]
+async fn c2_a_drain_that_runs_out_cuts_the_old_work_off_and_the_engine_is_still_replaced() {
+    let rig = Rig::new(&stateful_with_term_marker());
+    let port = rig.port;
+    let endpoint = rig.endpoint();
+    let mut timings = fast();
+    timings.drain_timeout = Duration::from_millis(400);
+    let full = Arc::new(Full::start_with(rig, Scripted::claiming(port), timings).await);
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    let old = full.rig.pid(0);
+
+    // 一个永远不答的聊天。
+    full.rig.fake.hold(Hold::Chat);
+    let chats = full.rig.fake.requests_of("POST:/v1/chat/completions");
+    let in_flight = {
+        let full = full.clone();
+        tokio::spawn(async move { full.chat().await })
+    };
+    wait_for("the chat to reach the engine", || {
+        full.rig.fake.requests_of("POST:/v1/chat/completions") == chats + 1
+    })
+    .await;
+
+    let generation = endpoint_generation(&endpoint);
+    let started = Instant::now();
+    let (status, _) = full
+        .admin("POST", "/admin/api/v1/upstreams/omlx/restart")
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    wait_for("the old engine to get SIGTERM", || {
+        full.rig.fake.got_sigterm(old)
+    })
+    .await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(350),
+        "the drain was waited for: {:?}",
+        started.elapsed()
+    );
+    // 到点了：旧一代的凭证被切断（代际前进）才停的进程。
+    assert!(endpoint_generation(&endpoint) > generation);
+    assert_eq!(full.logged("排空的上限到了"), 1);
+
+    // 被切断的聊天失败（引擎被停了），不是挂着；新引擎照样换上、账本重建、聊天回来。
+    let (status, _) = in_flight.await.unwrap();
+    assert_ne!(status, StatusCode::OK);
+    full.rig.fake.release(Hold::Chat);
+    wait_for("the replacement to be ready", || {
+        full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    assert_eq!(full.rig.fake.launches(), 2);
+    assert_eq!(loaded_models(&full).await, json!([]));
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn c3_a_load_in_flight_when_the_engine_is_replaced_never_reaches_the_new_engine() {
+    // Codex 预审 1 的场景落到真引擎上：旧的加载已经准入（围栏已写）、已经发给旧引擎、还在加载；引擎被换掉。
+    let rig = Rig::new(&stateful_with_term_marker());
+    let port = rig.port;
+    let mut timings = fast();
+    timings.drain_timeout = Duration::from_millis(300);
+    let full = Arc::new(Full::start_with(rig, Scripted::claiming(port), timings).await);
+    full.wait_open().await;
+    let old = full.rig.pid(0);
+
+    full.rig.fake.hold(Hold::Load);
+    let in_flight = {
+        let full = full.clone();
+        tokio::spawn(async move { full.chat().await })
+    };
+    wait_for("the load to reach the old engine", || {
+        full.rig.fake.model_loads() == 1
+    })
+    .await;
+
+    let (status, _) = full
+        .admin("POST", "/admin/api/v1/upstreams/omlx/restart")
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    wait_for("the old engine to get SIGTERM", || {
+        full.rig.fake.got_sigterm(old)
+    })
+    .await;
+    // 加载随旧引擎一起死了，聊天（等它的）失败。
+    let (status, _) = in_flight.await.unwrap();
+    assert_ne!(status, StatusCode::OK);
+    full.rig.fake.release(Hold::Load);
+
+    wait_for("the replacement to be ready", || {
+        full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    // 一个字节的加载也没有发给新引擎：整个引擎的历史里只有旧引擎收到的那一条。新进程里什么都没有，账本也是空的。
+    assert_eq!(full.rig.fake.model_loads(), 1);
+    assert_eq!(loaded_models(&full).await, json!([]));
+    // 之后的请求才在新引擎上加载（带着新一代的凭证）。
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(full.rig.fake.model_loads(), 2);
+}
+
+#[tokio::test]
+async fn c4_an_accepted_stop_is_unservable_at_once_and_the_door_stays_shut_while_the_engine_is_still_exiting()
+ {
+    let rig = Rig::new(&Behavior {
+        trap_sigterm_secs: Some(1.5),
+        ..stateful()
+    });
+    let port = rig.port;
+    let full = Arc::new(Full::start(rig, Scripted::claiming(port)).await);
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    let old = full.rig.pid(0);
+
+    let (status, body) = full
+        .admin("POST", "/admin/api/v1/upstreams/omlx/stop")
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    // 受理的那一刻状态已经不是 `ready`：不可服务。
+    assert_eq!(body["state"], "stopped", "{body}");
+    wait_for("the engine to get SIGTERM", || {
+        full.rig.fake.got_sigterm(old)
+    })
+    .await;
+
+    // 引擎在退出的这一秒多里：进程还在、还是我们的（`owned`、`pid`），状态是 `stopped`；数据面 503，没有请求到引擎。
+    assert!(pid_alive(old));
+    let element = full.element("omlx").await;
+    assert_eq!(element["state"], "stopped", "{element}");
+    assert_eq!(element["owned"], true, "{element}");
+    assert_eq!(element["pid"], json!(old), "{element}");
+    let requests = full.rig.fake.requests().len();
+    let (status, body) = full.chat().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(full.rig.fake.requests().len(), requests);
+
+    // 进程没了才是 `owned: false`；账本也清空了，端点封上。
+    let element = full.until_gone().await;
+    assert!(element.get("pid").is_none());
+    assert_eq!(loaded_models(&full).await, json!([]));
+    assert_eq!(
+        governed_endpoint(&full.rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
+}
+
+#[tokio::test]
+async fn c5_a_stop_waits_for_the_chat_in_flight_before_it_signals_the_engine() {
+    let rig = Rig::new(&stateful_with_term_marker());
+    let port = rig.port;
+    let full = Arc::new(Full::start(rig, Scripted::claiming(port)).await);
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    let old = full.rig.pid(0);
+    full.rig.fake.hold(Hold::Chat);
+    let chats = full.rig.fake.requests_of("POST:/v1/chat/completions");
+    let in_flight = {
+        let full = full.clone();
+        tokio::spawn(async move { full.chat().await })
+    };
+    wait_for("the chat to reach the engine", || {
+        full.rig.fake.requests_of("POST:/v1/chat/completions") == chats + 1
+    })
+    .await;
+
+    let (status, body) = full
+        .admin("POST", "/admin/api/v1/upstreams/omlx/stop")
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(
+        body["state"], "stopped",
+        "unservable from the acceptance on"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !full.rig.fake.got_sigterm(old),
+        "signalled before it drained"
+    );
+    full.rig.fake.release(Hold::Chat);
+    assert_eq!(in_flight.await.unwrap().0, StatusCode::OK);
+    wait_for("the engine to get SIGTERM", || {
+        full.rig.fake.got_sigterm(old)
+    })
+    .await;
+    full.until_gone().await;
+}
+
+#[tokio::test]
+async fn c6_a_restart_enqueued_while_the_reset_is_waiting_is_merged_and_the_engine_is_replaced_once()
+ {
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let full = Arc::new(Full::start(rig, Scripted::claiming(port)).await);
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+
+    // 新引擎起来之后，账本复位的那次采样（`GET /api/status`）停在引擎里：管理器在等它，不去收命令。
+    let samples = full.rig.fake.requests_of("/api/status");
+    full.rig.fake.hold(Hold::Status);
+    let first = {
+        let full = full.clone();
+        tokio::spawn(async move {
+            full.admin("POST", "/admin/api/v1/upstreams/omlx/restart")
+                .await
+        })
+    };
+    wait_for("the reset sample to reach the new engine", || {
+        full.rig.fake.launches() == 2 && full.rig.fake.requests_of("/api/status") > samples
+    })
+    .await;
+    // 第二个 `restart` 此刻到达：管理器正卡在复位里，命令排在队里。
+    let second = {
+        let full = full.clone();
+        tokio::spawn(async move {
+            full.admin("POST", "/admin/api/v1/upstreams/omlx/restart")
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    full.rig.fake.release(Hold::Status);
+
+    let (status, body) = first.await.unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let (status, body) = second.await.unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for("the replacement to be ready", || {
+        full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    // 并发的两个 `restart` 只换了一次引擎：之后也不会再换。
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(full.rig.fake.launches(), 2, "a second restart ran");
+    assert_eq!(full.health.view().upstreams[0].state, UpstreamState::Ready);
+    assert_eq!(full.logged("收到命令 restart，已受理"), 2);
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn c7_an_operator_restart_is_not_a_failure_but_a_restart_whose_new_engines_keep_dying_is_counted_every_time()
+ {
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let full = Full::start(rig, Scripted::claiming(port)).await;
+    full.wait_open().await;
+    let before = failures_of(&full.element("omlx").await);
+    assert_eq!(before, 0, "a clean first start has no failure");
+
+    // 一次顺利的 `restart` 不算失败，`restarting` 也不进熔断窗口。
+    full.admin("POST", "/admin/api/v1/upstreams/omlx/restart")
+        .await;
+    full.until("the replacement", |element| {
+        element["state"] == "ready" && element["pid"] != json!(full.rig.pid(0))
+    })
+    .await;
+    assert_eq!(failures_of(&full.element("omlx").await), before);
+
+    // 之后拉起的引擎都一起来就退出：每一次真的失败都按次计数，熔断照常（上限 2，第三次是 `failed`）。
+    full.rig.fake.set_behavior(&Behavior {
+        exit_immediately: Some(1),
+        ..stateful()
+    });
+    full.admin("POST", "/admin/api/v1/upstreams/omlx/restart")
+        .await;
+    let failed = full
+        .until("the breaker", |element| element["state"] == "failed")
+        .await;
+    assert_eq!(failed["reason"], "crash_loop", "{failed}");
+    assert_eq!(
+        failures_of(&failed),
+        3,
+        "each real failure of the restart counted once: {failed}"
+    );
+}
+
+#[tokio::test]
+async fn c8_an_external_engine_that_is_replaced_by_another_process_gets_a_rebuilt_ledger_before_it_is_ready_again()
+ {
+    let work = tempfile::tempdir().unwrap();
+    let mut a = External::start_on(work.path(), "external-a", &stateful(), free_port());
+    let port = a.port;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let inspector = Scripted::new();
+    inspector.external_listener(port, a.pid(), Some(TEAM));
+    let full = Full::start(rig, inspector.clone()).await;
+    full.wait_open().await;
+    // A 里加载了模型，账本也这么认为。
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(a.fake.model_loads(), 1);
+    assert_eq!(loaded_models(&full).await, json!(["fake-model"]));
+
+    // 用户把 A 关了：没有监听者。`unavailable`，端点封上，请求立刻 503，没有东西发出去。
+    a.kill();
+    inspector.forget_listener(port);
+    full.until_unavailable().await;
+    assert_eq!(
+        governed_endpoint(&full.rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
+    assert_eq!(full.chat().await.0, StatusCode::SERVICE_UNAVAILABLE);
+
+    // B 在同一个端口上起来了（另一个进程）。它的 `/api/status` 被扣着：管理器认出它换了进程（pid 与启动时间都变了），封上端点、
+    // 关了门，正对着它重建账本，采样停在 B 里。
+    let b = External::start_on(work.path(), "external-b", &stateful(), port);
+    b.fake.hold(Hold::Status);
+    inspector.external_listener(port, b.pid(), Some(TEAM));
+    wait_for("the rebuild's sample to reach B", || {
+        b.fake.requests_of("/api/status") >= 1
+    })
+    .await;
+    // 这时 B 还没就绪：请求仍然是 503，B 收不到聊天也收不到加载。
+    assert_ne!(
+        full.health.view().upstreams[0].state,
+        UpstreamState::Ready,
+        "ready before the ledger was rebuilt"
+    );
+    assert_eq!(full.chat().await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(b.fake.model_loads(), 0);
+    assert_eq!(b.fake.requests_of("POST:/v1/chat/completions"), 0);
+
+    // 放开：账本对着 B 重建（空的），开门，`ready`；下一个聊天在 B 上重新加载。
+    b.fake.release(Hold::Status);
+    wait_for("ready again", || {
+        full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    assert_eq!(
+        loaded_models(&full).await,
+        json!([]),
+        "the old ledger is gone"
+    );
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(b.fake.model_loads(), 1, "chat reloaded on B");
+    assert_eq!(
+        governed_endpoint(&full.rig.endpoint()),
+        Some(EndpointKey::External {
+            settings_key_verified: true
+        })
+    );
+}
+
+#[tokio::test]
+async fn c9_the_same_external_process_coming_back_keeps_its_ledger_and_the_door_is_reopened() {
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start_on(work.path(), "external-a", &stateful(), free_port());
+    let port = external.port;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let inspector = Scripted::new();
+    inspector.external_listener(port, external.pid(), Some(TEAM));
+    let full = Full::start(rig, inspector.clone()).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+
+    // 一次「没有监听者」的误读：端点封上、门关上、请求 503。
+    inspector.forget_listener(port);
+    full.until_unavailable().await;
+    assert_eq!(full.chat().await.0, StatusCode::SERVICE_UNAVAILABLE);
+    // 同一个进程又被看到了：账本没有过期（模型还在里面），不复位，门开回来。
+    inspector.external_listener(port, external.pid(), Some(TEAM));
+    wait_for("ready again", || {
+        full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    assert_eq!(loaded_models(&full).await, json!(["fake-model"]));
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(
+        external.fake.model_loads(),
+        1,
+        "no reload: the ledger was right"
+    );
+}
+
+#[tokio::test]
+async fn c10_a_managed_endpoint_is_blocked_from_the_first_instant_and_stays_so_until_a_listener_is_verified()
+ {
+    // 引擎一直不监听：端点从管理器启动起就是封上的（没有任何凭证发往它），不是「没人管、回退链适用」。
+    let rig = Rig::new(&Behavior {
+        never_listen: true,
+        ..Behavior::default()
+    });
+    let endpoint = rig.endpoint();
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        None,
+        "nobody has governed it yet"
+    );
+    let (manager, _health) = start_manager(&rig, Scripted::claiming(rig.port), StopOnExit::Owned);
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Blocked),
+        "blocked while nothing verified listens"
+    );
+    manager.shutdown(true).await;
+    assert_eq!(governed_endpoint(&endpoint), Some(EndpointKey::Blocked));
 }
