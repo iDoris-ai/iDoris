@@ -488,9 +488,11 @@ async fn force_replaces_only_the_files_this_engine_owns() {
     let mut forced = options(&out, adopt());
     forced.force = true;
     run_setup(&engine, &forced, None).await.unwrap();
-    // 另一个引擎留下的文件不在这个引擎的覆盖范围里。
+    // 另一个引擎留下的文件不在这个引擎的覆盖范围里：不带 --force 拒绝，说明里只点这个引擎自己的文件。
     std::fs::write(out.join("omlx.yaml"), "x").unwrap();
-    let error = run_setup(&engine, &forced, None).await.unwrap_err();
+    let error = run_setup(&engine, &options(&out, adopt()), None)
+        .await
+        .unwrap_err();
     assert_eq!(error.code, "out_dir_not_empty");
     assert!(
         error.message.contains("fakeserve.yaml"),
@@ -498,6 +500,11 @@ async fn force_replaces_only_the_files_this_engine_owns() {
         error.message
     );
     assert!(!error.message.contains("subscription.yaml"));
+    // 带 --force 也不替换它（#626）：它不是合法的卡，整体校验失败，说明里点名那个文件，它原样留着。
+    let error = run_setup(&engine, &forced, None).await.unwrap_err();
+    assert_eq!(error.code, "validation_failed");
+    assert!(error.message.contains("omlx.yaml"), "{}", error.message);
+    assert_eq!(std::fs::read(out.join("omlx.yaml")).unwrap(), b"x");
 }
 
 /// 卡的托管声明与这次 setup 的模式必须一致：采纳（没有 `idoris_managed`）却拿到一张自己声明了托管的模板，

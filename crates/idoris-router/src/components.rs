@@ -152,6 +152,12 @@ pub fn load_components(dir: &Path, allow_mock_env: bool) -> Result<Vec<Component
             file: file.clone(),
             message,
         })?;
+        crate::engine_kind::check_upstream_declaration(&card).map_err(|error| {
+            LoadError::Invalid {
+                file: file.clone(),
+                message: error.to_string(),
+            }
+        })?;
         classify_subscription_card(&card).map_err(|error| LoadError::SubscriptionCard {
             id: card.provider.id.clone(),
             message: error.to_string(),

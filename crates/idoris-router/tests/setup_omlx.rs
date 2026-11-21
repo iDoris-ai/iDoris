@@ -149,6 +149,7 @@ async fn ok_without_auth_writes_loadable_dir() {
     assert_eq!(o.json["models"], json!(["m1", "m2"]));
     assert_eq!(o.json["bindings"], json!({"daily": "m1", "fast": "m2"}));
     assert!(o.json["next"].get("needs_env").is_none());
+    assert!(o.json["next"].get("key_note").is_none());
     let cards = idoris_router::components::load_components(&out, false).unwrap();
     assert_eq!(cards.len(), 2);
     let omlx = fs::read_to_string(out.join("omlx.yaml")).unwrap();
@@ -176,6 +177,14 @@ async fn ok_with_auth_never_persists_key_and_server_starts() {
     assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
     assert_eq!(o.json["auth"], "required");
     assert_eq!(o.json["next"]["needs_env"], json!(["IDORIS_OMLX_API_KEY"]));
+    // key 是可选的：说明里给出取值顺序（环境变量，再 settings.json，再无鉴权）。
+    let note = o.json["next"]["key_note"].as_str().unwrap();
+    assert!(note.contains("可选"), "{note}");
+    let (env_at, settings_at) = (
+        note.find("IDORIS_OMLX_API_KEY").unwrap(),
+        note.find("settings.json").unwrap(),
+    );
+    assert!(env_at < settings_at, "{note}");
     assert_no_key(&o, &out);
     assert_eq!(
         o.json["next"]["env"]["IDORIS_COMPONENTS_DIR"],
@@ -330,11 +339,19 @@ async fn out_dir_rules() {
     let out = tmp.path().join("comp");
     fs::create_dir(&out).unwrap();
     fs::write(out.join("other.txt"), "x").unwrap();
+    // 不带 --force，目录非空：拒绝，且不动任何文件。
     assert_eq!(
-        err_code(&setup(&server.uri(), &out, &["--force"], None).await),
+        err_code(&setup(&server.uri(), &out, &[], None).await),
         "out_dir_not_empty"
     );
+    assert!(!out.join("omlx.yaml").exists());
+    // 带 --force：别的文件（#626）原样保留，oMLX 自己的文件生成。
+    let o = setup(&server.uri(), &out, &["--force"], None).await;
+    assert_eq!(o.code, 0, "{}", o.stdout);
+    assert_eq!(fs::read_to_string(out.join("other.txt")).unwrap(), "x");
     fs::remove_file(out.join("other.txt")).unwrap();
+    fs::remove_file(out.join("omlx.yaml")).unwrap();
+    fs::remove_file(out.join("subscription.yaml")).unwrap();
     fs::write(out.join("omlx.yaml"), "stale").unwrap();
     assert_eq!(
         err_code(&setup(&server.uri(), &out, &[], None).await),
@@ -371,9 +388,13 @@ async fn out_dir_dot_is_the_working_directory() {
     assert_eq!(names, ["omlx.yaml", "subscription.yaml"]);
     idoris_router::components::load_components(&cwd, false).unwrap();
 
+    // 工作目录里有别的文件：不带 --force 拒绝；带 --force 保留它（暂存目录不算别的文件）。
     fs::write(cwd.join("other.txt"), "x").unwrap();
-    let o = setup_in(Some(&cwd), &server.uri(), dot, &["--force"], None).await;
+    let o = setup_in(Some(&cwd), &server.uri(), dot, &[], None).await;
     assert_eq!(err_code(&o), "out_dir_not_empty");
+    let o = setup_in(Some(&cwd), &server.uri(), dot, &["--force"], None).await;
+    assert_eq!(o.code, 0, "{}", o.stdout);
+    assert_eq!(fs::read_to_string(cwd.join("other.txt")).unwrap(), "x");
 }
 
 #[tokio::test(flavor = "multi_thread")]
