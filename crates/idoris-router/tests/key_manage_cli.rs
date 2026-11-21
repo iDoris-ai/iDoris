@@ -1,5 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// 起的真二进制用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+#[path = "support/child_guard.rs"]
+mod child_guard;
+use child_guard::SpawnGuarded;
+
 use std::{
     fs,
     io::Write,
@@ -21,7 +26,7 @@ fn idoris(db: &Path, args: &[&str], stdin: Option<&str>) -> Output {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let mut pipe = child.stdin.take().unwrap();
     if let Some(input) = stdin {
@@ -145,7 +150,7 @@ fn running_server_rejects_key_revoked_while_serving() {
         .env("IDORIS_DB_PATH", &db)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_guarded()
         .unwrap();
 
     let result = std::panic::catch_unwind(|| {

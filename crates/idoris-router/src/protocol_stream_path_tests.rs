@@ -76,6 +76,7 @@ async fn configured_chat_and_messages_streams_use_selected_provider_not_endpoint
             served_locality: idoris_contracts::provider::Locality::Loopback,
             privacy: PrivacyClass::Any,
             require_openai_usage: false,
+            attach_omlx_key: false,
         };
         for _ in 0..2 {
             assert_eq!(

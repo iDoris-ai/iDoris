@@ -27,6 +27,7 @@ fn opts() -> ForwardOpts<'static> {
         served_locality: Locality::Loopback,
         privacy: PrivacyClass::Any,
         require_openai_usage: false,
+        attach_omlx_key: false,
     }
 }
 fn ready(p: &ChatProxy, key: &BreakerKey, now: u64) -> Admission {

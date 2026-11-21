@@ -22,6 +22,9 @@
 //! 全部对本地假上游进行，**不连接任何真实的推理或安全服务**。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// 起的真二进制用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+#[path = "support/child_guard.rs"]
+mod child_guard;
 #[path = "support/child_safety.rs"]
 mod child_safety;
 #[path = "../../idoris-upstream/tests/support/fake_upstream.rs"]
@@ -35,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use child_guard::SpawnGuarded;
 use child_safety::{
     ANSWER_SENTINEL, CHILD_SENTINEL, answer, benign_question, child_body, contains,
     content_needles, files_under, harmful_question, judge_allow,
@@ -280,7 +284,7 @@ impl Fixture {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_guarded()
             .unwrap();
         child
             .stdin

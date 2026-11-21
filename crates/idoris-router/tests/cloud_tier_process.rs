@@ -11,15 +11,19 @@
 //! 本机的 oMLX 指向一个关着的端口（运行时「不在线」）：不连接任何真实的外部服务，不启动任何推理进程。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// 起的真二进制用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+#[path = "support/child_guard.rs"]
+mod child_guard;
 #[path = "support/cloud_tier_harness.rs"]
 mod h;
 
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use child_guard::{ChildGuard, SpawnGuarded};
 use h::*;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -105,7 +109,7 @@ async fn run(mut command: Command, stdin: Option<String>) -> Output {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_guarded()
             .unwrap();
         let mut pipe = child.stdin.take().unwrap();
         if let Some(input) = stdin {
@@ -703,7 +707,7 @@ async fn the_cloud_commands_need_a_configuration_and_only_make_sense_for_the_per
 // ================================================================================================
 
 struct Serving {
-    child: Option<Child>,
+    child: Option<ChildGuard>,
     port: u16,
     admin_port: u16,
     admin_token: String,
@@ -799,7 +803,7 @@ async fn serve(f: &Fixture, env: &[(&str, &str)], tenant: Option<&str>) -> Servi
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().unwrap();
+    let mut child = command.spawn_guarded().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     stdin
         .write_all(format!("{admin_token}\n").as_bytes())

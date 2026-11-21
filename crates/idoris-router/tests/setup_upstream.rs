@@ -1,7 +1,7 @@
 //! `idoris setup upstream`（最小版，接口规范 §2.7.8）：登记 loopback 上的 OpenAI 兼容上游，往组件目录里加一张卡。
 //!
 //! 全部走真的 `idoris` 二进制（调用方 Agent24 看到的就是它）：上游是 wiremock 假服务，目录是临时目录，家目录指向不存在的
-//! 临时路径。**不启动任何推理进程、不连外网、不碰真实的 `~/.omlx` 与 `~/.agent24`**。起子进程的地方都有 `Reaped` 守卫
+//! 临时路径。**不启动任何推理进程、不连外网、不碰真实的 `~/.omlx` 与 `~/.agent24`**。起子进程的地方都有 `ChildGuard` 守卫
 //! （Drop 时 SIGKILL 加 wait），断言失败或 panic 也不留进程。
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -9,10 +9,15 @@
 #[path = "support/startup_wait.rs"]
 mod startup_wait;
 
+// 起的真二进制用 `ChildGuard`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+#[path = "support/child_guard.rs"]
+mod child_guard;
+use child_guard::ChildGuard;
+
 use std::io::Write;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use idoris_contracts::ComponentCard;
@@ -37,34 +42,6 @@ const STDIN_KEY: &str = "stdin-key-canary-upstream-zzz";
 // ---------------------------------------------------------------------------------------------
 // 子进程守卫与命令行台架
 // ---------------------------------------------------------------------------------------------
-
-/// 子进程的守卫：测试断言失败或 panic 时（栈展开会运行 Drop），Drop 里 SIGKILL 并 wait，不留孤儿进程；
-/// 测试进程自己被 SIGKILL 时 Drop 不会运行。
-struct Reaped(Option<Child>);
-
-impl Reaped {
-    fn spawn(cmd: &mut Command) -> Self {
-        Self(Some(startup_wait::spawn_when_executable(cmd)))
-    }
-
-    fn child(&mut self) -> &mut Child {
-        self.0.as_mut().unwrap()
-    }
-
-    /// 正常等它跑完并取走输出（取走之后 Drop 不再杀）。
-    fn finish(mut self) -> std::process::Output {
-        self.0.take().unwrap().wait_with_output().unwrap()
-    }
-}
-
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
 
 struct Out {
     code: i32,
@@ -104,14 +81,14 @@ async fn setup_in(cwd: Option<&Path>, args: &[String], stdin: Option<&str>) -> O
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = Reaped::spawn(&mut cmd);
-        let mut pipe = child.child().stdin.take().unwrap();
+        let mut child = ChildGuard::new(startup_wait::spawn_when_executable(&mut cmd));
+        let mut pipe = child.stdin.take().unwrap();
         if let Some(text) = stdin {
             // 命令不读 stdin 就退出了：写失败（EPIPE）不是测试要查的事。
             let _ = pipe.write_all(text.as_bytes());
         }
         drop(pipe);
-        let output = child.finish();
+        let output = child.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         Out {
             code: output.status.code().unwrap(),
@@ -802,13 +779,13 @@ async fn the_command_does_not_wait_for_stdin() {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = Reaped::spawn(&mut cmd);
+        let mut child = ChildGuard::new(startup_wait::spawn_when_executable(&mut cmd));
         // 这个管道到命令退出为止都不关：读 stdin 的命令会一直等在这里。
-        let _held = child.child().stdin.take().unwrap();
+        let _held = child.stdin.take().unwrap();
         let limit = startup_wait::startup_observe_limit();
         let deadline = Instant::now() + limit;
         loop {
-            if let Some(status) = child.child().try_wait().unwrap() {
+            if let Some(status) = child.try_wait().unwrap() {
                 return status.code();
             }
             assert!(
@@ -854,7 +831,8 @@ async fn an_upstream_that_wants_a_key_is_refused_and_nothing_is_written() {
     }
 }
 
-/// 只 chat：`embed`、`rerank`、`vision` 不能绑，未知角色也不行；排在任何探测之前（上游一个请求也没收到），什么也不写。
+/// `--bind` 的角色：`rerank`、`vision` 不能绑，未知角色也不行，只绑 `embed` 也不行（至少要有一个 chat 角色）；
+/// 排在任何探测之前（上游一个请求也没收到），什么也不写。chat 加 `embed` 的合法组合见 `an_embed_binding_...`。
 #[tokio::test(flavor = "multi_thread")]
 async fn only_chat_roles_can_be_bound_and_the_refusal_comes_before_any_request() {
     let server = upstream(&[MODEL]).await;
@@ -876,7 +854,14 @@ async fn only_chat_roles_can_be_bound_and_the_refusal_comes_before_any_request()
     let result = setup(
         &server.uri(),
         &out,
-        &["--bind", "daily=qwen3-8b", "--bind", "embed=qwen3-8b"],
+        &["--bind", "daily=qwen3-8b", "--bind", "rerank=qwen3-8b"],
+    )
+    .await;
+    assert_eq!(err_code(&result), "invalid_role");
+    let result = setup(
+        &server.uri(),
+        &out,
+        &["--bind", "embed=qwen3-8b", "--bind", "vision=qwen3-8b"],
     )
     .await;
     assert_eq!(err_code(&result), "invalid_role");
@@ -1422,7 +1407,9 @@ async fn setup_omlx_no_probe(out: &Path, extra: &[&str]) -> Out {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-        let output = Reaped::spawn(&mut cmd).finish();
+        let output = ChildGuard::new(startup_wait::spawn_when_executable(&mut cmd))
+            .wait_with_output()
+            .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         Out {
             code: output.status.code().unwrap(),
@@ -1808,19 +1795,19 @@ fn issue_key(db: &Path, roles: &[&str]) -> String {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = Reaped::spawn(&mut cmd);
-    let mut pipe = child.child().stdin.take().unwrap();
+    let mut child = ChildGuard::new(startup_wait::spawn_when_executable(&mut cmd));
+    let mut pipe = child.stdin.take().unwrap();
     pipe.write_all(spec.to_string().as_bytes()).unwrap();
     drop(pipe);
-    let output = child.finish();
+    let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     json["secret"].as_str().unwrap().to_string()
 }
 
-/// 一个在跑的 `idoris serve`：Drop 时 SIGKILL 加 wait（经 `Reaped`）。
+/// 一个在跑的 `idoris serve`：Drop 时 SIGKILL 加 wait（经 `ChildGuard`）。
 struct Serve {
-    process: Reaped,
+    process: ChildGuard,
     base: String,
     log: PathBuf,
     client: reqwest::Client,
@@ -1844,6 +1831,8 @@ impl Serve {
         cmd.arg("serve")
             .env("HOME", tmp.join("home"))
             .env("IDORIS_STATE_DIR", tmp.join("state"))
+            // serve 的环境里有 oMLX key：自定义上游的卡不论怎么写都不会拿到它（按卡识别，`idoris_upstream` 的卡排除）。
+            .env("IDORIS_OMLX_API_KEY", OMLX_KEY)
             .env("IDORIS_PORT", port.to_string())
             .env("IDORIS_ADMIN_PORT", admin_port.to_string())
             .env("IDORIS_DB_PATH", db)
@@ -1856,7 +1845,7 @@ impl Serve {
                 std::fs::OpenOptions::new().append(true).open(&log).unwrap(),
             ));
         let mut serve = Self {
-            process: Reaped::spawn(&mut cmd),
+            process: ChildGuard::new(startup_wait::spawn_when_executable(&mut cmd)),
             base: format!("http://127.0.0.1:{port}"),
             log,
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
@@ -1881,7 +1870,7 @@ impl Serve {
                 }
             }
             assert!(
-                serve.process.child().try_wait().unwrap().is_none(),
+                serve.process.try_wait().unwrap().is_none(),
                 "serve 提前退出：{}",
                 serve.logs()
             );
@@ -2089,6 +2078,146 @@ async fn a_hand_written_chat_and_embedding_card_still_serves_both_and_reports_it
         .collect();
     assert_eq!(embeddings.len(), 1);
     assert_anonymous(&embeddings);
+    drop(serve);
+}
+
+/// `--bind daily=… --bind embed=…`：仍是**一张**卡，能力是 `[chat, embedding]`（单数），`embed` 绑定在卡上，resident。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_embed_binding_makes_one_chat_and_embedding_card_with_the_embed_role_bound() {
+    let server = upstream(&[MODEL, "bge-m3"]).await;
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("components");
+    let result = setup(
+        &server.uri(),
+        &out,
+        &[
+            "--bind",
+            "daily=qwen3-8b",
+            "--bind",
+            "embed=bge-m3",
+            "--id",
+            "lmstudio",
+        ],
+    )
+    .await;
+    let report = ok(&result);
+    assert_eq!(
+        report["bindings"],
+        json!({"daily": MODEL, "embed": "bge-m3"})
+    );
+    assert!(report.get("companion_card_file").is_none(), "不生成伴生卡");
+    assert_eq!(names(&out), ["lmstudio.yaml"], "仍是一张卡");
+    let card = read_card(&out, "lmstudio.yaml");
+    assert_eq!(
+        card.provider.capabilities,
+        [
+            idoris_contracts::common::Capability::Chat,
+            idoris_contracts::common::Capability::Embedding
+        ]
+    );
+    assert_eq!(
+        card.extensions.as_ref().unwrap()["idoris_role_models"],
+        json!({"daily": MODEL, "embed": "bge-m3"})
+    );
+    let policy = card.load_policy.as_ref().unwrap();
+    assert_eq!(
+        policy.mode,
+        idoris_contracts::load_policy::LoadMode::Resident
+    );
+    // 种类标注不变：engine_kind 是 openai_compat，仍带 idoris_upstream（所以不会拿到 oMLX key）。
+    assert_eq!(card.version_pin, "openai_compat@unknown");
+    assert!(
+        card.extensions
+            .as_ref()
+            .unwrap()
+            .contains_key("idoris_upstream")
+    );
+    // 没给 embed 时能力只有 chat。
+    let plain = tmp.path().join("plain");
+    ok(&setup(
+        &server.uri(),
+        &plain,
+        &["--bind", "daily=qwen3-8b", "--id", "p"],
+    )
+    .await);
+    assert_eq!(
+        read_card(&plain, "p.yaml").provider.capabilities,
+        [idoris_contracts::common::Capability::Chat]
+    );
+    // embed 模型也要在 /v1/models 的列表里。
+    let missing = tmp.path().join("missing");
+    let result = setup(
+        &server.uri(),
+        &missing,
+        &["--bind", "daily=qwen3-8b", "--bind", "embed=nope"],
+    )
+    .await;
+    assert_eq!(err_code(&result), "model_not_found");
+    assert!(!missing.exists());
+}
+
+/// 只绑 `embed`、没有 chat 角色：`invalid_role`，排在探测之前，什么也不写。
+#[tokio::test(flavor = "multi_thread")]
+async fn embed_alone_without_a_chat_role_is_invalid_role_before_any_request() {
+    let server = upstream(&[MODEL, "bge-m3"]).await;
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("components");
+    let result = setup(&server.uri(), &out, &["--bind", "embed=bge-m3"]).await;
+    assert_eq!(err_code(&result), "invalid_role");
+    assert!(requests(&server).await.is_empty());
+    assert!(!out.exists());
+}
+
+/// 端到端：`setup upstream --bind daily=… --bind embed=…`，serve 加载这张卡，`POST /v1/embeddings` 用 `idoris/embed`
+/// 经假上游返回 200，上游收到的是绑定的具体模型；oMLX key 在 serve 的环境里，但这张卡一个字节也不带。
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_routes_idoris_embed_to_the_generated_chat_and_embedding_card_without_any_key() {
+    let server = upstream(&[MODEL, "bge-m3"]).await;
+    let tmp = TempDir::new().unwrap();
+    let comp = tmp.path().join("components");
+    ok(&setup(
+        &server.uri(),
+        &comp,
+        &[
+            "--bind",
+            "daily=qwen3-8b",
+            "--bind",
+            "embed=bge-m3",
+            "--id",
+            "lmstudio",
+        ],
+    )
+    .await);
+    let db = tmp.path().join("idoris.sqlite3");
+    let key = issue_key(&db, &["daily", "deep", "embed"]);
+    let (serve, health) = Serve::start(tmp.path(), &comp, &db).await;
+    assert_eq!(health["components"], 1);
+    let response = serve
+        .client
+        .post(format!("{}/v1/embeddings", serve.base))
+        .bearer_auth(&key)
+        .json(&json!({"model": "idoris/embed", "input": ["hello", "world"]}))
+        .timeout(startup_wait::startup_observe_limit())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["model"], "bge-m3");
+    assert_eq!(
+        serve.chat(&key, "idoris/daily").await.status(),
+        reqwest::StatusCode::OK
+    );
+    let posts: Vec<_> = requests(&server)
+        .await
+        .into_iter()
+        .filter(|r| r.method == wiremock::http::Method::POST)
+        .collect();
+    assert_eq!(posts.len(), 2, "{posts:?}");
+    assert!(posts.iter().any(|r| r.url.path() == "/v1/embeddings"));
+    assert_anonymous(&posts);
+    assert!(!serve.logs().contains(&key));
     drop(serve);
 }
 

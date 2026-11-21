@@ -2,13 +2,18 @@
 //! validated output, and that the API key never reaches disk or stdout.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// 起的真二进制用 `ChildGuard`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+#[path = "support/child_guard.rs"]
+mod child_guard;
+use child_guard::SpawnGuarded;
+
 use serde_json::{Value, json};
 use std::{
     fs,
     io::Write,
     net::{Ipv4Addr, TcpListener},
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
@@ -56,33 +61,6 @@ async fn fake(key: Option<&str>, models: &[&str]) -> MockServer {
     server
 }
 
-/// 子进程的守卫：不管测试怎么结束（包括断言失败、panic），Drop 时 SIGKILL 并回收，不会留下孤儿进程。
-struct Reaped(Option<Child>);
-
-impl Reaped {
-    fn spawn(cmd: &mut Command) -> Self {
-        Self(Some(cmd.spawn().unwrap()))
-    }
-
-    fn child(&mut self) -> &mut Child {
-        self.0.as_mut().unwrap()
-    }
-
-    /// 正常等它跑完并取走输出（取走之后 Drop 不再杀）。
-    fn finish(mut self) -> std::process::Output {
-        self.0.take().unwrap().wait_with_output().unwrap()
-    }
-}
-
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
 struct Out {
     code: i32,
     stdout: String,
@@ -119,13 +97,13 @@ async fn setup_in(
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = Reaped::spawn(&mut cmd);
-        let mut pipe = child.child().stdin.take().unwrap();
+        let mut child = cmd.spawn_guarded().unwrap();
+        let mut pipe = child.stdin.take().unwrap();
         if let Some(s) = stdin {
             pipe.write_all(s.as_bytes()).unwrap();
         }
         drop(pipe);
-        let o = child.finish();
+        let o = child.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
         Out {
             code: o.status.code().unwrap(),
@@ -217,18 +195,19 @@ async fn ok_with_auth_never_persists_key_and_server_starts() {
     for (k, _) in std::env::vars_os().filter(|(k, _)| k.to_string_lossy().starts_with("IDORIS_")) {
         cmd.env_remove(k);
     }
-    let mut child = Reaped::spawn(
-        cmd.current_dir(tmp.path())
-            .env("IDORIS_PORT", port.to_string())
-            .env("IDORIS_ADMIN_PORT", admin_port.to_string())
-            .env("IDORIS_DB_PATH", tmp.path().join("t.sqlite3"))
-            .env("IDORIS_COMPONENTS_DIR", &out)
-            .env("IDORIS_ROUTING_POLICY", cfg.join("routing-policy.yaml"))
-            .env("IDORIS_CATALOG", cfg.join("catalog.yaml"))
-            .env("IDORIS_OMLX_API_KEY", KEY)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    );
+    let mut child = cmd
+        .current_dir(tmp.path())
+        .env("IDORIS_PORT", port.to_string())
+        .env("IDORIS_ADMIN_PORT", admin_port.to_string())
+        .env("IDORIS_DB_PATH", tmp.path().join("t.sqlite3"))
+        .env("IDORIS_COMPONENTS_DIR", &out)
+        .env("IDORIS_ROUTING_POLICY", cfg.join("routing-policy.yaml"))
+        .env("IDORIS_CATALOG", cfg.join("catalog.yaml"))
+        .env("IDORIS_OMLX_API_KEY", KEY)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn_guarded()
+        .unwrap();
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let healthy = loop {
@@ -241,7 +220,7 @@ async fn ok_with_auth_never_persists_key_and_server_starts() {
         {
             break r.json::<Value>().await.unwrap()["status"] == "ok";
         }
-        if child.child().try_wait().unwrap().is_some() || Instant::now() > deadline {
+        if child.try_wait().unwrap().is_some() || Instant::now() > deadline {
             break false;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -491,13 +470,13 @@ async fn cli(args: &[&str], home: Option<&Path>, stdin: Option<&str>) -> Out {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-        let mut child = Reaped::spawn(&mut cmd);
-        let mut pipe = child.child().stdin.take().unwrap();
+        let mut child = cmd.spawn_guarded().unwrap();
+        let mut pipe = child.stdin.take().unwrap();
         if let Some(s) = stdin {
             pipe.write_all(s.as_bytes()).unwrap();
         }
         drop(pipe);
-        let o = child.finish();
+        let o = child.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
         Out {
             code: o.status.code().unwrap(),

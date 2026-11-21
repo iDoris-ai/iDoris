@@ -2,6 +2,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// 起的真二进制用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+#[path = "support/child_guard.rs"]
+mod child_guard;
+use child_guard::SpawnGuarded;
+
 use std::fs;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -185,7 +190,7 @@ fn run_production_startup_once(
     // A competing process can still claim one then, so retry only that error.
     drop(port_reservation);
     drop(admin_reservation);
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded().unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut started = false;

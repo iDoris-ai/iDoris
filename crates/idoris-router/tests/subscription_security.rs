@@ -1,5 +1,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+// 起的真二进制用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+#[path = "support/child_guard.rs"]
+mod child_guard;
+use child_guard::SpawnGuarded;
+
 use std::fs;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -99,7 +104,7 @@ fn assert_production_gate_never_spawns(env: &[(&str, &str)]) {
         .envs(env.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
