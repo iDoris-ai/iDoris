@@ -702,6 +702,8 @@ async fn after_a_stop_start_brings_a_fresh_engine_back_with_a_new_private_key() 
 
     let (status, body) = world.post("omlx", "start").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    // 202 的体是受理之后的元素，不能还说 `stopped`。
+    assert_ne!(body["state"], "stopped", "{body}");
     let ready = world
         .until("a new engine", |element| {
             element["state"] == "ready" && element["pid"] != json!(first)
@@ -739,6 +741,11 @@ async fn restart_replaces_the_engine_process_even_though_the_gate_is_open() {
 
     let (status, body) = world.post("omlx", "restart").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    // 202 的体是受理之后的元素：旧引擎还在被停掉，它已经不是「就绪的旧 pid」（要么是 `starting`，要么快到新引擎已经就绪）。
+    assert!(
+        !(body["state"] == "ready" && body["pid"] == json!(first)),
+        "the 202 body still shows the engine that is being replaced: {body}"
+    );
     let ready = world
         .until("the replacement engine", |element| {
             element["state"] == "ready" && element["pid"] != json!(first)

@@ -454,24 +454,25 @@ impl Actor {
                 answer(Err(CommandError::RestartRequired));
                 current
             }
-            Command::Start => {
-                answer(Ok(()));
-                match self.state {
-                    // 已经好了、或正在启动：幂等，什么也不改。
-                    UpstreamState::Ready | UpstreamState::Starting | UpstreamState::Restarting => {
-                        current
-                    }
-                    UpstreamState::Stopped
-                    | UpstreamState::Failed
-                    | UpstreamState::Absent
-                    | UpstreamState::Unavailable => {
-                        // 操作员显式要求：之前的失败不再计数。一个还活着的自有引擎（`unavailable`：活着却不答）由 `attempt()` 开头
-                        // 走完整的停止路径停掉，再重新走启动决策（G3）。
-                        self.window.clear();
-                        Step::Attempt
-                    }
+            Command::Start => match self.state {
+                // 已经好了、或正在启动：幂等，什么也不改。
+                UpstreamState::Ready | UpstreamState::Starting | UpstreamState::Restarting => {
+                    answer(Ok(()));
+                    current
                 }
-            }
+                UpstreamState::Stopped
+                | UpstreamState::Failed
+                | UpstreamState::Absent
+                | UpstreamState::Unavailable => {
+                    // 操作员显式要求：之前的失败不再计数。一个还活着的自有引擎（`unavailable`：活着却不答）由 `attempt()` 开头
+                    // 走完整的停止路径停掉，再重新走启动决策（G3）。
+                    self.window.clear();
+                    // 先发布 `starting` 再回答：Admin 的 202 体是受理之后的元素，不能还说 `stopped`（数据面也马上对它 503）。
+                    self.publish(UpstreamState::Starting, None);
+                    answer(Ok(()));
+                    Step::Attempt
+                }
+            },
             Command::Stop => {
                 if let Some(owned) = self.engine.take() {
                     answer(Ok(()));
@@ -493,6 +494,9 @@ impl Actor {
             }
             Command::Restart => {
                 if let Some(owned) = self.engine.take() {
+                    // 先发布 `starting`（引擎已经不在这个实例手里，`owned` 为 false）再回答：旧引擎还要停至多一个 `stop_grace`，
+                    // 这段时间里 202 的体与数据面都不该还把它当成就绪的引擎。
+                    self.publish(UpstreamState::Starting, None);
                     answer(Ok(()));
                     self.stop_engine(owned).await;
                     self.window.clear();
