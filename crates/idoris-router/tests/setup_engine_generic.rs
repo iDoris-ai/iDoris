@@ -106,6 +106,10 @@ struct FakeSetup {
     models_dir_error: Option<&'static str>,
     /// `discover_executable` 被调用的次数。
     discover_calls: AtomicUsize,
+    /// 匿名探测被拒（`auth_required`），带 key 才通过。
+    wants_key: bool,
+    /// 带 key 的探测的次数。
+    keyed_probes: AtomicUsize,
 }
 
 impl FakeSetup {
@@ -126,6 +130,8 @@ impl FakeSetup {
             unsupported: false,
             models_dir_error: None,
             discover_calls: AtomicUsize::new(0),
+            wants_key: false,
+            keyed_probes: AtomicUsize::new(0),
         }
     }
 }
@@ -177,9 +183,15 @@ impl SetupEngine for FakeSetup {
     async fn probe(
         &self,
         endpoint: &str,
-        _key: Option<&str>,
+        key: Option<&str>,
         _lifecycle: bool,
     ) -> Result<Probed, SetupError> {
+        if key.is_some() {
+            self.keyed_probes.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.wants_key && key.is_none() {
+            return Err(SetupError::new("auth_required", "FakeServe wants a key"));
+        }
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .get(format!("{endpoint}/fake/ids"))
@@ -353,6 +365,34 @@ async fn auto_uses_the_engines_candidate_ports_and_names_it_in_the_error() {
             error.message
         );
     }
+}
+
+/// 通用流程里「能不能把 key 发给候选端口」是引擎的事（`verify_listener`）：没有实现它的引擎（缺省）永远确认不了监听者，
+/// `--auto` 带了 key 也一次带 key 的探测都不发，报 `auth_required` 并带候选的地址（#619）。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_engine_that_cannot_verify_its_listener_never_gets_a_key_from_auto() {
+    let server = fake_server(&["fake-model"]).await;
+    let tmp = TempDir::new().unwrap();
+    let mut engine = FakeSetup::new(tmp.path(), vec![server.address().port()]);
+    engine.wants_key = true;
+    let out = tmp.path().join("out");
+    let mut with_key = options(&out, SetupTarget::Auto { managed: None });
+    with_key.api_key_stdin = true;
+    let error = run_setup(&engine, &with_key, Some("generic-secret"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "auth_required");
+    assert_eq!(
+        error.endpoint.as_deref(),
+        Some(format!("http://127.0.0.1:{}", server.address().port()).as_str())
+    );
+    assert!(!error.message.contains("generic-secret"));
+    assert_eq!(
+        engine.keyed_probes.load(Ordering::SeqCst),
+        0,
+        "no probe carried the key: the engine cannot confirm who listens"
+    );
+    assert!(!out.exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

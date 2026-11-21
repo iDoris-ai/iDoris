@@ -47,8 +47,8 @@ pub struct SetupOptions {
 pub enum SetupTarget {
     /// `--endpoint <url>`：采纳这个端点上已有的引擎。`probe == false` 是 `--no-probe`：不连引擎。
     Endpoint { url: String, probe: bool },
-    /// `--auto`：探测候选端口（只发匿名请求，不接受 `--api-key-stdin`），找到就采纳；`managed` 有值（同时给了
-    /// `--managed`）时，没找到才托管。
+    /// `--auto`：探测候选端口，找到就采纳；`managed` 有值（同时给了 `--managed`）时，没找到才托管。探测先发匿名请求；
+    /// 带 `--api-key-stdin` 时，要鉴权的候选先过端口属主校验（#619）才发 key。
     Auto { managed: Option<ManagedOptions> },
     /// 只给了 `--managed`：由 iDoris 托管（不连引擎，`--no-probe` 隐含）。
     Managed(ManagedOptions),
@@ -167,9 +167,12 @@ fn parse_setup(args: &[OsString]) -> Result<SetupOptions, String> {
     if managed_port.is_some() && !managed {
         return Err(USAGE.to_string());
     }
-    // key 只给一个确定的端点：`--auto` 探测的端口是猜的，端口属主校验（#619）落地之前不把 key 发给它们；
-    // 不探测的运行用不上 key。两种情形给了 key 都是用法错误（不读 stdin 再悄悄丢掉）。
-    let key_allowed = matches!(&target, SetupTarget::Endpoint { probe: true, .. });
+    // key 只给要探测的运行：`--endpoint`（调用方指定的端点），和 `--auto`（候选端口是猜的，所以发 key 之前先校验端口属主，
+    // #619）。托管与 `--no-probe` 不连引擎，用不上 key：给了是用法错误（不读 stdin 再悄悄丢掉）。
+    let key_allowed = matches!(
+        &target,
+        SetupTarget::Endpoint { probe: true, .. } | SetupTarget::Auto { .. }
+    );
     if api_key_stdin && !key_allowed {
         return Err(USAGE.to_string());
     }
@@ -327,7 +330,7 @@ pub enum KeyCommand {
     Revoke(String),
 }
 
-const USAGE: &str = "用法: idoris [serve [--admin-token-stdin | --launcher-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris control bootstrap --spec-stdin | idoris cloud pair [--label <设备名>] | idoris cloud status | idoris cloud unpair | idoris recommend --role chat --json [--allocated-budget-bytes <u64>] | idoris models local --json | idoris setup omlx --out-dir <dir> (--endpoint <url> [--api-key-stdin] | --auto | --managed) [--managed-port <n>] [--bind <role>=<model>]... [--load-mode on_demand|resident] [--force] [--no-probe] | idoris setup upstream --kind openai_compat --endpoint <url> --out-dir <dir> --bind <role>=<model>... [--id <id>] [--default] [--force]";
+const USAGE: &str = "用法: idoris [serve [--admin-token-stdin | --launcher-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris control bootstrap --spec-stdin | idoris cloud pair [--label <设备名>] | idoris cloud status | idoris cloud unpair | idoris recommend --role chat --json [--allocated-budget-bytes <u64>] | idoris models local --json | idoris setup omlx --out-dir <dir> (--endpoint <url> [--api-key-stdin] | --auto [--api-key-stdin] | --managed) [--managed-port <n>] [--bind <role>=<model>]... [--load-mode on_demand|resident] [--force] [--no-probe] | idoris setup upstream --kind openai_compat --endpoint <url> --out-dir <dir> --bind <role>=<model>... [--id <id>] [--default] [--force]";
 
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let args = args.into_iter().collect::<Vec<_>>();
@@ -825,12 +828,33 @@ mod tests {
         let both = setup(&["--auto", "--out-dir", "o", "--force", "--bind", "daily=m"]).unwrap();
         assert!(both.force && !both.api_key_stdin);
         assert_eq!(both.bindings, [("daily".into(), "m".into())]);
-        // key 只配一个确定的、要探测的端点。
+        // key 配要探测的运行：一个确定的端点，或 `--auto`（#619 落地之后：发 key 之前先校验候选端口的属主）。
         assert!(
             setup(&["--endpoint", "e", "--out-dir", "o", "--api-key-stdin"])
                 .unwrap()
                 .api_key_stdin
         );
+        for args in [
+            vec!["--auto", "--out-dir", "o", "--api-key-stdin"],
+            vec!["--api-key-stdin", "--auto", "--out-dir", "o"],
+            vec!["--auto", "--managed", "--out-dir", "o", "--api-key-stdin"],
+            vec![
+                "--auto",
+                "--managed",
+                "--managed-port",
+                "19731",
+                "--out-dir",
+                "o",
+                "--api-key-stdin",
+            ],
+        ] {
+            let options = setup(&args).unwrap();
+            assert!(options.api_key_stdin, "{args:?}");
+            assert!(
+                matches!(options.target, SetupTarget::Auto { .. }),
+                "{args:?}"
+            );
+        }
     }
 
     /// 每一种不合法的组合都是用法错误，不是静默取其一。
@@ -858,9 +882,7 @@ mod tests {
                 "19731",
             ],
             vec!["--out-dir", "o", "--auto", "--managed-port", "19731"],
-            // key 只配一个确定的、要探测的端点：`--auto`（端口是猜的，#619 之前不发 key）、托管、不探测都不行。
-            vec!["--out-dir", "o", "--auto", "--api-key-stdin"],
-            vec!["--out-dir", "o", "--api-key-stdin", "--auto", "--managed"],
+            // key 只配要探测的运行（`--endpoint`、`--auto`，#619 之后）；托管、不探测不连引擎，用不上 key。
             vec!["--out-dir", "o", "--managed", "--api-key-stdin"],
             vec![
                 "--out-dir",

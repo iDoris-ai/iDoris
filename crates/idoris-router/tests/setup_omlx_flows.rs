@@ -14,11 +14,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use idoris_contracts::load_policy::LoadMode;
 use idoris_router::cli::{ManagedOptions, SetupOptions, SetupTarget};
 use idoris_router::engine_kind::engine_identity;
 use idoris_router::setup_engine::{SetupEngine, SetupError, run_setup};
 use idoris_router::setup_omlx::{AUTO_PORTS, OmlxSetup};
+use idoris_upstream::engine::{
+    InspectError, ListenerPolicy, ListenerVerifier, PidState, ProcessInspector,
+};
+use idoris_upstream::omlx::engine::OMLX_TEAM_ID;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use wiremock::matchers::{header, method, path};
@@ -488,26 +493,354 @@ async fn auto_continues_past_a_candidate_that_wants_a_key_to_a_good_one() {
     );
 }
 
-/// `--auto` 探测的端口是猜的：端口属主校验（#619）落地之前不发 key。命令行在解析期就拒绝（cli 单元测试与进程级的
-/// 用法测试）；库调用方给了 key 也拒绝，不静默丢弃，而且一个探测请求都不发。
-#[tokio::test(flavor = "multi_thread")]
-async fn auto_refuses_an_api_key_and_sends_no_request() {
-    let open = fake(None, &["m1"]).await;
-    let protected = fake(Some(KEY), &["m2"]).await;
-    let rig = Rig::new();
-    let setup = rig.setup(&[port_of(&open), port_of(&protected)]);
-    for target in [auto(None), auto(Some(managed(None)))] {
-        let result = run_setup(&setup, &rig.options(target), Some(KEY)).await;
-        assert_eq!(code(&result), "invalid_api_key_input");
-        let message = &result.as_ref().unwrap_err().message;
-        assert!(
-            message.contains("--endpoint") && !message.contains(KEY),
-            "{message}"
-        );
-        assert!(!rig.out().exists());
+// ---------------------------------------------------------------------------------------------
+// --auto 带 key（#619 落地之后）：先校验端口属主，通过了才发
+// ---------------------------------------------------------------------------------------------
+
+const ME: u32 = 501;
+
+/// 可编排的检查器：端口上的监听者、他们的 uid 与签名团队。校验器要求「uid 是 [`ME`]、团队是 oMLX 的」。
+struct Listeners {
+    ports: Vec<u16>,
+    uid: u32,
+    team: Option<String>,
+    /// `lsof` 读不出来。
+    unreadable: bool,
+}
+
+impl Listeners {
+    /// 通过属主校验的监听者：同一个用户、oMLX 的签名团队。
+    fn genuine(ports: &[u16]) -> Self {
+        Self {
+            ports: ports.to_vec(),
+            uid: ME,
+            team: Some(OMLX_TEAM_ID.to_owned()),
+            unreadable: false,
+        }
     }
-    assert_eq!(requests(&open).await, 0);
-    assert_eq!(requests(&protected).await, 0);
+
+    fn verifier(self) -> ListenerVerifier {
+        ListenerVerifier::new(
+            Arc::new(self),
+            ListenerPolicy::new(OMLX_TEAM_ID).with_uid(ME),
+        )
+    }
+}
+
+#[async_trait]
+impl ProcessInspector for Listeners {
+    fn pid_state(&self, _pid: u32) -> PidState {
+        PidState::Alive
+    }
+    async fn start_time(&self, _pid: u32) -> Result<String, InspectError> {
+        Ok("Fri Nov 20 15:14:05 2026".to_owned())
+    }
+    async fn command(&self, _pid: u32) -> Result<String, InspectError> {
+        Ok("omlx-server".to_owned())
+    }
+    async fn process_group(&self, _pid: u32) -> Result<u32, InspectError> {
+        Ok(4242)
+    }
+    async fn listens_on(&self, _pid: u32, _port: u16) -> Result<bool, InspectError> {
+        Ok(true)
+    }
+    async fn listeners_on(&self, port: u16) -> Result<Vec<u32>, InspectError> {
+        if self.unreadable {
+            return Err(InspectError::TimedOut);
+        }
+        Ok(if self.ports.contains(&port) {
+            vec![4242]
+        } else {
+            Vec::new()
+        })
+    }
+    async fn uid_of(&self, _pid: u32) -> Result<u32, InspectError> {
+        Ok(self.uid)
+    }
+    async fn signing_team(&self, _pid: u32) -> Result<Option<String>, InspectError> {
+        Ok(self.team.clone())
+    }
+}
+
+fn authorized(request: &wiremock::Request) -> bool {
+    request.headers.get("authorization").is_some()
+}
+
+/// 校验通过的监听者：key 在匿名请求被拒、属主校验通过之后才发出去，采纳成功，key 不落盘不回显。
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_sends_the_key_to_a_candidate_whose_listener_passed_the_owner_check() {
+    let protected = fake(Some(KEY), &["m1"]).await;
+    let port = port_of(&protected);
+    let address = format!("http://127.0.0.1:{port}");
+    let rig = Rig::new();
+    let setup = rig
+        .setup(&[port])
+        .with_listener_verifier(Listeners::genuine(&[port]).verifier());
+    for target in [auto(None), auto(Some(managed(None)))] {
+        let mut options = rig.options(target);
+        options.api_key_stdin = true;
+        options.force = true;
+        let report = ok(run_setup(&setup, &options, Some(KEY)).await);
+        assert_eq!(
+            report["mode"], "adopt",
+            "an external engine is adopted, not managed"
+        );
+        assert_eq!(report["endpoint"], address);
+        assert_eq!(report["auth"], "required");
+        assert_eq!(report["next"]["needs_env"], json!(["IDORIS_OMLX_API_KEY"]));
+        assert!(!report.to_string().contains(KEY));
+        for entry in std::fs::read_dir(rig.out()).unwrap() {
+            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            assert!(!text.contains(KEY));
+        }
+    }
+    // 匿名请求在前，被拒之后才有带 key 的请求。
+    let seen = protected.received_requests().await.unwrap();
+    assert!(!seen.is_empty());
+    assert!(!authorized(&seen[0]), "the first request is anonymous");
+    assert!(
+        seen.iter().any(authorized),
+        "and the key follows once the owner is verified"
+    );
+}
+
+/// 没通过校验就**不发 key**：别的用户的进程、没有团队签名（未签名的假冒者）、别的团队、读不出身份、根本看不到监听者。
+/// 候选收到的每个请求都没有 `Authorization`；报 `auth_required`（要 key 而没法给），带候选的地址，不转去托管。
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_never_sends_the_key_when_the_listener_did_not_pass_the_owner_check() {
+    let protected = fake(Some(KEY), &["m1"]).await;
+    let port = port_of(&protected);
+    let address = format!("http://127.0.0.1:{port}");
+    let wrong: [(&str, Listeners); 5] = [
+        (
+            "another user's process",
+            Listeners {
+                uid: 0,
+                ..Listeners::genuine(&[port])
+            },
+        ),
+        (
+            "no team signature (an unsigned impostor)",
+            Listeners {
+                team: None,
+                ..Listeners::genuine(&[port])
+            },
+        ),
+        (
+            "another team",
+            Listeners {
+                team: Some("EVILTEAM99".to_owned()),
+                ..Listeners::genuine(&[port])
+            },
+        ),
+        (
+            "the listener cannot be read",
+            Listeners {
+                unreadable: true,
+                ..Listeners::genuine(&[port])
+            },
+        ),
+        ("nobody visible on the port", Listeners::genuine(&[])),
+    ];
+    for (case, listeners) in wrong {
+        let rig = Rig::new();
+        let setup = rig
+            .setup(&[port])
+            .with_listener_verifier(listeners.verifier());
+        for target in [auto(None), auto(Some(managed(None)))] {
+            let mut options = rig.options(target);
+            options.api_key_stdin = true;
+            let result = run_setup(&setup, &options, Some(KEY)).await;
+            assert_eq!(code(&result), "auth_required", "{case}");
+            let error = result.as_ref().unwrap_err();
+            assert_eq!(error.endpoint.as_deref(), Some(address.as_str()), "{case}");
+            assert!(
+                error.message.contains("没有发送") && error.message.contains("--endpoint"),
+                "{case}: {}",
+                error.message
+            );
+            assert!(!error.message.contains(KEY), "{case}");
+            assert!(
+                !rig.out().exists(),
+                "{case}: nothing is written, and no managed card either"
+            );
+        }
+    }
+    for request in protected.received_requests().await.unwrap() {
+        assert!(
+            !authorized(&request),
+            "no credential reached an unverified listener: {request:?}"
+        );
+    }
+}
+
+/// 属主通过，但引擎拒绝这个 key：`auth_failed`，带候选的地址。
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_with_a_verified_listener_that_rejects_the_key_is_auth_failed() {
+    let protected = fake(Some(KEY), &["m1"]).await;
+    let port = port_of(&protected);
+    let rig = Rig::new();
+    let setup = rig
+        .setup(&[port])
+        .with_listener_verifier(Listeners::genuine(&[port]).verifier());
+    let mut options = rig.options(auto(None));
+    options.api_key_stdin = true;
+    let result = run_setup(&setup, &options, Some("not-the-key")).await;
+    assert_eq!(code(&result), "auth_failed");
+    assert_eq!(
+        result.unwrap_err().endpoint.as_deref(),
+        Some(format!("http://127.0.0.1:{port}").as_str())
+    );
+    assert!(!rig.out().exists());
+}
+
+/// 候选不要求鉴权：匿名请求就够了，key 一个字节都不发；带 key 也不改变这一点。
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_with_a_key_still_sends_nothing_to_a_candidate_that_wants_none() {
+    let open = fake(None, &["m1"]).await;
+    let port = port_of(&open);
+    let rig = Rig::new();
+    let setup = rig
+        .setup(&[port])
+        .with_listener_verifier(Listeners::genuine(&[port]).verifier());
+    let mut options = rig.options(auto(None));
+    options.api_key_stdin = true;
+    let report = ok(run_setup(&setup, &options, Some(KEY)).await);
+    assert_eq!(report["auth"], "none");
+    for request in open.received_requests().await.unwrap() {
+        assert!(!authorized(&request), "{request:?}");
+    }
+}
+
+/// 没通过校验的候选被跳过（key 没发），后面合格的候选照常采纳；key 只会发给通过校验的那一个。
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_with_a_key_skips_an_unverified_protected_candidate_and_adopts_a_good_one() {
+    let impostor = fake(Some(KEY), &["m1"]).await;
+    let genuine = fake(Some(KEY), &["m2"]).await;
+    let (impostor_port, genuine_port) = (port_of(&impostor), port_of(&genuine));
+    let rig = Rig::new();
+    // 只有第二个端口上的监听者是真的。
+    let setup = rig
+        .setup(&[impostor_port, genuine_port])
+        .with_listener_verifier(Listeners::genuine(&[genuine_port]).verifier());
+    let mut options = rig.options(auto(None));
+    options.api_key_stdin = true;
+    let report = ok(run_setup(&setup, &options, Some(KEY)).await);
+    assert_eq!(
+        report["endpoint"],
+        format!("http://127.0.0.1:{genuine_port}")
+    );
+    for request in impostor.received_requests().await.unwrap() {
+        assert!(
+            !authorized(&request),
+            "the unverified candidate never saw the key"
+        );
+    }
+    assert!(
+        genuine
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(authorized)
+    );
+}
+
+/// 引擎种类没有实现属主校验时（缺省），key 永远不会发给 `--auto` 的候选。
+/// 通用流程里这是缺省行为，见 `setup_engine_generic.rs`；这里钉住 oMLX 的校验器真的接在流程上：不注入，
+/// 用生产的检查器时，一个测试进程里的假 oMLX（没有 oMLX 的签名团队）不通过。
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_with_the_production_owner_check_does_not_trust_a_listener_that_is_not_signed_by_omlx()
+{
+    let protected = fake(Some(KEY), &["m1"]).await;
+    let port = port_of(&protected);
+    let rig = Rig::new();
+    let setup = rig.setup(&[port]); // 生产的 `SystemInspector` + oMLX 团队
+    let mut options = rig.options(auto(None));
+    options.api_key_stdin = true;
+    let result = run_setup(&setup, &options, Some(KEY)).await;
+    assert_eq!(code(&result), "auth_required");
+    for request in protected.received_requests().await.unwrap() {
+        assert!(!authorized(&request), "{request:?}");
+    }
+}
+
+/// 校验通过之后带 key 的探测走**新开的连接**，不复用校验之前（匿名探测）留下的连接。
+/// 一个数连接的最小 HTTP/1.1 服务（支持 keep-alive）：每个 `probe` 调用各自新建客户端，所以匿名探测与带 key 的探测至少是
+/// 两条连接；要是共用一个客户端，两个请求会挤在同一条 keep-alive 连接上。
+#[tokio::test(flavor = "multi_thread")]
+async fn the_request_that_carries_the_key_is_not_sent_over_a_connection_opened_before_the_check() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counted = connections.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream;
+                loop {
+                    // 读一个请求（到空行为止），记下有没有 Authorization。
+                    let mut authorized = false;
+                    let mut path = String::new();
+                    let mut first = true;
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        if first {
+                            path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+                            first = false;
+                        }
+                        if line.to_ascii_lowercase().starts_with("authorization:") {
+                            authorized = true;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let (status, body) = if !authorized {
+                        ("401 Unauthorized", "{}".to_owned())
+                    } else {
+                        match path.as_str() {
+                            "/v1/models" => ("200 OK", r#"{"data":[{"id":"m1"}]}"#.to_owned()),
+                            "/v1/models/status" => (
+                                "200 OK",
+                                r#"{"models":[{"id":"m1","estimated_size":1}]}"#.to_owned(),
+                            ),
+                            _ => ("200 OK", "{}".to_owned()),
+                        }
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if writer.write_all(response.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let rig = Rig::new();
+    let setup = rig
+        .setup(&[port])
+        .with_listener_verifier(Listeners::genuine(&[port]).verifier());
+    let mut options = rig.options(auto(None));
+    options.api_key_stdin = true;
+    let report = ok(run_setup(&setup, &options, Some(KEY)).await);
+    assert_eq!(report["auth"], "required");
+    assert!(
+        connections.load(Ordering::SeqCst) >= 2,
+        "the anonymous probe and the keyed probe must not share one connection, saw {}",
+        connections.load(Ordering::SeqCst)
+    );
 }
 
 /// 采纳一个确定的端点：key 在匿名请求被拒之后才带上，对不要求鉴权的服务一个字节都不发。
