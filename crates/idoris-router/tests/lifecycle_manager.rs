@@ -886,10 +886,6 @@ async fn an_external_engine_is_adopted_without_a_signal_and_survives_idoris_even
     let rig = rig_for(&external);
     let inspector = Scripted::new();
     inspector.external_listener(external.port, external.pid(), Some(TEAM));
-    // 围栏：外部引擎的围栏不是我们的，原样留着（没有证据证明加载已经停止）。
-    let fence = rig.fence_path();
-    std::fs::create_dir_all(fence.parent().unwrap()).unwrap();
-    std::fs::write(&fence, b"idoris load in progress\n").unwrap();
     let h = Harness::start(
         &rig,
         default_backend(&rig),
@@ -931,12 +927,52 @@ async fn an_external_engine_is_adopted_without_a_signal_and_survives_idoris_even
         "iDoris never signals an engine it does not own"
     );
     assert_eq!(rig.records(), 0);
-    assert!(fence.exists(), "an external engine's fence is left alone");
     assert!(
         governed_endpoint(&rig.endpoint()).is_none(),
         "released at shutdown"
     );
     // 引擎看到的只有匿名请求（它没要求 key）：没有带 key 的请求。
+    assert!(
+        external
+            .fake
+            .requests()
+            .iter()
+            .all(|(_, auth)| auth == "none")
+    );
+}
+
+#[tokio::test]
+async fn an_external_engine_behind_a_leftover_fence_is_not_let_through_and_the_fence_is_left_alone()
+{
+    // 外部引擎的围栏不是我们的（没有证据证明它的加载已经停止）：原样留着，要人工处理。Supervisor 在围栏存在时会把启动错误
+    // 粘滞住，所以门控不放行，状态是 `unavailable` + `fence_pending`（不是放行之后才报 `startup_latched`）。
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start(work.path(), None);
+    let rig = rig_for(&external);
+    let inspector = Scripted::new();
+    inspector.external_listener(external.port, external.pid(), Some(TEAM));
+    let fence = rig.fence_path();
+    std::fs::create_dir_all(fence.parent().unwrap()).unwrap();
+    std::fs::write(&fence, b"idoris load in progress\n").unwrap();
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector,
+        fast(),
+        StopOnExit::Owned,
+    );
+    let status = h.until_state(UpstreamState::Unavailable).await;
+    assert_eq!(status.reason, Some(UpstreamReason::FencePending));
+    assert!(!status.owned);
+    assert_eq!(h.health.view().phase, Phase::Degraded);
+    assert!(!h.manager.open_gate());
+    assert_eq!(rig.fake.launches(), 0, "nothing is spawned beside it");
+    h.manager.shutdown(true).await;
+    assert!(fence.exists(), "an external engine's fence is left alone");
+    assert!(
+        pid_alive(u64::from(external.pid())),
+        "and the engine is not signalled"
+    );
     assert!(
         external
             .fake
@@ -1164,8 +1200,8 @@ async fn a_new_manager_adopts_the_engine_a_previous_one_left_and_goes_on_using_i
 }
 
 #[tokio::test]
-async fn a_fence_makes_an_adopted_engine_killed_cleared_and_respawned_but_an_external_fence_is_not_touched()
- {
+async fn a_fence_makes_an_adopted_own_engine_killed_cleared_and_respawned() {
+    // （外部引擎的围栏原样留着、不放行：见 `an_external_engine_behind_a_leftover_fence_…`。）
     let rig = Rig::new(&Behavior::default());
     let inspector = Scripted::claiming(rig.port);
     let pid = leave_an_orphan(&rig, &inspector).await;

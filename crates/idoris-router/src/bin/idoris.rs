@@ -1633,6 +1633,8 @@ mod tests {
 
     const CONFLICT_LINE: &str =
         "idoris: 登记被 agent24d 以 instance_conflict 拒绝（已有另一个健康实例），已停止";
+    const ENGINE_FAILED_LINE: &str =
+        "idoris: 自己拉起的引擎已失效，无法在进程内恢复，已停止（退出码 5，由启动器重启）";
 
     fn stderr(text: &str) -> StopLine {
         StopLine::Stderr(text.to_string())
@@ -1663,6 +1665,14 @@ mod tests {
             StopReport {
                 lines: vec![stderr("idoris: 无启动器登记超过 900 秒，已停止")],
                 result: Ok(4),
+            }
+        );
+        // 自己拉起的引擎失效（规范 §2.7.5）：退出码 5，原因行写 stderr，说明无法在进程内恢复、由启动器重启。
+        assert_eq!(
+            stop_report(Some(StopCause::EngineFailed), Ok(()), 0),
+            StopReport {
+                lines: vec![stderr(ENGINE_FAILED_LINE)],
+                result: Ok(5),
             }
         );
     }
@@ -1721,6 +1731,27 @@ mod tests {
                     ),
                 ],
                 result: Ok(4),
+            }
+        );
+    }
+
+    /// 退出码 5 与 3、4 一样：原因已经确定，排空超时不把它变成 1（launcher 把 1 当崩溃，而 5 要让界面显示「模型引擎异常」）。
+    #[test]
+    fn a_drain_timeout_does_not_turn_an_engine_failure_into_exit_code_1() {
+        assert_eq!(
+            stop_report(
+                Some(StopCause::EngineFailed),
+                Err(shutdown_timeout_message()),
+                0
+            ),
+            StopReport {
+                lines: vec![
+                    stderr(ENGINE_FAILED_LINE),
+                    stderr(
+                        "[idoris] 停止失败：优雅停机超过 10s，强制退出（停止原因已确定，退出码仍为 5）"
+                    ),
+                ],
+                result: Ok(5),
             }
         );
     }

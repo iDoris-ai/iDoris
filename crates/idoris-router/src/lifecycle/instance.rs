@@ -629,6 +629,15 @@ impl Actor {
         if !adopted {
             return Attempt::Failure { reason: None };
         }
+        // 外部引擎的围栏不是我们的：没有证据证明它的加载已经停止，原样留着，要人工处理。但 Supervisor 在围栏存在时会把启动
+        // 错误粘滞住，数据面之后一直 503：所以不放行，把原因说清楚（`fence_pending`），而不是放行之后报 `startup_latched`。
+        if self.fence_is_present() {
+            self.log("外部引擎的加载围栏还在（上一个 iDoris 在加载中被停）：不放行，需要人工确认后删除围栏");
+            return Attempt::Terminal {
+                state: UpstreamState::Unavailable,
+                reason: Some(UpstreamReason::FencePending),
+            };
+        }
         self.external = Some(External { verifier });
         Attempt::Ready
     }

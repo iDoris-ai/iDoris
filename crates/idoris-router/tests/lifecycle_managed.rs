@@ -711,6 +711,13 @@ async fn a_budget_too_small_to_hold_anything_never_launches_and_says_budget_zero
             0,
             "budget {budget}: nothing would fit, nothing is started"
         );
+        if budget == "0" {
+            // 额度为 0 在碰任何东西之前就拒绝：连 iDoris 自己的 base 目录都没有建。
+            assert!(
+                !env.state_dir().join("omlx-base").exists(),
+                "a zero budget is refused before anything is prepared"
+            );
+        }
         // iDoris 本身继续服务：`/health` 一直答，数据面 503。
         let response = client
             .get(format!("http://127.0.0.1:{data_port}/v1/models"))
