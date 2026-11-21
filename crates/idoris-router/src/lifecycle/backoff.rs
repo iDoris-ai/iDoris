@@ -18,6 +18,9 @@ pub struct Timings {
     pub probe_timeout: Duration,
     /// 就绪之后对引擎的周期探测间隔（与 `/health.upstreams` 的探测器一致：5 秒）。
     pub probe_interval: Duration,
+    /// 就绪之后看自有引擎进程还在不在的间隔（便宜：自己的子进程只是一次 `waitid`）。进程退出在这个间隔里就被发现，
+    /// 不必等下一次探测：退出码 5 的停止越早越好。
+    pub liveness_interval: Duration,
     /// 重启退避：第 `n` 次失败等 `restart_backoff_base × 2^(n-1)`，封顶 `restart_backoff_cap`，±`restart_jitter`。
     pub restart_backoff_base: Duration,
     pub restart_backoff_cap: Duration,
@@ -43,6 +46,7 @@ impl Default for Timings {
             ready_max_interval: Duration::from_secs(1),
             probe_timeout: Duration::from_secs(2),
             probe_interval: Duration::from_secs(5),
+            liveness_interval: Duration::from_secs(1),
             restart_backoff_base: Duration::from_secs(1),
             restart_backoff_cap: Duration::from_secs(30),
             restart_jitter: 0.2,
@@ -141,6 +145,7 @@ mod tests {
         assert_eq!(timings.ready_initial_interval, Duration::from_millis(250));
         assert_eq!(timings.ready_max_interval, Duration::from_secs(1));
         assert_eq!(timings.probe_interval, Duration::from_secs(5));
+        assert_eq!(timings.liveness_interval, Duration::from_secs(1));
         assert_eq!(timings.restart_backoff_base, Duration::from_secs(1));
         assert_eq!(timings.restart_backoff_cap, Duration::from_secs(30));
         assert!((timings.restart_jitter - 0.2).abs() < f64::EPSILON);

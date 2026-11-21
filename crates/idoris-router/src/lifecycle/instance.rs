@@ -181,21 +181,68 @@ impl Actor {
         }
     }
 
-    /// 可被命令打断的等待。已经有暂存的命令时立刻返回打断。
+    /// 可被命令打断的等待，返回是否被打断。已经有暂存的命令时立刻返回打断。
+    ///
+    /// 在当前状态下什么也改变不了的命令（正在启动时又 `start`、没有自有引擎时 `stop`/`restart`）当场回答，不打断等待：
+    /// 否则一个多余的 `start` 会把进行到一半的启动白白废掉。
     async fn wait(&mut self, duration: Duration) -> bool {
-        if self.pending.is_some() {
-            return true;
-        }
-        tokio::select! {
-            () = tokio::time::sleep(duration) => false,
-            request = self.commands.recv() => {
-                self.pending = Some(request.unwrap_or(Request {
-                    // 管理器没有走 `shutdown` 就丢了：当作不停引擎的收尾，让 `OwnedEngine` 的 `Drop` 按自己的规则处置。
-                    command: Command::Shutdown { stop_engine: false },
-                    reply: None,
-                }));
-                true
+        let deadline = Instant::now() + duration;
+        loop {
+            if self.pending.is_some() {
+                return true;
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(remaining) => return false,
+                request = self.commands.recv() => {
+                    let Some(request) = request else {
+                        // 管理器没有走 `shutdown` 就丢了：当作不停引擎的收尾，让 `OwnedEngine` 的 `Drop` 按自己的规则处置。
+                        self.pending = Some(Request {
+                            command: Command::Shutdown { stop_engine: false },
+                            reply: None,
+                        });
+                        return true;
+                    };
+                    match self.immediate_answer(&request.command) {
+                        Some(result) => {
+                            if let Some(reply) = request.reply {
+                                let _ = reply.send(result);
+                            }
+                        }
+                        None => {
+                            self.pending = Some(request);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 在当前状态下什么也改变不了的命令的回答（`None` = 这个命令要真的处理）。
+    fn immediate_answer(&self, command: &Command) -> Option<Result<(), CommandError>> {
+        match command {
+            // 已经好了、或正在启动：幂等。
+            Command::Start
+                if matches!(
+                    self.state,
+                    UpstreamState::Ready | UpstreamState::Starting | UpstreamState::Restarting
+                ) =>
+            {
+                Some(Ok(()))
+            }
+            // 已经停下了：幂等。
+            Command::Stop if self.engine.is_none() && self.state == UpstreamState::Stopped => {
+                Some(Ok(()))
+            }
+            // 不是自己拥有的引擎（外部引擎、还在启动、没有引擎）：iDoris 不给别人的进程发信号。
+            Command::Stop | Command::Restart if self.engine.is_none() => {
+                Some(Err(CommandError::NotOwned))
+            }
+            _ => None,
         }
     }
 
@@ -836,17 +883,28 @@ impl Actor {
     // -----------------------------------------------------------------------------------------
 
     async fn supervise(&mut self) -> Step {
+        // 两个节拍：进程还在不在（便宜，每 `liveness_interval`）与探测（每 `probe_interval`）。
+        let mut last_probe = Instant::now();
         loop {
-            let interval = self.timings().probe_interval;
-            if self.wait(interval).await {
+            let tick = self
+                .timings()
+                .liveness_interval
+                .min(self.timings().probe_interval);
+            if self.wait(tick).await {
                 return Step::Supervise;
             }
+            let probe_due = last_probe.elapsed() >= self.timings().probe_interval;
+            if probe_due {
+                last_probe = Instant::now();
+            }
             if self.engine.is_some() {
-                if let Some(step) = self.supervise_owned().await {
+                if let Some(step) = self.supervise_owned(probe_due).await {
                     return step;
                 }
             } else if self.external.is_some() {
-                self.supervise_external().await;
+                if probe_due {
+                    self.supervise_external().await;
+                }
             } else {
                 return Step::Attempt;
             }
@@ -871,14 +929,17 @@ impl Actor {
         )
     }
 
-    /// 一个周期的自有引擎监管。`Some(step)` 表示离开监管。
-    async fn supervise_owned(&mut self) -> Option<Step> {
+    /// 一个节拍的自有引擎监管：进程退出了就处理；`probe_due` 时再探测一次。`Some(step)` 表示离开监管。
+    async fn supervise_owned(&mut self, probe_due: bool) -> Option<Step> {
         let running = match self.engine.as_mut() {
             Some(owned) => owned.engine.is_running().await,
             None => return Some(Step::Attempt),
         };
         if let Ok(false) = running {
             return Some(self.owned_engine_exited().await);
+        }
+        if !probe_due {
+            return None;
         }
         // 进程活着：探测只决定状态，不杀它（oMLX 加载大模型时 `/v1/models` 可能很慢，那不是失效）。
         let (recipe, key) = match self.engine.as_ref() {

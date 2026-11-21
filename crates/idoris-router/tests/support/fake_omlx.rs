@@ -33,6 +33,7 @@ pub struct FakeOmlx {
     pub executable: PathBuf,
     /// 启动记录与请求记录所在的目录。
     pub record_dir: PathBuf,
+    script: PathBuf,
 }
 
 impl FakeOmlx {
@@ -55,7 +56,16 @@ impl FakeOmlx {
         Self {
             executable,
             record_dir,
+            script,
         }
+    }
+
+    /// 换掉之后新启动的引擎的行为（已经在跑的不受影响）：原子地换 python 脚本（先写临时文件再改名），
+    /// 所以正好有一次启动在这时 `exec` 它，也只会读到旧的或新的完整脚本。包装脚本不动。
+    pub fn set_behavior(&self, behavior: &Behavior) {
+        let temporary = self.script.with_extension("py.tmp");
+        std::fs::write(&temporary, python_source(behavior, &self.record_dir)).unwrap();
+        std::fs::rename(&temporary, &self.script).unwrap();
     }
 
     /// 已经启动过几次（`launch-*.json` 的个数）。
@@ -149,6 +159,9 @@ with open(os.path.join(RECORDS, "launch-%04d.json" % index), "w") as f:
         "env": sorted(os.environ.keys()),
         "env_values": {{k: os.environ[k] for k in ("OMLX_BASE_PATH", "HOME", "PATH") if k in os.environ}},
         "has_api_key": "OMLX_API_KEY" in os.environ,
+        "api_key": os.environ.get("OMLX_API_KEY"),
+        "env_all": dict(os.environ),
+        "time": time.time(),
         "pid": os.getpid(),
         "pgid": os.getpgrp(),
         "cwd": os.getcwd(),

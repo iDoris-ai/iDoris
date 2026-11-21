@@ -64,6 +64,13 @@ pub enum PlanError {
     NoBackend { id: String, engine_kind: String },
     /// 两张托管卡用了同一个端口。
     PortShared { id: String, other: String },
+    /// 同一种引擎有两张托管卡：它们会共用同一个私有 base 目录（oMLX 把命令行设置落盘到 base，共用会互相覆盖，还共用缓存与日志）。
+    /// v0.6.0 每种引擎只托管一个实例（同种类的多个实例是预留，规范 §2.12.2）。
+    SecondOfKind {
+        id: String,
+        other: String,
+        engine_kind: String,
+    },
 }
 
 impl std::fmt::Display for PlanError {
@@ -83,6 +90,14 @@ impl std::fmt::Display for PlanError {
                     "托管卡 \"{id}\" 与 \"{other}\" 的 endpoint 用了同一个端口"
                 )
             }
+            Self::SecondOfKind {
+                id,
+                other,
+                engine_kind,
+            } => write!(
+                f,
+                "托管卡 \"{id}\" 与 \"{other}\" 都是 {engine_kind} 引擎：本版本每种引擎只托管一个实例（它们会共用同一个私有目录）"
+            ),
         }
     }
 }
@@ -116,6 +131,16 @@ pub fn plan_managed_with(
             return Err(PlanError::PortShared {
                 id,
                 other: other.id.clone(),
+            });
+        }
+        if let Some(other) = plans
+            .iter()
+            .find(|plan| plan.backend.kind() == backend.kind())
+        {
+            return Err(PlanError::SecondOfKind {
+                id,
+                other: other.id.clone(),
+                engine_kind: upstream.identity.engine_kind.clone(),
             });
         }
         plans.push(ManagedPlan {
