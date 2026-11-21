@@ -252,6 +252,41 @@ pub fn build_admin_app_with_token(state: AppState, token: SharedAdminToken) -> R
         .fallback(StatusCode::NOT_FOUND)
 }
 
+/// 启动期的 Admin「starting 体」（接口规范 §2.7.6）：托管引擎还没有就绪，完整的 Admin Router 还没有替换上去。
+/// `/admin/` 控制台与 `GET /admin/api/v1/status` 照常（Agent24 的「iDoris 可用」判据要它能答 200，§2.7.4）；其余
+/// `/admin/api/v1/*` 通过认证之后一律 503 `idoris_starting`（没有 token 仍是 401：认证在前，不因为状态不同而多泄露什么）。
+pub fn build_admin_starting_app(state: AppState, token: SharedAdminToken) -> Router {
+    let state = AdminHttpState {
+        app: Arc::new(state),
+        token,
+    };
+    let api = Router::new()
+        .route("/status", get(admin_status))
+        .fallback(admin_starting)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_auth,
+        ))
+        .with_state(state);
+
+    Router::new()
+        .route("/admin/", get(admin_console))
+        .nest("/admin/api/v1", api)
+        .fallback(StatusCode::NOT_FOUND)
+}
+
+/// 启动期 Admin 其余路径的 503：和数据面一样，`error.type` 与 `error.reason_code` 都是 `idoris_starting`，带 `Retry-After`。
+async fn admin_starting() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "2")],
+        Json(serde_json::json!({
+            "error": {"type": "idoris_starting", "reason_code": "idoris_starting"}
+        })),
+    )
+        .into_response()
+}
+
 const ADMIN_CONSOLE_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <meta charset="utf-8">

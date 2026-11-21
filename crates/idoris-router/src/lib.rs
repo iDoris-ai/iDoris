@@ -87,11 +87,16 @@ pub mod discovery;
 pub mod engine_kind;
 pub mod instance_nonce;
 pub mod launcher_frame;
+/// IDORIS-CORE S5（接口规范 §2.7.6、§2.7.7）：引擎管理器（状态机、退避、熔断、探测、所有权与孤儿接管、私有 key、
+/// 围栏）与启动门控。和发现文件（`discovery`）一样只支持 unix。
+pub mod lifecycle;
 pub mod readiness;
 /// IDORIS-CORE S2（接口规范 §2.10，修订 1.6）：向 agent24d 登记与心跳（UDS 客户端）、发现文件自愈、孤儿计时。
 pub mod register;
 /// Persistent record/budget storage bootstrap (B1 task18).
 pub mod storage;
+/// IDORIS-CORE S5（接口规范 §2.7.6）：可原子替换的服务体。启动门控期间服务「starting 体」，引擎就绪之后换成完整的 Router。
+pub mod swap;
 mod usage;
 
 mod event_identifier;
@@ -533,6 +538,46 @@ pub fn build_app(state: AppState) -> Router {
         Some(plane) => app.merge(control::router(plane)),
         None => app,
     }
+}
+
+/// `Retry-After`（秒）：启动门控期间数据面的 503 给调用方的重试建议。
+const STARTING_RETRY_AFTER_SECONDS: &str = "2";
+
+/// 启动期的「starting 体」（接口规范 §2.7.6）：托管引擎还没有就绪，完整的 Router（它的 Supervisor 要在引擎就绪之后才能
+/// 创建）还没有替换上去。`GET /health` 照常回答（`phase` 是 `starting` 或 `degraded`，上游状态来自引擎管理器写的快照，
+/// O(1)，不做任何上游 I/O）；其余任何路径一律 503，`error.type` 与 `error.reason_code` 都是 `idoris_starting`，带
+/// `Retry-After`。不经过鉴权、审计与记录存储：它只回答固定的内容，不碰任何状态。
+pub fn build_starting_app(state: AppState) -> Router {
+    let state = Arc::new(state);
+    Router::new()
+        .route("/health", get(health))
+        .fallback(idoris_starting)
+        .layer(middleware::from_fn(starting_record_id_middleware))
+        .with_state(state)
+}
+
+/// 启动期数据面的 503（接口规范 §2.11.1）。
+async fn idoris_starting() -> Response {
+    let mut response = error_envelope_with_reason(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "idoris_starting",
+        "idoris_starting",
+        "iDoris 正在启动它托管的模型引擎，稍后重试（/health 的 phase 与 upstreams 说明进度）",
+    );
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from_static(STARTING_RETRY_AFTER_SECONDS),
+    );
+    response
+}
+
+/// 和完整 Router 一样，每个响应都带服务端生成的 `X-iDoris-Record-Id`（不写任何审计记录）。
+async fn starting_record_id_middleware(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&Uuid::new_v4().to_string()) {
+        response.headers_mut().insert(HEADER_RECORD_ID, value);
+    }
+    response
 }
 
 async fn post_feedback(

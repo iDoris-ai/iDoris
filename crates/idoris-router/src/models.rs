@@ -122,6 +122,10 @@ async fn fetch_models_body(
 ) -> Result<Option<Value>, ModelsError> {
     let url = format!("{}/v1/models", card.endpoint.trim_end_matches('/'));
     let mut request = client.get(&url).timeout(MODELS_TIMEOUT);
+    // 引擎管理器接管的端点（托管卡，接口规范 §2.7.7）：自有引擎只用它的私有 key，外部引擎的 settings.json key 要先过
+    // 端口属主校验；这个口径覆盖调用方传进来的 key。没有登记的端点沿用调用方的 key（行为不变）。
+    let governed = idoris_upstream::omlx::key::resolve_governed_os(&card.endpoint);
+    let api_key = governed.as_ref().map_or(api_key, |key| key.as_deref());
     if is_loopback_omlx(card)
         && let Some(key) = api_key.filter(|key| !key.is_empty())
     {
