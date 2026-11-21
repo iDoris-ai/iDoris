@@ -2,6 +2,8 @@
 
 > **文档修订 1.6（已冻结，wire 1.3.0，2026-11-21；Agent24 已评审并同意）**：Agent24 的 IDORIS-CORE（[Agent24#1937](https://github.com/iDoris-ai/Agent24/pull/1937)）要求 iDoris 成为 Agent24 的必选核心：动态端口与发现、登记与心跳、由 iDoris 托管本地推理引擎（首个实现是 oMLX）、embeddings 与预热。owner 同日追加：契约按多引擎设计，v0.6.0 只实现 oMLX。本修订新增 §2.10（登记协议 v1，含冻结时补入的 §2.10.10 口径）、§2.11（wire 契约 1.3.0，只新增）与 §2.12（多引擎，预留），增补 §2.1、§2.2、§2.3、§2.5、§2.7、§2.8、§2.9、§4.2，协商记录见 R12。依据是 iDoris 侧评估与接口提案（[PR #614](https://github.com/iDoris-ai/iDoris/pull/614)，下称设计稿）和 Agent24 2026-11-20 对设计稿 §3.3 七个问题的答复。**本修订已冻结（2026-11-21，Agent24 已同意）；冻结的是契约，不表示 iDoris 已实现，实现随 v0.6.0 发版；§2.12 中标「预留」的部分除外，待后续修订冻结。本修订不改变任何更早冻结条款的承诺，增补处逐处标注，被取代的句子保留原文并注明。** 修订号说明：Agent24 方案里的「§2.7 修订 1.4」已被 §2.9（修订 1.4）占用，故本次记为修订 1.6。
 >
+> **文档修订 1.6 勘误（不改 wire，2026-11-21）**：补入 PR #617（oMLX 配方）带出的事实，只增不改契约：§2.7.6 自有 base 的目录名与 `lstat` 核对方式、`--model-dir` 的空 `models/` 与逗号约束、落盘设置跨启动生效、`HOME` 下 `~/.omlx/bin/omlx-cluster-python` 的写入为已知行为；§2.7.7 的 D10 静态结论；§2.7.5 退出码 3、4 的排空失败口径；§2.10.5 `error` 帧不带认证。
+>
 > **文档修订 1.5，2026-11-19**：只改状态说法，不改契约内容。§2.9 中的推荐接口、本地模型列表和 oMLX 密钥顺序已在 iDoris v0.5.0 实现，wire 契约 1.2.0 随该版本生效；§2.9 的下载部分仍未实现，接口形状待另行修订。
 >
 > **文档修订 1.4，2026-11-15**：owner 要求装了 oMLX 的机器首次启动时按硬件自动选默认 chat 模型，由 iDoris 负责推荐。新增 §2.9（本机 chat 模型推荐、本地模型类别与下载，拟议 wire 1.2.0，只新增），档位表由 owner 拍板，iDoris 与 Agent24 两个会话各确认一次。iDoris 侧推荐、本地模型列表与密钥顺序已在 v0.5.0 实现（见修订 1.5）；下载部分仍未实现。
@@ -282,6 +284,8 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 | 4（新） | 孤儿超时：launcher 给了 `orphan_timeout_s`，超过该时间没有已 `ack` 的登记会话（§2.10.8），主动优雅停止 | 按预期停止，**不计入**崩溃熔断（R12-Q5） |
 | 5（新） | iDoris 自己拉起（`owned`）的引擎失效，v0.6.0 无法在进程内恢复，优雅停止以让上层重启（§2.7.6） | **计入**崩溃熔断（R12-Q5），重启后走全新的启动门控 |
 
+修订 1.6 勘误（不改 wire）：退出码 3、4 的停止过程中，HTTP 排空失败（超时或服务器报错）时，仍以 3、4 退出，另记一行排空失败日志；只有信号（SIGTERM、SIGINT）触发的停止遇到排空失败，才以 1 退出。
+
 #### 2.7.6 引擎生命周期（首个实现是 oMLX）（已冻结）
 
 **范围与已定决策。** 「引擎」指 iDoris 经 HTTP 对话的本地推理服务进程，种类用 `engine_kind` 区分（§2.12.1，首个实现是 `omlx`），「模型」指引擎里的权重。本节的流程是**通用的**：引擎管理器按「引擎实例」建模，每个实例带自己的 `engine_kind`、状态机、所有权记录与日志，并按种类分派到该种类的「配方」（怎么探测、怎么发现与校验可执行文件、怎么拉起、是否支持私有 key）。v0.6.0 只实现 `omlx` 配方（本节标明「oMLX 配方」的段落）；以后加引擎种类只是增加配方，不改本节的通用字段与流程（owner 2026-11-20 的多引擎需求，§2.12）。现有 Supervisor 管模型（load、unload、chat），引擎管理器在它之下，只管进程；`OmlxAdapter` 继续用 HTTP 与 oMLX 引擎对话，不变。owner 已定：（设计稿 D2a）adopt 优先，找不到才拉起，拉起的实例是 iDoris 私有的；（设计稿 D2b）v0.6.0 的引擎由用户自装，iDoris 探测并报 `engine_not_found`，由 Agent24 界面引导安装，附带或按需下载引擎以后再议。**只对声明了 `extensions.idoris_managed` 的卡生效**（§2.3）；没有托管卡时完全走 v0.5.0 的现有路径，行为不变。
@@ -295,7 +299,7 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 
 **oMLX 配方 · 识别与探测。** `GET /v1/models`（key 按 §2.9「oMLX 密钥」的顺序）返回 200 且 JSON 里有 `data` 数组，就算就绪，空列表也算（模型目录可能是空的）；判据同 `setup omlx`，另要求 `/v1/models/status` 与 `/api/status` 也是 oMLX 的形状，形状不符按「端口被不是这种引擎的服务占用」处理。oMLX 没有 `/health`。
 
-**oMLX 配方 · 可执行文件的发现与校验。** 发现顺序：（1）stdin 帧的 `engine.executables.omlx`（launcher 已校验，视为可信）；（2）`/Applications/oMLX.app/Contents/MacOS/omlx-cli`；（3）`~/Applications/oMLX.app/Contents/MacOS/omlx-cli`。**不使用 PATH 查找**：Agent24 启动 iDoris 时把 PATH 固定为 `/usr/bin:/bin:/usr/sbin:/sbin`，Homebrew 路径本来就不在里面；`~/.omlx/bin/omlx`、`/opt/homebrew/bin/omlx`、`/usr/local/bin/omlx` 只是指向 app 内 `omlx-cli` 的包装或链接，不作为发现目标。校验：`canonicalize` 之后必须是普通可执行文件；位于 `.app` 内时用 `/usr/bin/codesign --verify --strict` 并要求 `TeamIdentifier` 为 `PSK5Q5T46L`；launcher 显式给的路径不再校验团队。以上路径与团队标识来自设计稿附录 A 在 oMLX 0.6.4 上的只读实测，其他版本未实测，oMLX 换签名团队会使校验失败。**oMLX 配方 · 落盘行为与 iDoris 自有 base**（oMLX 0.6.4 的行为，来自设计稿 §2.7.3）：`omlx serve` 只要收到 `--host`、`--port`、`--model-dir`、`--memory-guard-gb` 任何一项，就把它们写入 `<base>/settings.json`；`<base>` 依次取环境变量 `OMLX_BASE_PATH`、oMLX.app 的 bootstrap 文件（`~/Library/Application Support/oMLX/base-path` 的内容）、`~/.omlx`。iDoris 每次拉起都会传 `--host` 与 `--port`，若不指定 base，就会改写用户自己的 `~/.omlx/settings.json`（或 bootstrap 指向的目录）。所以：（1）iDoris 拉起 oMLX **必须使用自有 base**：`OMLX_BASE_PATH` 指向 `<IDORIS_STATE_DIR>` 下的专用目录（如 `engines/omlx`），目录权限 0700、属主为当前用户、不是符号链接（不跟随链接地校验）；（2）没有配置出这个目录，或校验不过，**拒绝拉起**（`reason:"base_unavailable"`），不回退到 `~/.omlx`，也不读取 bootstrap 文件；（3）需要与用户的 oMLX 共用已下载的模型时，由部署方显式给出模型目录，iDoris 以 `--model-dir` 传入，它只会被写进 iDoris 自有 base 的 `settings.json`，不改动用户目录里的任何设置；不给就用自有 base 下的默认模型目录；（4）用户 oMLX 设置里的 `skip_api_key_verification`、子 key（sub keys）等只存在于用户自己的 base，**不影响 iDoris 私有引擎**：私有引擎只读自有 base 的设置，鉴权只认 iDoris 传入的私有 key（§2.7.7）。
+**oMLX 配方 · 可执行文件的发现与校验。** 发现顺序：（1）stdin 帧的 `engine.executables.omlx`（launcher 已校验，视为可信）；（2）`/Applications/oMLX.app/Contents/MacOS/omlx-cli`；（3）`~/Applications/oMLX.app/Contents/MacOS/omlx-cli`。**不使用 PATH 查找**：Agent24 启动 iDoris 时把 PATH 固定为 `/usr/bin:/bin:/usr/sbin:/sbin`，Homebrew 路径本来就不在里面；`~/.omlx/bin/omlx`、`/opt/homebrew/bin/omlx`、`/usr/local/bin/omlx` 只是指向 app 内 `omlx-cli` 的包装或链接，不作为发现目标。校验：`canonicalize` 之后必须是普通可执行文件；位于 `.app` 内时用 `/usr/bin/codesign --verify --strict` 并要求 `TeamIdentifier` 为 `PSK5Q5T46L`；launcher 显式给的路径不再校验团队。以上路径与团队标识来自设计稿附录 A 在 oMLX 0.6.4 上的只读实测，其他版本未实测，oMLX 换签名团队会使校验失败。**oMLX 配方 · 落盘行为与 iDoris 自有 base**（oMLX 0.6.4 的行为，来自设计稿 §2.7.3）：`omlx serve` 只要收到 `--host`、`--port`、`--model-dir`、`--memory-guard-gb` 任何一项，就把它们写入 `<base>/settings.json`；`<base>` 依次取环境变量 `OMLX_BASE_PATH`、oMLX.app 的 bootstrap 文件（`~/Library/Application Support/oMLX/base-path` 的内容）、`~/.omlx`。iDoris 每次拉起都会传 `--host` 与 `--port`，若不指定 base，就会改写用户自己的 `~/.omlx/settings.json`（或 bootstrap 指向的目录）。所以：（1）iDoris 拉起 oMLX **必须使用自有 base**：`OMLX_BASE_PATH` 指向 `<IDORIS_STATE_DIR>` 下的专用目录（实现的目录名是常量 `BASE_DIR_NAME`，即 `<IDORIS_STATE_DIR>/omlx-base`），目录权限 0700、属主为当前用户、不是符号链接。核对方式是对路径做 `lstat`（不跟随链接）：存在、是目录、不是符号链接、属主是当前用户、组与其他人没有任何权限，每次拉起前各核对一次；iDoris 不持有该目录的 fd（oMLX 之后按路径自己重开，持有 fd 也挡不住那个窗口）；（2）没有配置出这个目录，或校验不过，**拒绝拉起**（`reason:"base_unavailable"`），不回退到 `~/.omlx`，也不读取 bootstrap 文件；（3）需要与用户的 oMLX 共用已下载的模型时，由部署方显式给出模型目录，iDoris 以 `--model-dir` 传入，它只会被写进 iDoris 自有 base 的 `settings.json`，不改动用户目录里的任何设置；不给就用自有 base 下的默认模型目录。自有 base 下的 `models/` 起初是空的，所以不给 `--model-dir` 意味着引擎起初没有任何模型；用户已有的模型要由部署方显式给 `--model-dir`。oMLX 把 `--model-dir` 的值按逗号拆成多个目录，所以模型目录路径**不得含逗号**：这是对调用方（部署方）的约束，iDoris 目前只校验该路径是绝对路径，不校验逗号；（4）用户 oMLX 设置里的 `skip_api_key_verification`、子 key（sub keys）等只存在于用户自己的 base，**不影响 iDoris 私有引擎**：私有引擎只读自有 base 的设置，鉴权只认 iDoris 传入的私有 key（§2.7.7）。iDoris 不读、不校验自有 base 里的 `settings.json`；自有 base 由 iDoris 创建，其中 `skip_api_key_verification` 与 sub keys 取默认值，iDoris 自己不写它们（静态阅读 oMLX 0.6.4 的结论见 §2.7.7）；（5）落盘的设置跨启动生效：这次传过 `--model-dir` 或 `--memory-guard-gb`，下次不传，引擎用的仍是落盘的值，不传不等于恢复缺省。iDoris 的约定是每次拉起都显式传 `--host` 与 `--port`；`--memory-guard-gb` 只在设置了额度时传，`--model-dir` 只在部署方显式给了才传，所以这两项**没有**「每次都传」的保证，设置过之后又去掉，引擎沿用落盘的旧值（要改动它们须由部署方显式给出新值）；同一状态目录下的多个 oMLX 实例要各用各的 base（共用会互相覆盖 `settings.json`，还共用缓存与日志）；（6）**base 之外的写入**：oMLX 0.6.4 的 `serve` 启动时还会按 `HOME` 写 `~/.omlx/bin/omlx-cluster-python`（让集群里别的 Mac 经 SSH 找到解释器的辅助启动文件，不是设置），`OMLX_BASE_PATH` 管不到；iDoris 接受这一点，视为已知行为，不为此改写 `HOME`，因此不承诺 oMLX 只写 base。
 
 **oMLX 配方 · 启动命令**（flags 已对照 oMLX 0.6.4 的 `omlx serve --help`，其他版本未实测）：
 
@@ -328,6 +332,7 @@ oMLX 配方：`--memory-guard-gb` 让 oMLX 自己的内存上限与 iDoris 的�
 
 - 做法（oMLX 配方；其他引擎种类各自声明是否支持私有 key 以及怎么传，不支持的种类没有这种隔离，不影响其他设计）：iDoris 自己拥有的引擎，每次拉起时由 CSPRNG 生成一个随机 key，经环境变量 `OMLX_API_KEY` 交给引擎子进程（不用 `--api-key`，argv 同 UID 可见），并记入 0600 的所有权记录（§2.7.6）。别的进程不带这个 key 访问该引擎得到 401，「所有模型调用只经 iDoris」才成为技术约束，而不只是约定。iDoris 内部 oMLX key 的解析仍是单一入口：私有引擎的 key 优先，其次才是 §2.9「oMLX 密钥」的顺序；外部（adopt）引擎不适用，仍按 §2.9 的顺序。该 key 只在 iDoris 与该引擎之间，不是 virtual key，也不会交给 Agent24。**边界（设计稿 D1，与 §2.1 对 `instance_nonce` 的说法相同）：**私有 key 同时存在于引擎子进程的环境变量、所有权记录的 `api_key` 字段和 iDoris 进程内存三处，同 UID 的进程能读 0600 文件，macOS 上同 UID 也能用 `ps -E` 之类读到进程环境。所以它只挡读不到该目录的沙箱进程和不知情的其他客户端，**不挡同 UID 的恶意进程，不能当作对抗同 UID 的隔离**；验收项写作「不知情的其他客户端被拒」，不写「任何进程都无法直连引擎」。
 - **待实测，结论待回填**：环境变量 `OMLX_API_KEY` 与 iDoris 自有 base 下 `settings.json` 里的 `auth.api_key` 同时存在时 oMLX 认哪个（用户 base 里的设置私有引擎根本不读，§2.7.6；iDoris 自己不往自有 base 写 `auth.api_key`，所以通常两者不会同时存在），尚未验证（设计稿起草时没有起引擎做实测）。验证办法：在一个空闲端口临时起 `omlx serve`，设环境变量，另用一份 settings.json，分别带两个 key 请求 `/v1/models`，看谁被接受，不加载任何模型。通过则启用上述做法；`settings.json` 优先则私有 key 不生效，退回现有 key 顺序，失去隔离，其余设计不变，并把本节改成「不隔离」。回填格式：结论（环境变量优先或 `settings.json` 优先）、oMLX 版本、日期。
+- 静态结论（修订 1.6 勘误，仍待实测）：静态阅读 oMLX 0.6.4，`settings.py` 的载入顺序是文件、环境变量、命令行，所以环境变量 `OMLX_API_KEY` 优先于文件里的 `auth.api_key`；但 `skip_api_key_verification` 与 sub keys 只来自文件，环境变量盖不掉，所以私有 key 的隔离依赖自有 base（§2.7.6）：自有 base 由 iDoris 创建，这两项为默认值。这只是静态结论，没有运行过真实的 oMLX。
 - 结论：**待实测**。
 
 #### 2.7.8 `setup omlx` 的扩展（已冻结）
@@ -614,6 +619,8 @@ idoris-ack/v1\n0123456789abcdef\n00112233445566778899aabbccddeeff\na1b2c3d4e5f60
 `proof` = `099e173f6990315a62de5c9426ecbf0ed395a58e47728c5453e3e5a483cc0967`
 
 可用 Python `hmac.new(bytes.fromhex(nonce), transcript, hashlib.sha256).hexdigest()` 复算；起草本节时已用这段代码核对上面两个值。
+
+**`error` 帧不带认证（修订 1.6 勘误）**：`error` 帧没有 proof，不防伪造。socket 所在目录的完整性由 Agent24 负责（目录权限与属主，不让别的用户替换 socket）；同 UID 的进程不在威胁模型内（与 §2.1 对 `instance_nonce` 的边界一致）。
 
 #### 2.10.6 会话内轮换 Admin token：`set_admin_token`
 
