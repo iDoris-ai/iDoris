@@ -1993,6 +1993,30 @@ async fn resident_upstream_answers_map_onto_the_warmup_error_matrix() {
     assert_eq!(reply.error_type(), "upstream_auth_failed");
     assert!(!reply.raw.contains("API key required"), "{}", reply.raw);
 
+    // 504：上游自己说「网关超时」。对调用方就是「模型这会儿没就绪」，和我们自己的期限到点是同一个 504 `warmup_timeout`，上游的文字不外传。
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(504).set_body_string("upstream gateway says no"))
+        .mount(&server)
+        .await;
+    let app = resident_app(vec![resident_card(
+        "lmstudio",
+        &server.uri(),
+        "chat",
+        "daily: \"up-model\"",
+        false,
+    )]);
+    let reply = warm(&app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT, "{}", reply.raw);
+    assert_eq!(reply.error_type(), "warmup_timeout");
+    assert_eq!(reply.reason(), "warmup_timeout");
+    assert!(
+        !reply.raw.contains("upstream gateway says no"),
+        "上游的文字不外传: {}",
+        reply.raw
+    );
+    assert_eq!(reply.header("x-idoris-served-locality"), Some("loopback"));
+
     // 其他非 2xx：和聊天的 resident 路径一样原样透传。
     let server = MockServer::start().await;
     Mock::given(method("POST"))
