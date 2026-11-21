@@ -10,8 +10,8 @@
 //!   不查 PATH：Agent24 启动 iDoris 时把 PATH 固定了，Homebrew 路径本来就不在里面；
 //!   `~/.omlx/bin/omlx`、`/opt/homebrew/bin/omlx`、`/usr/local/bin/omlx` 都只是指向 app 内 `omlx-cli`
 //!   的包装或符号链接，不作为发现目标。
-//! - **怎么拉起**：`serve --host 127.0.0.1 --port <port> [--memory-guard-gb <N>] [--model-dir <dir>]`
-//!   （flags 对照本机 oMLX 0.6.4 的 `omlx serve --help`）；私有 key 走 `OMLX_API_KEY`，base 目录走
+//! - **怎么拉起**：`serve --host 127.0.0.1 --port <port> (--memory-guard-gb <N> | --memory-guard balanced) --model-dir <dir>`
+//!   （flags 对照本机 oMLX 0.6.4 的 `omlx serve --help`；**四项每次都传**，原因见下）；私有 key 走 `OMLX_API_KEY`，base 目录走
 //!   `OMLX_BASE_PATH`；不使用 `--api-key`（argv 同 UID 可见）。
 //!   - **oMLX 会把命令行参数落盘到 base，所以 iDoris 用自己的 base，不用用户的。** oMLX 0.6.4 的 `serve` 只要命令行里有
 //!     `--host`、`--port`、`--model-dir`、`--memory-guard-gb` 中的任何一个，就把命令行设置连同 base 里已有的设置写回
@@ -30,13 +30,18 @@
 //!   - **base 之外的写入**：oMLX 0.6.4 的 `serve` 启动时还会写 `~/.omlx/bin/omlx-cluster-python`（给集群里别的 Mac 经 SSH
 //!     找解释器的垫片，`omlx/cluster/worker_shim.py`，启动流程直接调用，内容变了才改写）。路径取自 `HOME`，而 `HOME`
 //!     是通用层白名单里原样继承的变量，`OMLX_BASE_PATH` 管不到；本配方不改 `HOME`（会连带改掉 HF 缓存等其他位置，没有实测过）。
-//!   - `--memory-guard-gb`：额度字节数除以 2^30 向下取整（整数 GiB），设置了额度才传，让 oMLX 自己的上限不高于 iDoris 的
+//!   - **`--memory-guard-gb` 与 `--model-dir` 每次拉起都传**（与 Agent24 商定，S5）：它们被落盘到 iDoris 自己的 base，
+//!     不传就沿用上一次落盘的值，一个去掉了额度或换了模型目录的新启动会悄悄沿用旧的。所以 `--model-dir` 是必配的
+//!     （没配、不是绝对路径、路径里有逗号都拒绝，`LaunchError::Invalid("model_dir")`）；`--memory-guard-gb` 有额度就传
+//!     额度换算出的整数，**没有额度就传 `--memory-guard balanced`**（oMLX 自己的缺省档位：落盘的是「本次的意图」，上一次的
+//!     自定义上限不会留下来，也不凭空造一个上限）。
+//!   - `--memory-guard-gb`：额度字节数除以 2^30 向下取整（整数 GiB），让 oMLX 自己的上限不高于 iDoris 的
 //!     额度账本（`docs/13-…md` B-11：不开 memory guard，第二个模型载入会让 server 无响应）。oMLX 0.6.4 里它是正浮点
 //!     （`cli.py` 的 `_positive_float`：0、负数、非有限数在命令行解析时就被拒绝，启动即退出），单位是 GiB
 //!     （`process_memory_enforcer.py`：`int(gb * 1024**3)`）；取整数是本配方的选择，不是 oMLX 的限制。额度不足 1 GiB 时
 //!     整数部分是 0；不传则 oMLX 用缺省的 balanced 档位，可能超过额度。所以不拉起，原因码 `budget_zero`（额度为 0 由通用层拒绝）。
-//!   - `--model-dir` 默认不传：引擎用 iDoris 自己 base 下的 `models`，起初是空的；要用用户已有的模型，由调用方显式给
-//!     [`OmlxRecipe::with_model_dir`]（落在 iDoris 自己的 `settings.json` 里）。oMLX 把这个值按逗号拆成多个目录，路径里带逗号会被拆开。
+//!   - `--model-dir` 由调用方给 [`OmlxRecipe::with_model_dir`]（引擎管理器取 S4 的 `managed_models_dir()`，即用户的
+//!     `~/.omlx/models`；落在 iDoris 自己的 `settings.json` 里）。oMLX 把这个值按逗号拆成多个目录，所以路径里不得有逗号。
 //!   - 以上 oMLX 的行为来自静态阅读 `/Applications/oMLX.app/Contents/Resources/omlx/` 里的 0.6.4 源码，没有运行过真实的 oMLX。
 //! - **怎么判就绪**：`GET /v1/models` 返回 200 且 JSON 里有 `data` 数组即可（空列表也算：模型目录可能是空的）。
 //!   oMLX 没有 `/health`。这是**引擎**就绪，不是某个**模型**就绪（后者是 [`crate::OmlxAdapter::probe_ready`]）。这个形状任何
@@ -123,8 +128,8 @@ impl OmlxRecipe {
         self
     }
 
-    /// 显式的 `--model-dir`（绝对路径）；缺省不传，引擎用 iDoris 自己 base 下的 `models`（起初是空的）。
-    /// 要共用用户已有的模型，传用户的模型目录。
+    /// `--model-dir`（绝对路径，不得含逗号）。拉起必须配它（每次都传，见模块文档）；没配、相对路径、含逗号，
+    /// [`OmlxRecipe::launch_plan`] 都拒绝。
     pub fn with_model_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.model_dir = Some(dir.into());
         self
@@ -216,11 +221,12 @@ impl EngineRecipe for OmlxRecipe {
     }
 
     fn launch_plan(&self, input: &LaunchInput<'_>) -> Result<LaunchPlan, LaunchError> {
-        if self
-            .model_dir
-            .as_deref()
-            .is_some_and(|dir| !dir.is_absolute())
-        {
+        // `--model-dir` 每次都传（模块文档）：没配不拉起，而不是让引擎沿用上一次落盘的值。绝对路径；路径里不得有逗号：
+        // oMLX 把这个值按逗号拆成多个目录（`omlx/settings.py` 的 `_apply_cli_overrides`），一个带逗号的路径会变成两个目录。
+        let Some(model_dir) = self.model_dir.as_deref() else {
+            return Err(LaunchError::Invalid("model_dir"));
+        };
+        if !model_dir.is_absolute() || model_dir.as_os_str().as_encoded_bytes().contains(&b',') {
             return Err(LaunchError::Invalid("model_dir"));
         }
         // oMLX 会把命令行参数落盘到 base（模块文档）：base 要是 iDoris 自己的、配好的、磁盘上核对过的；
@@ -239,20 +245,26 @@ impl EngineRecipe for OmlxRecipe {
             "--port".into(),
             input.port.to_string().into(),
         ];
-        if let Some(budget) = input.allocated_budget_bytes {
-            // 整数 GiB 的粒度下，不足 1 GiB 的额度取整得 0，oMLX 不接受 0（`--memory-guard-gb` 要正数）；
-            // 不传则 oMLX 用它自己的缺省档位，可能超过额度。按「额度为 0 不拉起」的同一精神拒绝，
-            // 复用原因码 `budget_zero`，不新增原因码。
-            let Some(gib) = memory_guard_gib(budget) else {
-                return Err(LaunchError::BudgetZero);
-            };
-            args.push("--memory-guard-gb".into());
-            args.push(gib.to_string().into());
+        match input.allocated_budget_bytes {
+            Some(budget) => {
+                // 整数 GiB 的粒度下，不足 1 GiB 的额度取整得 0，oMLX 不接受 0（`--memory-guard-gb` 要正数）；
+                // 不传则 oMLX 用它自己的缺省档位，可能超过额度。按「额度为 0 不拉起」的同一精神拒绝，
+                // 复用原因码 `budget_zero`，不新增原因码。
+                let Some(gib) = memory_guard_gib(budget) else {
+                    return Err(LaunchError::BudgetZero);
+                };
+                args.push("--memory-guard-gb".into());
+                args.push(gib.to_string().into());
+            }
+            // 没有额度也要传一个内存护栏参数：落盘的设置跨启动生效，不传就沿用上一次的自定义上限。
+            // 传 oMLX 自己的缺省档位：既抹掉旧的上限，也不凭空造一个上限。
+            None => {
+                args.push("--memory-guard".into());
+                args.push("balanced".into());
+            }
         }
-        if let Some(dir) = &self.model_dir {
-            args.push("--model-dir".into());
-            args.push(dir.as_os_str().to_owned());
-        }
+        args.push("--model-dir".into());
+        args.push(model_dir.as_os_str().to_owned());
 
         let mut env = BTreeMap::new();
         if let Some(key) = input.api_key {
@@ -347,11 +359,16 @@ mod tests {
             base_path_in(self.state.path())
         }
 
-        /// 配好这个 base 的配方。
+        /// 配好这个 base 与模型目录的配方（拉起需要两者）。
         fn recipe(&self) -> OmlxRecipe {
-            OmlxRecipe::new().with_base_path(self.path())
+            OmlxRecipe::new()
+                .with_base_path(self.path())
+                .with_model_dir(MODEL_DIR)
         }
     }
+
+    /// 测试用的模型目录：只是一个绝对路径（拉起前不核对它存不存在，引擎自己会处理）。
+    const MODEL_DIR: &str = "/Users/x/.omlx/models";
 
     fn mode(path: &Path) -> u32 {
         std::fs::symlink_metadata(path)
@@ -381,9 +398,21 @@ mod tests {
     fn the_default_argv_is_exactly_the_design_form() {
         let base = Base::new();
         let l = launch(base.recipe(), spec());
+        // Every launch states the persisted settings (memory guard, model dir) itself: no budget set means oMLX's
+        // own default tier, spelled out.
         assert_eq!(
             argv(&l),
-            ["serve", "--host", "127.0.0.1", "--port", "19731"]
+            [
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "19731",
+                "--memory-guard",
+                "balanced",
+                "--model-dir",
+                MODEL_DIR
+            ]
         );
         assert_eq!(l.endpoint(), "http://127.0.0.1:19731");
         assert_eq!(l.kind().as_str(), "omlx");
@@ -409,16 +438,16 @@ mod tests {
             argv(&launch(base.recipe(), s))
         };
         assert_eq!(
-            argv(&launch(base.recipe(), spec())).len(),
-            5,
-            "no budget set: no flag"
+            argv(&launch(base.recipe(), spec()))[5..7],
+            ["--memory-guard", "balanced"],
+            "no budget set: oMLX's default tier, stated explicitly so a stale ceiling does not survive"
         );
-        assert_eq!(guard(GIB)[5..], ["--memory-guard-gb", "1"]);
-        assert_eq!(guard(2 * GIB - 1)[5..], ["--memory-guard-gb", "1"]);
+        assert_eq!(guard(GIB)[5..7], ["--memory-guard-gb", "1"]);
+        assert_eq!(guard(2 * GIB - 1)[5..7], ["--memory-guard-gb", "1"]);
         // 16 GiB, the budget the design uses as its example: exactly 16; one byte less: 15.
-        assert_eq!(guard(16 * GIB)[5..], ["--memory-guard-gb", "16"]);
-        assert_eq!(guard(16 * GIB - 1)[5..], ["--memory-guard-gb", "15"]);
-        assert_eq!(guard(16 * GIB + 1)[5..], ["--memory-guard-gb", "16"]);
+        assert_eq!(guard(16 * GIB)[5..7], ["--memory-guard-gb", "16"]);
+        assert_eq!(guard(16 * GIB - 1)[5..7], ["--memory-guard-gb", "15"]);
+        assert_eq!(guard(16 * GIB + 1)[5..7], ["--memory-guard-gb", "16"]);
         // oMLX 0.6.4 reads the number as GiB (static reading of its source; it was not run). The
         // check also holds for the decimal reading, so a version that changed the unit would still
         // not be handed a limit above the budget.
@@ -471,14 +500,74 @@ mod tests {
         assert_eq!(error, LaunchError::BudgetZero);
     }
 
+    /// The persisted settings are stated on every launch, so both flags are always there, in this order,
+    /// whatever the budget (hard condition agreed with Agent24: a launch that leaves them out would inherit whatever
+    /// the previous launch persisted into the base).
     #[test]
-    fn the_model_dir_is_passed_only_when_configured() {
+    fn both_persisted_settings_are_passed_on_every_launch() {
+        const GIB: u64 = 1 << 30;
         let base = Base::new();
-        let l = launch(base.recipe(), spec());
-        assert_eq!(argv(&l).len(), 5, "no model dir configured: no flag");
-
+        for budget in [None, Some(GIB), Some(16 * GIB), Some(u64::MAX)] {
+            let mut s = spec();
+            s.allocated_budget_bytes = budget;
+            let argv = argv(&launch(base.recipe(), s));
+            assert!(
+                argv.contains(&"--memory-guard-gb".to_owned())
+                    || argv.contains(&"--memory-guard".to_owned()),
+                "{budget:?}: {argv:?}"
+            );
+            assert_eq!(
+                argv[argv.len() - 2..],
+                ["--model-dir", MODEL_DIR],
+                "{budget:?}: the model dir comes last, always"
+            );
+        }
         let l = launch(base.recipe().with_model_dir("/Volumes/models"), spec());
-        assert_eq!(argv(&l)[5..], ["--model-dir", "/Volumes/models"]);
+        assert_eq!(argv(&l)[7..], ["--model-dir", "/Volumes/models"]);
+    }
+
+    #[test]
+    fn a_model_dir_is_required_absolute_and_free_of_commas() {
+        let base = Base::new();
+        let state = tempfile::tempdir().unwrap();
+        let no_dir = {
+            let base = base_path_in(state.path());
+            prepare_base_dir(&base).unwrap();
+            OmlxRecipe::new().with_base_path(base)
+        };
+        // No model dir configured: the launch is refused, not left to inherit the persisted one.
+        let error = refused(no_dir);
+        assert_eq!(error, LaunchError::Invalid("model_dir"));
+        // oMLX splits `--model-dir` at every comma into several directories.
+        for bad in [
+            "/Users/a,b/.omlx/models",
+            "/Volumes/m,n",
+            "/models,",
+            ",/models",
+            "/a,/b",
+            "models",
+            "",
+        ] {
+            assert_eq!(
+                refused(base.recipe().with_model_dir(bad)),
+                LaunchError::Invalid("model_dir"),
+                "{bad:?}"
+            );
+        }
+        // A plain absolute path is fine, spaces and all.
+        for good in ["/Users/a b/.omlx/models", "/Volumes/models"] {
+            assert!(
+                EngineLaunch::new(
+                    &instance(base.recipe().with_model_dir(good)),
+                    spec(),
+                    env(&[])
+                )
+                .is_ok(),
+                "{good}"
+            );
+        }
+        // The reason code of a refused model dir is the generic one: the manager reports it as no stable reason.
+        assert_eq!(error.reason_code(), "invalid_launch");
     }
 
     // ---- base directory: oMLX writes the command-line settings into it ----
@@ -513,7 +602,9 @@ mod tests {
             ("HOME", user_home.path().to_str().unwrap()),
             ("OMLX_BASE_PATH", users_base.path().to_str().unwrap()),
         ]);
-        let recipe = OmlxRecipe::new().with_home(user_home.path());
+        let recipe = OmlxRecipe::new()
+            .with_home(user_home.path())
+            .with_model_dir(MODEL_DIR);
         let error = EngineLaunch::new(&instance(recipe), spec(), parent).unwrap_err();
         assert_eq!(error, LaunchError::Invalid("base_path"));
         assert_eq!(error.reason_code(), "base_unavailable");
@@ -523,7 +614,11 @@ mod tests {
     fn a_missing_base_is_refused_until_it_is_prepared() {
         let state = tempfile::tempdir().unwrap();
         let base = base_path_in(state.path());
-        let recipe = || OmlxRecipe::new().with_base_path(&base);
+        let recipe = || {
+            OmlxRecipe::new()
+                .with_base_path(&base)
+                .with_model_dir(MODEL_DIR)
+        };
         assert_eq!(refused(recipe()), LaunchError::Invalid("base_path"));
         prepare_base_dir(&base).unwrap();
         assert!(EngineLaunch::new(&instance(recipe()), spec(), env(&[])).is_ok());
@@ -538,11 +633,17 @@ mod tests {
         let link = base_path_in(state.path());
         symlink(&real, &link).unwrap();
         assert_eq!(
-            refused(OmlxRecipe::new().with_base_path(&link)),
+            refused(
+                OmlxRecipe::new()
+                    .with_base_path(&link)
+                    .with_model_dir(MODEL_DIR)
+            ),
             LaunchError::Invalid("base_path")
         );
         // 对照：链接指向的那个目录本身没问题。
-        let recipe = OmlxRecipe::new().with_base_path(&real);
+        let recipe = OmlxRecipe::new()
+            .with_base_path(&real)
+            .with_model_dir(MODEL_DIR);
         assert!(EngineLaunch::new(&instance(recipe), spec(), env(&[])).is_ok());
     }
 
@@ -575,7 +676,11 @@ mod tests {
         std::fs::write(&file, b"").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
-            refused(OmlxRecipe::new().with_base_path(&file)),
+            refused(
+                OmlxRecipe::new()
+                    .with_base_path(&file)
+                    .with_model_dir(MODEL_DIR)
+            ),
             LaunchError::Invalid("base_path")
         );
     }
@@ -600,7 +705,11 @@ mod tests {
         assert!(!relative.is_absolute());
         assert_eq!(check_base_dir(&relative), Ok(()));
         assert_eq!(
-            refused(OmlxRecipe::new().with_base_path(&relative)),
+            refused(
+                OmlxRecipe::new()
+                    .with_base_path(&relative)
+                    .with_model_dir(MODEL_DIR)
+            ),
             LaunchError::Invalid("base_path")
         );
     }
@@ -615,7 +724,9 @@ mod tests {
             LaunchError::Invalid("model_dir")
         );
         assert_eq!(
-            e(OmlxRecipe::new().with_base_path("base")),
+            e(OmlxRecipe::new()
+                .with_base_path("base")
+                .with_model_dir(MODEL_DIR)),
             LaunchError::Invalid("base_path")
         );
     }

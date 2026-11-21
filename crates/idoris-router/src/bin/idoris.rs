@@ -38,7 +38,7 @@ use idoris_router::{
     discovery, host_facts,
     instance_nonce::InstanceNonce,
     launcher_frame::{self, LauncherConfig},
-    parse_port, profile, readiness,
+    lifecycle, parse_port, profile, readiness,
     register::{self, Registration, RegistrationConfig, SelfHeal, StopCause},
     routing_policy,
     runtime::RuntimeRegistry,
@@ -49,6 +49,7 @@ use idoris_router::{
         config::SubscriptionConfig,
         runtime::{SubscriptionRuntimeHandle, SubscriptionRuntimeRegistry, authorize_subscription},
     },
+    swap::SwapApp,
     write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
 };
 use std::{
@@ -131,9 +132,10 @@ struct StopReport {
 /// - 排空成功：照原因退出（0、3、4），写原因对应的那一行。
 /// - 排空失败（超过 `SHUTDOWN_GRACE`，或订阅停不下来），而原因是信号，或没有记下原因（服务自己倒了）：这是「停止失败」，
 ///   带着错误以退出码 1 退出（§2.7.5 退出码 1），不写原因行。
-/// - 排空失败，而原因已经确定是 `instance_conflict`（3）或孤儿超时（4）：退出码与原因行都不变，另加一行说明排空失败。
-///   不把 3、4 变成 1：launcher 把退出码 1 当崩溃退避重启，对 `instance_conflict` 就是让后来者再撞一次冲突；而 3（不要重启）
-///   与 4（按预期停止，不计入崩溃熔断）正是这两种停止要告诉 launcher 的。
+/// - 排空失败，而原因已经确定是 `instance_conflict`（3）、孤儿超时（4）或自有引擎失效（5）：退出码与原因行都不变，另加一行
+///   说明排空失败。不把 3、4、5 变成 1：launcher 把退出码 1 当崩溃退避重启，对 `instance_conflict` 就是让后来者再撞一次冲突；
+///   而 3（不要重启）、4（按预期停止，不计入崩溃熔断）、5（计入崩溃熔断，界面显示「模型引擎异常」）正是这几种停止要告诉
+///   launcher 的。
 fn stop_report(
     cause: Option<StopCause>,
     served: Result<(), String>,
@@ -161,6 +163,11 @@ fn stop_report(
         StopCause::OrphanTimeout => StopLine::Stderr(format!(
             "idoris: 无启动器登记超过 {orphan_timeout_s} 秒，已停止"
         )),
+        // 接口规范 §2.7.5：自己拉起的引擎失效，v0.6.0 无法在进程内恢复，优雅停止，由 agent24d 重启走全新的启动门控。
+        StopCause::EngineFailed => StopLine::Stderr(
+            "idoris: 自己拉起的引擎已失效，无法在进程内恢复，已停止（退出码 5，由启动器重启）"
+                .to_string(),
+        ),
     }];
     if let Some(message) = drain_failure {
         lines.push(StopLine::Stderr(format!(
@@ -545,6 +552,9 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     // `idoris_managed` 声明不合法（引擎种类不认识、与 `version_pin` 不一致）是卡校验失败：启动失败，
     // 排在实例锁之前，和其他组件校验同一个优先级。
     let upstream_plans = readiness::plan_upstreams(&cards).map_err(|error| error.to_string())?;
+    // 接口规范 §2.7.6：声明了 `idoris_managed` 的卡由引擎管理器托管。托管卡的 endpoint、引擎种类、端口也是卡校验，
+    // 排在实例锁之前；没有托管卡时这一整块都不参与，行为与 v0.5.0 字节级一致。
+    let managed = ManagedEngines::plan(&upstream_plans)?;
     let health_state = readiness::HealthState::with_upstreams(
         started_at_ms,
         upstream_plans
@@ -585,12 +595,19 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
         Err(storage::InstanceLockError::Other(message)) => return Err(message),
     };
     let remote_kill_switch = env_flag("IDORIS_REMOTE_KILL_SWITCH");
-    let runtimes = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
-        &cards,
-        &local_runtime_configs,
-        allocated_budget_bytes,
-        remote_kill_switch,
-    )?;
+    // 有托管卡时，Supervisor 要等托管引擎落定（就绪，或终局的失败）才能创建（它在创建时对引擎采样一次，引擎还没好就会把启动错误粘滞住）：
+    // 这里只做不启动任何任务的校验，完整的 Router（含 Supervisor）在启动门控完成时才创建并替换上去（接口规范 §2.7.6）。
+    let runtimes = if managed.is_some() {
+        RuntimeRegistry::validate_local_configs(&cards, &local_runtime_configs)?;
+        RuntimeRegistry::default()
+    } else {
+        RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
+            &cards,
+            &local_runtime_configs,
+            allocated_budget_bytes,
+            remote_kill_switch,
+        )?
+    };
     // Preserve startup-gate precedence: component/policy/runtime validation
     // (including subscription authorization and fixed card gates) must fail
     // before tenant storage/config bootstrap can surface a later error.
@@ -641,7 +658,8 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     let ingress_authenticator = cloud.then(|| virtual_key_authenticator.clone());
 
     let catalog_path = config::resolve_env("IDORIS_CATALOG", "config/catalog.yaml")?;
-    let capabilities = match host_facts::current_host_facts() {
+    // 目录与主机事实现在就读（读错是启动失败，顺序不变）；provider 依赖 Supervisor 表，有托管卡时在门控完成时才建。
+    let capabilities_inputs = match host_facts::current_host_facts() {
         Ok(facts) => {
             let catalog =
                 idoris_recommender::catalog::load_catalog(&catalog_path).map_err(|error| {
@@ -650,15 +668,23 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
                         catalog_path.display()
                     )
                 })?;
-            Some(Arc::new(
-                LiveCapabilitiesProvider::new(catalog, facts, runtimes.clone())
-                    .with_allocated_budget_bytes(allocated_budget_bytes),
-            ) as Arc<dyn CapabilitiesProvider>)
+            Some((catalog, facts))
         }
         Err(error) => {
             eprintln!("[idoris] capabilities unavailable: {error}");
             None
         }
+    };
+    let mut capabilities_inputs = capabilities_inputs;
+    let capabilities = if managed.is_some() {
+        None
+    } else {
+        capabilities_inputs.take().map(|(catalog, facts)| {
+            Arc::new(
+                LiveCapabilitiesProvider::new(catalog, facts, runtimes.clone())
+                    .with_allocated_budget_bytes(allocated_budget_bytes),
+            ) as Arc<dyn CapabilitiesProvider>
+        })
     };
 
     // 接口规范 §2.9 的只读推荐 / 本地模型列表。探测不到（没有 HOME、探不到内存）只让这两条路由返回 503，
@@ -915,60 +941,236 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
             &component_list
         }
     );
-    // 上游就绪探测器（接口规范 §2.11.1）：`/health` 只读它写的快照，O(1)。
+    // 引擎管理器（接口规范 §2.7.6）：有托管卡时，各托管引擎在后台走启动决策；完整的 Router 等它们都落定（就绪，或终局的失败：降级放行）才替换上去。
+    // 启动输入里 launcher 给的 `engine`（可执行文件、`stop_on_exit`）在这里才读到（帧在端口绑定之后读）。
+    let engines = match &managed {
+        Some(managed) => Some(managed.start(
+            allocated_budget_bytes,
+            &launcher.engine,
+            instance_id.clone(),
+            health_state.clone(),
+        )),
+        None => None,
+    };
+    let non_managed_plans: Vec<readiness::UpstreamPlan> = upstream_plans
+        .iter()
+        .filter(|plan| !plan.identity.managed)
+        .cloned()
+        .collect();
+    // 上游就绪探测器（接口规范 §2.11.1）：`/health` 只读它写的快照，O(1)。托管上游由引擎管理器写，探测器不碰；
+    // 有托管卡时探测器等门控完成之后才起（那时 Supervisor 表才有），之前数据面本来就是 503。
     let prober_cancel = CancellationToken::new();
-    let prober = readiness::spawn_prober(
-        readiness::ProberContext {
-            health: health_state,
-            plans: upstream_plans,
-            runtimes: state.runtimes.clone(),
-            client: state.http_client.clone(),
-            remote_kill_switch: state.remote_kill_switch.clone(),
-            timings: readiness::ProberTimings::default(),
-        },
-        prober_cancel.clone(),
-    );
-    // 停止的原因：SIGTERM、SIGINT，或登记客户端要求停止（`instance_conflict`、孤儿超时）。三者走同一条停止路径
-    // （接口规范 §2.7.5），原因在这里记下来，决定退出码、日志与是否发 `bye`。
+    let prober_slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    // 停止的原因：SIGTERM、SIGINT，登记客户端要求停止（`instance_conflict`、孤儿超时），或自己拉起的引擎失效（退出码 5）。
+    // 走同一条停止路径（接口规范 §2.7.5），原因在这里记下来，决定退出码、日志、是否发 `bye`、停不停引擎。
     let stop_cause: Arc<Mutex<Option<StopCause>>> = Arc::new(Mutex::new(None));
+    // 引擎的停止与 HTTP 排空并行（接口规范 §2.7.5 第 1 到 3 步）：停止原因一确定就在后台开始，之后等它做完。
+    let engines_stopping: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(None));
+    // 完整的服务体创建失败（门控完成时）：启动失败，退出码 1。
+    let gate_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let (gate, bodies) = match &engines {
+        Some(engines) => {
+            // 门控：数据面与 Admin 先服务「starting 体」。
+            let data = SwapApp::new(idoris_router::build_starting_app(state.clone()));
+            let admin = SwapApp::new(idoris_router::admin::build_admin_starting_app(
+                state.clone(),
+                admin_token.clone(),
+            ));
+            let finalize: lifecycle::gate::Finalize = {
+                let admin_token = admin_token.clone();
+                let prober_slot = prober_slot.clone();
+                let prober_cancel = prober_cancel.clone();
+                let mut state = state.clone();
+                let mut capabilities_inputs = capabilities_inputs;
+                let prober_inputs = (
+                    health_state.clone(),
+                    non_managed_plans.clone(),
+                    state.http_client.clone(),
+                    state.remote_kill_switch.clone(),
+                );
+                Box::new(move |outcome: &lifecycle::GateOutcome| {
+                    // 降级放行（有托管引擎终局失败，接口规范 §2.7.6 勘误六）：没就绪的托管卡不建 Supervisor——它会去采样一个没起来、
+                    // 或者没通过属主校验的端点；路由到这些卡的请求由 `managed_failures` 直接 503（带原因），别的卡照常服务。
+                    let runtime_cards: Vec<_> = state
+                        .cards
+                        .iter()
+                        .filter(|card| !outcome.degraded.contains_key(&card.provider.id))
+                        .cloned()
+                        .collect();
+                    let runtimes =
+                        RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
+                            &runtime_cards,
+                            &local_runtime_configs,
+                            allocated_budget_bytes,
+                            remote_kill_switch,
+                        )?;
+                    state.runtimes = runtimes.clone();
+                    state.managed_failures = Arc::new(outcome.degraded.clone());
+                    state.capabilities = capabilities_inputs.take().map(|(catalog, facts)| {
+                        Arc::new(
+                            LiveCapabilitiesProvider::new(catalog, facts, runtimes.clone())
+                                .with_allocated_budget_bytes(allocated_budget_bytes),
+                        ) as Arc<dyn CapabilitiesProvider>
+                    });
+                    let (health, plans, client, kill_switch) = prober_inputs;
+                    let prober = readiness::spawn_prober(
+                        readiness::ProberContext {
+                            health,
+                            plans,
+                            runtimes: runtimes.clone(),
+                            client,
+                            remote_kill_switch: kill_switch,
+                            timings: readiness::ProberTimings::default(),
+                        },
+                        prober_cancel,
+                    );
+                    *prober_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(prober);
+                    Ok(lifecycle::gate::Finalized {
+                        data: build_app(state.clone()),
+                        admin: build_admin_app_with_token(state, admin_token),
+                        runtimes,
+                    })
+                })
+            };
+            let gate = lifecycle::gate::spawn(
+                engines.clone(),
+                health_state.clone(),
+                data.clone(),
+                admin.clone(),
+                finalize,
+                prober_cancel.clone(),
+            );
+            (Some(gate), Some((data, admin)))
+        }
+        None => (None, None),
+    };
+    // 没有托管卡：与 v0.5.0 一样，探测器现在就起，服务体就是 `build_app` 的结果（下面）。
+    if bodies.is_none() {
+        let prober = readiness::spawn_prober(
+            readiness::ProberContext {
+                health: health_state.clone(),
+                plans: non_managed_plans.clone(),
+                runtimes: state.runtimes.clone(),
+                client: state.http_client.clone(),
+                remote_kill_switch: state.remote_kill_switch.clone(),
+                timings: readiness::ProberTimings::default(),
+            },
+            prober_cancel.clone(),
+        );
+        *prober_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(prober);
+    }
+    let gate_failed = async move {
+        match gate {
+            Some(gate) => match gate.failed.await {
+                Ok(message) => message,
+                // 任务结束而没有失败（门控完成，或被取消）：永远不是失败。
+                Err(_) => std::future::pending::<String>().await,
+            },
+            None => std::future::pending::<String>().await,
+        }
+    };
+    let launcher_stop_on_exit = launcher.engine.stop_on_exit;
     let shutdown_signal = {
         let registration = registration.clone();
         let stop_cause = stop_cause.clone();
+        let engines = engines.clone();
+        let engines_stopping = engines_stopping.clone();
+        let gate_failure = gate_failure.clone();
         async move {
-            let cause = match &registration {
-                Some(registration) => {
-                    tokio::select! {
-                        _ = termination_signal() => StopCause::Signal,
-                        cause = registration.wants_stop() => cause,
-                    }
-                }
-                None => {
-                    termination_signal().await;
-                    StopCause::Signal
+            // 引擎失效通常只在门控完成之后才会有（之前走重启与熔断；实例任务自己 panic 是例外，也报在这里）。
+            // 没有引擎管理器时永不返回。
+            let engine_failed = async {
+                match &engines {
+                    Some(engines) => engines.engine_failed().await,
+                    None => std::future::pending().await,
                 }
             };
-            if let Some(registration) = &registration {
-                // 立即返回：自愈马上停止；信号停止时 `bye`（至多 0.5 秒）与下面的 HTTP 排空并行。
+            let registration_stop = async {
+                match &registration {
+                    Some(registration) => registration.wants_stop().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let cause = tokio::select! {
+                _ = termination_signal() => Some(StopCause::Signal),
+                cause = registration_stop => Some(cause),
+                _ = engine_failed => Some(StopCause::EngineFailed),
+                message = gate_failed => {
+                    // 启动失败：不是任何一种「预期的停止」，不发 `bye`，退出码 1（调用方读到 `gate_failure` 后返回 `Err`）。
+                    *gate_failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(message);
+                    None
+                }
+            };
+            if let (Some(registration), Some(cause)) = (&registration, cause) {
+                // 立即返回：自愈马上停止；信号与引擎失效时 `bye`（至多 0.5 秒）与下面的 HTTP 排空并行。
                 registration.begin_stop(cause);
             }
-            // S3、S5 接入引擎之后，引擎的停止也在这里并行启动，由 `cause.stops_owned_engines(launcher.engine.stop_on_exit)`
-            // 决定停不停（`stop_on_exit:"never"` 只对退出码 0 有效）。S2 还没有引擎，这里什么也不停。
-            *stop_cause.lock().unwrap_or_else(PoisonError::into_inner) = Some(cause);
+            // 引擎的停止与 HTTP 排空并行：`stop_on_exit:"never"` 只对退出码 0 有效，退出码 4、5 与 3 一律停（接口规范 §2.7.5）；
+            // 启动失败当作要停（没有对外服务过，留着引擎没有意义）。
+            if let Some(engines) = engines {
+                let stop =
+                    cause.is_none_or(|cause| cause.stops_owned_engines(launcher_stop_on_exit));
+                let handle = tokio::spawn(async move { engines.shutdown(stop).await });
+                *engines_stopping
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(handle);
+            }
+            *stop_cause.lock().unwrap_or_else(PoisonError::into_inner) = cause;
         }
     };
-    let served = serve_bound_with_hooks(
-        data_listener,
-        admin_listener,
-        state,
-        admin_token,
-        shutdown_signal,
-        ServeHooks {
-            on_serving: serving_hook,
-        },
-    )
-    .await;
+    let served = match bodies {
+        Some((data, admin)) => {
+            serve_apps_with_hooks(
+                data_listener,
+                admin_listener,
+                data.router(),
+                admin.router(),
+                state.subscriptions.clone(),
+                shutdown_signal,
+                ServeHooks {
+                    on_serving: serving_hook,
+                },
+            )
+            .await
+        }
+        None => {
+            serve_bound_with_hooks(
+                data_listener,
+                admin_listener,
+                state,
+                admin_token,
+                shutdown_signal,
+                ServeHooks {
+                    on_serving: serving_hook,
+                },
+            )
+            .await
+        }
+    };
     prober_cancel.cancel();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), prober).await;
+    let prober = prober_slot
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some(prober) = prober {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), prober).await;
+    }
+    // 引擎的收尾：停止在停止原因确定时就已经开始（与排空并行），这里等它做完；服务自己倒了（没有走停止原因）时现在才停。
+    if let Some(engines) = &engines {
+        let stopping = engines_stopping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        match stopping {
+            Some(handle) => {
+                let _ = tokio::time::timeout(ENGINE_STOP_WAIT, handle).await;
+            }
+            None => {
+                let _ = tokio::time::timeout(ENGINE_STOP_WAIT, engines.shutdown(true)).await;
+            }
+        }
+    }
     // 登记客户端与自愈先收尾（`bye` 已在排空期间并行发出），之后才删发现文件：否则自愈可能在删除之后又把它写回来。
     if let Some(registration) = &registration {
         registration.finish().await;
@@ -978,11 +1180,18 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     if let Some(target) = discovery_target {
         remove_discovery_file(target, instance_id).await;
     }
+    if let Some(message) = gate_failure
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    {
+        return Err(message);
+    }
     let cause = stop_cause
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .take();
-    // 排空失败不能盖掉已经确定的停止原因（3、4）：决定在 `stop_report` 里，那里有测试。
+    // 排空失败不能盖掉已经确定的停止原因（3、4、5）：决定在 `stop_report` 里，那里有测试。
     let report = stop_report(cause, served, launcher.orphan_timeout_s);
     for line in report.lines {
         match line {
@@ -992,6 +1201,9 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     }
     report.result
 }
+
+/// 等引擎停止的上限：SIGTERM 之后 8 秒宽限，加上 SIGKILL 与收尾（`EngineManager::shutdown` 自己也有上限，这里是外面的兜底）。
+const ENGINE_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(14);
 
 /// 退出时删发现文件：只在文件属于自己时删；删不掉（旁路锁不可用或等锁超时、IO 失败）只留一行日志，文件成为崩溃残留，
 /// 由下一个拿到实例锁的实例覆盖。日志不含路径与文件内容（`launcher_discovery.rs` 里两条进程级测试逐字断言了这两行）。
@@ -1015,6 +1227,57 @@ async fn remove_discovery_file(target: Arc<discovery::DiscoveryTarget>, instance
                 "[idoris] 发现文件未删除：删除失败（文件保留，下一个实例会覆盖）",
             );
         }
+    }
+}
+
+/// 托管卡的计划（接口规范 §2.7.6）：有 `idoris_managed` 声明的卡由引擎管理器托管；没有任何托管卡时没有这个值，
+/// 整个引擎管理与启动门控都不参与，行为与 v0.5.0 字节级一致。
+struct ManagedEngines {
+    plans: Vec<lifecycle::ManagedPlan>,
+    state_dir: std::path::PathBuf,
+}
+
+impl ManagedEngines {
+    /// 校验托管卡（endpoint 形状、引擎种类、端口不重复）与状态目录。出错是启动失败。
+    fn plan(upstreams: &[readiness::UpstreamPlan]) -> Result<Option<Self>, String> {
+        let plans = lifecycle::plan_managed(upstreams).map_err(|error| error.to_string())?;
+        if plans.is_empty() {
+            return Ok(None);
+        }
+        // 所有权记录、引擎日志、oMLX 自己的 base、加载围栏都在状态目录下：没有它就没法托管。
+        let state_dir = discovery::resolve_state_dir().ok_or_else(|| {
+            "托管引擎需要状态目录：请设置绝对路径的 IDORIS_STATE_DIR（或绝对路径的 HOME）"
+                .to_string()
+        })?;
+        Ok(Some(Self { plans, state_dir }))
+    }
+
+    /// 启动各托管引擎的实例任务。`frame` 是 launcher 帧里的 `engine`（可执行文件与 `stop_on_exit`）。
+    fn start(
+        &self,
+        allocated_budget_bytes: Option<u64>,
+        frame: &launcher_frame::EngineFrame,
+        launched_by: String,
+        health: readiness::HealthState,
+    ) -> Arc<lifecycle::EngineManager> {
+        let stop_on_exit = match frame.stop_on_exit {
+            launcher_frame::StopOnExit::Owned => idoris_upstream::engine::StopOnExit::Owned,
+            launcher_frame::StopOnExit::Never => idoris_upstream::engine::StopOnExit::Never,
+        };
+        Arc::new(lifecycle::EngineManager::start(
+            lifecycle::ManagerConfig {
+                state_dir: self.state_dir.clone(),
+                allocated_budget_bytes,
+                stop_on_exit,
+                executables: frame.executables.clone(),
+                launched_by,
+                timings: lifecycle::Timings::default(),
+                inspector: Arc::new(idoris_upstream::engine::SystemInspector::new()),
+                log: register::stderr_log(),
+            },
+            self.plans.clone(),
+            health,
+        ))
     }
 }
 
@@ -1225,15 +1488,41 @@ async fn serve_bound_with_hooks<S>(
 where
     S: Future<Output = ()>,
 {
+    let subscriptions = state.subscriptions.clone();
+    let data_app = build_app(state.clone());
+    let admin_app = build_admin_app_with_token(state, admin_token.into());
+    serve_apps_with_hooks(
+        data_listener,
+        admin_listener,
+        data_app,
+        admin_app,
+        subscriptions,
+        shutdown_signal,
+        hooks,
+    )
+    .await
+}
+
+/// 与 [`serve_bound_with_hooks`] 一样，只是服务体由调用方给：有托管卡时是两个 [`SwapApp::router`]（启动期服务
+/// 「starting 体」，引擎就绪之后换成完整的 Router，接口规范 §2.7.6）。
+async fn serve_apps_with_hooks<S>(
+    data_listener: tokio::net::TcpListener,
+    admin_listener: tokio::net::TcpListener,
+    data_app: axum::Router,
+    admin_app: axum::Router,
+    subscriptions: SubscriptionRuntimeRegistry,
+    shutdown_signal: S,
+    hooks: ServeHooks,
+) -> Result<(), String>
+where
+    S: Future<Output = ()>,
+{
     let data_addr = data_listener
         .local_addr()
         .map_err(|err| format!("无法读取 data listener 地址：{err}"))?;
     let admin_addr = admin_listener
         .local_addr()
         .map_err(|err| format!("无法读取 Admin listener 地址：{err}"))?;
-    let subscriptions = state.subscriptions.clone();
-    let data_app = build_app(state.clone());
-    let admin_app = build_admin_app_with_token(state, admin_token.into());
     let shutdown = CancellationToken::new();
     let data_listener = WriteTimeoutListener::new(
         ConnectionListener::new(data_listener, shutdown.clone())
@@ -1354,6 +1643,8 @@ mod tests {
 
     const CONFLICT_LINE: &str =
         "idoris: 登记被 agent24d 以 instance_conflict 拒绝（已有另一个健康实例），已停止";
+    const ENGINE_FAILED_LINE: &str =
+        "idoris: 自己拉起的引擎已失效，无法在进程内恢复，已停止（退出码 5，由启动器重启）";
 
     fn stderr(text: &str) -> StopLine {
         StopLine::Stderr(text.to_string())
@@ -1384,6 +1675,14 @@ mod tests {
             StopReport {
                 lines: vec![stderr("idoris: 无启动器登记超过 900 秒，已停止")],
                 result: Ok(4),
+            }
+        );
+        // 自己拉起的引擎失效（规范 §2.7.5）：退出码 5，原因行写 stderr，说明无法在进程内恢复、由启动器重启。
+        assert_eq!(
+            stop_report(Some(StopCause::EngineFailed), Ok(()), 0),
+            StopReport {
+                lines: vec![stderr(ENGINE_FAILED_LINE)],
+                result: Ok(5),
             }
         );
     }
@@ -1442,6 +1741,27 @@ mod tests {
                     ),
                 ],
                 result: Ok(4),
+            }
+        );
+    }
+
+    /// 退出码 5 与 3、4 一样：原因已经确定，排空超时不把它变成 1（launcher 把 1 当崩溃，而 5 要让界面显示「模型引擎异常」）。
+    #[test]
+    fn a_drain_timeout_does_not_turn_an_engine_failure_into_exit_code_1() {
+        assert_eq!(
+            stop_report(
+                Some(StopCause::EngineFailed),
+                Err(shutdown_timeout_message()),
+                0
+            ),
+            StopReport {
+                lines: vec![
+                    stderr(ENGINE_FAILED_LINE),
+                    stderr(
+                        "[idoris] 停止失败：优雅停机超过 10s，强制退出（停止原因已确定，退出码仍为 5）"
+                    ),
+                ],
+                result: Ok(5),
             }
         );
     }

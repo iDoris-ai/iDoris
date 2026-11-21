@@ -552,16 +552,9 @@ async fn contradictory_setup_flags_are_a_usage_error_before_anything_runs() {
         vec!["--out-dir", out_str, "--auto", "--no-probe"],
         vec!["--out-dir", out_str, "--managed-port", "19731"],
         vec!["--out-dir", out_str, "--managed", "--managed-port", "0"],
+        // 托管不连引擎，用不上 key。（`--auto` 带 key 在 #619 落地之后是合法的：它会去探测本机的候选端口，所以这里不拿它
+        // 当「会被拒绝」的用法错误来跑；解析层见 cli.rs 的单元测试，流程见 setup_omlx_flows.rs，那里候选端口是注入的。）
         vec!["--out-dir", out_str, "--managed", "--api-key-stdin"],
-        // `--auto` 探测的端口是猜的：端口属主校验（#619）落地之前不发 key，要鉴权的引擎用 `--endpoint`。
-        vec!["--out-dir", out_str, "--auto", "--api-key-stdin"],
-        vec![
-            "--out-dir",
-            out_str,
-            "--auto",
-            "--managed",
-            "--api-key-stdin",
-        ],
     ] {
         let o = cli(&args, None, Some(&format!("{KEY}\n"))).await;
         assert_eq!(o.code, 1, "{args:?}");

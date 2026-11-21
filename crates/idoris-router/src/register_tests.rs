@@ -423,16 +423,23 @@ fn stop_causes_map_to_exit_codes_and_stop_on_exit_never_only_counts_for_exit_0()
     assert_eq!(StopCause::Signal.exit_code(), 0);
     assert_eq!(StopCause::InstanceConflict.exit_code(), 3);
     assert_eq!(StopCause::OrphanTimeout.exit_code(), 4);
+    assert_eq!(StopCause::EngineFailed.exit_code(), 5);
     assert_eq!(EXIT_INSTANCE_CONFLICT, 3);
     assert_eq!(EXIT_ORPHAN_TIMEOUT, 4);
-    // `bye` 只在信号停止时发：孤儿超时与 `instance_conflict` 都发生在没有已 ack 的会话时。
+    assert_eq!(EXIT_ENGINE_FAILED, 5);
+    // `bye` 只在优雅停止时发（信号，或自有引擎失效的退出码 5）：孤儿超时与 `instance_conflict` 都发生在没有已 ack 的会话时。
     assert!(StopCause::Signal.says_bye());
+    assert!(StopCause::EngineFailed.says_bye());
     assert!(!StopCause::InstanceConflict.says_bye());
     assert!(!StopCause::OrphanTimeout.says_bye());
-    // 规范 §2.7.5：`never` 只对退出码 0 有效；退出码 4、因 `instance_conflict` 退出的 3 一律停自己拉起的引擎。
+    // 规范 §2.7.5：`never` 只对退出码 0 有效；退出码 4、5、因 `instance_conflict` 退出的 3 一律停自己拉起的引擎。
     assert!(StopCause::Signal.stops_owned_engines(StopOnExit::Owned));
     assert!(!StopCause::Signal.stops_owned_engines(StopOnExit::Never));
-    for cause in [StopCause::InstanceConflict, StopCause::OrphanTimeout] {
+    for cause in [
+        StopCause::InstanceConflict,
+        StopCause::OrphanTimeout,
+        StopCause::EngineFailed,
+    ] {
         assert!(cause.stops_owned_engines(StopOnExit::Owned), "{cause:?}");
         assert!(cause.stops_owned_engines(StopOnExit::Never), "{cause:?}");
     }

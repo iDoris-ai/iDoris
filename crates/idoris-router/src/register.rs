@@ -56,6 +56,8 @@ pub const FRAME_VERSION: u64 = 1;
 pub const EXIT_INSTANCE_CONFLICT: u8 = 3;
 /// 孤儿超时的退出码（规范 §2.7.5 新增）。
 pub const EXIT_ORPHAN_TIMEOUT: u8 = 4;
+/// iDoris 自己拉起的引擎失效、进程内无法恢复的退出码（规范 §2.7.5 新增，设计稿 D4 的 B）。
+pub const EXIT_ENGINE_FAILED: u8 = 5;
 
 const REGISTER_LABEL: &str = "idoris-register/v1";
 const ACK_LABEL: &str = "idoris-ack/v1";
@@ -76,6 +78,10 @@ pub enum StopCause {
     InstanceConflict,
     /// 超过 `orphan_timeout_s` 没有已 `ack` 的登记会话：退出码 4，不发 `bye`（同一条规则；按定义也没有会话可发）。
     OrphanTimeout,
+    /// iDoris 自己拉起的引擎失效，v0.6.0 无法在进程内恢复（热恢复是 v0.6.1）：优雅停止，退出码 5，由 agent24d 重启走全新的
+    /// 启动门控。信号以外唯一**发 `bye`** 的停止（规范 §2.10.8、§2.10.10 第 10 条）；一律停掉自己拥有的引擎。原因来自引擎管理器
+    /// （`lifecycle::EngineManager::engine_failed`），不来自登记客户端，所以走 `bin` 里与信号并列的那条路，不经 `wants_stop`。
+    EngineFailed,
 }
 
 impl StopCause {
@@ -84,28 +90,29 @@ impl StopCause {
             Self::Signal => 0,
             Self::InstanceConflict => EXIT_INSTANCE_CONFLICT,
             Self::OrphanTimeout => EXIT_ORPHAN_TIMEOUT,
+            Self::EngineFailed => EXIT_ENGINE_FAILED,
         }
     }
 
     /// 停止时要不要在已建立的登记会话上发 `bye`（规范 §2.10.8、§2.10.10 第 10 条：信号停止，或退出码 5 的停止，并且当时存在
-    /// 已 `ack` 的会话，才尽力发，让 agent24d 区分「预期停止」与「崩溃」；其他退出路径不发）。信号停止发；孤儿超时与
-    /// `instance_conflict`（包括会话里收到的）不是这两种停止，不发。S5 加上「自有引擎失效，退出码 5」之后，那个原因在这里返回 `true`。
+    /// 已 `ack` 的会话，才尽力发，让 agent24d 区分「预期停止」与「崩溃」；其他退出路径不发）。信号停止与自有引擎失效
+    /// （退出码 5）发；孤儿超时与 `instance_conflict`（包括会话里收到的）不是这两种停止，不发。
     pub fn says_bye(self) -> bool {
         match self {
-            Self::Signal => true,
+            Self::Signal | Self::EngineFailed => true,
             Self::InstanceConflict | Self::OrphanTimeout => false,
         }
     }
 
     /// 停止时要不要停掉**自己拉起**的引擎（规范 §2.7.5）：`engine.stop_on_exit:"never"` **只对退出码 0 有效**
     /// （正常停止，升级重启时保留引擎给下一个 iDoris 接管）；孤儿超时（4）、因 `instance_conflict` 退出的 3
-    /// （以及以后的 5）一律停，否则会留下没有任何管理者的引擎，正是孤儿策略要避免的「孤儿占内存」。
+    /// 与 5（自有引擎失效）一律停，否则会留下没有任何管理者的引擎，正是孤儿策略要避免的「孤儿占内存」。
     ///
-    /// S2 还没有引擎（S3、S5 才有）：这里只定下判定，S5 的停止路径调用它。
+    /// `bin` 的停止路径（引擎管理器的 `shutdown`）按这里的判定停或不停。
     pub fn stops_owned_engines(self, stop_on_exit: StopOnExit) -> bool {
         match self {
             Self::Signal => stop_on_exit == StopOnExit::Owned,
-            Self::InstanceConflict | Self::OrphanTimeout => true,
+            Self::InstanceConflict | Self::OrphanTimeout | Self::EngineFailed => true,
         }
     }
 }

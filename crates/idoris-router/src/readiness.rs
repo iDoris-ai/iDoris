@@ -79,8 +79,41 @@ pub enum UpstreamState {
     Absent,
 }
 
+impl UpstreamState {
+    /// 线上的字符串（与 serde 的 `snake_case` 一致），给日志用。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Starting => "starting",
+            Self::Unavailable => "unavailable",
+            Self::Restarting => "restarting",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+impl UpstreamReason {
+    /// 线上的字符串（与 serde 的 `snake_case` 一致），给日志用。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EngineNotFound => "engine_not_found",
+            Self::PortInUse => "port_in_use",
+            Self::AuthRequired => "auth_required",
+            Self::AuthFailed => "auth_failed",
+            Self::StartupTimeout => "startup_timeout",
+            Self::CrashLoop => "crash_loop",
+            Self::FencePending => "fence_pending",
+            Self::BudgetZero => "budget_zero",
+            Self::BaseUnavailable => "base_unavailable",
+            Self::StartupLatched => "startup_latched",
+        }
+    }
+}
+
 /// `upstreams[].reason`：稳定原因码。给人看的文字另放，不属于契约。S1 只会产生 `auth_required`、
-/// `auth_failed`、`startup_latched`。
+/// `auth_failed`、`startup_latched`；其余由引擎管理器（S5）产生。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamReason {
@@ -92,7 +125,18 @@ pub enum UpstreamReason {
     CrashLoop,
     FencePending,
     BudgetZero,
+    /// iDoris 自己的 oMLX base 目录建不出来或核对不过（规范 §2.7.6）。
+    BaseUnavailable,
     StartupLatched,
+}
+
+/// 门控降级放行时没有就绪的托管上游（接口规范 §2.7.6，勘误六）：路由到它的请求不碰引擎，直接 503，原因码取自 `reason`
+/// （没有稳定原因码的失败，例如模型目录取不到，沿用已有的 `supervisor_unavailable`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedFailure {
+    pub engine_kind: String,
+    pub state: UpstreamState,
+    pub reason: Option<UpstreamReason>,
 }
 
 /// `/health.upstreams[]` 的元素。`reason` 出现时 `state` 不是 `ready`。
@@ -105,7 +149,7 @@ pub struct UpstreamStatus {
     pub reason: Option<UpstreamReason>,
     /// 卡声明了由 iDoris 管理引擎（`extensions.idoris_managed`）。
     pub managed: bool,
-    /// 引擎进程是 iDoris 自己拉起的。S1 恒为 false。
+    /// 引擎进程是 iDoris 自己拉起的（含接管上一个 iDoris 留下的）。外部引擎、没有引擎管理器的卡恒为 false。
     pub owned: bool,
 }
 
@@ -126,13 +170,60 @@ impl Phase {
     }
 }
 
-/// 由上游状态推出 `phase`。
+/// 启动门控（规范 §2.7.6「与 Supervisor、围栏、`/health` 的关系」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateState {
+    /// 没有托管卡：门控视为立即完成，`phase` 只由上游状态推出（v0.5.0 的行为，字节级不变）。
+    NotGated,
+    /// 有托管卡，完整的 Router 还没有替换上去：数据面除 `/health` 外一律 503 `idoris_starting`。
+    Pending,
+    /// 门控已完成（完整的 Router 已替换）。
+    Open,
+}
+
+/// 上游处于终态（`absent`、`failed`、`unavailable`、`stopped`）：此刻没有在往就绪走，要等外部变化（用户装好引擎、外部
+/// 引擎自己恢复）、半开重试或显式 `start` 才会回到就绪（门控降级放行之后，没就绪的托管引擎冻结，只有重启 iDoris 才会）。
+/// 托管上游处于终态是它「落定」的失败，不拖住门控（接口规范 §2.7.6，勘误六）；`phase` 是 `degraded`（规范 §2.11.1）。
+fn is_terminal(state: UpstreamState) -> bool {
+    matches!(
+        state,
+        UpstreamState::Absent
+            | UpstreamState::Failed
+            | UpstreamState::Unavailable
+            | UpstreamState::Stopped
+    )
+}
+
+/// 门控未完成时的 `phase`（规范 §2.11.1）：任一托管上游已经处于终态（落定的失败；其余托管上游落定之后门控降级放行）是
+/// `degraded`；否则门控仍在进行
+/// （正在探测、拉起引擎或等它就绪），是 `starting`。门控未完成时不会是 `ready`，哪怕某张 resident 卡已经探测为 `ready`。
+fn gated_phase(upstreams: &[UpstreamStatus]) -> Phase {
+    if upstreams
+        .iter()
+        .any(|upstream| upstream.managed && is_terminal(upstream.state))
+    {
+        Phase::Degraded
+    } else {
+        Phase::Starting
+    }
+}
+
+/// 由上游状态推出 `phase`（没有门控，或门控已完成）。
+///
+/// 门控放行之后，有托管上游处于终态（`absent`、`failed`、`unavailable`、`stopped`）是 `degraded`，哪怕别的上游
+/// 都在服务：门控不会被一个起不来的托管引擎拖住（接口规范 §2.7.6，勘误六），但界面要能看出有一个托管引擎没好。
+/// 没有托管上游时这一条不起作用（`managed` 恒为 false），行为与 v0.5.0 一致。
 pub fn phase_of(upstreams: &[UpstreamStatus]) -> Phase {
     if upstreams
         .iter()
         .any(|upstream| upstream.state == UpstreamState::Starting)
     {
         Phase::Starting
+    } else if upstreams
+        .iter()
+        .any(|upstream| upstream.managed && is_terminal(upstream.state))
+    {
+        Phase::Degraded
     } else if upstreams
         .iter()
         .any(|upstream| upstream.state == UpstreamState::Ready)
@@ -166,6 +257,7 @@ pub enum Observation {
 struct Inner {
     started_at_ms: u64,
     registered: AtomicBool,
+    gate: RwLock<GateState>,
     upstreams: RwLock<Vec<UpstreamStatus>>,
 }
 
@@ -200,6 +292,7 @@ impl HealthState {
             inner: Arc::new(Inner {
                 started_at_ms,
                 registered: AtomicBool::new(false),
+                gate: RwLock::new(GateState::NotGated),
                 upstreams: RwLock::new(upstreams),
             }),
         }
@@ -219,6 +312,24 @@ impl HealthState {
         self.inner.registered.store(registered, Ordering::SeqCst);
     }
 
+    /// 启动门控的当前状态。
+    pub fn gate(&self) -> GateState {
+        *self
+            .inner
+            .gate
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 引擎管理器（S5）设置：有托管卡时先 [`GateState::Pending`]，完整的 Router 替换上去之后 [`GateState::Open`]。
+    pub fn set_gate(&self, gate: GateState) {
+        *self
+            .inner
+            .gate
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = gate;
+    }
+
     fn read(&self) -> Vec<UpstreamStatus> {
         self.inner
             .upstreams
@@ -227,9 +338,34 @@ impl HealthState {
             .clone()
     }
 
+    /// 引擎管理器写一个托管上游的状态（它是这些上游的唯一写者，探测器不碰它们）。不认识的 id 什么也不改。
+    pub fn set_managed(
+        &self,
+        id: &str,
+        state: UpstreamState,
+        reason: Option<UpstreamReason>,
+        owned: bool,
+    ) {
+        let mut upstreams = self
+            .inner
+            .upstreams
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(upstream) = upstreams.iter_mut().find(|upstream| upstream.id == id) {
+            upstream.state = state;
+            upstream.reason = reason;
+            upstream.owned = owned;
+        }
+    }
+
     pub fn view(&self) -> HealthView {
+        // 先读门控再读上游：门控从 Pending 变成 Open 发生在上游都落定之后，这样读到 Open 时看到的上游不会比门控旧。
+        let gate = self.gate();
         let upstreams = self.read();
-        let phase = phase_of(&upstreams);
+        let phase = match gate {
+            GateState::Pending => gated_phase(&upstreams),
+            GateState::NotGated | GateState::Open => phase_of(&upstreams),
+        };
         HealthView {
             phase,
             ready: phase == Phase::Ready,
@@ -239,14 +375,15 @@ impl HealthState {
         }
     }
 
-    /// 是否还有上游没有第一次观测。
+    /// 是否还有**探测器管的**上游没有第一次观测。托管上游由引擎管理器写，它们的 `starting` 是在拉起、等就绪，
+    /// 不该让探测器一直用启动期的勤快间隔去探别的卡。
     pub fn any_starting(&self) -> bool {
         self.inner
             .upstreams
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .any(|upstream| upstream.state == UpstreamState::Starting)
+            .any(|upstream| !upstream.managed && upstream.state == UpstreamState::Starting)
     }
 
     /// 写入一次观测。`reason` 只在 `unavailable` 时出现；`NoChange` 不动。
@@ -303,7 +440,7 @@ impl UpstreamPlan {
         &self.card
     }
 
-    /// 探测之前的初始状态：`starting`，没有原因，`owned` 恒 false（S1 不拉起任何进程）。
+    /// 探测之前的初始状态：`starting`，没有原因，`owned` 为 false（托管卡由引擎管理器接着写）。
     pub fn initial_status(&self) -> UpstreamStatus {
         UpstreamStatus {
             id: self.id.clone(),
@@ -370,8 +507,8 @@ pub async fn probe_resident(
     let mut request = client.get(&url).timeout(timeout);
     let mut key_sent = false;
     if crate::models::is_loopback_omlx(card)
-        && let Some(key) =
-            idoris_upstream::omlx::key::resolve_omlx_api_key_os(true).filter(|key| !key.is_empty())
+        && let Some(key) = idoris_upstream::omlx::key::resolve_omlx_api_key_os_for(&card.endpoint)
+            .filter(|key| !key.is_empty())
     {
         // 非 UTF-8、放不进请求头的 key 是无效凭证，不是「没有凭证」（与 `GET /v1/models` 同口径）。
         let Some(mut authorization) = key
@@ -580,6 +717,187 @@ mod tests {
         }
     }
 
+    fn managed_status(id: &str, state: UpstreamState) -> UpstreamStatus {
+        UpstreamStatus {
+            managed: true,
+            ..status(id, state, None)
+        }
+    }
+
+    #[test]
+    fn while_the_gate_is_pending_phase_is_starting_unless_a_managed_engine_is_stuck() {
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(0, vec![managed_status("omlx", Starting)]);
+        assert_eq!(
+            health.gate(),
+            GateState::NotGated,
+            "no managed card: no gate"
+        );
+        health.set_gate(GateState::Pending);
+        // Probing, spawning, waiting for ready, backing off: still in progress.
+        for state in [Starting, Restarting] {
+            health.set_managed("omlx", state, None, false);
+            let view = health.view();
+            assert_eq!(
+                (view.phase, view.ready),
+                (Phase::Starting, false),
+                "{state:?}"
+            );
+        }
+        // Terminal states keep the gate from ever completing: degraded, not starting.
+        for state in [Absent, Failed, Unavailable, Stopped] {
+            health.set_managed("omlx", state, None, false);
+            let view = health.view();
+            assert_eq!(
+                (view.phase, view.ready),
+                (Phase::Degraded, false),
+                "{state:?}"
+            );
+        }
+        // Even a ready engine is not `ready` until the full router has replaced the starting body.
+        health.set_managed("omlx", Ready, None, true);
+        let view = health.view();
+        assert_eq!((view.phase, view.ready), (Phase::Starting, false));
+        health.set_gate(GateState::Open);
+        let view = health.view();
+        assert_eq!((view.phase, view.ready), (Phase::Ready, true));
+    }
+
+    #[test]
+    fn a_resident_card_that_probes_ready_does_not_make_a_pending_gate_ready() {
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", Starting),
+                status("lmstudio", Ready, None),
+            ],
+        );
+        health.set_gate(GateState::Pending);
+        assert_eq!(health.view().phase, Phase::Starting);
+        // A terminal state on a card that is not managed does not hold the gate (it is not the manager's).
+        health.apply("lmstudio", Observation::Unavailable(None));
+        assert_eq!(health.view().phase, Phase::Starting);
+        health.set_managed("omlx", Failed, Some(UpstreamReason::CrashLoop), false);
+        assert_eq!(health.view().phase, Phase::Degraded);
+    }
+
+    #[test]
+    fn after_the_gate_opens_phase_follows_the_upstreams_again() {
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(0, vec![managed_status("omlx", Ready)]);
+        health.set_gate(GateState::Open);
+        assert_eq!(health.view().phase, Phase::Ready);
+        health.set_managed("omlx", Unavailable, None, true);
+        assert_eq!(health.view().phase, Phase::Degraded);
+        health.set_managed("omlx", Ready, None, true);
+        assert_eq!(health.view().phase, Phase::Ready);
+    }
+
+    #[test]
+    fn after_the_gate_a_managed_upstream_in_a_terminal_state_is_degraded_even_while_another_upstream_serves()
+     {
+        // 门控不被一个起不来的托管引擎拖住（降级放行，规范 §2.7.6 勘误六）：别的上游照常服务，但 `phase` 要让界面看出
+        // 有一个托管引擎没好：`degraded`，不是 `ready`。
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", Absent),
+                status("lmstudio", Ready, None),
+            ],
+        );
+        health.set_gate(GateState::Open);
+        for state in [Absent, Failed, Unavailable, Stopped] {
+            health.set_managed("omlx", state, None, false);
+            let view = health.view();
+            assert_eq!(
+                (view.phase, view.ready),
+                (Phase::Degraded, false),
+                "{state:?}"
+            );
+        }
+        // 一个上游还没有第一次观测（探测器刚起）：还是 `starting`。
+        health.apply("lmstudio", Observation::Unavailable(None));
+        health.set_managed("omlx", Failed, Some(UpstreamReason::CrashLoop), false);
+        assert_eq!(health.view().phase, Phase::Degraded);
+        // 托管引擎好了（或者它根本就绪），别的上游照常：`ready`。
+        health.apply("lmstudio", Observation::Ready);
+        health.set_managed("omlx", Ready, None, true);
+        assert_eq!(health.view().phase, Phase::Ready);
+    }
+
+    #[test]
+    fn a_non_managed_upstream_that_is_down_never_degrades_the_phase_while_another_is_ready() {
+        // v0.5.0 的口径不变：`managed` 才算；没有托管卡时这一条不起作用。
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(
+            0,
+            vec![status("a", Ready, None), status("b", Unavailable, None)],
+        );
+        assert_eq!(health.gate(), GateState::NotGated);
+        assert_eq!(health.view().phase, Phase::Ready);
+        health.set_gate(GateState::Open);
+        assert_eq!(health.view().phase, Phase::Ready);
+    }
+
+    #[test]
+    fn set_managed_writes_state_reason_and_owned_and_ignores_unknown_ids() {
+        let health = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", UpstreamState::Starting),
+                status("other", UpstreamState::Starting, None),
+            ],
+        );
+        health.set_managed(
+            "omlx",
+            UpstreamState::Restarting,
+            Some(UpstreamReason::StartupTimeout),
+            true,
+        );
+        let view = health.view();
+        let omlx = &view.upstreams[0];
+        assert_eq!(omlx.state, UpstreamState::Restarting);
+        assert_eq!(omlx.reason, Some(UpstreamReason::StartupTimeout));
+        assert!(omlx.owned);
+        assert!(
+            omlx.managed,
+            "the manager does not change what the card declared"
+        );
+        // Another upstream is untouched, and so is everything when the id is unknown.
+        assert_eq!(view.upstreams[1].state, UpstreamState::Starting);
+        health.set_managed("missing", UpstreamState::Failed, None, true);
+        assert_eq!(health.view().upstreams.len(), 2);
+        // A later state without a reason clears the old one.
+        health.set_managed("omlx", UpstreamState::Ready, None, true);
+        assert_eq!(health.view().upstreams[0].reason, None);
+    }
+
+    #[test]
+    fn the_prober_ignores_a_managed_engines_starting_state() {
+        let health = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", UpstreamState::Starting),
+                status("lmstudio", UpstreamState::Ready, None),
+            ],
+        );
+        assert!(
+            !health.any_starting(),
+            "the manager's `starting` is not an upstream the prober has yet to observe"
+        );
+        health.apply("lmstudio", Observation::Unavailable(None));
+        let other = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", UpstreamState::Ready),
+                status("lmstudio", UpstreamState::Starting, None),
+            ],
+        );
+        assert!(other.any_starting());
+    }
+
     #[test]
     fn the_view_is_internally_consistent_and_registered_defaults_to_false() {
         let health = HealthState::with_upstreams(
@@ -654,6 +972,11 @@ mod tests {
             (UpstreamState::Absent, "absent"),
         ] {
             assert_eq!(serde_json::to_value(state).unwrap(), json!(expected));
+            assert_eq!(
+                state.as_str(),
+                expected,
+                "the log spelling follows the wire"
+            );
         }
         for (reason, expected) in [
             (UpstreamReason::EngineNotFound, "engine_not_found"),
@@ -664,9 +987,15 @@ mod tests {
             (UpstreamReason::CrashLoop, "crash_loop"),
             (UpstreamReason::FencePending, "fence_pending"),
             (UpstreamReason::BudgetZero, "budget_zero"),
+            (UpstreamReason::BaseUnavailable, "base_unavailable"),
             (UpstreamReason::StartupLatched, "startup_latched"),
         ] {
             assert_eq!(serde_json::to_value(reason).unwrap(), json!(expected));
+            assert_eq!(
+                reason.as_str(),
+                expected,
+                "the log spelling follows the wire"
+            );
         }
     }
 

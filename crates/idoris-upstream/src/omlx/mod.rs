@@ -79,6 +79,24 @@ pub const DEFAULT_CHAT_TIMEOUT: Duration = Duration::from_secs(120);
 /// in an error message.
 pub const OMLX_API_KEY_ENV: &str = "IDORIS_OMLX_API_KEY";
 
+/// Where the durable load fence of the engine at `base_url` lives under the state directory `root`:
+/// `<root>/omlx/<the endpoint, percent-encoded as a whole>/load.pending`. [`OmlxAdapter`]'s fence path is this
+/// (with `root` resolved from `IDORIS_STATE_DIR` / `HOME`); the engine manager clears the very same file when it
+/// has just spawned (or killed and respawned) an engine it owns, so both sides must agree on the path: there is
+/// one implementation, here. Credentials and fragments in the URL do not identify a different engine.
+pub fn load_fence_path_in(
+    root: &std::path::Path,
+    base_url: &str,
+) -> Result<std::path::PathBuf, BackendError> {
+    let mut endpoint = reqwest::Url::parse(base_url)
+        .map_err(|_| BackendError::internal("invalid oMLX endpoint for load fence"))?;
+    let _ = endpoint.set_username("");
+    let _ = endpoint.set_password(None);
+    endpoint.set_fragment(None);
+    let key = utf8_percent_encode(endpoint.as_str().trim_end_matches('/'), NON_ALPHANUMERIC);
+    Ok(root.join("omlx").join(key.to_string()).join("load.pending"))
+}
+
 /// `BackendError` has no `upstream()` constructor (only `Upstream
 /// { message }`) — shorthand shared by `http` and `status`.
 pub(crate) fn upstream_error(message: impl Into<String>) -> BackendError {
@@ -480,14 +498,7 @@ impl RuntimeAdapter for OmlxAdapter {
                     "a persistent absolute IDORIS_STATE_DIR or HOME is required for the load fence",
                 )
             })?;
-        let mut endpoint = reqwest::Url::parse(&self.base_url)
-            .map_err(|_| BackendError::internal("invalid oMLX endpoint for load fence"))?;
-        // Credentials and fragments do not identify a different engine.
-        let _ = endpoint.set_username("");
-        let _ = endpoint.set_password(None);
-        endpoint.set_fragment(None);
-        let key = utf8_percent_encode(endpoint.as_str().trim_end_matches('/'), NON_ALPHANUMERIC);
-        Ok(root.join("omlx").join(key.to_string()).join("load.pending"))
+        load_fence_path_in(&root, &self.base_url)
     }
 
     async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {

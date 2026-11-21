@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use idoris_contracts::ComponentCard;
 use idoris_recommender::local_models::{default_models_dir, scan_local_models};
 #[cfg(unix)]
-use idoris_upstream::omlx::engine::OmlxRecipe;
+use idoris_upstream::engine::{ListenerPolicy, ListenerVerifier, SystemInspector};
+#[cfg(unix)]
+use idoris_upstream::omlx::engine::{OMLX_TEAM_ID, OmlxRecipe};
 use serde_json::Value;
 
 use crate::cli::SetupOptions;
@@ -116,6 +118,9 @@ fn check_model_dir_path(dir: &Path) -> Result<(), SetupError> {
 pub struct OmlxSetup {
     #[cfg(unix)]
     recipe: OmlxRecipe,
+    /// `--auto` 带 key 时，向要鉴权的候选端口发 key 之前，校验监听者（同一个用户、oMLX 的签名团队，#619）。
+    #[cfg(unix)]
+    listener: ListenerVerifier,
     models_dir: Option<PathBuf>,
     #[cfg_attr(not(unix), allow(dead_code))]
     explicit_executable: Option<PathBuf>,
@@ -140,6 +145,11 @@ impl OmlxSetup {
         Self {
             #[cfg(unix)]
             recipe,
+            #[cfg(unix)]
+            listener: ListenerVerifier::new(
+                std::sync::Arc::new(SystemInspector::new()),
+                ListenerPolicy::new(OMLX_TEAM_ID),
+            ),
             models_dir: home.as_deref().map(default_models_dir),
             explicit_executable: None,
             auto_ports: AUTO_PORTS.to_vec(),
@@ -168,6 +178,13 @@ impl OmlxSetup {
     /// 换掉离线核对 `--bind` 用的模型目录。
     pub fn with_models_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.models_dir = Some(dir.into());
+        self
+    }
+
+    /// 换掉端口属主校验器（测试里用可编排的检查器，不依赖本机的 `lsof` 与 `codesign`）。
+    #[cfg(unix)]
+    pub fn with_listener_verifier(mut self, listener: ListenerVerifier) -> Self {
+        self.listener = listener;
         self
     }
 }
@@ -213,6 +230,19 @@ impl SetupEngine for OmlxSetup {
 
     fn auto_ports(&self) -> &[u16] {
         &self.auto_ports
+    }
+
+    fn verify_listener(&self, port: u16) -> impl std::future::Future<Output = bool> + Send {
+        #[cfg(unix)]
+        {
+            let listener = self.listener.clone();
+            async move { listener.check(port).await.is_verified() }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = port;
+            async { false }
+        }
     }
 
     fn managed_port_range(&self) -> RangeInclusive<u16> {

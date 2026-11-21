@@ -723,10 +723,13 @@ fn a_managed_declaration_this_version_does_not_know_or_that_contradicts_the_vers
     }
 }
 
-/// 声明了托管的卡：`managed` 是声明事实（`/health` 与 `launch.engines` 一致），`owned` 在 S1 恒为 false
-/// （S1 不拉起任何进程，引擎管理是 S3/S5）。
+/// 声明了托管的卡：`managed` 是声明事实（`/health` 与 `launch.engines` 一致）。S5 起这张卡由引擎管理器接管：端点上
+/// 已经有服务在答（这里是测试进程里的 mock，不是 oMLX，没有 oMLX 的签名团队），按 #619 校验端口属主不过，所以
+/// 不接管、不发 key，报 `failed` + `port_in_use`；`owned` 是 false（不是 iDoris 拉起的）。接管真正的外部引擎与自己拉起的
+/// 引擎由 `lifecycle_manager.rs`、`lifecycle_managed.rs` 覆盖。
 #[tokio::test]
-async fn a_managed_declaration_is_reported_as_managed_but_never_owned_in_s1() {
+async fn a_managed_declaration_is_reported_as_managed_and_a_listener_that_is_not_the_engine_is_refused()
+ {
     let env = Env::new();
     let upstream = MockServer::start().await;
     Mock::given(method("GET"))
@@ -745,8 +748,8 @@ async fn a_managed_declaration_is_reported_as_managed_but_never_owned_in_s1() {
         body["upstreams"].as_array().is_some_and(|upstreams| {
             upstreams
                 .iter()
-                .any(|u| u["id"] == "managed-engine" && u["state"] == "ready")
-        })
+                .any(|u| u["id"] == "managed-engine" && u["state"] == "failed")
+        }) && body["phase"] == "degraded"
     })
     .await;
     let managed = body["upstreams"]
@@ -757,8 +760,12 @@ async fn a_managed_declaration_is_reported_as_managed_but_never_owned_in_s1() {
         .unwrap();
     assert_eq!(
         managed,
-        &json!({"id": "managed-engine", "engine_kind": "omlx", "state": "ready", "managed": true, "owned": false})
+        &json!({"id": "managed-engine", "engine_kind": "omlx", "state": "failed", "reason": "port_in_use", "managed": true, "owned": false})
     );
+    // 托管上游处于终态：门控不被它拖住（降级放行，别的卡照常服务），`phase` 是 `degraded`（不是 `ready`）。放行之后默认卡
+    // `omlx` 的探测器才起，它第一次观测之前是 `starting`，所以上面等到 `degraded` 为止。
+    assert_eq!(body["phase"], "degraded");
+    assert_eq!(body["ready"], false);
     assert!(
         file["launch"]["engines"]
             .as_array()

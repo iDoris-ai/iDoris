@@ -60,6 +60,10 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 indexmap = "2"
 ring = "0.17"
 subtle = { workspace = true }
+# IDORIS-CORE S5：`swap`（可原子替换的服务体）要在运行期调用 axum `Router` 的 `Service::call`，引擎管理器的
+# `EngineBackend` 是 `async_trait`。两个都是 workspace 里早已有的 crate（以前只在 dev-dependencies），没有新增 crate，Cargo.lock 不变。
+async-trait = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(unix)'.dependencies]
 # S6：`resource` 只用来调用 `setrlimit(RLIMIT_CORE, 0, 0)`（处理儿童数据的部署关闭崩溃转储，见
@@ -71,10 +75,8 @@ subtle = { workspace = true }
 nix = { workspace = true, features = ["poll", "resource", "fs", "user"] }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 wiremock = "0.6"

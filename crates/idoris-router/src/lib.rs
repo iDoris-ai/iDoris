@@ -87,11 +87,16 @@ pub mod discovery;
 pub mod engine_kind;
 pub mod instance_nonce;
 pub mod launcher_frame;
+/// IDORIS-CORE S5（接口规范 §2.7.6、§2.7.7）：引擎管理器（状态机、退避、熔断、探测、所有权与孤儿接管、私有 key、
+/// 围栏）与启动门控。和发现文件（`discovery`）一样只支持 unix。
+pub mod lifecycle;
 pub mod readiness;
 /// IDORIS-CORE S2（接口规范 §2.10，修订 1.6）：向 agent24d 登记与心跳（UDS 客户端）、发现文件自愈、孤儿计时。
 pub mod register;
 /// Persistent record/budget storage bootstrap (B1 task18).
 pub mod storage;
+/// IDORIS-CORE S5（接口规范 §2.7.6）：可原子替换的服务体。启动门控期间服务「starting 体」，引擎落定（就绪，或终局的失败）之后换成完整的 Router。
+pub mod swap;
 mod usage;
 
 mod event_identifier;
@@ -348,6 +353,10 @@ pub struct AppState {
     /// 启动时由 `idoris` 二进制按组件卡装配并起后台探测器（`readiness::spawn_prober`）。
     /// `/health` 只读它，O(1)，不做任何上游 I/O。
     pub health_state: readiness::HealthState,
+    /// 门控降级放行时没有就绪的托管上游（接口规范 §2.7.6，勘误六）：上游 id → 状态与原因。路由到这些卡的请求不碰引擎，
+    /// 直接 503 `local_only_unavailable`，原因码是 `reason`（没有稳定原因码的失败沿用已有的 `supervisor_unavailable`），见
+    /// [`managed_unavailable_response`]。默认空：没有托管卡，或者托管引擎都就绪了。
+    pub managed_failures: Arc<std::collections::BTreeMap<String, readiness::ManagedFailure>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -397,6 +406,7 @@ impl std::fmt::Debug for AppState {
                 &self.cloud_tier.as_ref().map(|_| "configured"),
             )
             .field("health_state", &self.health_state)
+            .field("managed_failures", &self.managed_failures)
             .finish()
     }
 }
@@ -443,6 +453,7 @@ impl Default for AppState {
             cloud_ingress: None,
             cloud_tier: None,
             health_state: readiness::HealthState::default(),
+            managed_failures: Arc::default(),
             http_client,
         }
     }
@@ -533,6 +544,46 @@ pub fn build_app(state: AppState) -> Router {
         Some(plane) => app.merge(control::router(plane)),
         None => app,
     }
+}
+
+/// `Retry-After`（秒）：启动门控期间数据面的 503 给调用方的重试建议。
+const STARTING_RETRY_AFTER_SECONDS: &str = "2";
+
+/// 启动期的「starting 体」（接口规范 §2.7.6）：托管引擎还没有落定（还在启动中），完整的 Router（它的 Supervisor 要在引擎落定之后才能
+/// 创建）还没有替换上去。`GET /health` 照常回答（`phase` 是 `starting` 或 `degraded`，上游状态来自引擎管理器写的快照，
+/// O(1)，不做任何上游 I/O）；其余任何路径一律 503，`error.type` 与 `error.reason_code` 都是 `idoris_starting`，带
+/// `Retry-After`。不经过鉴权、审计与记录存储：它只回答固定的内容，不碰任何状态。
+pub fn build_starting_app(state: AppState) -> Router {
+    let state = Arc::new(state);
+    Router::new()
+        .route("/health", get(health))
+        .fallback(idoris_starting)
+        .layer(middleware::from_fn(starting_record_id_middleware))
+        .with_state(state)
+}
+
+/// 启动期数据面的 503（接口规范 §2.11.1）。
+async fn idoris_starting() -> Response {
+    let mut response = error_envelope_with_reason(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "idoris_starting",
+        "idoris_starting",
+        "iDoris 正在启动它托管的模型引擎，稍后重试（/health 的 phase 与 upstreams 说明进度）",
+    );
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from_static(STARTING_RETRY_AFTER_SECONDS),
+    );
+    response
+}
+
+/// 和完整 Router 一样，每个响应都带服务端生成的 `X-iDoris-Record-Id`（不写任何审计记录）。
+async fn starting_record_id_middleware(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&Uuid::new_v4().to_string()) {
+        response.headers_mut().insert(HEADER_RECORD_ID, value);
+    }
+    response
 }
 
 async fn post_feedback(
@@ -899,6 +950,9 @@ async fn embeddings(
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
     };
+    if let Some(response) = managed_unavailable_response(&state, &selected) {
+        return response;
+    }
 
     // B7-02 reuses the direct buffered transport. Paid embeddings need a
     // distinct usage-settlement contract (OpenAI embeddings do not report
@@ -1148,6 +1202,9 @@ async fn rerank(
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
     };
+    if let Some(response) = managed_unavailable_response(&state, &selected) {
+        return response;
+    }
 
     let value = match bound_http_body(&parsed, &value, &selected.card) {
         Ok(body) => body,
@@ -1408,6 +1465,9 @@ async fn messages(
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
     };
+    if let Some(response) = managed_unavailable_response(&state, &selected) {
+        return response;
+    }
 
     let value = match bound_http_body(&parsed, &value, &selected.card) {
         Ok(body) => body,
@@ -1886,9 +1946,24 @@ async fn get_capabilities(State(state): State<Arc<AppState>>) -> Response {
 /// `provider.id`, matching `server.ts`). Delegates to [`models::list_models`];
 /// authentication failures surface as structured upstream errors.
 async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // 降级放行时没就绪的托管卡不探测（接口规范 §2.7.6，勘误六）：它的引擎没起来，或者那个端口上的东西没有通过属主校验、
+    // 不能给它发 key；探测只会得到错误（一个 401 就会把整个列表变成 502）。别的卡照常列出。
+    let cards: std::borrow::Cow<'_, [idoris_contracts::ComponentCard]> =
+        if state.managed_failures.is_empty() {
+            std::borrow::Cow::Borrowed(state.cards.as_slice())
+        } else {
+            std::borrow::Cow::Owned(
+                state
+                    .cards
+                    .iter()
+                    .filter(|card| !state.managed_failures.contains_key(&card.provider.id))
+                    .cloned()
+                    .collect(),
+            )
+        };
     match models::list_models_with_subscriptions(
         &state.http_client,
-        &state.cards,
+        &cards,
         &state.models_health,
         &state.subscriptions,
         state.remote_kill_switch.load(Ordering::SeqCst),
@@ -2150,6 +2225,44 @@ fn headroom_breach_confirmed(headers: &HeaderMap) -> bool {
         (values.next(), values.next()),
         (Some(value), None) if value.as_bytes().eq_ignore_ascii_case(b"confirmed")
     )
+}
+
+/// 路由到了一个没有就绪的托管引擎（门控降级放行，接口规范 §2.7.6，勘误六）：不碰引擎，直接 503 `local_only_unavailable`
+/// （和别的本地失败同一个 `type`），原因码是该上游在 `/health` 里的 `reason`（`engine_not_found`、`budget_zero`、
+/// `crash_loop`……都是已有的原因码，不新增错误码）；没有稳定原因码的失败（例如模型目录取不到）沿用这条路径上已有的
+/// `supervisor_unavailable`。这张卡不是没就绪的托管卡时返回 `None`。
+///
+/// 这一步在选定候选之后、转发之前：resident 的托管卡也走这里，所以**请求不会发给一个没有通过属主校验、或者根本没起来的端口**。
+fn managed_unavailable_response(
+    state: &AppState,
+    selected: &dispatch::Selected,
+) -> Option<Response> {
+    let failure = state.managed_failures.get(&selected.card.provider.id)?;
+    let reason_code = failure
+        .reason
+        .map_or("supervisor_unavailable", readiness::UpstreamReason::as_str);
+    let mut response = error_envelope_with_reason(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "local_only_unavailable",
+        reason_code,
+        format!(
+            "the managed {} engine behind \"{}\" is {} and does not serve requests until iDoris is restarted",
+            failure.engine_kind,
+            selected.card.provider.id,
+            failure.state.as_str()
+        ),
+    );
+    // 候选已经选定：和别的本地失败一样带上 served-locality 与 reason 头。
+    if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+        response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+    }
+    let reason = reason_header_value(&selected.decision.reason_codes);
+    if !reason.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&reason)
+    {
+        response.headers_mut().insert(HEADER_REASON, value);
+    }
+    Some(response)
 }
 
 fn dispatch_failure_response(
@@ -2973,6 +3086,17 @@ async fn chat_completions(
                     .insert(HEADER_DEGRADED, HeaderValue::from_static("true"));
             }
             return response;
+        }
+        // 选中了一个没有就绪的托管引擎（门控降级放行）：不碰引擎，503 带原因；和别的本地失败一样，云端兜底（如果配置了）
+        // 照常有机会接手。
+        if let Some(original) = managed_unavailable_response(&state, selected) {
+            let unavailable = BackendError::supervisor_unavailable();
+            return cloud_tier::fallback(
+                cloud_scope.as_ref(),
+                cloud_tier::LocalFailure::Backend(&unavailable),
+                original,
+            )
+            .await;
         }
         if selected.card.provider.id == idoris_policy::SUBSCRIPTION_PROVIDER_ID {
             let privacy = parsed

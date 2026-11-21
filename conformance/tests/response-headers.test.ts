@@ -69,6 +69,7 @@ const UPSTREAM_REASONS = [
   "crash_loop",
   "fence_pending",
   "budget_zero",
+  "base_unavailable",
   "startup_latched",
 ];
 const ENGINE_KIND_RE = /^[a-z][a-z0-9_]{0,31}$/;
