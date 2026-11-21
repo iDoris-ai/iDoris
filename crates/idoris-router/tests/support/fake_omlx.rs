@@ -190,7 +190,8 @@ def arg(name):
 # One record per launch: what the engine was started with. Numbered by the files already there.
 os.makedirs(RECORDS, exist_ok=True)
 index = len([n for n in os.listdir(RECORDS) if n.startswith("launch-")])
-with open(os.path.join(RECORDS, "launch-%04d.json" % index), "w") as f:
+tmp = os.path.join(RECORDS, "tmp-%04d-%d" % (index, os.getpid()))
+with open(tmp, "w") as f:
     json.dump({{
         "argv": sys.argv[1:],
         "env": sorted(os.environ.keys()),
@@ -203,6 +204,7 @@ with open(os.path.join(RECORDS, "launch-%04d.json" % index), "w") as f:
         "pgid": os.getpgrp(),
         "cwd": os.getcwd(),
     }}, f)
+os.rename(tmp, os.path.join(RECORDS, "launch-%04d.json" % index))
 
 if EXIT_IMMEDIATELY is not None:
     sys.exit(EXIT_IMMEDIATELY)
