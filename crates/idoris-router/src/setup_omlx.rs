@@ -17,7 +17,7 @@ use crate::cli::SetupOptions;
 #[cfg(unix)]
 use crate::setup_engine::recipe_backed;
 use crate::setup_engine::{
-    FindFailure, FoundExecutable, MANAGED_PORT_RANGE, Probed, Reply, SetupEngine, get_json,
+    Accept, FindFailure, FoundExecutable, MANAGED_PORT_RANGE, Probed, Reply, SetupEngine, get_json,
     probe_client, run_setup,
 };
 pub use crate::setup_engine::{SetupError, read_api_key};
@@ -33,7 +33,7 @@ fn not_omlx() -> SetupError {
 }
 
 async fn get(client: &reqwest::Client, url: &str, key: Option<&str>) -> Result<Reply, SetupError> {
-    get_json(client, url, key, "oMLX", not_omlx).await
+    get_json(client, url, key, "oMLX", Accept::AnySuccess, not_omlx).await
 }
 
 /// `lifecycle` 为真时还要求 `/v1/models/status` 与 `/api/status`（oMLX 生命周期适配器用的两个接口）。

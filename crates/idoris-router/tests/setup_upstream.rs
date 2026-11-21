@@ -168,8 +168,13 @@ fn assert_usage_error(out: &Out, why: &str) {
 // 假上游与目录台架
 // ---------------------------------------------------------------------------------------------
 
-/// 假 OpenAI 兼容上游（任何 OpenAI 兼容服务都有的两个接口），没有鉴权。
+/// 假 OpenAI 兼容上游（任何 OpenAI 兼容服务都有的两个接口），没有鉴权。聊天回答 `pong`。
 async fn upstream(models: &[&str]) -> MockServer {
+    upstream_replying(models, "pong").await
+}
+
+/// 同上，聊天回答 `reply`（两个上游同时在时，凭它认出请求落在了哪一个）。
+async fn upstream_replying(models: &[&str], reply: &'static str) -> MockServer {
     let server = MockServer::start().await;
     let data: Vec<Value> = models
         .iter()
@@ -184,13 +189,13 @@ async fn upstream(models: &[&str]) -> MockServer {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(|request: &wiremock::Request| {
+        .respond_with(move |request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             ResponseTemplate::new(200).set_body_json(json!({
                 "id": "chatcmpl-1",
                 "object": "chat.completion",
                 "model": body["model"],
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
             }))
         })
@@ -897,6 +902,27 @@ async fn a_response_that_is_not_an_openai_model_list_is_refused() {
     let cases: Vec<(&str, ResponseTemplate)> = vec![
         ("404", ResponseTemplate::new(404)),
         ("500", ResponseTemplate::new(500)),
+        // 状态码不是 200，正文却是一个合格的列表：状态码本身就够拒绝（出了错的服务，或者是别的东西，不是模型列表）。
+        (
+            "404 with a valid list",
+            ResponseTemplate::new(404).set_body_json(json!({"data": [{"id": "m"}]})),
+        ),
+        (
+            "500 with a valid list",
+            ResponseTemplate::new(500).set_body_json(json!({"data": [{"id": "m"}]})),
+        ),
+        (
+            "302 with a valid list",
+            ResponseTemplate::new(302).set_body_json(json!({"data": [{"id": "m"}]})),
+        ),
+        (
+            "201 with a valid list",
+            ResponseTemplate::new(201).set_body_json(json!({"data": [{"id": "m"}]})),
+        ),
+        (
+            "202 with a valid list",
+            ResponseTemplate::new(202).set_body_json(json!({"data": [{"id": "m"}]})),
+        ),
         (
             "not json",
             ResponseTemplate::new(200).set_body_string("<html>hi</html>"),
@@ -1213,6 +1239,13 @@ async fn an_out_dir_that_is_a_file_is_refused_before_probing() {
     assert_eq!(err_code(&result), "out_dir_not_empty");
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "i am a file");
     assert!(requests(&server).await.is_empty(), "拒绝在探测之前");
+    // 路径中间有一个普通文件（读元数据得到 ENOTDIR，不是「不存在」）：同样在探测之前拒绝，什么也不创建。
+    let below = out.join("sub").join("components");
+    let result = setup(&server.uri(), &below, &["--bind", "daily=qwen3-8b"]).await;
+    assert_eq!(err_code(&result), "out_dir_not_empty");
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "i am a file");
+    assert!(requests(&server).await.is_empty(), "拒绝在探测之前");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
 }
 
 /// `--default`：卡带 `extensions.idoris_default: true`，输出的 `default` 为真；至多一张默认卡。
@@ -1599,6 +1632,23 @@ async fn the_library_entry_point_gives_the_same_report_as_the_binary() {
         "invalid_role"
     );
     assert!(!tmp.path().join("none").exists());
+    // 同一个角色绑两次：库入口也拒绝（命令行在解析期就拒绝，库调用方不经过它），不探测、不写。
+    let probes_before = requests(&server).await.len();
+    let mut twice = options.clone();
+    twice.out_dir = tmp.path().join("twice");
+    twice.bindings = vec![
+        ("daily".into(), MODEL.into()),
+        ("daily".into(), "other".into()),
+    ];
+    assert_eq!(
+        idoris_router::setup_upstream::run(&twice)
+            .await
+            .unwrap_err()
+            .code,
+        "invalid_role"
+    );
+    assert_eq!(requests(&server).await.len(), probes_before);
+    assert!(!tmp.path().join("twice").exists());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1633,6 +1683,101 @@ fn issue_key(db: &Path, roles: &[&str]) -> String {
     json["secret"].as_str().unwrap().to_string()
 }
 
+/// 一个在跑的 `idoris serve`：Drop 时 SIGKILL 加 wait（经 `Reaped`）。
+struct Serve {
+    process: Reaped,
+    base: String,
+    log: PathBuf,
+    client: reqwest::Client,
+}
+
+impl Serve {
+    /// 起 serve，等到 `/health` 报 `phase: ready` 且每个上游都是 `ready`；一起返回那时的 `/health`。
+    async fn start(tmp: &Path, comp: &Path, db: &Path) -> (Self, Value) {
+        let port = free_port();
+        // 数据面与 Admin 不能是同一个端口：绑上又放掉的端口号可能被马上再给出一次。
+        let admin_port = loop {
+            let candidate = free_port();
+            if candidate != port {
+                break candidate;
+            }
+        };
+        let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let log = tmp.join("serve.log");
+        std::fs::create_dir_all(tmp.join("home")).unwrap();
+        let mut cmd = idoris();
+        cmd.arg("serve")
+            .env("HOME", tmp.join("home"))
+            .env("IDORIS_STATE_DIR", tmp.join("state"))
+            .env("IDORIS_PORT", port.to_string())
+            .env("IDORIS_ADMIN_PORT", admin_port.to_string())
+            .env("IDORIS_DB_PATH", db)
+            .env("IDORIS_COMPONENTS_DIR", comp)
+            .env("IDORIS_ROUTING_POLICY", config.join("routing-policy.yaml"))
+            .env("IDORIS_CATALOG", config.join("catalog.yaml"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .stderr(Stdio::from(
+                std::fs::OpenOptions::new().append(true).open(&log).unwrap(),
+            ));
+        let mut serve = Self {
+            process: Reaped::spawn(&mut cmd),
+            base: format!("http://127.0.0.1:{port}"),
+            log,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let limit = startup_wait::startup_observe_limit();
+        let deadline = Instant::now() + limit;
+        let health = loop {
+            if let Ok(response) = serve
+                .client
+                .get(format!("{}/health", serve.base))
+                .timeout(startup_wait::HTTP_PROBE_TIMEOUT)
+                .send()
+                .await
+                && response.status().is_success()
+            {
+                let health: Value = response.json().await.unwrap();
+                let all_ready = health["upstreams"]
+                    .as_array()
+                    .is_some_and(|all| all.iter().all(|u| u["state"] == "ready"));
+                if health["phase"] == "ready" && all_ready {
+                    break health;
+                }
+            }
+            assert!(
+                serve.process.child().try_wait().unwrap().is_none(),
+                "serve 提前退出：{}",
+                serve.logs()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "{}s 内没有就绪：{}",
+                limit.as_secs(),
+                serve.logs()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        (serve, health)
+    }
+
+    fn logs(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap()
+    }
+
+    /// `POST /v1/chat/completions`，`model` 是 `idoris/<role>` 或具体模型名。
+    async fn chat(&self, key: &str, model: &str) -> reqwest::Response {
+        self.client
+            .post(format!("{}/v1/chat/completions", self.base))
+            .bearer_auth(key)
+            .json(&json!({"model": model, "messages": [{"role": "user", "content": "ping"}]}))
+            .timeout(startup_wait::startup_observe_limit())
+            .send()
+            .await
+            .unwrap()
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn serve_loads_the_generated_card_and_chat_through_idoris_daily_reaches_the_fake_upstream() {
     let server = upstream(&[MODEL, "other"]).await;
@@ -1663,57 +1808,7 @@ async fn serve_loads_the_generated_card_and_chat_through_idoris_daily_reaches_th
             "fast", "daily", "deep", "vision", "embed", "rerank", "decide", "auto",
         ],
     );
-    let (port, admin_port) = (free_port(), free_port());
-    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
-    let log = tmp.path().join("serve.log");
-    std::fs::create_dir_all(tmp.path().join("home")).unwrap();
-    let mut cmd = idoris();
-    cmd.arg("serve")
-        .env("HOME", tmp.path().join("home"))
-        .env("IDORIS_STATE_DIR", tmp.path().join("state"))
-        .env("IDORIS_PORT", port.to_string())
-        .env("IDORIS_ADMIN_PORT", admin_port.to_string())
-        .env("IDORIS_DB_PATH", &db)
-        .env("IDORIS_COMPONENTS_DIR", &comp)
-        .env("IDORIS_ROUTING_POLICY", config.join("routing-policy.yaml"))
-        .env("IDORIS_CATALOG", config.join("catalog.yaml"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(std::fs::File::create(&log).unwrap()))
-        .stderr(Stdio::from(
-            std::fs::OpenOptions::new().append(true).open(&log).unwrap(),
-        ));
-    let mut serve = Reaped::spawn(&mut cmd);
-
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let base = format!("http://127.0.0.1:{port}");
-    let limit = startup_wait::startup_observe_limit();
-    let deadline = Instant::now() + limit;
-    let health = loop {
-        if let Ok(response) = client
-            .get(format!("{base}/health"))
-            .timeout(startup_wait::HTTP_PROBE_TIMEOUT)
-            .send()
-            .await
-            && response.status().is_success()
-        {
-            let health: Value = response.json().await.unwrap();
-            if health["phase"] == "ready" {
-                break health;
-            }
-        }
-        assert!(
-            serve.child().try_wait().unwrap().is_none(),
-            "serve 提前退出：{}",
-            std::fs::read_to_string(&log).unwrap()
-        );
-        assert!(
-            Instant::now() < deadline,
-            "{}s 内没有就绪：{}",
-            limit.as_secs(),
-            std::fs::read_to_string(&log).unwrap()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let (serve, health) = Serve::start(tmp.path(), &comp, &db).await;
     // 引擎种类取自 `version_pin`：`openai_compat`（规范 §2.3）。
     assert_eq!(health["components"], 1);
     assert_eq!(
@@ -1722,32 +1817,24 @@ async fn serve_loads_the_generated_card_and_chat_through_idoris_daily_reaches_th
                 "managed": false, "owned": false}])
     );
 
-    let chat = |key: &str, model: &str| {
-        client
-            .post(format!("{base}/v1/chat/completions"))
-            .bearer_auth(key)
-            .json(&json!({"model": model, "messages": [{"role": "user", "content": "ping"}]}))
-            .timeout(limit)
-            .send()
-    };
     // `idoris/daily` 解析到绑定的模型：上游收到的是具体模型 id。
-    let response = chat(&key, "idoris/daily").await.unwrap();
+    let response = serve.chat(&key, "idoris/daily").await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "pong");
     assert_eq!(body["model"], MODEL);
     // 另一个角色绑的是另一个模型。
-    let response = chat(&key, "idoris/deep").await.unwrap();
+    let response = serve.chat(&key, "idoris/deep").await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.json::<Value>().await.unwrap()["model"], "other");
     // 具体模型名（没有角色）原样转发，但按既有的 key 范围规则要全角色的 key：只放行三个角色的 key 得 403。
-    let response = chat(&key, MODEL).await.unwrap();
+    let response = serve.chat(&key, MODEL).await;
     assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
     assert_eq!(
         response.json::<Value>().await.unwrap()["error"]["reason_code"],
         "VIRTUAL_KEY_ROLE_FORBIDDEN"
     );
-    let response = chat(&full_key, MODEL).await.unwrap();
+    let response = serve.chat(&full_key, MODEL).await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
     let posts: Vec<_> = requests(&server)
@@ -1773,11 +1860,12 @@ async fn serve_loads_the_generated_card_and_chat_through_idoris_daily_reaches_th
     assert_anonymous(&posts);
 
     // 只 chat：这张卡没有 embedding 能力，`idoris/embed` 的请求到不了上游。
-    let response = client
-        .post(format!("{base}/v1/embeddings"))
+    let response = serve
+        .client
+        .post(format!("{}/v1/embeddings", serve.base))
         .bearer_auth(&key)
         .json(&json!({"model": "idoris/embed", "input": ["hello"]}))
-        .timeout(limit)
+        .timeout(startup_wait::startup_observe_limit())
         .send()
         .await
         .unwrap();
@@ -1790,8 +1878,78 @@ async fn serve_loads_the_generated_card_and_chat_through_idoris_daily_reaches_th
         "embeddings 请求不应到达只有 chat 的上游"
     );
     // serve 的日志里没有 key。
-    let logs = std::fs::read_to_string(&log).unwrap();
-    assert!(!logs.contains(&key));
+    assert!(!serve.logs().contains(&key));
     // Drop 杀掉并回收；放在最后，断言失败也不留进程。
+    drop(serve);
+}
+
+/// 两张卡加进同一个目录（也是「加一张卡」不动别的卡的端到端证据）：`aaa` 不当默认，`zzz` 当默认，id 字典序靠后。
+/// 其余条件相同时，选择按 id 字典序取小的（`idoris-policy` 的 `pick`），v0.6.0 不读 `idoris_default`：请求仍然落在
+/// `aaa`。这条钉住规范 §2.7.8 回填的「路由不读这个键」；默认引擎的选择语义实现之后（§2.12.3），它要随之改。
+#[tokio::test(flavor = "multi_thread")]
+async fn idoris_default_is_only_an_annotation_in_v0_6_0_and_routing_ignores_it() {
+    let aaa = upstream_replying(&[MODEL], "from-aaa").await;
+    let zzz = upstream_replying(&[MODEL], "from-zzz").await;
+    let tmp = TempDir::new().unwrap();
+    let comp = tmp.path().join("components");
+    ok(&setup(
+        &aaa.uri(),
+        &comp,
+        &["--bind", "daily=qwen3-8b", "--id", "aaa"],
+    )
+    .await);
+    let result = setup(
+        &zzz.uri(),
+        &comp,
+        &["--bind", "daily=qwen3-8b", "--id", "zzz", "--default"],
+    )
+    .await;
+    assert_eq!(ok(&result)["default"], true);
+    assert_eq!(names(&comp), ["aaa.yaml", "zzz.yaml"]);
+
+    let db = tmp.path().join("idoris.sqlite3");
+    let key = issue_key(&db, &["daily"]);
+    let (serve, health) = Serve::start(tmp.path(), &comp, &db).await;
+    assert_eq!(health["components"], 2);
+    let mut upstreams: Vec<(String, String, String)> = health["upstreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| {
+            (
+                u["id"].as_str().unwrap().to_string(),
+                u["engine_kind"].as_str().unwrap().to_string(),
+                u["state"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    upstreams.sort();
+    let expected = |id: &str| {
+        (
+            id.to_string(),
+            "openai_compat".to_string(),
+            "ready".to_string(),
+        )
+    };
+    assert_eq!(upstreams, [expected("aaa"), expected("zzz")]);
+
+    for _ in 0..3 {
+        let response = serve.chat(&key, "idoris/daily").await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "from-aaa");
+    }
+    let chats = |requests: Vec<wiremock::Request>| {
+        requests
+            .into_iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .count()
+    };
+    assert_eq!(chats(requests(&aaa).await), 3);
+    assert_eq!(
+        chats(requests(&zzz).await),
+        0,
+        "默认卡没有因为它是默认而被优先"
+    );
     drop(serve);
 }

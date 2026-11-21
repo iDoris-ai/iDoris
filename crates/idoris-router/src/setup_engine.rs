@@ -105,6 +105,24 @@ pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 探测响应体的上限；超过就当作不是这种引擎。
 pub(crate) const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// 探测响应的状态码要求。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Accept {
+    /// 任何 2xx（`setup omlx` 的探测，与 S4 一致）。
+    AnySuccess,
+    /// 恰好 200（`setup upstream` 的探测，规范 §2.7.8 写的是「要求 200」）。
+    Ok200,
+}
+
+impl Accept {
+    fn allows(self, status: reqwest::StatusCode) -> bool {
+        match self {
+            Self::AnySuccess => status.is_success(),
+            Self::Ok200 => status == reqwest::StatusCode::OK,
+        }
+    }
+}
+
 /// 一次探测请求的回答：JSON，或者对端要求鉴权（401 / 403）。
 pub(crate) enum Reply {
     Ok(Value),
@@ -123,12 +141,14 @@ pub(crate) fn probe_client() -> Result<reqwest::Client, SetupError> {
 }
 
 /// `GET <url>`，`key` 有值就带 Bearer。401 / 403 是 [`Reply::Denied`]；连不上是 `unreachable`（说明里带
-/// `engine_name`）；别的非 2xx、响应体超过 [`MAX_BODY_BYTES`]、不是 JSON，都是 `not_engine()` 给的错误。
+/// `engine_name`）；状态码不合 `accept`（401 / 403 除外）、响应体超过 [`MAX_BODY_BYTES`]、不是 JSON，都是
+/// `not_engine()` 给的错误。
 pub(crate) async fn get_json(
     client: &reqwest::Client,
     url: &str,
     key: Option<&str>,
     engine_name: &str,
+    accept: Accept,
     not_engine: impl Fn() -> SetupError,
 ) -> Result<Reply, SetupError> {
     let unreachable = || SetupError::new("unreachable", format!("无法连接 {engine_name} endpoint"));
@@ -141,7 +161,7 @@ pub(crate) async fn get_json(
     if matches!(status.as_u16(), 401 | 403) {
         return Ok(Reply::Denied);
     }
-    if !status.is_success() {
+    if !accept.allows(status) {
         return Err(not_engine());
     }
     let mut body = Vec::new();

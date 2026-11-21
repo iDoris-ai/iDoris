@@ -9,7 +9,7 @@
 //! - **无 key**：没有密钥参数，探测不带凭据；上游要求鉴权（401 / 403）是 `auth_required`，不写卡。
 //! - **只 chat**：`--bind` 只接受 chat 类角色（[`is_chat_role`]），卡的能力只有 `chat`；embedding 由 `setup omlx` 的
 //!   伴生卡承载（规范 §2.3）。
-//! - **探测**：写卡之前 `GET <endpoint>/v1/models`，要 200 加带 `data` 数组的 JSON（每一项有字符串 `id`）；每个 `--bind`
+//! - **探测**：写卡之前 `GET <endpoint>/v1/models`，要恰好 200 加带 `data` 数组的 JSON（每一项有字符串 `id`）；每个 `--bind`
 //!   的模型要在这个列表里。
 //!
 //! # 生成的卡
@@ -41,8 +41,8 @@ use std::path::PathBuf;
 use crate::cli::{SetupOptions, SetupTarget, UpstreamKind, UpstreamOptions};
 use crate::engine_kind::{DEFAULT_EXTENSION, UPSTREAM_EXTENSION};
 use crate::setup_engine::{
-    FindFailure, FoundExecutable, OutDirUse, Probed, Reply, SetupEngine, SetupError, get_json,
-    normalize_endpoint, probe_client, run_setup,
+    Accept, FindFailure, FoundExecutable, OutDirUse, Probed, Reply, SetupEngine, SetupError,
+    get_json, normalize_endpoint, probe_client, run_setup,
 };
 
 /// 给人看的名字，错误说明里用。
@@ -187,7 +187,7 @@ impl SetupEngine for UpstreamSetup {
         ))
     }
 
-    /// `GET <endpoint>/v1/models`，不带凭据；`lifecycle` 对 OpenAI 兼容上游没有意义（没有生命周期状态接口）。
+    /// `GET <endpoint>/v1/models`，不带凭据，要求恰好 200；`lifecycle` 对 OpenAI 兼容上游没有意义（没有生命周期状态接口）。
     async fn probe(
         &self,
         endpoint: &str,
@@ -212,6 +212,7 @@ impl SetupEngine for UpstreamSetup {
             &format!("{endpoint}/v1/models"),
             None,
             DISPLAY_NAME,
+            Accept::Ok200,
             not_openai,
         )
         .await?
@@ -283,7 +284,15 @@ impl SetupEngine for UpstreamSetup {
                 format!("至少要用 --bind 绑定一个 chat 角色（{}）", chat_roles()),
             ));
         }
+        let mut seen = std::collections::BTreeSet::new();
         for (role, _) in bindings {
+            // 命令行在解析期就拒绝同一个角色绑两次；库调用方不经过解析，这里再核对一次（否则后一个悄悄盖掉前一个）。
+            if !seen.insert(role.as_str()) {
+                return Err(SetupError::new(
+                    "invalid_role",
+                    format!("角色 {role} 绑定了不止一次：每个角色只能绑一个模型"),
+                ));
+            }
             let chat = ROLES
                 .iter()
                 .copied()
@@ -459,6 +468,14 @@ mod tests {
             engine.check_requested_bindings(&[]).unwrap_err().code,
             "invalid_role"
         );
+        // 同一个角色绑两次（库调用方不经过命令行的解析）：拒绝，不是后一个盖掉前一个。
+        let twice = vec![
+            ("daily".to_string(), "a".to_string()),
+            ("daily".to_string(), "b".to_string()),
+        ];
+        let error = engine.check_requested_bindings(&twice).unwrap_err();
+        assert_eq!(error.code, "invalid_role");
+        assert!(error.message.contains("不止一次"), "{}", error.message);
     }
 
     /// 卡的标注：`idoris_upstream` 的 `kind`、`flavor` 与 `version_pin` 的产品名是同一个种类名（规范 §2.3）。
