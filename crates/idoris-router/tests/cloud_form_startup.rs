@@ -6,11 +6,15 @@
 //! 假上游是进程内的 `127.0.0.1` 假服务；不连接任何真实的推理供应商，也不启动任何推理进程。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// 起的真二进制用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+#[path = "support/child_guard.rs"]
+mod child_guard;
 #[path = "../../idoris-upstream/tests/support/fake_upstream.rs"]
 mod fake_upstream;
 #[path = "support/cloud_harness.rs"]
 mod harness;
 
+use child_guard::SpawnGuarded;
 use std::io::Write;
 use std::{
     fs,
@@ -248,7 +252,7 @@ impl Fixture {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_guarded()
             .unwrap();
         child
             .stdin
