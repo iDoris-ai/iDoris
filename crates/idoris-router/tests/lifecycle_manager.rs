@@ -25,11 +25,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use fake_omlx::{Behavior, FakeOmlx, spawn_retrying};
 use idoris_router::lifecycle::{
-    CommandError, EngineBackend, EngineManager, ManagedPlan, ManagerConfig, OmlxBackend, PlanError,
-    PrepareFailure, Timings, plan_managed_with,
+    CommandError, EngineBackend, EngineManager, GateOutcome, ManagedPlan, ManagerConfig,
+    OmlxBackend, PlanError, PrepareFailure, Timings, plan_managed_with,
 };
 use idoris_router::readiness::{
-    GateState, HealthState, Phase, UpstreamReason, UpstreamState, UpstreamStatus,
+    GateState, HealthState, ManagedFailure, Phase, UpstreamReason, UpstreamState, UpstreamStatus,
 };
 use idoris_router::register::{JitterSource, LogSink};
 use idoris_upstream::engine::{
@@ -386,6 +386,25 @@ impl Harness {
         timings: Timings,
         stop_on_exit: StopOnExit,
     ) -> Self {
+        Self::start_with(
+            rig,
+            backend,
+            inspector,
+            timings,
+            stop_on_exit,
+            rig.fake.executable.clone(),
+        )
+    }
+
+    /// 同 [`Self::start`]，引擎的可执行文件由调用方给（给一个不存在的路径就是「没装 oMLX」）。
+    fn start_with(
+        rig: &Rig,
+        backend: Arc<TestBackend>,
+        inspector: Arc<dyn ProcessInspector>,
+        timings: Timings,
+        stop_on_exit: StopOnExit,
+        executable: PathBuf,
+    ) -> Self {
         let health = HealthState::with_upstreams(0, vec![upstream_status("omlx")]);
         let log: Arc<Mutex<Vec<String>>> = Arc::default();
         let sink: LogSink = {
@@ -397,7 +416,7 @@ impl Harness {
                 state_dir: rig.state_dir(),
                 allocated_budget_bytes: Some(16 * GIB),
                 stop_on_exit,
-                executables: BTreeMap::from([("omlx".to_owned(), rig.fake.executable.clone())]),
+                executables: BTreeMap::from([("omlx".to_owned(), executable)]),
                 launched_by: "test-instance".to_owned(),
                 timings,
                 inspector,
@@ -536,9 +555,9 @@ async fn an_engine_that_exits_after_the_gate_opened_is_an_engine_failure_not_a_r
         fast(),
         StopOnExit::Owned,
     );
-    h.manager.wait_all_ready().await;
+    h.manager.wait_all_settled().await;
     assert!(
-        h.manager.open_gate(),
+        h.manager.open_gate().is_some(),
         "everything is ready, so the gate opens"
     );
     assert!(h.manager.gate_is_open());
@@ -558,8 +577,68 @@ async fn an_engine_that_exits_after_the_gate_opened_is_an_engine_failure_not_a_r
 }
 
 #[tokio::test]
-async fn open_gate_refuses_while_an_engine_is_not_ready_and_the_gate_task_waits_for_it() {
-    // 第二个实例起不来（`launch_recipe` 拒绝）：只有一个就绪，不放行；修好之后 `start` 它，两个都就绪才放行。
+async fn a_process_exit_is_noticed_on_the_liveness_tick_not_on_the_probe_interval() {
+    // 探测很稀（20 秒一次），存活检查很密（50 毫秒）：进程退出要在存活检查那一拍里发现，不能等下一次探测。
+    let rig = Rig::new(&Behavior {
+        exit_after_secs: 1.0,
+        ..Behavior::default()
+    });
+    let mut timings = fast();
+    timings.probe_interval = Duration::from_secs(20);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        timings,
+        StopOnExit::Owned,
+    );
+    h.manager.wait_all_settled().await;
+    assert!(h.manager.open_gate().is_some());
+    let failure = tokio::time::timeout(Duration::from_secs(10), h.manager.engine_failed())
+        .await
+        .expect("the exit is noticed long before the next probe is due");
+    assert_eq!(failure.upstream_id, "omlx");
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn the_gate_waits_while_an_engine_is_still_starting_and_opens_once_it_is_ready() {
+    // 还在 `starting` 的引擎不算落定：门控等它，不放行；好了之后放行，没有降级。
+    let rig = Rig::new(&Behavior {
+        listen_delay_secs: 1.0,
+        ..Behavior::default()
+    });
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    assert_eq!(h.view().state, UpstreamState::Starting);
+    assert!(
+        h.manager.open_gate().is_none(),
+        "a starting engine is not settled"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), h.manager.wait_all_settled())
+            .await
+            .is_err()
+    );
+    assert!(!h.manager.gate_is_open());
+    tokio::time::timeout(PATIENT, h.manager.wait_all_settled())
+        .await
+        .expect("ready is settled");
+    let outcome = h.manager.open_gate().expect("settled: the gate opens");
+    assert!(outcome.degraded.is_empty(), "everything is ready");
+    assert!(h.manager.gate_is_open());
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn a_terminally_failed_engine_does_not_hold_the_gate_it_opens_degraded_and_the_engine_is_frozen()
+ {
+    // 第二个实例起不来（`launch_recipe` 拒绝，配置性的终局失败）：它「落定」了，不拖住门控；第一个就绪。
     let rig_a = Rig::new(&Behavior::default());
     let backend_a = default_backend(&rig_a);
     let backend_b = default_backend(&rig_a);
@@ -608,29 +687,42 @@ async fn open_gate_refuses_while_an_engine_is_not_ready_and_the_gate_task_waits_
         health.view().upstreams[1].reason,
         Some(UpstreamReason::BaseUnavailable)
     );
+    assert_eq!(health.view().phase, Phase::Degraded);
+    // 终局的失败不拖住门控：两个都落定了，放行，降级：失败的那个带着当时的状态与原因。
+    tokio::time::timeout(PATIENT, manager.wait_all_settled())
+        .await
+        .expect("both are settled");
+    let outcome = manager.open_gate().expect("settled: the gate opens");
+    assert_eq!(
+        outcome.degraded.len(),
+        1,
+        "only the failed one: {outcome:?}"
+    );
+    let failure = &outcome.degraded["omlx-b"];
+    assert_eq!(failure.engine_kind, "omlx");
+    assert_eq!(failure.state, UpstreamState::Failed);
+    assert_eq!(failure.reason, Some(UpstreamReason::BaseUnavailable));
+    health.set_gate(GateState::Open);
     assert_eq!(
         health.view().phase,
         Phase::Degraded,
-        "a stuck managed engine: the gate cannot complete"
+        "a managed engine that is down: degraded, even though the other one serves"
     );
-    assert!(!manager.open_gate(), "one ready engine is not enough");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(400), manager.wait_all_ready())
-            .await
-            .is_err()
-    );
-    // 修好，再 `start`：两个都就绪，放行。
+    // 冻结：降级放行之后它不再启动，哪怕「修好了」；要重启 iDoris（它的 Supervisor 是放行时创建的）。
     *backend_b.refuse_launch.lock().unwrap() = false;
-    manager.start_upstream("omlx-b").await.unwrap();
-    tokio::time::timeout(PATIENT, manager.wait_all_ready())
-        .await
-        .expect("both ready");
-    assert!(manager.open_gate());
     assert_eq!(
-        health.view().phase,
-        Phase::Starting,
-        "the gate is still pending until the router is swapped in"
+        manager.start_upstream("omlx-b").await,
+        Err(CommandError::RestartRequired)
     );
+    assert_eq!(
+        manager.restart_upstream("omlx-b").await,
+        Err(CommandError::RestartRequired)
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(health.view().upstreams[1].state, UpstreamState::Failed);
+    assert_eq!(rig_a.fake.launches(), 1, "nothing was launched for omlx-b");
+    // 就绪的那个不受影响：`start` 幂等。
+    manager.start_upstream("omlx").await.unwrap();
     manager.shutdown(true).await;
 }
 
@@ -1001,7 +1093,7 @@ async fn an_external_engine_is_adopted_without_a_signal_and_survives_idoris_even
         Err(CommandError::NotOwned)
     );
     h.manager.start_upstream("omlx").await.unwrap();
-    assert!(h.manager.open_gate());
+    assert!(h.manager.open_gate().is_some());
     // 停止时「停掉自己拥有的引擎」：外部引擎不在其中。它仍在运行，没有所有权记录，围栏原样。
     h.manager.shutdown(true).await;
     assert!(
@@ -1027,7 +1119,8 @@ async fn an_external_engine_is_adopted_without_a_signal_and_survives_idoris_even
 async fn an_external_engine_behind_a_leftover_fence_is_not_let_through_and_the_fence_is_left_alone()
 {
     // 外部引擎的围栏不是我们的（没有证据证明它的加载已经停止）：原样留着，要人工处理。Supervisor 在围栏存在时会把启动错误
-    // 粘滞住，所以门控不放行，状态是 `unavailable` + `fence_pending`（不是放行之后才报 `startup_latched`）。
+    // 粘滞住，所以不把它当成就绪：状态是 `unavailable` + `fence_pending`（不是放行之后才报 `startup_latched`）；它是终局的失败，
+    // 门控不被它拖住，降级放行。
     let work = tempfile::tempdir().unwrap();
     let external = External::start(work.path(), None);
     let rig = rig_for(&external);
@@ -1047,7 +1140,15 @@ async fn an_external_engine_behind_a_leftover_fence_is_not_let_through_and_the_f
     assert_eq!(status.reason, Some(UpstreamReason::FencePending));
     assert!(!status.owned);
     assert_eq!(h.health.view().phase, Phase::Degraded);
-    assert!(!h.manager.open_gate());
+    // 终局的失败不拖住门控：降级放行（别的卡照常服务），围栏与引擎都不动。
+    let outcome = h
+        .manager
+        .open_gate()
+        .expect("a terminal failure is settled: the gate opens, degraded");
+    assert_eq!(
+        outcome.degraded["omlx"].reason,
+        Some(UpstreamReason::FencePending)
+    );
     assert_eq!(rig.fake.launches(), 0, "nothing is spawned beside it");
     h.manager.shutdown(true).await;
     assert!(fence.exists(), "an external engine's fence is left alone");
@@ -1500,7 +1601,7 @@ async fn an_own_engine_that_is_alive_but_stops_answering_is_unavailable_never_ki
     );
     h.until_state(UpstreamState::Ready).await;
     assert!(
-        h.manager.open_gate(),
+        h.manager.open_gate().is_some(),
         "from here an engine exit is fatal; an unresponsive engine must not be"
     );
     let pid = rig.pid(0);
@@ -1686,6 +1787,49 @@ async fn an_external_listener_that_turns_into_another_service_is_failed_with_por
 }
 
 #[tokio::test]
+async fn an_external_listener_that_stops_passing_the_owner_check_is_failed_and_the_settings_key_goes_off()
+ {
+    // 接管之后，端口上换了一个没通过属主校验的监听者（另一个进程，没有签名团队）：`failed` + `port_in_use`；`settings.json` 的 key
+    // 立刻不再允许（之后任何走这个端点的请求都不会带它），也不再有任何请求发给它。
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start(work.path(), Some("ext-secret"));
+    let rig = rig_for(&external);
+    let inspector = Scripted::new();
+    inspector.external_listener(external.port, external.pid(), Some(TEAM));
+    let backend = default_backend(&rig);
+    *backend.external_key.lock().unwrap() = Some("ext-secret".to_owned());
+    let h = Harness::start(&rig, backend, inspector.clone(), fast(), StopOnExit::Owned);
+    h.until_state(UpstreamState::Ready).await;
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::External {
+            settings_key_verified: true
+        })
+    );
+    // 换监听者：另一个 pid（借测试进程自己：同一个用户，没有团队）。校验按 pid 与启动时间缓存，所以会重新校验。
+    inspector.external_listener(external.port, std::process::id(), None);
+    let status = h.until_state(UpstreamState::Failed).await;
+    assert_eq!(status.reason, Some(UpstreamReason::PortInUse));
+    assert!(!status.owned);
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::External {
+            settings_key_verified: false
+        }),
+        "the settings.json key is off again for a listener that failed the check"
+    );
+    let before = external.fake.requests().len();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        external.fake.requests().len(),
+        before,
+        "nothing more is sent to the engine once its listener failed the check"
+    );
+    assert!(pid_alive(u64::from(external.pid())), "never signalled");
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
 async fn an_external_engine_whose_listener_is_gone_is_unavailable_and_nothing_is_spawned() {
     let work = tempfile::tempdir().unwrap();
     let external = External::start(work.path(), None);
@@ -1725,7 +1869,7 @@ async fn a_ready_engine_whose_supervisor_latched_its_startup_error_is_unavailabl
         StopOnExit::Owned,
     );
     h.until_state(UpstreamState::Ready).await;
-    assert!(h.manager.open_gate());
+    assert!(h.manager.open_gate().is_some());
     // Supervisor 在创建时对引擎采样一次：此刻引擎回 503，启动错误就粘滞住，之后所有调用都失败。
     rig.fake.force_status(503);
     let registry = RuntimeRegistry::spawn(&[card("omlx", &rig.endpoint(), true)]).unwrap();
@@ -1775,6 +1919,278 @@ async fn an_instance_task_that_panics_is_an_engine_failure_and_never_a_silent_ha
     assert!(!status.owned);
     assert!(h.logged("panic"));
     h.manager.shutdown(true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 门控不被一个起不来的托管引擎无限期拖住：终局的失败「落定」，降级放行；等待有上限；放行之后它冻结
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_engine_that_is_not_installed_settles_the_gate_which_opens_degraded_and_the_engine_is_frozen()
+ {
+    let rig = Rig::new(&Behavior::default());
+    let missing = rig.work.path().join("no-such-omlx-cli");
+    let h = Harness::start_with(
+        &rig,
+        default_backend(&rig),
+        Scripted::new(),
+        fast(),
+        StopOnExit::Owned,
+        missing,
+    );
+    let status = h.until_state(UpstreamState::Absent).await;
+    assert_eq!(status.reason, Some(UpstreamReason::EngineNotFound));
+    // `absent` + `engine_not_found` 是终局：落定，门控放行，降级（别的卡照常服务）。
+    tokio::time::timeout(PATIENT, h.manager.wait_all_settled())
+        .await
+        .expect("an engine that is not installed is settled");
+    let outcome = h.manager.open_gate().expect("settled: the gate opens");
+    assert_eq!(
+        outcome.degraded["omlx"],
+        ManagedFailure {
+            engine_kind: "omlx".to_owned(),
+            state: UpstreamState::Absent,
+            reason: Some(UpstreamReason::EngineNotFound),
+        }
+    );
+    assert!(h.manager.gate_is_open());
+    assert_eq!(rig.fake.launches(), 0);
+    // 冻结：用户装好引擎之后也要重启 iDoris；`start` 不接受。
+    assert_eq!(
+        h.manager.start_upstream("omlx").await,
+        Err(CommandError::RestartRequired)
+    );
+    assert_eq!(h.view().state, UpstreamState::Absent);
+    // 退出码 5 的语义不变：没有进程的失败不触发它。
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), h.manager.engine_failed())
+            .await
+            .is_err()
+    );
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn a_tripped_breaker_settles_the_gate_and_no_half_open_retry_follows_a_degraded_open() {
+    let rig = Rig::new(&Behavior {
+        exit_immediately: Some(5),
+        ..Behavior::default()
+    });
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        observable_restarts(),
+        StopOnExit::Owned,
+    );
+    // 还在 `restarting`（熔断之前的失败）不算落定：门控等着。
+    h.until_state(UpstreamState::Restarting).await;
+    assert!(
+        h.manager.open_gate().is_none(),
+        "a restarting engine is not settled"
+    );
+    // 熔断：`failed` + `crash_loop` 落定，门控放行，降级。
+    tokio::time::timeout(PATIENT, h.manager.wait_all_settled())
+        .await
+        .expect("a tripped breaker is settled");
+    let outcome = h.manager.open_gate().expect("settled: the gate opens");
+    assert_eq!(
+        outcome.degraded["omlx"].reason,
+        Some(UpstreamReason::CrashLoop)
+    );
+    assert_eq!(h.view().state, UpstreamState::Failed);
+    let launches = rig.fake.launches();
+    assert_eq!(launches, 3, "three failed starts, then the breaker");
+    // 降级放行之后不再半开重试（门控放行之前会，见 `a_crash_loop_trips_…`）：半开间隔是 400 毫秒，等四个。
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+    assert_eq!(
+        rig.fake.launches(),
+        launches,
+        "no half-open retry after a degraded open"
+    );
+    assert_eq!(h.view().state, UpstreamState::Failed);
+    assert_eq!(h.view().reason, Some(UpstreamReason::CrashLoop));
+    assert_eq!(
+        h.manager.start_upstream("omlx").await,
+        Err(CommandError::RestartRequired)
+    );
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn the_gate_task_gives_up_on_an_engine_that_never_becomes_ready_at_the_deadline_and_opens_degraded()
+ {
+    use axum::Router;
+    use idoris_router::lifecycle::gate::{self, Finalized};
+    use idoris_router::runtime::RuntimeRegistry;
+    use idoris_router::swap::SwapApp;
+
+    // 引擎活着、一直不监听；熔断远在天边（上限 50）：只有门控自己的截止时间能让它落定。
+    let rig = Rig::new(&Behavior {
+        never_listen: true,
+        ..Behavior::default()
+    });
+    let mut timings = fast();
+    timings.startup_timeout = Duration::from_millis(1500);
+    timings.crash_limit = 50;
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        timings,
+        StopOnExit::Owned,
+    );
+    let manager = Arc::new(h.manager);
+    let seen: Arc<Mutex<Option<GateOutcome>>> = Arc::default();
+    let record = seen.clone();
+    let started = Instant::now();
+    let task = gate::spawn(
+        manager.clone(),
+        h.health.clone(),
+        SwapApp::new(Router::new()),
+        SwapApp::new(Router::new()),
+        Box::new(move |outcome| {
+            *record.lock().unwrap() = Some(outcome.clone());
+            Ok(Finalized {
+                data: Router::new(),
+                admin: Router::new(),
+                runtimes: RuntimeRegistry::default(),
+            })
+        }),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    wait_for("the gate to open at the deadline", || {
+        h.health.gate() == GateState::Open
+    })
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the wait for the gate is bounded by the startup timeout, not by the breaker"
+    );
+    task.handle.await.unwrap();
+    // 到点放弃：`failed` + `startup_timeout`，降级放行；finalize 拿到的就是这个结果。
+    let outcome = seen.lock().unwrap().clone().expect("finalize ran");
+    assert_eq!(
+        outcome.degraded["omlx"].reason,
+        Some(UpstreamReason::StartupTimeout)
+    );
+    assert_eq!(outcome.degraded["omlx"].state, UpstreamState::Failed);
+    assert_eq!(
+        h.health.view().phase,
+        Phase::Degraded,
+        "a managed engine that was given up on: degraded"
+    );
+    // 半拉起的引擎停掉了，放弃之后不再重试（冻结）。
+    let launches = rig.fake.launches();
+    if launches >= 1 {
+        wait_for("the abandoned engine to be stopped", || {
+            !pid_alive(rig.pid(0))
+        })
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(rig.fake.launches(), launches, "no retry after giving up");
+    assert_eq!(
+        manager.start_upstream("omlx").await,
+        Err(CommandError::RestartRequired)
+    );
+    manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn giving_up_on_an_owned_engine_that_stopped_answering_stops_it_and_reports_the_startup_timeout()
+ {
+    // 就绪过、之后活着却不答的自有引擎（`unavailable`，不是终局）：门控一直等它，到截止时间放弃（这里直接调放弃的那一步）。
+    // 放弃就是停掉它：不能留一个没人管的引擎进程在后台，状态却说 `failed`。
+    let rig = Rig::new(&Behavior::default());
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    let pid = rig.pid(0);
+    rig.fake.force_status(503);
+    let status = h.until_state(UpstreamState::Unavailable).await;
+    assert!(status.owned);
+    assert!(
+        h.manager.open_gate().is_none(),
+        "unavailable is not settled: it can still come back"
+    );
+    h.manager.give_up_unsettled().await;
+    let status = h.until_state(UpstreamState::Failed).await;
+    assert_eq!(status.reason, Some(UpstreamReason::StartupTimeout));
+    assert!(!status.owned, "the engine is gone");
+    wait_for("the given-up engine to be stopped", || !pid_alive(pid)).await;
+    assert_eq!(rig.records(), 0, "its ownership record went with it");
+    let outcome = h.manager.open_gate().expect("settled now");
+    assert_eq!(
+        outcome.degraded["omlx"].reason,
+        Some(UpstreamReason::StartupTimeout)
+    );
+    // 冻结的实例没有进程：不是引擎失效，没有退出码 5；也不再重试。
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), h.manager.engine_failed())
+            .await
+            .is_err()
+    );
+    assert_eq!(rig.fake.launches(), 1, "no retry");
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn the_gate_task_hands_the_degraded_outcome_to_finalize_and_the_health_says_degraded() {
+    use axum::Router;
+    use idoris_router::lifecycle::gate::{self, Finalized};
+    use idoris_router::runtime::RuntimeRegistry;
+    use idoris_router::swap::SwapApp;
+
+    let rig = Rig::new(&Behavior::default());
+    let missing = rig.work.path().join("no-such-omlx-cli");
+    let h = Harness::start_with(
+        &rig,
+        default_backend(&rig),
+        Scripted::new(),
+        fast(),
+        StopOnExit::Owned,
+        missing,
+    );
+    let manager = Arc::new(h.manager);
+    let seen: Arc<Mutex<Option<GateOutcome>>> = Arc::default();
+    let record = seen.clone();
+    let task = gate::spawn(
+        manager.clone(),
+        h.health.clone(),
+        SwapApp::new(Router::new()),
+        SwapApp::new(Router::new()),
+        Box::new(move |outcome| {
+            *record.lock().unwrap() = Some(outcome.clone());
+            Ok(Finalized {
+                data: Router::new(),
+                admin: Router::new(),
+                runtimes: RuntimeRegistry::default(),
+            })
+        }),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    wait_for("the gate to open", || h.health.gate() == GateState::Open).await;
+    task.handle.await.unwrap();
+    let outcome = seen.lock().unwrap().clone().expect("finalize ran");
+    assert_eq!(
+        outcome.degraded["omlx"].reason,
+        Some(UpstreamReason::EngineNotFound)
+    );
+    let view = h.health.view();
+    assert_eq!(view.phase, Phase::Degraded);
+    assert!(!view.ready);
+    assert_eq!(view.upstreams[0].state, UpstreamState::Absent);
+    assert_eq!(
+        view.upstreams[0].reason,
+        Some(UpstreamReason::EngineNotFound)
+    );
+    manager.shutdown(true).await;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1935,7 +2351,7 @@ async fn the_gate_task_swaps_the_full_router_in_only_once_the_engines_are_ready(
         h.health.clone(),
         data.clone(),
         admin.clone(),
-        Box::new(move || {
+        Box::new(move |_| {
             counted.fetch_add(1, Ordering::SeqCst);
             Ok(Finalized {
                 data: Router::new().route("/x", get(|| async { "ready" })),
@@ -2002,7 +2418,7 @@ async fn a_failing_finalize_is_reported_as_a_startup_failure_and_nothing_is_swap
         h.health.clone(),
         data,
         admin,
-        Box::new(|| Err("runtime construction failed".to_owned())),
+        Box::new(|_| Err("runtime construction failed".to_owned())),
         tokio_util::sync::CancellationToken::new(),
     );
     let message = tokio::time::timeout(PATIENT, task.failed)
@@ -2036,7 +2452,7 @@ async fn a_panicking_finalize_is_reported_as_a_startup_failure_and_nothing_is_sw
         h.health.clone(),
         data,
         SwapApp::new(Router::new()),
-        Box::new(|| -> Result<Finalized, String> {
+        Box::new(|_| -> Result<Finalized, String> {
             panic!("test: building the full router panicked")
         }),
         tokio_util::sync::CancellationToken::new(),
@@ -2078,7 +2494,7 @@ async fn a_cancelled_gate_task_never_swaps() {
         h.health.clone(),
         SwapApp::new(Router::new()),
         SwapApp::new(Router::new()),
-        Box::new(move || {
+        Box::new(move |_| {
             counted.fetch_add(1, Ordering::SeqCst);
             Err("must not be called".to_owned())
         }),

@@ -749,7 +749,7 @@ async fn a_managed_declaration_is_reported_as_managed_and_a_listener_that_is_not
             upstreams
                 .iter()
                 .any(|u| u["id"] == "managed-engine" && u["state"] == "failed")
-        })
+        }) && body["phase"] == "degraded"
     })
     .await;
     let managed = body["upstreams"]
@@ -762,7 +762,8 @@ async fn a_managed_declaration_is_reported_as_managed_and_a_listener_that_is_not
         managed,
         &json!({"id": "managed-engine", "engine_kind": "omlx", "state": "failed", "reason": "port_in_use", "managed": true, "owned": false})
     );
-    // 托管上游处于终态：门控不放行，`phase` 是 `degraded`（不是 `ready`）。
+    // 托管上游处于终态：门控不被它拖住（降级放行，别的卡照常服务），`phase` 是 `degraded`（不是 `ready`）。放行之后默认卡
+    // `omlx` 的探测器才起，它第一次观测之前是 `starting`，所以上面等到 `degraded` 为止。
     assert_eq!(body["phase"], "degraded");
     assert_eq!(body["ready"], false);
     assert!(

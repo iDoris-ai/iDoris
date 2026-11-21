@@ -595,7 +595,7 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
         Err(storage::InstanceLockError::Other(message)) => return Err(message),
     };
     let remote_kill_switch = env_flag("IDORIS_REMOTE_KILL_SWITCH");
-    // 有托管卡时，Supervisor 要等托管引擎就绪才能创建（它在创建时对引擎采样一次，引擎还没好就会把启动错误粘滞住）：
+    // 有托管卡时，Supervisor 要等托管引擎落定（就绪，或终局的失败）才能创建（它在创建时对引擎采样一次，引擎还没好就会把启动错误粘滞住）：
     // 这里只做不启动任何任务的校验，完整的 Router（含 Supervisor）在启动门控完成时才创建并替换上去（接口规范 §2.7.6）。
     let runtimes = if managed.is_some() {
         RuntimeRegistry::validate_local_configs(&cards, &local_runtime_configs)?;
@@ -941,7 +941,7 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
             &component_list
         }
     );
-    // 引擎管理器（接口规范 §2.7.6）：有托管卡时，各托管引擎在后台走启动决策；完整的 Router 等它们都就绪才替换上去。
+    // 引擎管理器（接口规范 §2.7.6）：有托管卡时，各托管引擎在后台走启动决策；完整的 Router 等它们都落定（就绪，或终局的失败：降级放行）才替换上去。
     // 启动输入里 launcher 给的 `engine`（可执行文件、`stop_on_exit`）在这里才读到（帧在端口绑定之后读）。
     let engines = match &managed {
         Some(managed) => Some(managed.start(
@@ -989,15 +989,24 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
                     state.http_client.clone(),
                     state.remote_kill_switch.clone(),
                 );
-                Box::new(move || {
+                Box::new(move |outcome: &lifecycle::GateOutcome| {
+                    // 降级放行（有托管引擎终局失败，接口规范 §2.7.6 勘误六）：没就绪的托管卡不建 Supervisor——它会去采样一个没起来、
+                    // 或者没通过属主校验的端点；路由到这些卡的请求由 `managed_failures` 直接 503（带原因），别的卡照常服务。
+                    let runtime_cards: Vec<_> = state
+                        .cards
+                        .iter()
+                        .filter(|card| !outcome.degraded.contains_key(&card.provider.id))
+                        .cloned()
+                        .collect();
                     let runtimes =
                         RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
-                            &state.cards,
+                            &runtime_cards,
                             &local_runtime_configs,
                             allocated_budget_bytes,
                             remote_kill_switch,
                         )?;
                     state.runtimes = runtimes.clone();
+                    state.managed_failures = Arc::new(outcome.degraded.clone());
                     state.capabilities = capabilities_inputs.take().map(|(catalog, facts)| {
                         Arc::new(
                             LiveCapabilitiesProvider::new(catalog, facts, runtimes.clone())

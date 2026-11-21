@@ -9,11 +9,12 @@ use std::time::Duration;
 use idoris_upstream::engine::{ProcessInspector, StopOnExit};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use super::backend::{EngineBackend, OmlxBackend};
 use super::backoff::Timings;
 use super::instance::{Actor, Command, Request};
-use crate::readiness::{HealthState, UpstreamPlan, UpstreamReason, UpstreamState};
+use crate::readiness::{HealthState, ManagedFailure, UpstreamPlan, UpstreamReason, UpstreamState};
 use crate::register::LogSink;
 use crate::runtime::RuntimeRegistry;
 
@@ -185,6 +186,16 @@ pub enum CommandError {
     NotOwned,
     /// 实例任务已经结束（管理器在停止）。
     Closed,
+    /// 这个上游在门控放行时就没有就绪（降级放行）：完整的 Router 里它的 Supervisor 看到的是一个失败的引擎，之后即使引擎好了
+    /// 也读不到（运行期引擎换代是 v0.6.1 / S10 的事）。保守起见降级放行之后不再重试也不接受 `start`，要重启 iDoris。
+    RestartRequired,
+}
+
+/// 门控放行的结果：放行时没有就绪的托管上游（降级放行）。空 = 全部就绪。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GateOutcome {
+    /// 上游 id → 放行时的状态与原因。
+    pub degraded: BTreeMap<String, ManagedFailure>,
 }
 
 /// 一个实例当前的状态（管理器内部，也是门控判据的来源）。
@@ -193,16 +204,33 @@ pub(super) struct Status {
     pub state: UpstreamState,
     pub reason: Option<UpstreamReason>,
     pub owned: bool,
+    /// 终局：这个实例不会自己再往就绪走了（`Idle::Terminal`、熔断、被 `stop`、被放弃）。和 `state` 分开记：
+    /// `owned_engine_exited` 在重启之前会短暂发布一次 `failed`，那不是终局，门控不能把它当成「落定」。
+    pub terminal: bool,
+}
+
+impl Status {
+    /// 落定：就绪，或终局。门控等所有托管实例都落定才放行（接口规范 §2.7.6，勘误六）。
+    pub fn is_settled(&self) -> bool {
+        self.state == UpstreamState::Ready || self.terminal
+    }
 }
 
 /// 各实例任务共用的东西。
 pub(super) struct Shared {
     pub config: ManagerConfig,
     pub health: HealthState,
-    /// 完整的 Router 已经按「所有引擎就绪」的判据放行（[`EngineManager::open_gate`]）：之后自有引擎的进程退出
+    /// 完整的 Router 已经按「所有引擎落定」的判据放行（[`EngineManager::open_gate`]）：之后（放行时已经就绪的）自有引擎的进程退出
     /// 无法在进程内恢复，是退出码 5。
     pub gate_open: AtomicBool,
     statuses: Mutex<BTreeMap<String, Status>>,
+    /// 上游 id → 引擎种类（`GateOutcome` 要带）。
+    kinds: BTreeMap<String, String>,
+    /// 门控放行时没有就绪的实例，只在 [`EngineManager::open_gate`] 里写一次（持有 `statuses` 的锁时写，所以与状态一致）。
+    /// 这些实例「冻结」：不再半开重试，不再接受 `start`（见 [`CommandError::RestartRequired`]）。
+    degraded: Mutex<BTreeMap<String, ManagedFailure>>,
+    /// 管理器启动的时刻：门控最晚等到这之后一个启动超时（[`EngineManager::gate_deadline`]）。
+    started: Instant,
     changed: watch::Sender<u64>,
     failure: watch::Sender<Option<EngineFailure>>,
     /// 完整的 Router 创建之后挂上来的 Supervisor 表：门控完成之后，Supervisor 的启动错误粘滞要反映到 `/health`。
@@ -225,10 +253,17 @@ impl Shared {
         self.changed.send_modify(|version| *version += 1);
     }
 
-    fn all_ready(statuses: &BTreeMap<String, Status>) -> bool {
-        statuses
-            .values()
-            .all(|status| status.state == UpstreamState::Ready)
+    /// 每个实例都落定了（就绪，或终局）。
+    fn all_settled(statuses: &BTreeMap<String, Status>) -> bool {
+        statuses.values().all(Status::is_settled)
+    }
+
+    /// 这个实例在门控放行时没有就绪：冻结（不再半开重试、不再接受 `start`）。
+    pub fn is_frozen(&self, id: &str) -> bool {
+        self.degraded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(id)
     }
 
     /// 自有引擎失效：通知 `bin` 去走退出码 5 的停止路径。只记第一个。
@@ -259,11 +294,18 @@ impl EngineManager {
     pub fn start(config: ManagerConfig, plans: Vec<ManagedPlan>, health: HealthState) -> Self {
         let (changed, _) = watch::channel(0_u64);
         let (failure, _) = watch::channel(None);
+        let kinds = plans
+            .iter()
+            .map(|plan| (plan.id.clone(), plan.backend.kind().as_str().to_owned()))
+            .collect();
         let shared = Arc::new(Shared {
             config,
             health,
             gate_open: AtomicBool::new(false),
             statuses: Mutex::new(BTreeMap::new()),
+            kinds,
+            degraded: Mutex::new(BTreeMap::new()),
+            started: Instant::now(),
             changed,
             failure,
             runtimes: OnceLock::new(),
@@ -282,6 +324,7 @@ impl EngineManager {
                     state: UpstreamState::Starting,
                     reason: None,
                     owned: false,
+                    terminal: false,
                 },
             );
             senders.insert(plan.id.clone(), sender);
@@ -301,9 +344,10 @@ impl EngineManager {
         self.senders.keys().cloned().collect()
     }
 
-    /// 等到每个实例都处于 `ready`（同一时刻）。已经是了就立刻返回；有实例处于终态时一直等下去，直到它们被
-    /// `start`、半开重试等带回就绪，或进程停止。
-    pub async fn wait_all_ready(&self) {
+    /// 等到每个实例都「落定」（同一时刻）：`ready`，或不会自己好的终局（配置性失败、`engine_not_found`、熔断……）。
+    /// 还在 `starting`、`restarting` 的不算。已经落定了就立刻返回。有实例一直不落定（引擎既不好也不彻底失败）时
+    /// 不会返回：调用方用 [`Self::gate_deadline`] 给它一个上限，到点用 [`Self::give_up_unsettled`] 放弃。
+    pub async fn wait_all_settled(&self) {
         let mut changed = self.shared.changed.subscribe();
         loop {
             {
@@ -312,7 +356,7 @@ impl EngineManager {
                     .statuses
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                if Shared::all_ready(&statuses) {
+                if Shared::all_settled(&statuses) {
                     return;
                 }
             }
@@ -323,21 +367,109 @@ impl EngineManager {
         }
     }
 
-    /// 门控放行：**在同一把锁里**确认所有实例仍是 `ready`，是就把 `gate_open` 置位并返回 `true`；不是（引擎在
-    /// [`Self::wait_all_ready`] 返回之后又失效了）返回 `false`，调用方回去再等。置位之后，自有引擎的进程退出就是
-    /// 退出码 5（[`Self::engine_failed`]）。
-    pub fn open_gate(&self) -> bool {
+    /// 门控最晚等到这个时刻：管理器启动之后一个启动超时（oMLX 缺省 90 秒，`Timings::startup_timeout`）。
+    /// 到点还有实例没落定，调用方 [`Self::give_up_unsettled`] 之后放行（降级）：门控的等待有界。
+    pub fn gate_deadline(&self) -> Instant {
+        self.shared.started + self.shared.config.timings.startup_timeout
+    }
+
+    /// 等所有实例落定，**最多等到 [`Self::gate_deadline`]**；到点还没落定的放弃（[`Self::give_up_unsettled`]）。返回时每个
+    /// 实例都落定了，除非有实例任务已经没了（管理器在停止）：调用方再用 [`Self::open_gate`] 确认。
+    pub async fn settle(&self) {
+        let _ = tokio::time::timeout_at(self.gate_deadline(), self.wait_all_settled()).await;
+        self.give_up_unsettled().await;
+    }
+
+    /// 等到可以放行并放行：所有实例落定（[`Self::settle`]：最多等到 [`Self::gate_deadline`]，到点还没落定的放弃），再在同一把锁里
+    /// 确认并放行（[`Self::open_gate`]）。确认时又有实例不落定了（一个就绪的引擎在这之间又失效了，或者放弃时有实例没答）：
+    /// 等下一次状态变化再来，不空转；下一轮仍受**同一个**截止时间约束，所以整个等待有界（实例任务已经没了的除外：管理器在停止）。
+    pub async fn open_when_settled(&self) -> GateOutcome {
+        loop {
+            // 先订阅、后判断：之后的任何一次状态变化都不会漏掉。
+            let mut changes = self.shared.changed.subscribe();
+            self.settle().await;
+            if let Some(outcome) = self.open_gate() {
+                return outcome;
+            }
+            if changes.changed().await.is_err() {
+                // 管理器不再有写者：永远不会再变。
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// 门控放行：**在同一把锁里**确认所有实例仍然落定（[`Self::wait_all_settled`] 返回之后可能又变了：例如一个就绪的
+    /// 引擎又失效了），是就把 `gate_open` 置位并返回放行的结果；不是返回 `None`，调用方回去再等。
+    ///
+    /// 放行时没有就绪的实例（终局的失败）进 [`GateOutcome::degraded`]，并从这一刻起**冻结**：不再半开重试，不再接受
+    /// `start`，要重启 iDoris（它们的 Supervisor 在放行时创建，看到的是一个失败的引擎）。置位之后，已经就绪的自有
+    /// 引擎的进程退出就是退出码 5（[`Self::engine_failed`]）；冻结的实例没有进程，不会触发它。
+    pub fn open_gate(&self) -> Option<GateOutcome> {
         let statuses = self
             .shared
             .statuses
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if Shared::all_ready(&statuses) {
-            self.shared.gate_open.store(true, Ordering::SeqCst);
-            true
-        } else {
-            false
+        if !Shared::all_settled(&statuses) {
+            return None;
         }
+        let degraded: BTreeMap<String, ManagedFailure> = statuses
+            .iter()
+            .filter(|(_, status)| status.state != UpstreamState::Ready)
+            .map(|(id, status)| {
+                let failure = ManagedFailure {
+                    engine_kind: self.shared.kinds.get(id).cloned().unwrap_or_default(),
+                    state: status.state,
+                    reason: status.reason,
+                };
+                (id.clone(), failure)
+            })
+            .collect();
+        *self
+            .shared
+            .degraded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = degraded.clone();
+        self.shared.gate_open.store(true, Ordering::SeqCst);
+        Some(GateOutcome { degraded })
+    }
+
+    /// 门控等不下去了（到了 [`Self::gate_deadline`]）：还没落定的实例放弃：停掉半拉起的引擎，报 `failed` +
+    /// `startup_timeout`，不再重试。等它们回答（至多 `stop_grace` 加一点余量）。已经落定的不动。
+    pub async fn give_up_unsettled(&self) {
+        let unsettled: Vec<String> = {
+            let statuses = self
+                .shared
+                .statuses
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            statuses
+                .iter()
+                .filter(|(_, status)| !status.is_settled())
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut waits = Vec::new();
+        for id in unsettled {
+            let Some(sender) = self.senders.get(&id) else {
+                continue;
+            };
+            let (reply, answer) = oneshot::channel();
+            let request = Request {
+                command: Command::GiveUp,
+                reply: Some(reply),
+            };
+            if sender.send(request).await.is_ok() {
+                waits.push(answer);
+            }
+        }
+        let budget = self.shared.config.timings.stop_grace + Duration::from_secs(3);
+        let _ = tokio::time::timeout(budget, async {
+            for answer in waits {
+                let _ = answer.await;
+            }
+        })
+        .await;
     }
 
     pub fn gate_is_open(&self) -> bool {
@@ -440,6 +572,50 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    fn status(state: UpstreamState, terminal: bool) -> Status {
+        Status {
+            state,
+            reason: None,
+            owned: false,
+            terminal,
+        }
+    }
+
+    fn table(list: &[Status]) -> BTreeMap<String, Status> {
+        list.iter()
+            .enumerate()
+            .map(|(index, status)| (format!("engine-{index}"), *status))
+            .collect()
+    }
+
+    #[test]
+    fn the_gate_waits_for_every_instance_to_be_ready_or_terminal() {
+        let ready = status(UpstreamState::Ready, false);
+        let terminal = status(UpstreamState::Failed, true);
+        // 一个落定、另一个还在往前走：不放行（只要有一个还没有结论，Supervisor 就不能创建）。
+        for pending in [
+            status(UpstreamState::Starting, false),
+            status(UpstreamState::Restarting, false),
+            // `owned_engine_exited` 在重启之前短暂发布的 `failed`：不是终局。
+            status(UpstreamState::Failed, false),
+            status(UpstreamState::Unavailable, false),
+        ] {
+            assert!(!Shared::all_settled(&table(&[pending])), "{pending:?}");
+            assert!(
+                !Shared::all_settled(&table(&[ready, pending])),
+                "{pending:?}"
+            );
+            assert!(
+                !Shared::all_settled(&table(&[terminal, pending])),
+                "{pending:?}"
+            );
+        }
+        // 就绪或终局的都落定了，不管几个。
+        assert!(Shared::all_settled(&table(&[ready])));
+        assert!(Shared::all_settled(&table(&[terminal])));
+        assert!(Shared::all_settled(&table(&[ready, terminal, ready])));
+    }
 
     #[test]
     fn only_a_loopback_endpoint_with_an_explicit_port_can_be_managed() {

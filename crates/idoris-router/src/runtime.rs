@@ -182,7 +182,7 @@ impl RuntimeRegistry {
     }
 
     /// 本地 runtime 配置与组件卡对得上：每个配置都有对应的卡、不绑 Resident 直连卡、form/locality/endpoint 一致。
-    /// 不启动任何任务。启动门控期间（接口规范 §2.7.6）Supervisor 要等引擎就绪才创建，但这些配置错误仍要在启动的
+    /// 不启动任何任务。启动门控期间（接口规范 §2.7.6）Supervisor 要等引擎落定才创建，但这些配置错误仍要在启动的
     /// 一开头报出来（先于绑定端口），所以单独拿出来，[`Self::spawn_with_local_configs_budget_and_kill_switch`] 也先调它。
     pub fn validate_local_configs(
         cards: &[ComponentCard],

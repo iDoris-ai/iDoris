@@ -3,7 +3,7 @@
 //! 托管引擎要先就绪，完整的 Router 才能创建（它的 Supervisor 在创建时对引擎采样一次，引擎还没好就会把启动错误粘滞住，
 //! 之后一直 503）；而引擎可能要 90 秒才好，期间 iDoris 要能答 `/health`。做法：数据面与 Admin 两个监听器照旧最先绑定，
 //! 各自服务一个 [`SwapApp`]：启动期里面是「starting 体」（[`crate::build_starting_app`]、
-//! [`crate::admin::build_admin_starting_app`]），引擎就绪之后把完整的 Router [`SwapApp::swap`] 进去。
+//! [`crate::admin::build_admin_starting_app`]），引擎落定（就绪，或终局的失败）之后把完整的 Router [`SwapApp::swap`] 进去。
 //!
 //! # 替换的语义
 //!

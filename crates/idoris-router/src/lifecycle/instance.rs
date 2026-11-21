@@ -27,6 +27,9 @@ pub(super) enum Command {
     Start,
     Stop,
     Restart,
+    /// 门控等的时间到了（启动超时），这个实例还没落定：放弃。停掉半拉起的引擎，报 `failed` + `startup_timeout`，
+    /// 不再重试（[`EngineManager::give_up_unsettled`]）。已经落定的实例当场回答，什么也不改。
+    GiveUp,
     /// iDoris 停止：收尾并结束任务。`stop_engine` 为假时让自有引擎继续跑。
     Shutdown {
         stop_engine: bool,
@@ -42,9 +45,9 @@ pub(super) struct Request {
 /// 空闲时在等什么。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Idle {
-    /// 终态（`absent`、配置性的 `failed`、`unavailable`）：只等命令。
+    /// 终态（`absent`、配置性的 `failed`、`unavailable`、被放弃）：只等命令。
     Terminal,
-    /// 熔断（`failed` + `crash_loop`）：每隔半开间隔重试一次，也等命令。
+    /// 熔断（`failed` + `crash_loop`）：每隔半开间隔重试一次，也等命令；门控降级放行之后不再重试（冻结）。
     CrashLoop,
     /// 被 `stop` 停下：只等命令。
     Stopped,
@@ -62,7 +65,7 @@ enum Step {
 enum Attempt {
     /// 引擎就绪（`Actor::engine` 或 `Actor::external` 已设）。
     Ready,
-    /// 终态：不会自己好，等 `start`。
+    /// 终态：不会自己好，等 `start`（门控降级放行时没就绪的实例冻结，连 `start` 也不接受，见 `Actor::frozen`）。
     Terminal {
         state: UpstreamState,
         reason: Option<UpstreamReason>,
@@ -114,6 +117,7 @@ impl Drop for PanicReport {
                 state: UpstreamState::Failed,
                 reason: None,
                 owned: false,
+                terminal: true,
             },
         );
         self.shared.signal_failure(EngineFailure {
@@ -134,6 +138,8 @@ pub(super) struct Actor {
     /// 当前发布的状态。
     state: UpstreamState,
     reason: Option<UpstreamReason>,
+    /// 当前发布的状态是不是终局（见 [`Status::terminal`]）。
+    terminal: bool,
     /// 等待期间收到、还没有处理的命令。
     pending: Option<Request>,
 }
@@ -156,6 +162,7 @@ impl Actor {
             external: None,
             state: UpstreamState::Starting,
             reason: None,
+            terminal: false,
             pending: None,
         }
     }
@@ -194,17 +201,33 @@ impl Actor {
             .log(&format!("[idoris] 引擎 {}：{text}", self.plan.id));
     }
 
-    /// 发布状态。只在状态或原因变化时写一行日志（不刷屏）。
+    /// 发布状态（还在往前走，不是终局）。只在状态或原因变化时写一行日志（不刷屏）。
     fn publish(&mut self, state: UpstreamState, reason: Option<UpstreamReason>) {
+        self.emit(state, reason, false);
+    }
+
+    /// 发布一个终局的状态：这个实例不会自己再往就绪走了，门控把它算作「落定」。
+    fn publish_terminal(&mut self, state: UpstreamState, reason: Option<UpstreamReason>) {
+        self.emit(state, reason, true);
+    }
+
+    /// 门控是在这个实例没有就绪的时候降级放行的：它冻结，不再半开重试，不再接受 `start`（要重启 iDoris）。
+    fn frozen(&self) -> bool {
+        self.shared.is_frozen(&self.plan.id)
+    }
+
+    fn emit(&mut self, state: UpstreamState, reason: Option<UpstreamReason>, terminal: bool) {
         let changed = self.state != state || self.reason != reason;
         self.state = state;
         self.reason = reason;
+        self.terminal = terminal;
         self.shared.publish(
             &self.plan.id,
             Status {
                 state,
                 reason,
                 owned: self.engine.is_some(),
+                terminal,
             },
         );
         if changed {
@@ -267,6 +290,12 @@ impl Actor {
                 ) =>
             {
                 Some(Ok(()))
+            }
+            // 已经落定（就绪，或终局）：门控等的时间到了也不用再放弃它。
+            Command::GiveUp if self.state == UpstreamState::Ready || self.terminal => Some(Ok(())),
+            // 降级放行之后，这个上游不再启动：它的 Supervisor 已经在放行时看过一个失败的引擎（要重启 iDoris）。
+            Command::Start | Command::Restart if self.frozen() => {
+                Some(Err(CommandError::RestartRequired))
             }
             // 已经停下了：幂等。
             Command::Stop if self.engine.is_none() && self.state == UpstreamState::Stopped => {
@@ -351,6 +380,21 @@ impl Actor {
                 answer(Ok(()));
                 Step::Exit
             }
+            Command::GiveUp => {
+                // 在启动的等待里被打断：半拉起的引擎已经被 `abandon` 收拾掉了。在监管里被打断（就绪过、之后活着却不答的
+                // 自有引擎）：它还在跑，放弃就是停掉它，不留一个没人管的引擎进程、状态却说 `failed`。
+                if let Some(owned) = self.engine.take() {
+                    self.stop_engine(owned).await;
+                }
+                self.log("门控等的时间到了而引擎还没就绪：放弃，不再重试");
+                self.publish_terminal(UpstreamState::Failed, Some(UpstreamReason::StartupTimeout));
+                answer(Ok(()));
+                Step::Idle(Idle::Terminal)
+            }
+            Command::Start | Command::Restart if self.frozen() => {
+                answer(Err(CommandError::RestartRequired));
+                current
+            }
             Command::Start => {
                 answer(Ok(()));
                 match self.state {
@@ -372,7 +416,7 @@ impl Actor {
                 if let Some(owned) = self.engine.take() {
                     answer(Ok(()));
                     self.stop_engine(owned).await;
-                    self.publish(UpstreamState::Stopped, None);
+                    self.publish_terminal(UpstreamState::Stopped, None);
                     Step::Idle(Idle::Stopped)
                 } else if self.state == UpstreamState::Stopped {
                     // 目标状态已经达成：幂等。
@@ -421,7 +465,7 @@ impl Actor {
                 Step::Supervise
             }
             Attempt::Terminal { state, reason } => {
-                self.publish(state, reason);
+                self.publish_terminal(state, reason);
                 Step::Idle(Idle::Terminal)
             }
             Attempt::Failure { reason } => self.fail(reason).await,
@@ -435,7 +479,7 @@ impl Actor {
         let now = Instant::now();
         let failures = self.window.record(now);
         if self.window.tripped(now) {
-            self.publish(UpstreamState::Failed, Some(UpstreamReason::CrashLoop));
+            self.publish_terminal(UpstreamState::Failed, Some(UpstreamReason::CrashLoop));
             return Step::Idle(Idle::CrashLoop);
         }
         self.publish(UpstreamState::Restarting, reason);
@@ -454,6 +498,9 @@ impl Actor {
             return Step::Idle(idle);
         }
         match idle {
+            // 门控已经在这个实例没就绪的时候降级放行了：不再半开重试（重试好了也读不到：Supervisor 的快照是放行时
+            // 创建的，要重启 iDoris）。
+            Idle::CrashLoop if self.frozen() => Step::Idle(idle),
             // 半开：试一次。
             Idle::CrashLoop => Step::Attempt,
             Idle::Terminal | Idle::Stopped => Step::Idle(idle),
@@ -1025,6 +1072,7 @@ impl Actor {
         self.publish(UpstreamState::Failed, None);
         if self.shared.gate_open.load(Ordering::SeqCst) {
             self.log("自有引擎已退出，进程内无法恢复（热恢复是 v0.6.1）：iDoris 将以退出码 5 停止，由 agent24d 重启");
+            self.publish_terminal(UpstreamState::Failed, None);
             self.shared.signal_failure(EngineFailure {
                 upstream_id: self.plan.id.clone(),
             });

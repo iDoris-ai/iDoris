@@ -130,6 +130,15 @@ pub enum UpstreamReason {
     StartupLatched,
 }
 
+/// 门控降级放行时没有就绪的托管上游（接口规范 §2.7.6，勘误六）：路由到它的请求不碰引擎，直接 503，原因码取自 `reason`
+/// （没有稳定原因码的失败，例如模型目录取不到，沿用已有的 `supervisor_unavailable`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedFailure {
+    pub engine_kind: String,
+    pub state: UpstreamState,
+    pub reason: Option<UpstreamReason>,
+}
+
 /// `/health.upstreams[]` 的元素。`reason` 出现时 `state` 不是 `ready`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpstreamStatus {
@@ -173,8 +182,8 @@ pub enum GateState {
 }
 
 /// 上游处于终态（`absent`、`failed`、`unavailable`、`stopped`）：此刻没有在往就绪走，要等外部变化（用户装好引擎、外部
-/// 引擎自己恢复）、半开重试或显式 `start` 才会回到就绪。门控未完成时，托管上游处于终态就意味着门控暂时完不成，
-/// `phase` 是 `degraded`（规范 §2.11.1）。
+/// 引擎自己恢复）、半开重试或显式 `start` 才会回到就绪（门控降级放行之后，没就绪的托管引擎冻结，只有重启 iDoris 才会）。
+/// 托管上游处于终态是它「落定」的失败，不拖住门控（接口规范 §2.7.6，勘误六）；`phase` 是 `degraded`（规范 §2.11.1）。
 fn is_terminal(state: UpstreamState) -> bool {
     matches!(
         state,
@@ -185,7 +194,8 @@ fn is_terminal(state: UpstreamState) -> bool {
     )
 }
 
-/// 门控未完成时的 `phase`（规范 §2.11.1）：任一托管上游处于终态，门控完不成，是 `degraded`；否则门控仍在进行
+/// 门控未完成时的 `phase`（规范 §2.11.1）：任一托管上游已经处于终态（落定的失败；其余托管上游落定之后门控降级放行）是
+/// `degraded`；否则门控仍在进行
 /// （正在探测、拉起引擎或等它就绪），是 `starting`。门控未完成时不会是 `ready`，哪怕某张 resident 卡已经探测为 `ready`。
 fn gated_phase(upstreams: &[UpstreamStatus]) -> Phase {
     if upstreams
@@ -199,12 +209,21 @@ fn gated_phase(upstreams: &[UpstreamStatus]) -> Phase {
 }
 
 /// 由上游状态推出 `phase`（没有门控，或门控已完成）。
+///
+/// 门控放行之后，有托管上游处于终态（`absent`、`failed`、`unavailable`、`stopped`）是 `degraded`，哪怕别的上游
+/// 都在服务：门控不会被一个起不来的托管引擎拖住（接口规范 §2.7.6，勘误六），但界面要能看出有一个托管引擎没好。
+/// 没有托管上游时这一条不起作用（`managed` 恒为 false），行为与 v0.5.0 一致。
 pub fn phase_of(upstreams: &[UpstreamStatus]) -> Phase {
     if upstreams
         .iter()
         .any(|upstream| upstream.state == UpstreamState::Starting)
     {
         Phase::Starting
+    } else if upstreams
+        .iter()
+        .any(|upstream| upstream.managed && is_terminal(upstream.state))
+    {
+        Phase::Degraded
     } else if upstreams
         .iter()
         .any(|upstream| upstream.state == UpstreamState::Ready)
@@ -340,7 +359,7 @@ impl HealthState {
     }
 
     pub fn view(&self) -> HealthView {
-        // 先读门控再读上游：门控从 Pending 变成 Open 发生在上游都就绪之后，这样读到 Open 时看到的上游不会比门控旧。
+        // 先读门控再读上游：门控从 Pending 变成 Open 发生在上游都落定之后，这样读到 Open 时看到的上游不会比门控旧。
         let gate = self.gate();
         let upstreams = self.read();
         let phase = match gate {
@@ -772,6 +791,53 @@ mod tests {
         health.set_managed("omlx", Unavailable, None, true);
         assert_eq!(health.view().phase, Phase::Degraded);
         health.set_managed("omlx", Ready, None, true);
+        assert_eq!(health.view().phase, Phase::Ready);
+    }
+
+    #[test]
+    fn after_the_gate_a_managed_upstream_in_a_terminal_state_is_degraded_even_while_another_upstream_serves()
+     {
+        // 门控不被一个起不来的托管引擎拖住（降级放行，规范 §2.7.6 勘误六）：别的上游照常服务，但 `phase` 要让界面看出
+        // 有一个托管引擎没好：`degraded`，不是 `ready`。
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", Absent),
+                status("lmstudio", Ready, None),
+            ],
+        );
+        health.set_gate(GateState::Open);
+        for state in [Absent, Failed, Unavailable, Stopped] {
+            health.set_managed("omlx", state, None, false);
+            let view = health.view();
+            assert_eq!(
+                (view.phase, view.ready),
+                (Phase::Degraded, false),
+                "{state:?}"
+            );
+        }
+        // 一个上游还没有第一次观测（探测器刚起）：还是 `starting`。
+        health.apply("lmstudio", Observation::Unavailable(None));
+        health.set_managed("omlx", Failed, Some(UpstreamReason::CrashLoop), false);
+        assert_eq!(health.view().phase, Phase::Degraded);
+        // 托管引擎好了（或者它根本就绪），别的上游照常：`ready`。
+        health.apply("lmstudio", Observation::Ready);
+        health.set_managed("omlx", Ready, None, true);
+        assert_eq!(health.view().phase, Phase::Ready);
+    }
+
+    #[test]
+    fn a_non_managed_upstream_that_is_down_never_degrades_the_phase_while_another_is_ready() {
+        // v0.5.0 的口径不变：`managed` 才算；没有托管卡时这一条不起作用。
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(
+            0,
+            vec![status("a", Ready, None), status("b", Unavailable, None)],
+        );
+        assert_eq!(health.gate(), GateState::NotGated);
+        assert_eq!(health.view().phase, Phase::Ready);
+        health.set_gate(GateState::Open);
         assert_eq!(health.view().phase, Phase::Ready);
     }
 

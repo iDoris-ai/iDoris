@@ -90,6 +90,41 @@ extensions:
     )
 }
 
+/// 托管卡再绑一个角色（`fast`）：`idoris/fast` 路由到它。
+fn managed_card_with_a_role(port: u16) -> String {
+    format!(
+        "{}  idoris_role_models: {{ fast: \"managed-model\" }}\n",
+        managed_card(port)
+    )
+}
+
+/// `setup upstream` 生成的那种卡（LM Studio 之类）：resident、带 `idoris_upstream`，绑 `daily`。
+fn upstream_card(endpoint: &str) -> String {
+    format!(
+        r#"provider:
+  id: lmstudio
+  family: local
+  tier: local
+  capabilities: [chat]
+  privacy_class: local_only
+  cost: {{ input_per_m: 0, output_per_m: 0 }}
+  locality: loopback
+form: http_service
+endpoint: "{endpoint}"
+version_pin: "openai_compat@unknown"
+privacy_class: local_only
+allowed_egress: [loopback]
+fallback_policy: fail_closed
+fail_closed: true
+load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexist }}
+extensions:
+  _degradation: "未配置时 daily 角色没有候选"
+  idoris_role_models: {{ daily: "up-model" }}
+  idoris_upstream: {{ kind: openai_compat, flavor: openai_compat }}
+"#
+    )
+}
+
 fn http() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
@@ -334,10 +369,10 @@ fn wait_ports(path: &Path, child: &mut Child) -> (u64, u64) {
                 value["admin_port"].as_u64().unwrap(),
             );
         }
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "the server exited before it wrote the discovery file"
-        );
+        if let Some(status) = child.try_wait().unwrap() {
+            let stderr = child.stderr.take().map(read_all).unwrap_or_default();
+            panic!("the server exited ({status}) before it wrote the discovery file: {stderr}");
+        }
         assert!(Instant::now() < deadline, "discovery file never appeared");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -734,13 +769,16 @@ async fn a_budget_too_small_to_hold_anything_never_launches_and_says_budget_zero
                 "a zero budget is refused before anything is prepared"
             );
         }
-        // iDoris 本身继续服务：`/health` 一直答，数据面 503。
+        // 终局的失败不拖住门控：iDoris 本身继续服务，数据面是完整的 Router（`/v1/models` 不再是启动期的 503；托管引擎没起来，
+        // 列表是空的）。
         let response = client
             .get(format!("http://127.0.0.1:{data_port}/v1/models"))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 503);
+        assert_eq!(response.status(), 200);
+        let models: Value = response.json().await.unwrap();
+        assert_eq!(models["data"], json!([]), "{models}");
         send("-TERM", child.id());
         assert_eq!(
             wait_exit(&mut child, Duration::from_secs(30)).code(),
@@ -802,6 +840,93 @@ async fn an_engine_that_cannot_start_is_restarted_with_backoff_and_the_phase_sta
 }
 
 // ---------------------------------------------------------------------------------------------
+// 门控不被一个起不来的托管引擎无限期拖住（接口规范 §2.7.6，勘误六）
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_missing_engine_does_not_hold_a_healthy_upstream_card_hostage_the_gate_opens_degraded() {
+    // 没装 oMLX（`engine_not_found`），另有一张健康的上游卡（`setup upstream` 生成的那种）：门控不被托管引擎拖住，
+    // 上游卡照常服务；路由到托管卡的请求直接 503 带 `engine_not_found`；`/health.phase` 是 `degraded`。
+    let lm_studio = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(url_path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"object": "list", "data": [{"id": "up-model", "object": "model"}]}),
+        ))
+        .mount(&lm_studio)
+        .await;
+    Mock::given(method("POST"))
+        .and(url_path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "up-model",
+            "choices": [{"message": {"content": "hello from the upstream"}}]
+        })))
+        .mount(&lm_studio)
+        .await;
+    let env = Env::new();
+    env.write_card(&managed_card_with_a_role(env.port));
+    fs::write(
+        env.components.path().join("lmstudio.yaml"),
+        upstream_card(&lm_studio.uri()),
+    )
+    .unwrap();
+    let (mut child, data_port, _) =
+        env.start(&env.frame(&env.missing_executable(), json!({}), json!({})));
+    let client = http();
+    // 门控放行之后非托管卡的探测器才起：上游卡 `ready` 说明数据面已经是完整的 Router。
+    let body = health_until(&client, data_port, |body| {
+        upstream(body, "lmstudio")["state"] == "ready"
+    })
+    .await;
+    assert_eq!(body["phase"], "degraded", "{body}");
+    assert_eq!(body["ready"], false);
+    assert_eq!(
+        upstream(&body, "omlx"),
+        &json!({"id": "omlx", "engine_kind": "omlx", "state": "absent", "reason": "engine_not_found", "managed": true, "owned": false}),
+    );
+    let chat = |model: &str| {
+        client
+            .post(format!("http://127.0.0.1:{data_port}/v1/chat/completions"))
+            .header("X-iDoris-Privacy", "local_only")
+            .json(&json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+    };
+    // 上游卡照常服务。
+    let response = chat("idoris/daily").await.unwrap();
+    assert_eq!(response.status(), 200);
+    let answer: Value = response.json().await.unwrap();
+    assert!(
+        answer.to_string().contains("hello from the upstream"),
+        "{answer}"
+    );
+    // 托管卡：503 带原因，请求没有发给任何人。
+    let response = chat("idoris/fast").await.unwrap();
+    assert_eq!(response.status(), 503);
+    let refused: Value = response.json().await.unwrap();
+    assert_eq!(
+        refused["error"]["type"], "local_only_unavailable",
+        "{refused}"
+    );
+    assert_eq!(
+        refused["error"]["reason_code"], "engine_not_found",
+        "{refused}"
+    );
+    let chats = lm_studio
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/v1/chat/completions")
+        .count();
+    assert_eq!(chats, 1, "only the daily request reached the upstream");
+    send("-TERM", child.id());
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(30)).code(),
+        Some(0)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // #619：端口属主。占着端口的、不是我们认的那种引擎的东西，不会收到 key，也不会被接管
 // ---------------------------------------------------------------------------------------------
 
@@ -822,7 +947,8 @@ async fn an_unsigned_listener_on_the_managed_port_gets_no_key_is_not_adopted_and
     env.port = impostor.address().port();
     env.write_card(&managed_card(env.port));
     let fake = env.fake("engine", &Behavior::default());
-    let (mut child, data_port, _) = env.start(&env.frame(&fake.executable, json!({}), json!({})));
+    let (mut child, data_port, admin_port) =
+        env.start(&env.frame(&fake.executable, json!({}), json!({})));
     let client = http();
     let body = omlx_until(&client, data_port, "failed").await;
     assert_eq!(
@@ -832,11 +958,37 @@ async fn an_unsigned_listener_on_the_managed_port_gets_no_key_is_not_adopted_and
     assert_eq!(body["phase"], "degraded");
     // 不拉起第二个：端口上已经有东西在答。
     assert_eq!(fake.launches(), 0);
-    // 冒充者收到的每个请求都没有 `Authorization`：先校验属主，才可能发 key。
-    // 给探测器几个周期，也不会有。
+    // 管理器自己的（匿名）探测已经发生过了。终局的失败降级放行：数据面是完整的 Router，但它**不再碰**这个没通过属主校验的端口：
+    // 没有为它建 Supervisor（它会去采样这个端口），`/v1/models` 与 Admin 的模型观察都不探测它。
+    let before = impostor.received_requests().await.unwrap().len();
+    assert!(before > 0, "the anonymous probe did reach it");
+    let models = client
+        .get(format!("http://127.0.0.1:{data_port}/v1/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(models.status(), 200);
+    let admin_models = client
+        .get(format!("http://127.0.0.1:{admin_port}/admin/api/v1/models"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_models.status(), 200);
+    let admin_models: Value = admin_models.json().await.unwrap();
+    assert_eq!(
+        admin_models["sources"][0]["state"], "error",
+        "reported as unavailable without a probe: {admin_models}"
+    );
+    // 冒充者收到的每个请求都没有 `Authorization`：先校验属主，才可能发 key。给 Supervisor（如果错建了）几个周期去采样，
+    // 也不会有新的请求。
     tokio::time::sleep(Duration::from_millis(600)).await;
     let received = impostor.received_requests().await.unwrap();
-    assert!(!received.is_empty(), "the anonymous probe did reach it");
+    assert_eq!(
+        received.len(),
+        before,
+        "nothing contacted the listener after the degraded open: {received:?}"
+    );
     for request in &received {
         assert!(
             request.headers.get("authorization").is_none(),
