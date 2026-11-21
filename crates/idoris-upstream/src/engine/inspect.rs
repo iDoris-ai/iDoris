@@ -62,6 +62,26 @@ pub trait ProcessInspector: Send + Sync {
     async fn process_group(&self, pid: u32) -> Result<u32, InspectError>;
     /// `pid` 是否在 TCP `port` 上监听。
     async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError>;
+
+    /// 正在 TCP `port` 上监听（任一地址：回环、通配、IPv6）的全部 pid，升序去重；没有人监听是空列表。
+    /// 端口属主校验（[`super::ListenerVerifier`]，#619）用它回答「这个端口上现在是谁」。缺省「读不出来」：
+    /// 不实现它的检查器永远通不过属主校验，也就永远不会有 key 发给它面对的端口。
+    async fn listeners_on(&self, _port: u16) -> Result<Vec<u32>, InspectError> {
+        Err(InspectError::NoAnswer)
+    }
+
+    /// 进程的有效 uid（`ps -o uid=`）。缺省「读不出来」。
+    async fn uid_of(&self, _pid: u32) -> Result<u32, InspectError> {
+        Err(InspectError::NoAnswer)
+    }
+
+    /// 进程**正在运行的代码**的签名团队：`codesign --verify <pid>` 通过、再读 `codesign -d --verbose=2 <pid>` 的
+    /// `TeamIdentifier`。签名无效、没有签名、ad-hoc 签名（没有团队）都是 `Ok(None)`：它们不是任何团队的代码。
+    /// 读 pid 而不读可执行文件路径，是因为进程可以改自己的进程名（oMLX 把自己改名为 `omlx-server`，`ps` 的 `comm`
+    /// 因此不是路径），而 `codesign` 给出的是内核认定的、这个进程实际在跑的那份代码。缺省「读不出来」。
+    async fn signing_team(&self, _pid: u32) -> Result<Option<String>, InspectError> {
+        Err(InspectError::NoAnswer)
+    }
 }
 
 /// 经 `/bin/ps` 与 `lsof` 读。
@@ -70,8 +90,10 @@ pub struct SystemInspector {
     ps: PathBuf,
     /// 按顺序找第一个存在的：macOS 在 `/usr/sbin/lsof`，常见 Linux 在 `/usr/bin/lsof`。
     lsof: Vec<PathBuf>,
+    codesign: PathBuf,
     ps_timeout: Duration,
     lsof_timeout: Duration,
+    codesign_timeout: Duration,
 }
 
 impl Default for SystemInspector {
@@ -88,8 +110,10 @@ impl SystemInspector {
                 PathBuf::from("/usr/sbin/lsof"),
                 PathBuf::from("/usr/bin/lsof"),
             ],
+            codesign: PathBuf::from(super::CODESIGN_TOOL),
             ps_timeout: Duration::from_secs(2),
             lsof_timeout: Duration::from_secs(3),
+            codesign_timeout: Duration::from_secs(10),
         }
     }
 
@@ -106,6 +130,21 @@ impl SystemInspector {
         self.ps_timeout = ps;
         self.lsof_timeout = lsof;
         self
+    }
+
+    /// 换掉 `codesign` 的路径与时限（测试用：假 `codesign` 脚本）。
+    pub fn with_codesign(mut self, tool: impl Into<PathBuf>, timeout: Duration) -> Self {
+        self.codesign = tool.into();
+        self.codesign_timeout = timeout;
+        self
+    }
+
+    /// `lsof` 的位置：按顺序找第一个存在的。
+    fn lsof_tool(&self) -> Result<&PathBuf, InspectError> {
+        self.lsof
+            .iter()
+            .find(|path| path.is_file())
+            .ok_or(InspectError::ToolMissing)
     }
 
     async fn ps_value(&self, pid: u32, column: &str) -> Result<String, InspectError> {
@@ -155,11 +194,7 @@ impl ProcessInspector for SystemInspector {
     }
 
     async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
-        let lsof = self
-            .lsof
-            .iter()
-            .find(|path| path.is_file())
-            .ok_or(InspectError::ToolMissing)?;
+        let lsof = self.lsof_tool()?;
         let args = [
             "-nP",
             "-a",
@@ -183,6 +218,66 @@ impl ProcessInspector for SystemInspector {
             _ => Err(InspectError::NoAnswer),
         }
     }
+
+    async fn listeners_on(&self, port: u16) -> Result<Vec<u32>, InspectError> {
+        let lsof = self.lsof_tool()?;
+        let args = ["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"].map(OsString::from);
+        let output = run_tool(lsof, &args, self.lsof_timeout).await?;
+        match output.code {
+            Some(0) => parse_lsof_pids(&output.stdout),
+            // lsof 自己的「没有匹配」：退出码 1，stdout 与 stderr 都是空的（出错同样退出 1，但会在 stderr 说话）。
+            Some(1) if output.stdout.trim().is_empty() && output.stderr.trim().is_empty() => {
+                Ok(Vec::new())
+            }
+            _ => Err(InspectError::NoAnswer),
+        }
+    }
+
+    async fn uid_of(&self, pid: u32) -> Result<u32, InspectError> {
+        self.ps_value(pid, "uid")
+            .await?
+            .parse()
+            .map_err(|_| InspectError::NoAnswer)
+    }
+
+    async fn signing_team(&self, pid: u32) -> Result<Option<String>, InspectError> {
+        let pid = OsString::from(pid.to_string());
+        let verified = run_tool(
+            Path::new(&self.codesign),
+            &[OsString::from("--verify"), pid.clone()],
+            self.codesign_timeout,
+        )
+        .await?;
+        if verified.code != Some(0) {
+            // 签名对这个进程不成立（没签名、被改过）：不是任何团队的代码。
+            return Ok(None);
+        }
+        // `codesign -d` 把说明写到 stderr。
+        let described = run_tool(
+            Path::new(&self.codesign),
+            &[OsString::from("-d"), OsString::from("--verbose=2"), pid],
+            self.codesign_timeout,
+        )
+        .await?;
+        if described.code != Some(0) {
+            return Err(InspectError::NoAnswer);
+        }
+        Ok(super::discovery::team_identifier(&described.stderr)
+            .or_else(|| super::discovery::team_identifier(&described.stdout)))
+    }
+}
+
+/// `lsof -Fp` 的输出：每个进程一行 `p<pid>`，其余字段行（`f…`、`n…`）忽略；`p` 行不是纯数字就是读不出来。
+fn parse_lsof_pids(text: &str) -> Result<Vec<u32>, InspectError> {
+    let mut pids = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            pids.push(rest.parse::<u32>().map_err(|_| InspectError::NoAnswer)?);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
 }
 
 /// Upper bound on [`retry_exec_busy`] attempts; with [`EXEC_BUSY_PAUSE`] this caps the wait at ~0.5 s.
@@ -461,6 +556,217 @@ mod tests {
         let someone_else = script(dir.path(), "lsof-other", "echo 43");
         let inspector = with_fake_tools(&ps, &someone_else);
         assert_eq!(inspector.listens_on(42, 80).await, Ok(false));
+    }
+
+    #[tokio::test]
+    async fn listeners_on_names_every_process_holding_the_port_and_nobody_for_a_free_one() {
+        let inspector = SystemInspector::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        match inspector.listeners_on(port).await {
+            Ok(pids) => assert_eq!(
+                pids,
+                [std::process::id()],
+                "this process is the one listener"
+            ),
+            Err(InspectError::ToolMissing) => return, // no lsof on this machine
+            Err(error) => panic!("{error}"),
+        }
+        drop(listener);
+        assert_eq!(inspector.listeners_on(port).await, Ok(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn the_lsof_listing_is_parsed_strictly() {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = script(dir.path(), "ps", "exit 1");
+        let listing = |name: &str, body: &str| {
+            let lsof = script(dir.path(), name, body);
+            with_fake_tools(&ps, lsof)
+        };
+        // `-Fp`: a `p` line per process, field lines (`f…`, `n…`) in between; sorted, deduplicated.
+        let inspector = listing(
+            "lsof-two",
+            "printf 'p43\\nf3\\nn*:80\\np42\\nf4\\np43\\nf9\\n'",
+        );
+        assert_eq!(inspector.listeners_on(80).await, Ok(vec![42, 43]));
+        // lsof's own "nothing matches": exit 1, no output. An lsof error also exits 1, but it says why.
+        let inspector = listing("lsof-nothing", "exit 1");
+        assert_eq!(inspector.listeners_on(80).await, Ok(Vec::new()));
+        let inspector = listing("lsof-broken", "echo 'lsof: WARNING' >&2; exit 1");
+        assert_eq!(
+            inspector.listeners_on(80).await,
+            Err(InspectError::NoAnswer)
+        );
+        // A `p` line that is not a number is unreadable, not a pid.
+        let inspector = listing("lsof-junk", "printf 'p42\\npabc\\n'");
+        assert_eq!(
+            inspector.listeners_on(80).await,
+            Err(InspectError::NoAnswer)
+        );
+        // A non-zero status other than the "nothing" shape is unreadable even when it printed a pid.
+        let inspector = listing("lsof-two-exit", "printf 'p42\\n'; exit 2");
+        assert_eq!(
+            inspector.listeners_on(80).await,
+            Err(InspectError::NoAnswer)
+        );
+        let missing = with_fake_tools(&ps, dir.path().join("no-such-lsof"));
+        assert_eq!(
+            missing.listeners_on(80).await,
+            Err(InspectError::ToolMissing)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lsof_query_names_the_port_and_asks_for_listeners_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = script(dir.path(), "ps", "exit 1");
+        let seen = dir.path().join("args");
+        let lsof = script(
+            dir.path(),
+            "lsof",
+            &format!("echo \"$@\" > '{}'; echo p4242", seen.display()),
+        );
+        let inspector = with_fake_tools(&ps, lsof);
+        assert_eq!(inspector.listeners_on(19731).await, Ok(vec![4242]));
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap().trim(),
+            "-nP -iTCP:19731 -sTCP:LISTEN -Fp"
+        );
+    }
+
+    #[tokio::test]
+    async fn uid_of_reads_the_effective_uid_of_a_process_and_refuses_junk() {
+        let me = std::process::id();
+        let uid = SystemInspector::new().uid_of(me).await.unwrap();
+        assert_eq!(uid, rustix::process::geteuid().as_raw());
+
+        let dir = tempfile::tempdir().unwrap();
+        let lsof = dir.path().join("lsof");
+        for (body, expected) in [
+            ("echo 501", Ok(501)),
+            ("echo '  0'", Ok(0)),
+            ("echo not-a-number", Err(InspectError::NoAnswer)),
+            ("echo -1", Err(InspectError::NoAnswer)),
+            ("exit 1", Err(InspectError::NoAnswer)),
+        ] {
+            let ps = script(dir.path(), "ps-uid", body);
+            assert_eq!(
+                with_fake_tools(&ps, &lsof).uid_of(2).await,
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    /// A fake `codesign` that answers `--verify` with `verify_code` and `-d` with `describe` on stderr (as the real one does).
+    fn fake_codesign(dir: &Path, verify_code: i32, describe_code: i32, describe: &str) -> PathBuf {
+        script(
+            dir,
+            "codesign",
+            &format!(
+                "case \"$1\" in\n  --verify) exit {verify_code};;\n  -d) printf '%s\\n' '{describe}' >&2; exit {describe_code};;\nesac\nexit 99"
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn signing_team_is_the_team_of_the_running_code_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = script(dir.path(), "ps", "exit 1");
+        let lsof = dir.path().join("lsof");
+        let timeout = Duration::from_secs(60);
+        let inspector =
+            |codesign: PathBuf| with_fake_tools(&ps, &lsof).with_codesign(codesign, timeout);
+        let describe = "Executable=/Applications/oMLX.app/Contents/Resources/Python/bin/python3.11\nIdentifier=python3\nTeamIdentifier=PSK5Q5T46L";
+        assert_eq!(
+            inspector(fake_codesign(dir.path(), 0, 0, describe))
+                .signing_team(42)
+                .await,
+            Ok(Some("PSK5Q5T46L".to_owned()))
+        );
+        // The signature does not hold for the running code: it is no team's code, whatever `-d` would say.
+        assert_eq!(
+            inspector(fake_codesign(dir.path(), 3, 0, describe))
+                .signing_team(42)
+                .await,
+            Ok(None)
+        );
+        // Signed ad hoc, or without any team line.
+        for describe in ["TeamIdentifier=not set", "Identifier=python3"] {
+            assert_eq!(
+                inspector(fake_codesign(dir.path(), 0, 0, describe))
+                    .signing_team(42)
+                    .await,
+                Ok(None),
+                "{describe}"
+            );
+        }
+        // A `-d` that fails is unreadable: not a pass, not a rejection.
+        assert_eq!(
+            inspector(fake_codesign(dir.path(), 0, 1, describe))
+                .signing_team(42)
+                .await,
+            Err(InspectError::NoAnswer)
+        );
+        assert_eq!(
+            inspector(dir.path().join("no-such-codesign"))
+                .signing_team(42)
+                .await,
+            Err(InspectError::ToolMissing)
+        );
+        let slow = script(dir.path(), "codesign-slow", "sleep 30");
+        assert_eq!(
+            with_fake_tools(&ps, &lsof)
+                .with_codesign(slow, Duration::from_millis(150))
+                .signing_team(42)
+                .await,
+            Err(InspectError::TimedOut)
+        );
+    }
+
+    /// The real `codesign` on a running process. This test binary is linker-signed (ad hoc) on macOS, so
+    /// it has no team: `Ok(None)`, never a team name. Other platforms have no `codesign`.
+    #[tokio::test]
+    async fn the_real_codesign_reads_a_running_process_and_an_ad_hoc_one_has_no_team() {
+        match SystemInspector::new()
+            .signing_team(std::process::id())
+            .await
+        {
+            Ok(team) => assert_eq!(team, None, "a test binary is not signed by any team"),
+            // No `codesign` here (not macOS): nothing to read.
+            Err(InspectError::ToolMissing) => {}
+            // codesign could not describe it on this machine: unreadable is a legitimate answer.
+            Err(_) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn codesign_is_asked_about_the_pid_not_about_a_path() {
+        // The question is "who is this process", so the argument is the pid itself.
+        let dir = tempfile::tempdir().unwrap();
+        let ps = script(dir.path(), "ps", "exit 1");
+        let seen = dir.path().join("seen");
+        let codesign = script(
+            dir.path(),
+            "codesign",
+            &format!(
+                "echo \"$@\" >> '{}'\ncase \"$1\" in --verify) exit 0;; *) echo 'TeamIdentifier=ABCDE12345' >&2; exit 0;; esac",
+                seen.display()
+            ),
+        );
+        let inspector = with_fake_tools(&ps, dir.path().join("lsof"))
+            .with_codesign(codesign, Duration::from_secs(60));
+        assert_eq!(
+            inspector.signing_team(31337).await,
+            Ok(Some("ABCDE12345".to_owned()))
+        );
+        let lines: Vec<String> = std::fs::read_to_string(&seen)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(lines, ["--verify 31337", "-d --verbose=2 31337"]);
     }
 
     #[tokio::test]

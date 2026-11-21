@@ -57,6 +57,7 @@ mod inspect;
 mod instance;
 mod key;
 mod launch;
+mod listener;
 mod logfile;
 mod owned;
 mod probe;
@@ -78,6 +79,9 @@ pub use key::{ENGINE_KEY_HEX_LEN, EngineKey, KeyError};
 pub use launch::{
     ENGINE_HOST, ENGINE_PATH, EngineLaunch, EngineLaunchSpec, INHERITED_ENV, LaunchError,
     StopOnExit,
+};
+pub use listener::{
+    ListenerPolicy, ListenerRejection, ListenerVerdict, ListenerVerifier, fresh_connection_client,
 };
 pub use logfile::{DEFAULT_KEEP, DEFAULT_MAX_BYTES, EngineLog};
 pub use owned::{

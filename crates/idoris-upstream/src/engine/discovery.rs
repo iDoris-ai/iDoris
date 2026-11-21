@@ -364,7 +364,7 @@ async fn verify_codesign(check: &CodesignCheck, bundle: &Path) -> Result<String,
 }
 
 /// `TeamIdentifier=XXXXXXXXXX`；`not set`（ad-hoc 签名）不算。
-fn team_identifier(text: &str) -> Option<String> {
+pub(super) fn team_identifier(text: &str) -> Option<String> {
     text.lines()
         .filter_map(|line| line.trim().strip_prefix("TeamIdentifier="))
         .map(str::trim)

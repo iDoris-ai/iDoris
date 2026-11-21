@@ -223,9 +223,11 @@ impl Rig {
         base
     }
 
-    /// 配好 iDoris 自己的 base 的 oMLX 配方。
+    /// 配好 iDoris 自己的 base 与模型目录的 oMLX 配方（拉起两者都要；假 `omlx` 脚本不看它们）。
     fn omlx_recipe(&self) -> OmlxRecipe {
-        OmlxRecipe::new().with_base_path(self.omlx_base())
+        OmlxRecipe::new()
+            .with_base_path(self.omlx_base())
+            .with_model_dir(self.work.path().join("models"))
     }
 
     /// 规范 §2.7.6：`<状态目录>/engines-owned/<engine_kind>`。
