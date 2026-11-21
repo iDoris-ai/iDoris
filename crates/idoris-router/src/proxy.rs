@@ -591,6 +591,9 @@ pub struct ChatProxy {
     pub(crate) embeddings_header_timeout: Duration,
     /// resident 预热的最小请求的响应头期限（[`WARMUP_HEADER_TIMEOUT`]）；字段只为了让测试能把它缩短。
     pub(crate) warmup_header_timeout: Duration,
+    /// 在途的 resident 预热请求：同一模型的并发预热合并成一个请求、每把数据 key 自己发起的在途请求有上限
+    /// （[`crate::warmup::Registry`]）。它保护的就是下面这 32 个并发许可，所以放在这个代理上：每个路由器各有各的。
+    pub(crate) warmups: Arc<crate::warmup::Registry>,
     body_timeout: Duration,
     max_body_bytes: usize,
     max_cache_bytes: usize,
@@ -877,6 +880,7 @@ impl ChatProxy {
             header_timeout: Duration::from_secs(10),
             embeddings_header_timeout: EMBEDDINGS_HEADER_TIMEOUT,
             warmup_header_timeout: WARMUP_HEADER_TIMEOUT,
+            warmups: Arc::default(),
             body_timeout: Duration::from_secs(60),
             max_body_bytes: 8 * 1024 * 1024,
             max_cache_bytes: 32 * 1024 * 1024,

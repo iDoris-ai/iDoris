@@ -20,9 +20,10 @@
 //! - 不进用量与预算记录（本地免费；付费卡直接拒绝），写一条 `intent: warmup` 的审计事件（见 `record_id_middleware`）。请求被取消
 //!   （客户端断开）时中间件走不到那里，由 [`CancelAudit`] 补上：完成、`timeout_ms` 到点、取消各写恰好一条。
 
+use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -36,6 +37,7 @@ use idoris_contracts::provider::Locality;
 use idoris_policy::Role;
 use idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey;
 use serde_json::{Map, Value, json};
+use tokio::sync::watch;
 
 use crate::dispatch::{
     self, ChatOutcome, DispatchError, DispatchFailure, EnsureLoadedError, Selected,
@@ -44,8 +46,8 @@ use crate::profile::parse_profile;
 use crate::proxy::{BufferedUpstreamPath, ChatProxy, ForwardOpts, ForwardOutcome};
 use crate::{
     AppState, BufferedAuditMeta, RequestRecordId, apply_selected_headers, backend_error_response,
-    error_envelope, error_envelope_with_reason, headroom_breach_confirmed,
-    managed_unavailable_response, models,
+    budget, budget_error_response, error_envelope, error_envelope_with_reason,
+    headroom_breach_confirmed, managed_unavailable_response, models,
 };
 
 /// 路径（`record_id_middleware` 与鉴权中间件的路径名单也用它）。
@@ -250,10 +252,216 @@ async fn warm_lifecycle(
 struct Job<'a> {
     privacy: PrivacyClass,
     tenant_id: Option<&'a str>,
+    /// 数据 key 的 id；没有认证（开发的无 key 模式）时是 `None`，那一个调用方算一个整体。
+    caller: Option<&'a str>,
     record_id: &'a str,
     capability: Capability,
     target: &'a str,
     started: Instant,
+}
+
+// ---------------------------------------------------------------------------------------------
+// 同一模型的并发预热合并，与每把数据 key 的在途上限
+// ---------------------------------------------------------------------------------------------
+
+/// 每把数据 key 此刻自己发起的 resident 预热请求数的上限（见 [`Registry`]）。2 个够 Agent24 同时预热一个 chat 模型与一个
+/// embedding 模型；再多的不同模型要等一个结束。
+const MAX_IN_FLIGHT_PER_KEY: usize = 2;
+
+/// 超过 [`MAX_IN_FLIGHT_PER_KEY`] 时的错误类型与原因码（429）。
+const LIMITED: &str = "warmup_in_flight_limited";
+
+/// 一个 resident 最小请求在合并表里的身份：同一张卡（id 与端点）、同一种最小请求、同一个模型。
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RequestKey {
+    provider_id: String,
+    endpoint: String,
+    /// `"chat"` 或 `"embedding"`：同一个模型的两种最小请求是两个请求。
+    kind: &'static str,
+    model: String,
+}
+
+/// 一个 resident 最小请求的结果，摘出预热需要的部分：状态码，以及非 2xx 时要原样透传的类型与正文。
+///
+/// 正文是**复制**出来的：代理给结果的正文挂着并发许可（结果被丢掉才还），而这个结果要在合并的几个预热之间共享，许可不能跟着
+/// 它们活。2xx 的正文预热用不到，不留。
+struct Answer {
+    status: u16,
+    content_type: Option<String>,
+    body: Bytes,
+}
+
+impl Answer {
+    /// 吃掉代理的结果：函数结束时那个结果被丢掉，并发许可就在这里还。
+    fn from_outcome(outcome: ForwardOutcome) -> Self {
+        let body = if (200..300).contains(&outcome.status) {
+            Bytes::new()
+        } else {
+            Bytes::copy_from_slice(&outcome.body)
+        };
+        Self {
+            status: outcome.status,
+            content_type: outcome.content_type.clone(),
+            body,
+        }
+    }
+}
+
+type Shared = watch::Receiver<Option<Arc<Answer>>>;
+
+/// 等一个在途请求的结果。
+struct Waiting(Shared);
+
+impl Waiting {
+    /// `None`：请求的任务没有留下结果就没了（panic，或运行时在关闭）。
+    async fn answer(mut self) -> Option<Arc<Answer>> {
+        let answered = self.0.wait_for(Option::is_some).await.ok()?;
+        answered.clone()
+    }
+}
+
+/// 一个代理上在途的 resident 预热请求，与每把数据 key 此刻自己发起了几个。
+///
+/// 为什么需要（PR-Daemon 对 #634 的预审 W-1）：resident 预热的请求在自己的任务里占着代理的一个并发许可，最长 180 秒加正文，
+/// 调用方却早就拿到了 504；一把数据 key 凑满 32 个并发预热就占满全部许可，别的租户的聊天得 503。两道限制：
+///
+/// 1. **合并**：同一（卡、端点、最小请求、模型）已经有请求在途时，后来的预热并入它——不再发请求、不占许可，等同一个结果。
+/// 2. **每 key 上限**：一把 key 自己发起（领头）的在途请求最多 [`MAX_IN_FLIGHT_PER_KEY`] 个，再多的 429 [`LIMITED`]。并入别人的
+///    请求不算（它不占许可）。名额由请求的任务持有，**请求真正结束才还**：调用方的 `timeout_ms` 到点、客户端断开都不还，所以
+///    一把 key 不论超时多少次，最多只占 N 个许可。
+///
+/// 只管 resident 卡：生命周期卡的预热不走代理的许可（加载在 Supervisor 里，同一模型本来就合并，别的模型 `supervisor_busy`）。
+/// 没有认证的调用方（开发的无 key 模式，只在本机回环）算一个整体。每个代理各有一份，所以每个路由器各管各的。
+#[derive(Default)]
+pub(crate) struct Registry {
+    table: Mutex<Table>,
+}
+
+#[derive(Default)]
+struct Table {
+    requests: HashMap<RequestKey, Shared>,
+    leading: HashMap<Option<String>, usize>,
+}
+
+/// 一个预热在表里的去向。
+enum Join {
+    /// 没有同样的请求在途，这个预热领头：发请求，请求结束时 [`Lead::finish`]。
+    Lead(Lead, Waiting),
+    /// 同样的请求已经在途：并入它，等它的结果。
+    Follow(Waiting),
+    /// 要领头，但这把 key 已经领着 [`MAX_IN_FLIGHT_PER_KEY`] 个了。
+    Refused,
+}
+
+impl Registry {
+    fn lock(&self) -> MutexGuard<'_, Table> {
+        // 表里只有计数与句柄，没有跨语句的不变量：别的线程 panic 留下的毒不必当真。
+        self.table.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 先看有没有同样的请求在途（并入不占名额，所以先于上限检查），没有才看这把 key 的名额。
+    fn join_or_lead(self: &Arc<Self>, key: RequestKey, caller: Option<&str>) -> Join {
+        let mut table = self.lock();
+        if let Some(shared) = table.requests.get(&key) {
+            return Join::Follow(Waiting(shared.clone()));
+        }
+        let caller = caller.map(str::to_string);
+        let leading = table.leading.get(&caller).copied().unwrap_or(0);
+        if leading >= MAX_IN_FLIGHT_PER_KEY {
+            return Join::Refused;
+        }
+        table.leading.insert(caller.clone(), leading + 1);
+        let (sender, receiver) = watch::channel(None);
+        table.requests.insert(key.clone(), receiver.clone());
+        Join::Lead(
+            Lead {
+                registry: Arc::clone(self),
+                key,
+                caller,
+                sender,
+                released: false,
+            },
+            Waiting(receiver),
+        )
+    }
+
+    /// 请求结束：表项与这把 key 的名额都还回去。
+    fn release(&self, key: &RequestKey, caller: &Option<String>) {
+        let mut table = self.lock();
+        table.requests.remove(key);
+        let now_idle = match table.leading.get_mut(caller) {
+            Some(leading) => {
+                *leading = leading.saturating_sub(1);
+                *leading == 0
+            }
+            None => false,
+        };
+        if now_idle {
+            table.leading.remove(caller);
+        }
+    }
+
+    /// 测试用：没有任何在途请求，也没有任何 key 占着名额。
+    #[cfg(test)]
+    pub(crate) fn is_idle(&self) -> bool {
+        let table = self.lock();
+        table.requests.is_empty() && table.leading.is_empty()
+    }
+
+    /// 测试用：这把 key 此刻自己发起了几个在途请求。
+    #[cfg(test)]
+    pub(crate) fn leading_for(&self, caller: Option<&str>) -> usize {
+        let caller = caller.map(str::to_string);
+        self.lock().leading.get(&caller).copied().unwrap_or(0)
+    }
+}
+
+/// 领头的预热：持有表项与这把 key 的名额，直到请求结束。放进请求的任务里，所以不随调用方的等待结束而还。
+struct Lead {
+    registry: Arc<Registry>,
+    key: RequestKey,
+    caller: Option<String>,
+    sender: watch::Sender<Option<Arc<Answer>>>,
+    released: bool,
+}
+
+impl Lead {
+    /// 请求结束：先还表项与名额（之后到的预热重新领头），再把结果交给所有在等的。
+    fn finish(mut self, answer: Answer) {
+        self.release();
+        // 没有人在等（领头的调用方走了、也没有并入的）也无妨：结果存进通道，没人要就随通道一起丢。
+        self.sender.send_replace(Some(Arc::new(answer)));
+    }
+
+    fn release(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.registry.release(&self.key, &self.caller);
+        }
+    }
+}
+
+impl Drop for Lead {
+    /// 任务没有留下结果就没了（panic）：名额与表项照样还；等着的拿到「没有结果」。
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// 这把 key 自己发起的在途预热请求已经到了上限：429。
+fn limited_response(selected: &Selected) -> Response {
+    with_headers(
+        error_envelope(
+            StatusCode::TOO_MANY_REQUESTS,
+            LIMITED,
+            format!(
+                "this key already has {MAX_IN_FLIGHT_PER_KEY} resident warmup requests in flight (the limit): \
+                 wait for one to finish and retry, or warm a model that is already being warmed, \
+                 because concurrent warmups of the same model share one request"
+            ),
+        ),
+        selected,
+    )
 }
 
 /// 一个 resident 预热的最小请求，连同它跑起来需要的一切。它在自己的任务里跑，所以拥有全部数据，不借用请求的任何东西。
@@ -314,7 +522,8 @@ impl ResidentRequest {
 /// 请求在**自己的任务**里跑，有自己的响应头期限（[`crate::proxy::WARMUP_HEADER_TIMEOUT`]，与调用方的 `timeout_ms` 无关）：
 /// 这个函数的 future 被丢掉——`timeout_ms` 到点、客户端断开——只是不再等结果，**不取消**发给上游的请求（上游那一侧的冷加载
 /// 不被我们的放弃打断），代理照常在请求结束时结算熔断的准入：成功，或 504 按既有规则计入提供方熔断。任务占着代理的一个
-/// 并发许可直到请求结束，所以同时挂着的预热请求总数受那 32 个许可限制。
+/// 并发许可直到请求结束，所以同时在途的预热请求要有界：同一（卡、模型）的并发预热合并成一个请求，每把数据 key 自己发起的在途
+/// 请求有上限（见 [`Registry`]）。
 ///
 /// 上游的回答按预热的错误矩阵翻译：404 是 `model_not_found`，504（响应头或正文超时）是 `warmup_timeout`，其余非 2xx 与聊天的
 /// resident 路径一样原样透传（含代理自己的 502 `upstream_auth_failed` 与熔断的 503）。不带幂等键：预热每次都是真请求，不重放缓存。
@@ -324,10 +533,11 @@ async fn warm_resident(
     job: &Job<'_>,
 ) -> Result<(), Response> {
     let target = job.target;
-    let (path, body) = match job.capability {
+    let (path, body, kind) = match job.capability {
         Capability::Embedding => (
             BufferedUpstreamPath::EMBEDDINGS,
             json!({"model": target, "input": MINIMAL_INPUT}),
+            "embedding",
         ),
         Capability::Chat => (
             BufferedUpstreamPath::CHAT_COMPLETIONS,
@@ -336,6 +546,7 @@ async fn warm_resident(
                 "messages": [{"role": "user", "content": MINIMAL_INPUT}],
                 "max_tokens": 1,
             }),
+            "chat",
         ),
         // 规范只定义了 chat 与 embedding 的最小请求：别的能力（rerank）的 resident 卡不发一个种类不对的请求，明确拒绝，什么也不发。
         _ => {
@@ -349,34 +560,49 @@ async fn warm_resident(
             ));
         }
     };
-    let request = ResidentRequest {
-        proxy: Arc::clone(&state.proxy),
-        endpoint: selected.card.endpoint.clone(),
-        path,
-        body,
-        tenant_id: job.tenant_id.map(str::to_string),
-        record_id: job.record_id.to_string(),
+    let key = RequestKey {
         provider_id: selected.card.provider.id.clone(),
-        served_locality: selected.served_locality,
-        privacy: job.privacy,
-        attach_omlx_key: models::is_loopback_omlx(&selected.card),
-        header_timeout: state.proxy.warmup_header_timeout,
+        endpoint: selected.card.endpoint.clone(),
+        kind,
+        model: target.to_string(),
     };
-    let outcome = match tokio::spawn(request.run()).await {
-        Ok(outcome) => outcome,
-        // 任务 panic 或运行时正在关闭：没有上游的回答可翻译。
-        Err(_) => {
-            return Err(with_headers(
-                error_envelope(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    "the warmup request did not complete",
-                ),
-                selected,
-            ));
+    let waiting = match state.proxy.warmups.join_or_lead(key, job.caller) {
+        Join::Refused => return Err(limited_response(selected)),
+        // 同样的请求已经在途：并入它，不发请求、不占并发许可。
+        Join::Follow(waiting) => waiting,
+        Join::Lead(lead, waiting) => {
+            let request = ResidentRequest {
+                proxy: Arc::clone(&state.proxy),
+                endpoint: selected.card.endpoint.clone(),
+                path,
+                body,
+                tenant_id: job.tenant_id.map(str::to_string),
+                record_id: job.record_id.to_string(),
+                provider_id: selected.card.provider.id.clone(),
+                served_locality: selected.served_locality,
+                privacy: job.privacy,
+                attach_omlx_key: models::is_loopback_omlx(&selected.card),
+                header_timeout: state.proxy.warmup_header_timeout,
+            };
+            tokio::spawn(async move {
+                let answer = Answer::from_outcome(request.run().await);
+                lead.finish(answer);
+            });
+            waiting
         }
     };
-    match outcome.status {
+    let Some(answer) = waiting.answer().await else {
+        // 请求的任务没有留下结果就没了（panic，或运行时正在关闭）：没有上游的回答可翻译。
+        return Err(with_headers(
+            error_envelope(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "the warmup request did not complete",
+            ),
+            selected,
+        ));
+    };
+    match answer.status {
         200..=299 => Ok(()),
         404 => Err(backend_failure(
             selected,
@@ -386,13 +612,10 @@ async fn warm_resident(
         status => {
             let mut response = (
                 StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                outcome.body,
+                answer.body.clone(),
             )
                 .into_response();
-            let content_type = outcome
-                .content_type
-                .as_deref()
-                .unwrap_or("application/json");
+            let content_type = answer.content_type.as_deref().unwrap_or("application/json");
             if let Ok(value) = HeaderValue::from_str(content_type) {
                 response
                     .headers_mut()
@@ -587,11 +810,40 @@ async fn handle(
         Ok(target) => target,
         Err(error) => return crate::model_resolution_error(error),
     };
+    // 预算（PR-Daemon 对 #634 的预审 W-2）：聊天对免费的本地模型也会过一遍账本（`SpendGate::All` 下余额为 0 是 402），预热不能是
+    // 绕开它的后门——加载或驱逐一个模型、对 resident 卡发一个 token，都是这个租户在用本机。这里只做一次**只读**的准入检查
+    // （`check_admission`，不预留、不结算、不写任何行）：预热本身不花钱，不占用预算，也不进用量记录。没有账本就不查（同聊天：
+    // 没接账本的部署里免费调用照常可用）；默认的 `PaidOnly` 对免费调用放行。余额不足的错误与聊天是同一个函数映射出来的。
+    if let Some(ledger) = state.budget_ledger.as_deref() {
+        let budget_identity = budget::BudgetIdentity::resolve(
+            identity.map(|identity| identity.key_id.as_str()),
+            Some(&target),
+            selected.card.provider.id.as_str(),
+        );
+        if let Err(err) = budget::check_admission(
+            ledger,
+            parsed.tenant_id.as_deref(),
+            &budget_identity,
+            selected.card.provider.id.as_str(),
+            0,
+        ) {
+            return budget_error_response(
+                &err,
+                &ChatOutcome {
+                    decision: selected.decision.clone(),
+                    served_locality: selected.served_locality,
+                    result: Err(DispatchFailure::Budget(err.clone())),
+                    actual_cost_minor: None,
+                },
+            );
+        }
+    }
 
     let started = Instant::now();
     let job = Job {
         privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         tenant_id: parsed.tenant_id.as_deref(),
+        caller: identity.map(|identity| identity.key_id.as_str()),
         record_id,
         capability,
         target: &target,
@@ -748,5 +1000,141 @@ mod tests {
         ] {
             assert_eq!(warm_capability(role), Capability::Chat, "{role:?}");
         }
+    }
+
+    // ---- 合并表与每 key 上限（W-1） ----
+
+    fn request(model: &str) -> RequestKey {
+        RequestKey {
+            provider_id: "card".to_string(),
+            endpoint: "http://127.0.0.1:9".to_string(),
+            kind: "chat",
+            model: model.to_string(),
+        }
+    }
+
+    fn new_registry() -> Arc<Registry> {
+        Arc::new(Registry::default())
+    }
+
+    /// 领头；不是领头就让用例失败（`Join` 里装着 future 与守卫，不实现 `Debug`，所以不用 `unwrap`）。
+    fn leads(registry: &Arc<Registry>, model: &str, caller: Option<&str>) -> (Lead, Waiting) {
+        match registry.join_or_lead(request(model), caller) {
+            Join::Lead(lead, waiting) => (lead, waiting),
+            Join::Follow(_) => panic!("{model}: expected to lead, but joined an in-flight request"),
+            Join::Refused => panic!("{model}: expected to lead, but the key is at its limit"),
+        }
+    }
+
+    fn follows(registry: &Arc<Registry>, model: &str, caller: Option<&str>) -> Waiting {
+        match registry.join_or_lead(request(model), caller) {
+            Join::Follow(waiting) => waiting,
+            Join::Lead(..) => panic!("{model}: expected to join an in-flight request, but led"),
+            Join::Refused => panic!("{model}: expected to join, but was refused"),
+        }
+    }
+
+    fn is_refused(registry: &Arc<Registry>, model: &str, caller: Option<&str>) -> bool {
+        matches!(registry.join_or_lead(request(model), caller), Join::Refused)
+    }
+
+    fn answer(status: u16) -> Answer {
+        Answer {
+            status,
+            content_type: Some("text/plain".to_string()),
+            body: Bytes::from_static(b"body"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_warmup_of_the_same_request_follows_and_gets_the_leaders_answer() {
+        let registry = new_registry();
+        let (lead, leader_waiting) = leads(&registry, "m", Some("key-a"));
+        // 另一把 key 也并入同一个请求：合并不分调用方。
+        let follower_waiting = follows(&registry, "m", Some("key-b"));
+        lead.finish(answer(404));
+        for waiting in [leader_waiting, follower_waiting] {
+            let got = waiting
+                .answer()
+                .await
+                .expect("the leader published an answer");
+            assert_eq!(got.status, 404);
+            assert_eq!(got.content_type.as_deref(), Some("text/plain"));
+            assert_eq!(&got.body[..], b"body");
+        }
+        assert!(registry.is_idle());
+    }
+
+    #[tokio::test]
+    async fn a_follower_that_starts_waiting_after_the_answer_was_published_still_gets_it() {
+        let registry = new_registry();
+        let (lead, _) = leads(&registry, "m", None);
+        let late = follows(&registry, "m", None);
+        lead.finish(answer(200));
+        let got = late
+            .answer()
+            .await
+            .expect("the answer is kept for those who joined");
+        assert_eq!(got.status, 200);
+    }
+
+    #[test]
+    fn a_key_leads_at_most_the_limit_and_following_does_not_use_a_slot() {
+        let registry = new_registry();
+        let held: Vec<_> = (0..MAX_IN_FLIGHT_PER_KEY)
+            .map(|index| leads(&registry, &format!("model-{index}"), Some("key")))
+            .collect();
+        assert_eq!(registry.leading_for(Some("key")), MAX_IN_FLIGHT_PER_KEY);
+        // 新的请求要领头，名额满了。
+        assert!(is_refused(&registry, "another", Some("key")));
+        // 并入一个已经在途的请求不占名额，名额满了也能并入。
+        for index in 0..MAX_IN_FLIGHT_PER_KEY {
+            follows(&registry, &format!("model-{index}"), Some("key"));
+        }
+        assert_eq!(registry.leading_for(Some("key")), MAX_IN_FLIGHT_PER_KEY);
+        drop(held);
+    }
+
+    #[test]
+    fn the_limit_is_per_key_and_the_unauthenticated_caller_is_one_caller() {
+        let registry = new_registry();
+        let mut held = Vec::new();
+        for caller in [Some("key-a"), Some("key-b"), None] {
+            for index in 0..MAX_IN_FLIGHT_PER_KEY {
+                held.push(leads(&registry, &format!("{caller:?}-{index}"), caller));
+            }
+            assert!(
+                is_refused(&registry, "one-too-many", caller),
+                "{caller:?} is at its own limit"
+            );
+        }
+        assert_eq!(registry.leading_for(Some("key-a")), MAX_IN_FLIGHT_PER_KEY);
+        assert_eq!(registry.leading_for(Some("key-b")), MAX_IN_FLIGHT_PER_KEY);
+        assert_eq!(registry.leading_for(None), MAX_IN_FLIGHT_PER_KEY);
+        drop(held);
+        assert!(registry.is_idle());
+    }
+
+    #[tokio::test]
+    async fn the_slot_and_the_table_entry_come_back_when_the_request_ends() {
+        let registry = new_registry();
+        let (lead, _) = leads(&registry, "m", Some("key"));
+        let (_other, _) = leads(&registry, "other", Some("key"));
+        assert!(is_refused(&registry, "third", Some("key")));
+        lead.finish(answer(200));
+        assert_eq!(registry.leading_for(Some("key")), 1);
+        // 名额回来了：第三个能领头；同一个模型也重新领头，不再并入已经结束的请求。
+        let _third = leads(&registry, "third", Some("key"));
+        let _again = leads(&registry, "m", Some("other-key"));
+    }
+
+    #[tokio::test]
+    async fn a_lead_dropped_without_an_answer_frees_everything_and_leaves_followers_with_none() {
+        let registry = new_registry();
+        let (lead, _) = leads(&registry, "m", Some("key"));
+        let follower = follows(&registry, "m", Some("key"));
+        drop(lead); // 任务 panic 了。
+        assert!(registry.is_idle());
+        assert!(follower.answer().await.is_none());
     }
 }
