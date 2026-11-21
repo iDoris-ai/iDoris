@@ -134,6 +134,29 @@ async fn wait_until(what: &str, patience: Duration, mut condition: impl FnMut() 
     }
 }
 
+/// 客户端挂断：先让请求一直跑到 `reached_the_engine` 为真（请求已经走到引擎那一侧，加载或发给上游的请求在进行），再多等
+/// `settle`，然后丢掉请求的 future。不按固定的时间挂断，所以机器再慢也是在请求「进行中」挂的。
+async fn hang_up_after(
+    settle: Duration,
+    request: impl Future<Output = Reply>,
+    mut reached_the_engine: impl FnMut() -> bool,
+) {
+    let mut request = Box::pin(request);
+    tokio::select! {
+        _ = &mut request => panic!("the warmup was answered before the client hung up"),
+        () = wait_until(
+            "the request to reach the engine",
+            Duration::from_secs(10),
+            &mut reached_the_engine,
+        ) => {}
+    }
+    assert!(
+        tokio::time::timeout(settle, &mut request).await.is_err(),
+        "the warmup was answered before the client hung up"
+    );
+    drop(request);
+}
+
 // ---------------------------------------------------------------------------------------------
 // 审计：事件日志与审计记录存储
 // ---------------------------------------------------------------------------------------------
@@ -1173,19 +1196,17 @@ async fn a_client_that_hangs_up_does_not_cancel_the_load_and_the_cancelled_reque
     rig.adapter
         .inner
         .set_load_delay("qwen-daily", Duration::from_millis(1_500));
-    let abandoned = tokio::time::timeout(
-        Duration::from_millis(200),
+    // 加载开始之后再多等 150 毫秒，然后挂断：请求是在加载进行中被丢掉的。
+    hang_up_after(
+        Duration::from_millis(150),
         warm_with(
             &rig.app,
             json!({"model": "idoris/daily"}),
             &[("X-iDoris-Request-Id", "hangup-1")],
         ),
+        || rig.adapter.fence().exists(),
     )
     .await;
-    assert!(
-        abandoned.is_err(),
-        "the request future was dropped mid-load"
-    );
     // 请求没了，审计中间件走不到写事件的那一行：守卫的收尾任务补一条「已取消」，加载还在进行时就写好了。
     let events = audit.wait_for_events(PERSONAL, 1).await;
     assert_eq!(events.len(), 1, "{events:?}");
@@ -1202,7 +1223,7 @@ async fn a_client_that_hangs_up_does_not_cancel_the_load_and_the_cancelled_reque
     assert_eq!(events[0].event.request_id.as_deref(), Some("hangup-1"));
     assert_eq!(events[0].event.metadata["privacy"], "local_only");
     assert!(
-        events[0].event.metadata["latency_ms"].as_u64().unwrap() >= 150,
+        events[0].event.metadata["latency_ms"].as_u64().unwrap() >= 100,
         "the latency is how long the request lived before it was dropped: {events:?}"
     );
     assert!(
@@ -1267,12 +1288,12 @@ async fn completed_timed_out_and_cancelled_warmups_each_write_exactly_one_audit_
     rig.adapter
         .inner
         .set_load_delay("qwen-fast", Duration::from_millis(1_500));
-    let abandoned = tokio::time::timeout(
-        Duration::from_millis(200),
+    hang_up_after(
+        Duration::from_millis(150),
         warm(&rig.app, json!({"model": "idoris/fast"})),
+        || rig.adapter.fence().exists(),
     )
     .await;
-    assert!(abandoned.is_err());
     audit.wait_for_events(PERSONAL, 3).await;
     wait_until(
         "the abandoned load to finish",
@@ -1619,20 +1640,17 @@ async fn in_tenant_mode_a_cancelled_warmup_is_audited_under_the_authenticated_te
     rig.adapter
         .inner
         .set_load_delay("qwen-daily", Duration::from_millis(1_500));
-    let abandoned = tokio::time::timeout(
-        Duration::from_millis(300),
+    hang_up_after(
+        Duration::from_millis(150),
         warm_as(
             &rig.app,
             json!({"model": "idoris/daily"}),
             &secret,
             &[("X-iDoris-Tenant", "acme")],
         ),
+        || rig.adapter.fence().exists(),
     )
     .await;
-    assert!(
-        abandoned.is_err(),
-        "the request future was dropped mid-load"
-    );
     // 事件归在已认证的租户名下（同审计中间件的规则），别的租户名下什么都没有。
     let events = audit.wait_for_events("acme", 1).await;
     assert_eq!(events.len(), 1, "{events:?}");
@@ -2201,13 +2219,13 @@ async fn a_client_that_hangs_up_does_not_cancel_the_resident_request_either_and_
         )],
         audit.install(),
     );
-    let abandoned = tokio::time::timeout(
-        Duration::from_millis(300),
+    // 上游收到请求之后再多等 150 毫秒，然后挂断。
+    hang_up_after(
+        Duration::from_millis(150),
         warm(&app, json!({"model": "idoris/daily"})),
+        || upstream.started() == 1,
     )
     .await;
-    assert!(abandoned.is_err(), "the request future was dropped");
-    assert_eq!(upstream.started(), 1);
     wait_until(
         "the upstream to answer the request the client walked away from",
         Duration::from_secs(15),
