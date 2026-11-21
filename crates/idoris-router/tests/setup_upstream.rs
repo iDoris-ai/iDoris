@@ -1407,10 +1407,28 @@ fn an_unreadable_entry_that_the_loader_would_read_blocks_the_addition() {
     assert_eq!(names(&out), ["trap.yaml"]);
 }
 
-/// 假引擎：声明「往已有目录里加一张卡」，却又带了固定文件。
-struct FixedFilesInAddMode;
+/// 假引擎：声明「往已有目录里加一张卡」。文件名与是否另带固定文件由测试给；`probes` 数探测被调用了几次。
+struct FakeAdd {
+    file: &'static str,
+    fixed_files: bool,
+    probes: std::sync::atomic::AtomicUsize,
+}
 
-impl SetupEngine for FixedFilesInAddMode {
+impl FakeAdd {
+    fn new(file: &'static str, fixed_files: bool) -> Self {
+        Self {
+            file,
+            fixed_files,
+            probes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn probes(&self) -> usize {
+        self.probes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl SetupEngine for FakeAdd {
     fn kind(&self) -> &str {
         "fakeadd"
     }
@@ -1448,6 +1466,8 @@ impl SetupEngine for FixedFilesInAddMode {
     }
 
     async fn probe(&self, _: &str, _: Option<&str>, _: bool) -> Result<Probed, SetupError> {
+        self.probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(Probed {
             models: vec!["m".into()],
             auth_required: false,
@@ -1455,7 +1475,7 @@ impl SetupEngine for FixedFilesInAddMode {
     }
 
     fn card_file(&self) -> &str {
-        "fakeadd.yaml"
+        self.file
     }
 
     fn card_template(&self) -> Result<ComponentCard, SetupError> {
@@ -1466,7 +1486,11 @@ impl SetupEngine for FixedFilesInAddMode {
     }
 
     fn static_files(&self) -> &'static [(&'static str, &'static str)] {
-        &[("extra.yaml", "x")]
+        if self.fixed_files {
+            &[("extra.yaml", "x")]
+        } else {
+            &[]
+        }
     }
 
     fn out_dir_use(&self) -> OutDirUse {
@@ -1474,29 +1498,64 @@ impl SetupEngine for FixedFilesInAddMode {
     }
 }
 
-/// 「加一张卡」的引擎不能再带固定文件：它们在这条路径上不会被写出，拒绝而不是悄悄丢掉。
-#[tokio::test(flavor = "multi_thread")]
-async fn an_engine_that_adds_one_card_cannot_also_ship_fixed_files() {
+fn add_options(out: &Path) -> idoris_router::cli::SetupOptions {
     use idoris_router::cli::{SetupOptions, SetupTarget};
-    let tmp = TempDir::new().unwrap();
-    let out = tmp.path().join("components");
-    let options = SetupOptions {
+    SetupOptions {
         target: SetupTarget::Endpoint {
             url: "http://127.0.0.1:1".into(),
             probe: true,
         },
-        out_dir: out.clone(),
+        out_dir: out.to_path_buf(),
         bindings: vec![("daily".into(), "m".into())],
         load_mode: idoris_contracts::load_policy::LoadMode::Resident,
         api_key_stdin: false,
         force: false,
-    };
-    let error = run_setup(&FixedFilesInAddMode, &options, None)
+    }
+}
+
+/// 「加一张卡」的引擎不能再带固定文件：它们在这条路径上不会被写出，拒绝而不是悄悄丢掉；排在探测之前。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_engine_that_adds_one_card_cannot_also_ship_fixed_files() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("components");
+    let engine = FakeAdd::new("fakeadd.yaml", true);
+    let error = run_setup(&engine, &add_options(&out), None)
         .await
         .unwrap_err();
     assert_eq!(error.code, "validation_failed");
     assert!(error.message.contains("固定文件"), "{}", error.message);
+    assert_eq!(engine.probes(), 0, "拒绝在探测之前");
     assert!(!out.exists());
+    // 对照：没有固定文件的同一个引擎照常加卡。
+    let engine = FakeAdd::new("fakeadd.yaml", false);
+    run_setup(&engine, &add_options(&out), None).await.unwrap();
+    assert_eq!(engine.probes(), 1);
+    assert_eq!(names(&out), ["fakeadd.yaml"]);
+}
+
+/// 引擎给的卡文件名会跑出目录或不会被加载（带路径、点开头、别的扩展名）：在探测之前拒绝，什么也不写。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_card_file_name_that_would_escape_or_not_load_is_refused_before_probing() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("components");
+    for bad in [
+        "../escape.yaml",
+        "a/b.yaml",
+        ".hidden.yaml",
+        "card.txt",
+        "card",
+        "",
+    ] {
+        let engine = FakeAdd::new(bad, false);
+        let error = run_setup(&engine, &add_options(&out), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "validation_failed", "{bad:?}");
+        assert_eq!(engine.probes(), 0, "{bad:?}：拒绝在探测之前");
+    }
+    assert!(!out.exists());
+    assert!(!tmp.path().join("escape.yaml").exists());
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 /// 公开的库入口：选项结构与命令行一致，`run` 与二进制给出同样的结果（不经子进程）。
