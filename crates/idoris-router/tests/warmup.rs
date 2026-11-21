@@ -25,7 +25,7 @@ use idoris_backend::mock::LoadOutcome;
 use idoris_backend::{
     BackendError, BackendStatus, ChatRequest, ChatResponse, MockAdapter, ModelInfo, RuntimeAdapter,
 };
-use idoris_contracts::common::PrivacyClass;
+use idoris_contracts::common::{Capability, PrivacyClass};
 use idoris_contracts::{ComponentCard, LoadPolicy};
 use idoris_router::readiness::{ManagedFailure, UpstreamReason, UpstreamState};
 use idoris_router::runtime::RuntimeRegistry;
@@ -539,8 +539,39 @@ async fn idoris_auto_is_warmed_as_an_ordinary_role_binding() {
     assert_eq!(rig.adapter.inner.load_call_count("qwen-auto"), 1);
 }
 
+/// 一张只会 rerank 的 oMLX 卡（on_demand）：模板卡的能力是 chat 与 embedding，不含 rerank。
+fn lifecycle_rerank_card(model: &str) -> ComponentCard {
+    let mut card = lifecycle_card(&[("rerank", model)]);
+    card.provider.capabilities = vec![Capability::Rerank];
+    card
+}
+
 #[tokio::test]
-async fn rerank_has_no_minimal_request_and_is_refused_explicitly() {
+async fn a_lifecycle_rerank_card_is_warmed_by_loading_it_like_any_other_role() {
+    let rig = rig_with(
+        vec![lifecycle_rerank_card("qwen-rerank")],
+        &[("qwen-rerank", 1.0)],
+        None,
+        |_| {},
+    );
+    let reply = warm(&rig.app, json!({"model": "idoris/rerank"})).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
+    assert_eq!(reply.body["model"], "qwen-rerank");
+    assert_eq!(reply.body["provider_id"], "omlx");
+    assert_eq!(reply.body["state"], "ready");
+    assert_eq!(reply.body["already_loaded"], false);
+    assert_eq!(rig.adapter.inner.load_call_count("qwen-rerank"), 1);
+    assert_eq!(rig.adapter.chats(), 0, "就绪就是已加载：不发任何请求");
+    assert!(!rig.adapter.fence().exists());
+    let again = warm(&rig.app, json!({"model": "idoris/rerank"})).await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.raw);
+    assert_eq!(again.body["already_loaded"], true);
+    assert_eq!(rig.adapter.inner.load_call_count("qwen-rerank"), 1);
+}
+
+#[tokio::test]
+async fn the_rerank_role_is_warmed_only_on_a_card_that_does_rerank() {
+    // 模板卡能 chat 与 embedding，不能 rerank：即使角色绑定把 rerank 指给它，也不是预热 rerank 的候选，什么都不加载。
     let rig = rig_with(
         vec![lifecycle_card(&[("rerank", "qwen-rerank")])],
         &[("qwen-rerank", 1.0)],
@@ -548,10 +579,15 @@ async fn rerank_has_no_minimal_request_and_is_refused_explicitly() {
         |_| {},
     );
     let reply = warm(&rig.app, json!({"model": "idoris/rerank"})).await;
-    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.raw);
-    assert_eq!(reply.error_type(), "unsupported_field");
-    assert_eq!(reply.reason(), "unsupported_model");
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.raw
+    );
+    assert_eq!(reply.error_type(), "no_eligible_candidate");
     assert_eq!(rig.adapter.inner.load_call_count("qwen-rerank"), 0);
+    assert_eq!(rig.adapter.chats(), 0);
 }
 
 #[tokio::test]
@@ -1628,6 +1664,32 @@ async fn a_paid_resident_card_is_refused_before_anything_is_sent() {
     );
     assert_eq!(reply.error_type(), "paid_proxy_unavailable");
     assert_eq!(requests_of(&server).await.len(), 0);
+}
+
+#[tokio::test]
+async fn a_resident_rerank_card_is_refused_because_the_spec_has_no_minimal_rerank_request() {
+    let server = upstream().await;
+    let app = resident_app(vec![resident_card(
+        "rerank-local",
+        &server.uri(),
+        "rerank",
+        "rerank: \"up-rerank\"",
+        false,
+    )]);
+    let reply = warm(&app, json!({"model": "idoris/rerank"})).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.raw);
+    assert_eq!(reply.error_type(), "unsupported_field");
+    assert_eq!(reply.reason(), "unsupported_model");
+    assert_eq!(
+        reply.header("x-idoris-served-locality"),
+        Some("loopback"),
+        "候选已选定，拒绝也带 served-locality"
+    );
+    assert_eq!(
+        requests_of(&server).await.len(),
+        0,
+        "不发一个种类不对的请求（既不是 chat 也不是 embeddings）"
+    );
 }
 
 #[tokio::test]

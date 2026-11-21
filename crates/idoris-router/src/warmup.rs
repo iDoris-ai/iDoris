@@ -4,13 +4,14 @@
 //! - **鉴权与 key 范围同聊天**：聊天在该模型上会被拒的 key，预热也被拒（`auth::enforce_scope`，与 embeddings 同一个入口
 //!   `enforce_protocol_key_scope`）。
 //! - **选卡同聊天**（同一套 `policy_cards` + `select_with_gate_fallback`，含角色绑定、隐私、熔断的就绪快照），另有三条：
-//!   订阅中转卡不参与（没有「加载」可言）；请求的能力由角色定（`embed` 是 embedding，其余是 chat，`rerank` 没有最小请求，
-//!   明确拒绝）；单价非零的卡拒绝（预热只服务本地免费卡）。
+//!   订阅中转卡不参与（没有「加载」可言）；请求的能力由角色定（`embed` 是 embedding，`rerank` 是 rerank，其余是 chat）；
+//!   单价非零的卡拒绝（预热只服务本地免费卡）。
 //! - **生命周期卡（oMLX 等）**：走 [`dispatch::ensure_loaded`]——和聊天的按需加载是同一段代码（读 catalog、拒未知模型、
-//!   Supervisor 的幂等 load：余量确认与驱逐都在里面）；加载完成即返回，**不生成任何 token**。同一模型的并发预热与并发的
-//!   首个聊天请求由 Supervisor 合并成一次加载。
+//!   Supervisor 的幂等 load：余量确认与驱逐都在里面）；加载完成即返回，**不生成任何 token**。三种角色（chat、embedding、
+//!   rerank）都一样，因为「就绪」就是「已加载」。同一模型的并发预热与并发的首个聊天请求由 Supervisor 合并成一次加载。
 //! - **resident 卡**：没有生命周期可管，按能力发一个最小的真实请求（chat：`max_tokens: 1`；embedding：输入 `"warmup"`），
-//!   响应头超时是请求的 `timeout_ms`（不是聊天的 10 秒）。
+//!   响应头超时是请求的 `timeout_ms`（不是聊天的 10 秒）。规范没有定义 rerank 的最小请求，rerank 的 resident 卡明确拒绝
+//!   （400 `unsupported_field` / `unsupported_model`），什么也不发。
 //! - **`timeout_ms` 到点只是放弃等待**：返回 504 `warmup_timeout`，**不取消、不缩短**引擎里的加载——Supervisor 的加载任务与请求
 //!   的 future 无关，照常跑完并清掉 `load.pending`，之后的预热或聊天直接看到「已就绪」。引擎自己的加载超时是另一回事
 //!   （`RuntimeAdapter::load_timeout`，生产缺省 180 秒）：加载超过它，结果才是「未知」，围栏保留（行为同聊天，没有变）。
@@ -146,16 +147,14 @@ fn parse_request(object: &Map<String, Value>) -> Result<WarmupRequest, BadField>
     })
 }
 
-/// 预热哪种能力：`embed` 角色是 embedding，其余（含没有角色的具体模型 id）是 chat，与聊天的缺省选卡一致。
-/// `rerank` 没有定义最小请求（规范只定义了 chat 与 embedding），明确拒绝，不静默当成 chat。
-fn warm_capability(role: Option<Role>) -> Result<Capability, BadField> {
+/// 预热哪种能力：`embed` 角色是 embedding，`rerank` 角色是 rerank，其余（含没有角色的具体模型 id）是 chat，与聊天的缺省选卡
+/// 一致。生命周期卡只需要加载，能力只决定哪些卡有资格；resident 卡要发请求，规范只定义了 chat 与 embedding 的最小请求，
+/// 别的能力在 [`warm_resident`] 里明确拒绝，不静默当成 chat。
+fn warm_capability(role: Option<Role>) -> Capability {
     match role {
-        Some(Role::Embed) => Ok(Capability::Embedding),
-        Some(Role::Rerank) => Err(BadField::new(
-            "unsupported_model",
-            "warmup supports chat and embedding models only; idoris/rerank has no minimal request",
-        )),
-        _ => Ok(Capability::Chat),
+        Some(Role::Embed) => Capability::Embedding,
+        Some(Role::Rerank) => Capability::Rerank,
+        _ => Capability::Chat,
     }
 }
 
@@ -270,7 +269,7 @@ async fn warm_resident(
             BufferedUpstreamPath::EMBEDDINGS,
             json!({"model": target, "input": MINIMAL_INPUT}),
         ),
-        _ => (
+        Capability::Chat => (
             BufferedUpstreamPath::CHAT_COMPLETIONS,
             json!({
                 "model": target,
@@ -278,6 +277,17 @@ async fn warm_resident(
                 "max_tokens": 1,
             }),
         ),
+        // 规范只定义了 chat 与 embedding 的最小请求：别的能力（rerank）的 resident 卡不发一个种类不对的请求，明确拒绝，什么也不发。
+        _ => {
+            return Err(with_headers(
+                BadField::new(
+                    "unsupported_model",
+                    "warmup has a minimal request for chat and embedding only: a resident card for this capability cannot be warmed",
+                )
+                .into_response(),
+                selected,
+            ));
+        }
     };
     let opts = ForwardOpts {
         request_id: None,
@@ -378,10 +388,7 @@ pub(crate) async fn warmup(
     {
         return response;
     }
-    let capability = match warm_capability(parsed.role) {
-        Ok(capability) => capability,
-        Err(bad) => return bad.into_response(),
-    };
+    let capability = warm_capability(parsed.role);
     // The endpoint, not the caller's `X-iDoris-Capabilities`, decides what is being warmed.
     parsed.task.capabilities = Some(vec![capability]);
     // 隐私：和其他协议端点一样过一遍（远程熔断开关、内容收紧）。预热的请求体里没有内容，但「开关一合上，一切都只走本地」
@@ -583,15 +590,9 @@ mod tests {
     }
 
     #[test]
-    fn embed_is_warmed_as_embedding_rerank_is_refused_and_everything_else_is_chat() {
-        assert_eq!(
-            warm_capability(Some(Role::Embed)).ok(),
-            Some(Capability::Embedding)
-        );
-        assert_eq!(
-            warm_capability(Some(Role::Rerank)).unwrap_err().reason_code,
-            "unsupported_model"
-        );
+    fn the_role_decides_what_is_warmed_embed_is_embedding_rerank_is_rerank_the_rest_is_chat() {
+        assert_eq!(warm_capability(Some(Role::Embed)), Capability::Embedding);
+        assert_eq!(warm_capability(Some(Role::Rerank)), Capability::Rerank);
         for role in [
             None,
             Some(Role::Fast),
@@ -601,11 +602,7 @@ mod tests {
             Some(Role::Decide),
             Some(Role::Auto),
         ] {
-            assert_eq!(
-                warm_capability(role).ok(),
-                Some(Capability::Chat),
-                "{role:?}"
-            );
+            assert_eq!(warm_capability(role), Capability::Chat, "{role:?}");
         }
     }
 }
