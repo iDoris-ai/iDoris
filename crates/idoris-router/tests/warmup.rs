@@ -1,7 +1,9 @@
 //! IDORIS-CORE S8（接口规范 §2.11.2，修订 1.6 勘误八）：`POST /v1/models/warmup`。
 //!
 //! 全部进程内、不启动任何真实模型进程：生命周期卡用 `MockAdapter`（外面套一个数 `chat` 调用的壳，证明预热不生成 token），
-//! resident 卡与假 oMLX 用 `wiremock`。状态码矩阵、余量确认、key 范围、并发合并、超时不留围栏、门控与降级冻结都在这里；
+//! resident 卡与假 oMLX 用 `wiremock`（要看客户端有没有半路挂断的用一个自己写的假上游）。状态码矩阵、余量确认、key 范围、
+//! 并发合并、`timeout_ms` 与客户端断开不取消、不留围栏、各写恰好一条审计（引擎侧的超时或 panic 保持既有的围栏保护，也有对照）、
+//! 门控与降级冻结都在这里；
 //! 需要 crate 内部旋钮的（代理的响应头超时）在 `src/warmup_tests.rs`。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -15,8 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
+    extract::State,
     http::{HeaderMap, Request, StatusCode},
 };
 use child_guard::SpawnGuarded;
@@ -30,7 +33,7 @@ use idoris_contracts::{ComponentCard, LoadPolicy};
 use idoris_router::readiness::{ManagedFailure, UpstreamReason, UpstreamState};
 use idoris_router::runtime::RuntimeRegistry;
 use idoris_router::{AppState, auth, build_app, build_starting_app};
-use idoris_tenancy::event_log::{EventLogStore, EventType};
+use idoris_tenancy::event_log::{EventLogEvent, EventLogQuery, EventLogStore, EventType};
 use idoris_tenancy::store::{RecordKind, TenantStore};
 use idoris_tenancy::virtual_key::MintedVirtualKey;
 use idoris_tenancy::virtual_key::store::{VirtualKeyScope, VirtualKeyStore};
@@ -132,13 +135,93 @@ async fn wait_until(what: &str, patience: Duration, mut condition: impl FnMut() 
 }
 
 // ---------------------------------------------------------------------------------------------
+// 审计：事件日志与审计记录存储
+// ---------------------------------------------------------------------------------------------
+
+/// 事件日志与审计记录存储：交给被测的应用，之后按租户读出写进去的东西。
+struct Audit {
+    log: Arc<EventLogStore>,
+    records: Arc<Mutex<TenantStore>>,
+}
+
+impl Audit {
+    fn new() -> Self {
+        Self {
+            log: Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap()),
+            records: Arc::new(Mutex::new(
+                TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+            )),
+        }
+    }
+
+    /// 给 `rig_with` 与 `resident_app_with` 的定制闭包：把两个存储装进 `AppState`。
+    fn install(&self) -> impl FnOnce(&mut AppState) + use<> {
+        let (log, records) = (self.log.clone(), self.records.clone());
+        move |state| {
+            state.event_log = Some(log);
+            state.record_store = Some(records);
+        }
+    }
+
+    /// 这个租户的全部审计事件，按写入顺序。
+    fn events(&self, tenant: &str) -> Vec<EventLogEvent> {
+        self.log
+            .events_for_tenant(
+                Some(tenant),
+                &EventLogQuery {
+                    limit: 100,
+                    ..EventLogQuery::default()
+                },
+            )
+            .unwrap()
+    }
+
+    /// 旧的审计记录（`RecordKind::Audit`）的条数。
+    fn records(&self, tenant: &str) -> usize {
+        self.records
+            .lock()
+            .unwrap()
+            .list(Some(tenant), Some(RecordKind::Audit))
+            .unwrap()
+            .len()
+    }
+
+    /// 等到这个租户至少有 `count` 条事件（取消的审计由它自己的任务异步写）。
+    async fn wait_for_events(&self, tenant: &str, count: usize) -> Vec<EventLogEvent> {
+        wait_until("the audit events", Duration::from_secs(15), || {
+            self.events(tenant).len() >= count
+        })
+        .await;
+        self.events(tenant)
+    }
+}
+
+/// 审计事件的 `status` / `reason` / `intent`。
+fn audit_summary(event: &EventLogEvent) -> (u64, String, String) {
+    let metadata = &event.event.metadata;
+    (
+        metadata["http_status"].as_u64().unwrap(),
+        metadata["reason"].as_str().unwrap().to_string(),
+        metadata["intent"].as_str().unwrap().to_string(),
+    )
+}
+
+/// 多余的第二条事件会晚一点才到：数之前留一小段时间。
+async fn let_late_audit_writes_land() {
+    tokio::time::sleep(Duration::from_millis(400)).await;
+}
+
+const PERSONAL: &str = idoris_router::budget::PERSONAL_TENANT_ID;
+
+// ---------------------------------------------------------------------------------------------
 // 生命周期卡：MockAdapter（数 chat 的壳）
 // ---------------------------------------------------------------------------------------------
 
-/// `MockAdapter` 加一个 `chat` 计数：预热「不生成任何 token」靠它证明。
+/// `MockAdapter` 加一个 `chat` 计数（预热「不生成任何 token」靠它证明），和一个让 `load` panic 的开关（引擎侧 panic 的对照）。
 struct Spy {
     inner: MockAdapter,
     chats: AtomicU32,
+    panic_on_load: std::sync::atomic::AtomicBool,
 }
 
 impl Spy {
@@ -154,6 +237,7 @@ impl Spy {
                     .collect(),
             ),
             chats: AtomicU32::new(0),
+            panic_on_load: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -177,6 +261,9 @@ impl RuntimeAdapter for Spy {
     }
 
     async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+        if self.panic_on_load.load(Ordering::SeqCst) {
+            panic!("scripted engine panic during load");
+        }
         self.inner.load(id, policy).await
     }
 
@@ -256,6 +343,11 @@ fn rig_with(
 
 /// 一张绑了 `daily`/`deep`/`fast` 的 oMLX 卡，三个模型；缺省 24 GB 额度。
 fn standard() -> Rig {
+    standard_with(|_| {})
+}
+
+/// [`standard`]，加一个对 `AppState` 的定制（例如装上审计存储）。
+fn standard_with(customize: impl FnOnce(&mut AppState)) -> Rig {
     rig_with(
         vec![lifecycle_card(&[
             ("daily", "qwen-daily"),
@@ -264,7 +356,7 @@ fn standard() -> Rig {
         ])],
         &[("qwen-daily", 2.0), ("qwen-deep", 4.0), ("qwen-fast", 1.0)],
         None,
-        |_| {},
+        customize,
     )
 }
 
@@ -974,12 +1066,14 @@ async fn concurrent_warmups_and_the_first_chat_of_one_model_load_it_once() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 超时：504 `warmup_timeout`，不取消加载、不留围栏
+// 超时与断开：`timeout_ms` 到点是 504 `warmup_timeout`，客户端断开什么都收不到——预热自己的 `timeout_ms` 与客户端断开都不取消
+// 加载、不留围栏，各写恰好一条审计。引擎侧的超时或 panic 不在此列：那是既有的「结果未知」保护，围栏保留（见本节末尾的两条对照）。
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
 async fn timeout_ms_expiring_is_504_warmup_timeout_and_the_load_finishes_without_leaving_a_fence() {
-    let rig = standard();
+    let audit = Audit::new();
+    let rig = standard_with(audit.install());
     rig.adapter
         .inner
         .set_load_delay("qwen-daily", Duration::from_millis(3_000));
@@ -998,6 +1092,15 @@ async fn timeout_ms_expiring_is_504_warmup_timeout_and_the_load_finishes_without
         "等了 timeout_ms，没有等到加载结束: {waited:?}"
     );
     assert_eq!(reply.header("x-idoris-served-locality"), Some("loopback"));
+    // 这个 504 是一次正常返回：审计中间件为它写恰好一条。
+    let record_id = reply.header("x-idoris-record-id").unwrap().to_string();
+    let events = audit.wait_for_events(PERSONAL, 1).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].event.record_id, record_id);
+    assert_eq!(
+        audit_summary(&events[0]),
+        (504, "degraded: http_504".to_string(), "warmup".to_string())
+    );
     // 放弃等待不是取消：加载还在引擎里进行，围栏正好说明它还没结束……
     assert!(rig.adapter.fence().exists(), "加载仍在进行，围栏在");
     // ……它自己跑完并清掉围栏，没有人留下 load.pending。
@@ -1025,6 +1128,10 @@ async fn timeout_ms_expiring_is_504_warmup_timeout_and_the_load_finishes_without
         0,
         "超时不卸载"
     );
+    // 加载跑完之后审计里仍然只有那一条：放弃等待不会让加载的收尾再记一次。
+    let_late_audit_writes_land().await;
+    assert_eq!(audit.events(PERSONAL).len(), 1);
+    assert_eq!(audit.records(PERSONAL), 1);
     // 之后的预热直接看到「已就绪」，聊天也不再加载。
     let after = warm(
         &rig.app,
@@ -1059,20 +1166,50 @@ async fn a_chat_that_arrives_after_a_warmup_timeout_joins_the_load_that_is_still
 }
 
 #[tokio::test]
-async fn a_client_that_hangs_up_does_not_cancel_the_load_either() {
-    let rig = standard();
+async fn a_client_that_hangs_up_does_not_cancel_the_load_and_the_cancelled_request_is_audited_once()
+{
+    let audit = Audit::new();
+    let rig = standard_with(audit.install());
     rig.adapter
         .inner
         .set_load_delay("qwen-daily", Duration::from_millis(1_500));
     let abandoned = tokio::time::timeout(
         Duration::from_millis(200),
-        warm(&rig.app, json!({"model": "idoris/daily"})),
+        warm_with(
+            &rig.app,
+            json!({"model": "idoris/daily"}),
+            &[("X-iDoris-Request-Id", "hangup-1")],
+        ),
     )
     .await;
     assert!(
         abandoned.is_err(),
         "the request future was dropped mid-load"
     );
+    // 请求没了，审计中间件走不到写事件的那一行：守卫的收尾任务补一条「已取消」，加载还在进行时就写好了。
+    let events = audit.wait_for_events(PERSONAL, 1).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        audit_summary(&events[0]),
+        (
+            499,
+            "degraded: request_cancelled".to_string(),
+            "warmup".to_string()
+        )
+    );
+    assert_eq!(events[0].event.event_type, EventType::AuditFinalized);
+    // 事件带着请求自己的关联信息，和中间件为完成的请求写的一样。
+    assert_eq!(events[0].event.request_id.as_deref(), Some("hangup-1"));
+    assert_eq!(events[0].event.metadata["privacy"], "local_only");
+    assert!(
+        events[0].event.metadata["latency_ms"].as_u64().unwrap() >= 150,
+        "the latency is how long the request lived before it was dropped: {events:?}"
+    );
+    assert!(
+        rig.adapter.fence().exists(),
+        "the load is still running when the cancelled result is recorded"
+    );
+    // 加载没有被取消：自己跑完、清掉围栏、引擎里有结束的记录，没有重新加载也没有卸载。
     let fence = rig.adapter.fence();
     wait_until(
         "the abandoned load to finish",
@@ -1081,8 +1218,145 @@ async fn a_client_that_hangs_up_does_not_cancel_the_load_either() {
     )
     .await;
     assert_eq!(rig.adapter.inner.load_call_count("qwen-daily"), 1);
+    assert!(
+        rig.adapter
+            .inner
+            .event_log()
+            .contains(&"load:qwen-daily:end".to_string()),
+        "the engine load ran to its end"
+    );
+    assert_eq!(rig.adapter.inner.unload_call_count("qwen-daily"), 0);
+    // 加载跑完之后审计里仍然恰好那一条：收尾不会再写第二条，旧的审计记录也只有一条。
+    let_late_audit_writes_land().await;
+    assert_eq!(audit.events(PERSONAL).len(), 1);
+    assert_eq!(audit.records(PERSONAL), 1);
     let after = warm(&rig.app, json!({"model": "idoris/daily"})).await;
     assert_eq!(after.body["already_loaded"], true, "{}", after.raw);
+}
+
+#[tokio::test]
+async fn completed_timed_out_and_cancelled_warmups_each_write_exactly_one_audit_event() {
+    let audit = Audit::new();
+    let rig = standard_with(audit.install());
+    // 1. 完成。
+    let done = warm(&rig.app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.raw);
+    // 2. `timeout_ms` 到点。
+    rig.adapter
+        .inner
+        .set_load_delay("qwen-deep", Duration::from_millis(2_500));
+    let timed_out = warm(
+        &rig.app,
+        json!({"model": "idoris/deep", "timeout_ms": 1000}),
+    )
+    .await;
+    assert_eq!(
+        timed_out.status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "{}",
+        timed_out.raw
+    );
+    // 3. 客户端断开。
+    let fence = rig.adapter.fence();
+    wait_until(
+        "the timed-out load to finish",
+        Duration::from_secs(15),
+        || !fence.exists(),
+    )
+    .await;
+    rig.adapter
+        .inner
+        .set_load_delay("qwen-fast", Duration::from_millis(1_500));
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(200),
+        warm(&rig.app, json!({"model": "idoris/fast"})),
+    )
+    .await;
+    assert!(abandoned.is_err());
+    audit.wait_for_events(PERSONAL, 3).await;
+    wait_until(
+        "the abandoned load to finish",
+        Duration::from_secs(15),
+        || !fence.exists(),
+    )
+    .await;
+    let_late_audit_writes_land().await;
+    // 三种结局，三条，按发生的顺序；完成与到点的是中间件写的，取消的是守卫写的。
+    let events = audit.events(PERSONAL);
+    let summaries: Vec<_> = events.iter().map(audit_summary).collect();
+    assert_eq!(
+        summaries,
+        [
+            (
+                200,
+                "intent_match: routed".to_string(),
+                "warmup".to_string()
+            ),
+            (504, "degraded: http_504".to_string(), "warmup".to_string()),
+            (
+                499,
+                "degraded: request_cancelled".to_string(),
+                "warmup".to_string()
+            ),
+        ],
+        "{events:?}"
+    );
+    let mut record_ids: Vec<_> = events.iter().map(|e| e.event.record_id.clone()).collect();
+    record_ids.sort();
+    record_ids.dedup();
+    assert_eq!(record_ids.len(), 3, "每个请求一条，没有重复的记录 id");
+    assert_eq!(audit.records(PERSONAL), 3, "旧的审计记录同样各一条");
+}
+
+#[tokio::test]
+async fn an_engine_side_load_timeout_keeps_the_existing_fence_protection_whatever_timeout_ms_says()
+{
+    // 对照上面几条：这次到点的是引擎自己的加载超时（适配器的 `load_timeout`，500 毫秒），不是调用方的 `timeout_ms`（60 秒）。
+    // 结果是「未知」，围栏保留——预热没有改变这条保护。
+    let server = fake_omlx("m", Duration::from_millis(3_000)).await;
+    let (app, fence) = omlx_rig(&server, Some(Duration::from_millis(500)));
+    let reply = warm(&app, json!({"model": "idoris/daily", "timeout_ms": 60_000})).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.raw
+    );
+    assert_eq!(reply.error_type(), "local_only_unavailable");
+    assert_eq!(reply.reason(), "load_unconfirmed");
+    assert!(fence.exists(), "an unknown outcome keeps the fence");
+    // 引擎之后自己加载完，也不会替人清掉它：只有人工确认（或重启后的对账）才清。
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    assert!(fence.exists());
+}
+
+#[tokio::test]
+async fn an_engine_side_panic_keeps_the_existing_fence_protection() {
+    let rig = standard();
+    rig.adapter.panic_on_load.store(true, Ordering::SeqCst);
+    let reply = warm(&rig.app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.raw
+    );
+    assert_eq!(reply.error_type(), "local_only_unavailable");
+    assert!(
+        rig.adapter.fence().exists(),
+        "a panicking engine load is an unknown outcome: the fence stays ({})",
+        reply.raw
+    );
+    // 围栏在，下一次预热不会越过它（和聊天一样），而不是悄悄再加载一次。
+    rig.adapter.panic_on_load.store(false, Ordering::SeqCst);
+    let again = warm(&rig.app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(
+        again.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        again.raw
+    );
+    assert_eq!(rig.adapter.inner.load_call_count("qwen-daily"), 0);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1096,6 +1370,11 @@ struct Keyring {
 
 /// 每把 key 一个名字：`(名字, allowed_roles, allowed_privacy)`。
 fn keyring(specs: &[(&'static str, &[&str], &[PrivacyClass])]) -> Keyring {
+    keyring_in(None, specs)
+}
+
+/// [`keyring`]，每把 key 都绑在 `tenant` 上（租户模式用）。
+fn keyring_in(tenant: Option<&str>, specs: &[(&'static str, &[&str], &[PrivacyClass])]) -> Keyring {
     let store = Arc::new(Mutex::new(
         VirtualKeyStore::new(Connection::open_in_memory().unwrap()).unwrap(),
     ));
@@ -1110,7 +1389,7 @@ fn keyring(specs: &[(&'static str, &[&str], &[PrivacyClass])]) -> Keyring {
                 key.hash,
                 &VirtualKeyScope {
                     owner: (*name).into(),
-                    tenant_id: None,
+                    tenant_id: tenant.map(str::to_string),
                     allowed_privacy: privacy.to_vec(),
                     allowed_roles: roles.iter().map(|role| (*role).to_string()).collect(),
                     budget_ref: None,
@@ -1320,6 +1599,108 @@ async fn tenant_mode_checks_the_tenant_header_before_authenticating_like_every_i
     assert_eq!(rig.adapter.inner.load_call_count("qwen-daily"), 0);
 }
 
+#[tokio::test]
+async fn in_tenant_mode_a_cancelled_warmup_is_audited_under_the_authenticated_tenant_only() {
+    let ring = keyring_in(Some("acme"), &[("all", ALL_ROLES, LOCAL)]);
+    let secret = ring.secrets["all"].clone();
+    let authenticator = ring.authenticator.clone();
+    let audit = Audit::new();
+    let install = audit.install();
+    let rig = rig_with(
+        vec![lifecycle_card(&[("daily", "qwen-daily")])],
+        &[("qwen-daily", 1.0)],
+        None,
+        move |state| {
+            state.deploy_mode = idoris_contracts::DeployMode::Tenant;
+            state.virtual_key_authenticator = Some(authenticator);
+            install(state);
+        },
+    );
+    rig.adapter
+        .inner
+        .set_load_delay("qwen-daily", Duration::from_millis(1_500));
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(300),
+        warm_as(
+            &rig.app,
+            json!({"model": "idoris/daily"}),
+            &secret,
+            &[("X-iDoris-Tenant", "acme")],
+        ),
+    )
+    .await;
+    assert!(
+        abandoned.is_err(),
+        "the request future was dropped mid-load"
+    );
+    // 事件归在已认证的租户名下（同审计中间件的规则），别的租户名下什么都没有。
+    let events = audit.wait_for_events("acme", 1).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        audit_summary(&events[0]),
+        (
+            499,
+            "degraded: request_cancelled".to_string(),
+            "warmup".to_string()
+        )
+    );
+    assert!(audit.events(PERSONAL).is_empty());
+    assert!(audit.events("other").is_empty());
+    let fence = rig.adapter.fence();
+    wait_until(
+        "the abandoned load to finish",
+        Duration::from_secs(15),
+        || !fence.exists(),
+    )
+    .await;
+    let_late_audit_writes_land().await;
+    assert_eq!(audit.events("acme").len(), 1);
+    // 对照：同一个租户里完成的预热由中间件写，同样归在这个租户名下。
+    let done = warm_as(
+        &rig.app,
+        json!({"model": "idoris/daily"}),
+        &secret,
+        &[("X-iDoris-Tenant", "acme")],
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.raw);
+    let events = audit.wait_for_events("acme", 2).await;
+    assert_eq!(events.len(), 2);
+    assert_eq!(audit_summary(&events[1]).0, 200);
+}
+
+#[tokio::test]
+async fn in_tenant_mode_an_unauthenticated_warmup_leaves_no_audit_event_under_the_tenant_it_names()
+{
+    // 没认证的请求不能往别人的租户审计里写东西：事件只归在已认证的身份的租户名下（中间件与取消守卫同一个规则）。
+    let ring = keyring_in(Some("acme"), &[("all", ALL_ROLES, LOCAL)]);
+    let authenticator = ring.authenticator.clone();
+    let audit = Audit::new();
+    let install = audit.install();
+    let rig = rig_with(
+        vec![lifecycle_card(&[("daily", "qwen-daily")])],
+        &[("qwen-daily", 1.0)],
+        None,
+        move |state| {
+            state.deploy_mode = idoris_contracts::DeployMode::Tenant;
+            state.virtual_key_authenticator = Some(authenticator);
+            install(state);
+        },
+    );
+    let denied = warm_as(
+        &rig.app,
+        json!({"model": "idoris/daily"}),
+        "not-a-real-key",
+        &[("X-iDoris-Tenant", "acme")],
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::UNAUTHORIZED, "{}", denied.raw);
+    let_late_audit_writes_land().await;
+    assert!(audit.events("acme").is_empty());
+    assert!(audit.events(PERSONAL).is_empty());
+    assert_eq!(rig.adapter.inner.load_call_count("qwen-daily"), 0);
+}
+
 // ---------------------------------------------------------------------------------------------
 // resident 卡：一个最小的真实请求
 // ---------------------------------------------------------------------------------------------
@@ -1383,10 +1764,16 @@ async fn upstream() -> MockServer {
 }
 
 fn resident_app(cards: Vec<ComponentCard>) -> Router {
-    build_app(AppState {
+    resident_app_with(cards, |_| {})
+}
+
+fn resident_app_with(cards: Vec<ComponentCard>, customize: impl FnOnce(&mut AppState)) -> Router {
+    let mut state = AppState {
         cards,
         ..AppState::default()
-    })
+    };
+    customize(&mut state);
+    build_app(state)
 }
 
 async fn requests_of(server: &MockServer) -> Vec<wiremock::Request> {
@@ -1638,6 +2025,212 @@ async fn a_resident_upstream_slower_than_timeout_ms_is_504_warmup_timeout() {
         started.elapsed()
     );
     assert_eq!(reply.header("x-idoris-served-locality"), Some("loopback"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// resident：调用方走了（`timeout_ms` 到点或客户端断开），发给上游的请求不被取消
+// ---------------------------------------------------------------------------------------------
+
+/// 一个假的 OpenAI 兼容上游，能说出客户端有没有半路挂断：`/v1/chat/completions` 睡 `delay` 再答；处理这个请求的 future 在睡眠里被丢掉
+/// （客户端关了连接，hyper 就丢掉它）记一次 `cancelled`，睡完答了记一次 `completed`。
+struct ProbeUpstream {
+    url: String,
+    started: Arc<AtomicU32>,
+    completed: Arc<AtomicU32>,
+    cancelled: Arc<AtomicU32>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl ProbeUpstream {
+    fn started(&self) -> u32 {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    fn completed(&self) -> u32 {
+        self.completed.load(Ordering::SeqCst)
+    }
+
+    fn cancelled(&self) -> u32 {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for ProbeUpstream {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+async fn probe_upstream(delay: Duration) -> ProbeUpstream {
+    #[derive(Clone)]
+    struct Shared {
+        started: Arc<AtomicU32>,
+        completed: Arc<AtomicU32>,
+        cancelled: Arc<AtomicU32>,
+        delay: Duration,
+    }
+
+    /// 在答完之前被丢掉就记一次 `cancelled`。
+    struct HangUp {
+        cancelled: Arc<AtomicU32>,
+        answered: bool,
+    }
+
+    impl Drop for HangUp {
+        fn drop(&mut self) {
+            if !self.answered {
+                self.cancelled.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    async fn answer(State(shared): State<Shared>) -> Json<Value> {
+        shared.started.fetch_add(1, Ordering::SeqCst);
+        let mut hang_up = HangUp {
+            cancelled: shared.cancelled.clone(),
+            answered: false,
+        };
+        tokio::time::sleep(shared.delay).await;
+        hang_up.answered = true;
+        shared.completed.fetch_add(1, Ordering::SeqCst);
+        Json(json!({"choices": [{"message": {"content": "x"}}]}))
+    }
+
+    let shared = Shared {
+        started: Arc::default(),
+        completed: Arc::default(),
+        cancelled: Arc::default(),
+        delay,
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", axum::routing::post(answer))
+        .with_state(shared.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    ProbeUpstream {
+        url,
+        started: shared.started,
+        completed: shared.completed,
+        cancelled: shared.cancelled,
+        server,
+    }
+}
+
+#[tokio::test]
+async fn the_probe_upstream_notices_a_client_that_hangs_up() {
+    // 对照：下面「不被取消」的断言只有在探针确实能发现挂断时才有意义。
+    let upstream = probe_upstream(Duration::from_secs(5)).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let gave_up = client
+        .post(format!("{}/v1/chat/completions", upstream.url))
+        .json(&json!({}))
+        .send()
+        .await;
+    assert!(gave_up.is_err(), "the client gave up on the slow upstream");
+    wait_until(
+        "the probe upstream to notice the hang-up",
+        Duration::from_secs(10),
+        || upstream.cancelled() == 1,
+    )
+    .await;
+    assert_eq!(upstream.completed(), 0);
+}
+
+#[tokio::test]
+async fn timeout_ms_expiring_does_not_cancel_the_resident_request() {
+    let upstream = probe_upstream(Duration::from_millis(2_500)).await;
+    let audit = Audit::new();
+    let app = resident_app_with(
+        vec![resident_card(
+            "lmstudio",
+            &upstream.url,
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        audit.install(),
+    );
+    let reply = warm(&app, json!({"model": "idoris/daily", "timeout_ms": 1000})).await;
+    assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT, "{}", reply.raw);
+    assert_eq!(reply.error_type(), "warmup_timeout");
+    assert_eq!(upstream.started(), 1);
+    assert_eq!(
+        upstream.completed(),
+        0,
+        "the caller gave up before the upstream answered"
+    );
+    // 调用方走了，发给上游的请求没有：它跑完，上游从来没发现客户端挂断。
+    wait_until(
+        "the upstream to answer the request the caller walked away from",
+        Duration::from_secs(15),
+        || upstream.completed() == 1,
+    )
+    .await;
+    assert_eq!(
+        upstream.cancelled(),
+        0,
+        "the upstream never saw the client hang up"
+    );
+    // 到点的 504 是一次正常返回：审计恰好一条。
+    let events = audit.wait_for_events(PERSONAL, 1).await;
+    let_late_audit_writes_land().await;
+    assert_eq!(audit.events(PERSONAL).len(), 1, "{events:?}");
+    assert_eq!(
+        audit_summary(&events[0]),
+        (504, "degraded: http_504".to_string(), "warmup".to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_hangs_up_does_not_cancel_the_resident_request_either_and_is_audited_once() {
+    let upstream = probe_upstream(Duration::from_millis(1_500)).await;
+    let audit = Audit::new();
+    let app = resident_app_with(
+        vec![resident_card(
+            "lmstudio",
+            &upstream.url,
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        audit.install(),
+    );
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(300),
+        warm(&app, json!({"model": "idoris/daily"})),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the request future was dropped");
+    assert_eq!(upstream.started(), 1);
+    wait_until(
+        "the upstream to answer the request the client walked away from",
+        Duration::from_secs(15),
+        || upstream.completed() == 1,
+    )
+    .await;
+    assert_eq!(
+        upstream.cancelled(),
+        0,
+        "the upstream never saw the client hang up"
+    );
+    let events = audit.wait_for_events(PERSONAL, 1).await;
+    let_late_audit_writes_land().await;
+    assert_eq!(audit.events(PERSONAL).len(), 1, "{events:?}");
+    assert_eq!(
+        audit_summary(&events[0]),
+        (
+            499,
+            "degraded: request_cancelled".to_string(),
+            "warmup".to_string()
+        )
+    );
+    assert_eq!(audit.records(PERSONAL), 1);
 }
 
 #[tokio::test]

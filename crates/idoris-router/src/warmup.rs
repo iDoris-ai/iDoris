@@ -10,14 +10,19 @@
 //!   Supervisor 的幂等 load：余量确认与驱逐都在里面）；加载完成即返回，**不生成任何 token**。三种角色（chat、embedding、
 //!   rerank）都一样，因为「就绪」就是「已加载」。同一模型的并发预热与并发的首个聊天请求由 Supervisor 合并成一次加载。
 //! - **resident 卡**：没有生命周期可管，按能力发一个最小的真实请求（chat：`max_tokens: 1`；embedding：输入 `"warmup"`），
-//!   响应头超时是请求的 `timeout_ms`（不是聊天的 10 秒）。规范没有定义 rerank 的最小请求，rerank 的 resident 卡明确拒绝
-//!   （400 `unsupported_field` / `unsupported_model`），什么也不发。
-//! - **`timeout_ms` 到点只是放弃等待**：返回 504 `warmup_timeout`，**不取消、不缩短**引擎里的加载——Supervisor 的加载任务与请求
-//!   的 future 无关，照常跑完并清掉 `load.pending`，之后的预热或聊天直接看到「已就绪」。引擎自己的加载超时是另一回事
-//!   （`RuntimeAdapter::load_timeout`，生产缺省 180 秒）：加载超过它，结果才是「未知」，围栏保留（行为同聊天，没有变）。
-//! - 不进用量与预算记录（本地免费；付费卡直接拒绝），写一条 `intent: warmup` 的审计事件（见 `record_id_middleware`）。
+//!   请求在自己的任务里跑、有自己的响应头期限（[`crate::proxy::WARMUP_HEADER_TIMEOUT`]，不是聊天的 10 秒，也不是 `timeout_ms`）。
+//!   规范没有定义 rerank 的最小请求，rerank 的 resident 卡明确拒绝（400 `unsupported_field` / `unsupported_model`），什么也不发。
+//! - **`timeout_ms` 到点只是放弃等待**：返回 504 `warmup_timeout`，**不取消、不缩短**任何东西。生命周期卡：Supervisor 的加载任务
+//!   与请求的 future 无关，照常跑完并清掉 `load.pending`，之后的预热或聊天直接看到「已就绪」。resident 卡：最小请求在它自己的
+//!   任务里，不被打断，直到上游答了或它自己的期限到点，代理照常结算熔断的准入（504 按既有规则计入提供方熔断）。客户端断开同理。
+//!   预热自己的 `timeout_ms` 与客户端断开不留围栏；引擎侧的超时（`RuntimeAdapter::load_timeout`，生产缺省 180 秒）或 panic 保持
+//!   既有的「结果未知」保护，围栏保留（行为同聊天，没有变）。
+//! - 不进用量与预算记录（本地免费；付费卡直接拒绝），写一条 `intent: warmup` 的审计事件（见 `record_id_middleware`）。请求被取消
+//!   （客户端断开）时中间件走不到那里，由 [`CancelAudit`] 补上：完成、`timeout_ms` 到点、取消各写恰好一条。
 
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -27,17 +32,20 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use idoris_backend::BackendError;
 use idoris_contracts::common::{Capability, PrivacyClass};
+use idoris_contracts::provider::Locality;
 use idoris_policy::Role;
+use idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey;
 use serde_json::{Map, Value, json};
 
 use crate::dispatch::{
     self, ChatOutcome, DispatchError, DispatchFailure, EnsureLoadedError, Selected,
 };
 use crate::profile::parse_profile;
-use crate::proxy::{BufferedUpstreamPath, ForwardOpts};
+use crate::proxy::{BufferedUpstreamPath, ChatProxy, ForwardOpts, ForwardOutcome};
 use crate::{
-    AppState, RequestRecordId, apply_selected_headers, backend_error_response, error_envelope,
-    error_envelope_with_reason, headroom_breach_confirmed, managed_unavailable_response, models,
+    AppState, BufferedAuditMeta, RequestRecordId, apply_selected_headers, backend_error_response,
+    error_envelope, error_envelope_with_reason, headroom_breach_confirmed,
+    managed_unavailable_response, models,
 };
 
 /// 路径（`record_id_middleware` 与鉴权中间件的路径名单也用它）。
@@ -189,15 +197,16 @@ fn backend_failure(selected: &Selected, err: BackendError) -> Response {
     backend_error_response(&err, &outcome)
 }
 
-/// `timeout_ms` 到点：504，类型与原因码都是 `warmup_timeout`。加载可能仍在引擎里继续，不等于失败。
-fn timeout_response(selected: &Selected, timeout: Duration) -> Response {
+/// 等了 `waited` 模型还没就绪：504，类型与原因码都是 `warmup_timeout`。通常是调用方的 `timeout_ms` 到点；resident 卡的最小请求
+/// 自己的期限（[`crate::proxy::WARMUP_HEADER_TIMEOUT`]）先到点时 `waited` 是那一段实际等待。引擎那一侧可能仍在加载，不等于失败。
+fn timeout_response(selected: &Selected, waited: Duration) -> Response {
     with_headers(
         error_envelope(
             StatusCode::GATEWAY_TIMEOUT,
             "warmup_timeout",
             format!(
                 "the model was not ready within {} ms; the engine may still be loading it, so this is not a failure: retry the warmup later",
-                timeout.as_millis()
+                waited.as_millis()
             ),
         ),
         selected,
@@ -237,17 +246,74 @@ async fn warm_lifecycle(
     .map_err(|failure: EnsureLoadedError| backend_failure(selected, failure.into_backend()))
 }
 
-/// 一次预热里与具体卡无关的那些：调用方是谁、预热哪种能力、预热哪个具体模型。
+/// 一次预热里与具体卡无关的那些：调用方是谁、预热哪种能力、预热哪个具体模型，以及这次预热从什么时候开始等。
 struct Job<'a> {
     privacy: PrivacyClass,
     tenant_id: Option<&'a str>,
     record_id: &'a str,
     capability: Capability,
     target: &'a str,
-    timeout: Duration,
+    started: Instant,
 }
 
-/// resident 卡：发一个最小的真实请求，上游答 2xx 就算可用。响应头超时是 `timeout`（调用方的 `timeout_ms`）。
+/// 一个 resident 预热的最小请求，连同它跑起来需要的一切。它在自己的任务里跑，所以拥有全部数据，不借用请求的任何东西。
+struct ResidentRequest {
+    proxy: Arc<ChatProxy>,
+    endpoint: String,
+    path: BufferedUpstreamPath,
+    body: Value,
+    tenant_id: Option<String>,
+    record_id: String,
+    provider_id: String,
+    served_locality: Locality,
+    privacy: PrivacyClass,
+    attach_omlx_key: bool,
+    /// 这个请求自己的响应头期限（`ChatProxy::warmup_header_timeout`），与调用方的 `timeout_ms` 无关。
+    header_timeout: Duration,
+}
+
+impl ResidentRequest {
+    /// 经聊天用的同一个代理发出去，一直等到它收尾（成功、上游的错误，或响应头期限到点的 504）。并发许可由代理在里面拿、在这个
+    /// 调用结束时放；熔断的准入也由代理在里面按既有规则结算（`claim.finish`）。不带幂等键。
+    async fn run(self) -> ForwardOutcome {
+        let opts = ForwardOpts {
+            request_id: None,
+            tenant_id: self.tenant_id.as_deref(),
+            record_id: &self.record_id,
+            provider_id: &self.provider_id,
+            served_locality: self.served_locality,
+            privacy: self.privacy,
+            require_openai_usage: false,
+            attach_omlx_key: self.attach_omlx_key,
+        };
+        match self
+            .proxy
+            .forward_buffered_path_finalized_within(
+                &self.endpoint,
+                self.path,
+                &self.body,
+                &opts,
+                Some(self.header_timeout),
+                |_| Ok(()),
+                (
+                    || async { Ok::<(), Infallible>(()) },
+                    |_| async { Ok::<(), Infallible>(()) },
+                ),
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(never) => match never {},
+        }
+    }
+}
+
+/// resident 卡：发一个最小的真实请求，上游答 2xx 就算可用。
+///
+/// 请求在**自己的任务**里跑，有自己的响应头期限（[`crate::proxy::WARMUP_HEADER_TIMEOUT`]，与调用方的 `timeout_ms` 无关）：
+/// 这个函数的 future 被丢掉——`timeout_ms` 到点、客户端断开——只是不再等结果，**不取消**发给上游的请求（上游那一侧的冷加载
+/// 不被我们的放弃打断），代理照常在请求结束时结算熔断的准入：成功，或 504 按既有规则计入提供方熔断。任务占着代理的一个
+/// 并发许可直到请求结束，所以同时挂着的预热请求总数受那 32 个许可限制。
 ///
 /// 上游的回答按预热的错误矩阵翻译：404 是 `model_not_found`，504（响应头或正文超时）是 `warmup_timeout`，其余非 2xx 与聊天的
 /// resident 路径一样原样透传（含代理自己的 502 `upstream_auth_failed` 与熔断的 503）。不带幂等键：预热每次都是真请求，不重放缓存。
@@ -256,15 +322,8 @@ async fn warm_resident(
     selected: &Selected,
     job: &Job<'_>,
 ) -> Result<(), Response> {
-    let Job {
-        privacy,
-        tenant_id,
-        record_id,
-        capability,
-        target,
-        timeout,
-    } = *job;
-    let (path, body) = match capability {
+    let target = job.target;
+    let (path, body) = match job.capability {
         Capability::Embedding => (
             BufferedUpstreamPath::EMBEDDINGS,
             json!({"model": target, "input": MINIMAL_INPUT}),
@@ -289,34 +348,32 @@ async fn warm_resident(
             ));
         }
     };
-    let opts = ForwardOpts {
-        request_id: None,
-        tenant_id,
-        record_id,
-        provider_id: selected.card.provider.id.as_str(),
+    let request = ResidentRequest {
+        proxy: Arc::clone(&state.proxy),
+        endpoint: selected.card.endpoint.clone(),
+        path,
+        body,
+        tenant_id: job.tenant_id.map(str::to_string),
+        record_id: job.record_id.to_string(),
+        provider_id: selected.card.provider.id.clone(),
         served_locality: selected.served_locality,
-        privacy,
-        require_openai_usage: false,
+        privacy: job.privacy,
         attach_omlx_key: models::is_loopback_omlx(&selected.card),
+        header_timeout: state.proxy.warmup_header_timeout,
     };
-    let outcome = match state
-        .proxy
-        .forward_buffered_path_finalized_within(
-            &selected.card.endpoint,
-            path,
-            &body,
-            &opts,
-            Some(timeout),
-            |_| Ok(()),
-            (
-                || async { Ok::<(), std::convert::Infallible>(()) },
-                |_| async { Ok::<(), std::convert::Infallible>(()) },
-            ),
-        )
-        .await
-    {
+    let outcome = match tokio::spawn(request.run()).await {
         Ok(outcome) => outcome,
-        Err(never) => match never {},
+        // 任务 panic 或运行时正在关闭：没有上游的回答可翻译。
+        Err(_) => {
+            return Err(with_headers(
+                error_envelope(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "the warmup request did not complete",
+                ),
+                selected,
+            ));
+        }
     };
     match outcome.status {
         200..=299 => Ok(()),
@@ -324,7 +381,7 @@ async fn warm_resident(
             selected,
             BackendError::model_not_found(target),
         )),
-        504 => Err(timeout_response(selected, timeout)),
+        504 => Err(timeout_response(selected, job.started.elapsed())),
         status => {
             let mut response = (
                 StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -345,15 +402,105 @@ async fn warm_resident(
     }
 }
 
+/// 审计里「已取消」的结果：状态码（nginx 的「客户端关闭了请求」）与原因。原因的前缀是 `ReasonKind` 里的 `degraded`，和被丢掉的流
+/// （`degraded: stream_cancelled`）同一类。
+const CANCELLED_STATUS: u16 = 499;
+const CANCELLED_REASON: &str = "degraded: request_cancelled";
+
+/// 请求的 future 在回答之前被丢掉（客户端挂了电话）时，把这条预热的审计事件补上。
+///
+/// 审计中间件在 handler 返回之后才写事件，被丢掉的请求走不到那里；而引擎里的加载（或 resident 的最小请求）照常跑完——没有这个
+/// 守卫，这次预热在审计里就像没发生过。守卫在 handler 开头装上、handler 返回响应时拆掉（之后由中间件为那个响应写唯一的一条）；
+/// 装着时被丢掉，就把「已取消」的事件交给**它自己的任务**去写（`Drop` 里不能 await，任务也不会随请求一起被丢掉）。这样
+/// 正常完成、`timeout_ms` 到点（是一个正常返回的 504）、被取消，三种结局各写**恰好一条**。
+///
+/// 事件归属的租户按审计中间件同一个规则（`audit_tenant_for`）从已认证的身份算出来；取消发生在认证之前（还没进 handler）时
+/// 没有装守卫，也就没有事件——那时还没有任何东西被预热。
+struct CancelAudit {
+    state: Arc<AppState>,
+    meta: Option<BufferedAuditMeta>,
+    started: Instant,
+}
+
+impl CancelAudit {
+    fn arm(
+        state: &Arc<AppState>,
+        headers: &HeaderMap,
+        identity: Option<&AuthenticatedVirtualKey>,
+        record_id: &str,
+    ) -> Self {
+        let meta = BufferedAuditMeta {
+            tenant_id: crate::audit_tenant_for(
+                state.deploy_mode,
+                crate::audit_tenant_id(state, headers),
+                identity,
+            ),
+            request_id: crate::audit_header(headers, crate::HEADER_REQUEST_ID, None),
+            privacy: crate::audit_header(headers, "x-idoris-privacy", Some("local_only")),
+            intent: Some(AUDIT_INTENT.to_string()),
+            record_id: record_id.to_string(),
+            status: StatusCode::from_u16(CANCELLED_STATUS).unwrap_or(StatusCode::BAD_REQUEST),
+            origin_record_id: None,
+            reason: CANCELLED_REASON.to_string(),
+            latency_ms: 0,
+        };
+        Self {
+            state: Arc::clone(state),
+            meta: Some(meta),
+            started: Instant::now(),
+        }
+    }
+
+    /// handler 返回了响应：这条预热由审计中间件记，守卫不再写。
+    fn defuse(&mut self) {
+        self.meta = None;
+    }
+}
+
+impl Drop for CancelAudit {
+    fn drop(&mut self) {
+        let Some(mut meta) = self.meta.take() else {
+            return;
+        };
+        meta.latency_ms = crate::elapsed_ms(self.started);
+        let state = Arc::clone(&self.state);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(crate::finish_buffered_audit(state, meta));
+            }
+            Err(_) => {
+                state.audit_failures.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "idoris: audit of a cancelled warmup could not be written: no async runtime"
+                );
+            }
+        }
+    }
+}
+
 /// `POST /v1/models/warmup`。
 pub(crate) async fn warmup(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    remote_identity: Option<Extension<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>>,
+    remote_identity: Option<Extension<AuthenticatedVirtualKey>>,
     Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
     body: Bytes,
 ) -> Response {
-    let value: Value = match serde_json::from_slice(&body) {
+    let identity = remote_identity.as_ref().map(|identity| &identity.0);
+    let mut cancel_audit = CancelAudit::arm(&state, &headers, identity, &record_id);
+    let response = handle(&state, &headers, identity, &record_id, &body).await;
+    cancel_audit.defuse();
+    response
+}
+
+async fn handle(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthenticatedVirtualKey>,
+    record_id: &str,
+    body: &Bytes,
+) -> Response {
+    let value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(_) => {
             return error_envelope(
@@ -374,17 +521,12 @@ pub(crate) async fn warmup(
         Ok(request) => request,
         Err(bad) => return bad.into_response(),
     };
-    let mut parsed = match parse_profile(&headers, Some(&request.model), state.deploy_mode) {
+    let mut parsed = match parse_profile(headers, Some(&request.model), state.deploy_mode) {
         Ok(parsed) => parsed,
         Err(error) => return error.into_response(),
     };
-    if let Err(response) = crate::enforce_protocol_key_scope(
-        &state,
-        &headers,
-        remote_identity.as_ref().map(|identity| &identity.0),
-        &parsed,
-    )
-    .await
+    if let Err(response) =
+        crate::enforce_protocol_key_scope(state, headers, identity, &parsed).await
     {
         return response;
     }
@@ -394,7 +536,7 @@ pub(crate) async fn warmup(
     // 隐私：和其他协议端点一样过一遍（远程熔断开关、内容收紧）。预热的请求体里没有内容，但「开关一合上，一切都只走本地」
     // 不能因为这条路径没有内容就绕过。
     let inspection = crate::protocol_inspection(
-        &state,
+        state,
         &value,
         body.len(),
         parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
@@ -425,7 +567,7 @@ pub(crate) async fn warmup(
         }
     };
     // 门控降级放行、没就绪的托管卡：不碰引擎，和聊天一样 503 带原因。
-    if let Some(response) = managed_unavailable_response(&state, &selected) {
+    if let Some(response) = managed_unavailable_response(state, &selected) {
         return response;
     }
     // 本地免费才预热：付费卡的最小请求也会花钱，而预热不进用量与预算记录。
@@ -449,21 +591,21 @@ pub(crate) async fn warmup(
     let job = Job {
         privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         tenant_id: parsed.tenant_id.as_deref(),
-        record_id: &record_id,
+        record_id,
         capability,
         target: &target,
-        timeout: request.timeout,
+        started,
     };
     let work = async {
         if dispatch::is_resident_http_service(&selected.card) {
             // 没有账本可问：resident 卡的 `already_loaded` 恒为 false，`load_ms` 是那一个最小请求的耗时。
-            warm_resident(&state, &selected, &job).await.map(|()| false)
+            warm_resident(state, &selected, &job).await.map(|()| false)
         } else {
             warm_lifecycle(
-                &state,
+                state,
                 &selected,
                 &target,
-                headroom_breach_confirmed(&headers),
+                headroom_breach_confirmed(headers),
             )
             .await
         }
@@ -471,7 +613,8 @@ pub(crate) async fn warmup(
     let already_loaded = match tokio::time::timeout(request.timeout, work).await {
         Ok(Ok(already_loaded)) => already_loaded,
         Ok(Err(response)) => return response,
-        // 只是放弃等待：`work` 被丢弃，引擎里（Supervisor 的后台任务里）的加载照常跑完。
+        // 只是放弃等待：`work` 被丢掉，但引擎里的加载（Supervisor 的后台任务）与 resident 的最小请求（`warm_resident` 自己的
+        // 任务）都与它无关，照常跑完。
         Err(_elapsed) => return timeout_response(&selected, request.timeout),
     };
     with_headers(

@@ -3881,15 +3881,13 @@ async fn record_id_middleware(
     req.extensions_mut()
         .insert(RequestRecordId(record_id.clone()));
     let mut response = next.run(req).await;
-    let audit_tenant = match state.deploy_mode {
-        idoris_contracts::DeployMode::Personal => requested_audit_tenant,
-        idoris_contracts::DeployMode::Tenant => response
+    let audit_tenant = audit_tenant_for(
+        state.deploy_mode,
+        requested_audit_tenant,
+        response
             .extensions()
-            .get::<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>()
-            .and_then(|identity| identity.scope.tenant_id.as_ref())
-            .filter(|tenant| Some(tenant.as_str()) == requested_audit_tenant.as_deref())
-            .cloned(),
-    };
+            .get::<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>(),
+    );
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
@@ -3988,6 +3986,24 @@ fn event_request_id(request_id: Option<&str>, record_id: &str) -> String {
         .filter(|value| !value.chars().any(char::is_control))
         .unwrap_or(record_id)
         .to_string()
+}
+
+/// The tenant an inference request's audit event is filed under: the personal tenant (personal deployments), or — in
+/// tenant mode — the authenticated key's tenant when it is the one the request asked for (`X-iDoris-Tenant`).
+/// `requested` is [`audit_tenant_id`]. Shared by the audit middleware (after the response) and the warmup's
+/// cancellation audit (before any response exists), so both file an event under the same tenant.
+fn audit_tenant_for(
+    deploy_mode: idoris_contracts::DeployMode,
+    requested: Option<String>,
+    identity: Option<&idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>,
+) -> Option<String> {
+    match deploy_mode {
+        idoris_contracts::DeployMode::Personal => requested,
+        idoris_contracts::DeployMode::Tenant => identity
+            .and_then(|identity| identity.scope.tenant_id.as_ref())
+            .filter(|tenant| Some(tenant.as_str()) == requested.as_deref())
+            .cloned(),
+    }
 }
 
 fn audit_tenant_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
