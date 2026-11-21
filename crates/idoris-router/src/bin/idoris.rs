@@ -61,10 +61,11 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 /// Exit code when another `idoris serve` already holds the database lock.
-/// Other failures (including a shutdown that exceeds `SHUTDOWN_GRACE`) exit 1.
+/// Other failures (including a signal stop whose shutdown exceeds `SHUTDOWN_GRACE`) end with code 1; a stop whose cause is
+/// already known to be an `instance_conflict` or an orphan timeout keeps its own exit code (see `stop_report`).
 const EXIT_ALREADY_RUNNING: i32 = 3;
 /// Upper bound for graceful shutdown after SIGTERM/SIGINT; if in-flight
-/// requests or subscriptions do not finish in time we exit with code 1.
+/// requests or subscriptions do not finish in time a signal stop exits with code 1 (`stop_report` for the other causes).
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Resolves on SIGINT or (unix) SIGTERM; both take the same graceful path.
@@ -102,6 +103,68 @@ fn serve_failure_label(message: &str) -> &'static str {
         "停止失败"
     } else {
         "启动失败"
+    }
+}
+
+/// 一行停止日志，以及它写到哪里。
+#[derive(Debug, PartialEq, Eq)]
+enum StopLine {
+    Stdout(String),
+    Stderr(String),
+}
+
+/// 停止收尾要做的事：按顺序写这些行，再以 `result` 结束（`Ok` 是退出码；`Err` 由 `real_main` 打印并以退出码 1 退出）。
+#[derive(Debug, PartialEq, Eq)]
+struct StopReport {
+    lines: Vec<StopLine>,
+    result: Result<u8, String>,
+}
+
+/// HTTP 排空结束之后怎么收尾（接口规范 §2.7.5）。`cause` 是记下来的停止原因，`served` 是排空的结果：
+///
+/// - 排空成功：照原因退出（0、3、4），写原因对应的那一行。
+/// - 排空失败（超过 `SHUTDOWN_GRACE`，或订阅停不下来），而原因是信号，或没有记下原因（服务自己倒了）：这是「停止失败」，
+///   带着错误以退出码 1 退出（§2.7.5 退出码 1），不写原因行。
+/// - 排空失败，而原因已经确定是 `instance_conflict`（3）或孤儿超时（4）：退出码与原因行都不变，另加一行说明排空失败。
+///   不把 3、4 变成 1：launcher 把退出码 1 当崩溃退避重启，对 `instance_conflict` 就是让后来者再撞一次冲突；而 3（不要重启）
+///   与 4（按预期停止，不计入崩溃熔断）正是这两种停止要告诉 launcher 的。
+fn stop_report(
+    cause: Option<StopCause>,
+    served: Result<(), String>,
+    orphan_timeout_s: u32,
+) -> StopReport {
+    let drain_failure = match (served, cause) {
+        (Err(message), None | Some(StopCause::Signal)) => {
+            return StopReport {
+                lines: Vec::new(),
+                result: Err(message),
+            };
+        }
+        (Err(message), Some(_)) => Some(message),
+        (Ok(()), _) => None,
+    };
+    let cause = cause.unwrap_or(StopCause::Signal);
+    let mut lines = vec![match cause {
+        StopCause::Signal => StopLine::Stdout("idoris: 已停止".to_string()),
+        // 接口规范 §2.10.4：agent24d 已有另一个健康实例，后来者没有候补价值，优雅停止并以退出码 3 退出。
+        StopCause::InstanceConflict => StopLine::Stderr(
+            "idoris: 登记被 agent24d 以 instance_conflict 拒绝（已有另一个健康实例），已停止"
+                .to_string(),
+        ),
+        // 接口规范 §2.10.8：从「没有已 ack 的登记会话」起超过 `orphan_timeout_s`。
+        StopCause::OrphanTimeout => StopLine::Stderr(format!(
+            "idoris: 无启动器登记超过 {orphan_timeout_s} 秒，已停止"
+        )),
+    }];
+    if let Some(message) = drain_failure {
+        lines.push(StopLine::Stderr(format!(
+            "[idoris] 停止失败：{message}（停止原因已确定，退出码仍为 {}）",
+            cause.exit_code()
+        )));
+    }
+    StopReport {
+        lines,
+        result: Ok(cause.exit_code()),
     }
 }
 
@@ -899,29 +962,19 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     if let Some(target) = discovery_target {
         remove_discovery_file(target, instance_id).await;
     }
-    served?;
     let cause = stop_cause
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .take()
-        .unwrap_or(StopCause::Signal);
-    match cause {
-        StopCause::Signal => println!("idoris: 已停止"),
-        // 接口规范 §2.10.4：agent24d 已有另一个健康实例，后来者没有候补价值，优雅停止并以退出码 3 退出。
-        StopCause::InstanceConflict => {
-            eprintln!(
-                "idoris: 登记被 agent24d 以 instance_conflict 拒绝（已有另一个健康实例），已停止"
-            );
-        }
-        // 接口规范 §2.10.8：从「没有已 ack 的登记会话」起超过 `orphan_timeout_s`。
-        StopCause::OrphanTimeout => {
-            eprintln!(
-                "idoris: 无启动器登记超过 {} 秒，已停止",
-                launcher.orphan_timeout_s
-            );
+        .take();
+    // 排空失败不能盖掉已经确定的停止原因（3、4）：决定在 `stop_report` 里，那里有测试。
+    let report = stop_report(cause, served, launcher.orphan_timeout_s);
+    for line in report.lines {
+        match line {
+            StopLine::Stdout(text) => println!("{text}"),
+            StopLine::Stderr(text) => eprintln!("{text}"),
         }
     }
-    Ok(cause.exit_code())
+    report.result
 }
 
 /// 退出时删发现文件：只在文件属于自己时删；删不掉（旁路锁不可用或等锁超时、IO 失败）只留一行日志，文件成为崩溃残留，
@@ -1277,6 +1330,120 @@ mod tests {
         assert_eq!(shutdown_timeout_message(), "优雅停机超过 10s，强制退出");
         assert_eq!(serve_failure_label(&shutdown_timeout_message()), "停止失败");
         assert_eq!(serve_failure_label("无法绑定 127.0.0.1:1"), "启动失败");
+    }
+
+    const CONFLICT_LINE: &str =
+        "idoris: 登记被 agent24d 以 instance_conflict 拒绝（已有另一个健康实例），已停止";
+
+    fn stderr(text: &str) -> StopLine {
+        StopLine::Stderr(text.to_string())
+    }
+
+    /// 排空成功：每种原因都照原因退出，只写原因对应的那一行（信号写 stdout，另两种写 stderr）。没有记下原因而排空成功只可能是
+    /// 信号停止，按信号处理。
+    #[test]
+    fn a_clean_drain_exits_with_the_cause_code_and_writes_only_the_cause_line() {
+        for cause in [Some(StopCause::Signal), None] {
+            assert_eq!(
+                stop_report(cause, Ok(()), 0),
+                StopReport {
+                    lines: vec![StopLine::Stdout("idoris: 已停止".to_string())],
+                    result: Ok(0),
+                }
+            );
+        }
+        assert_eq!(
+            stop_report(Some(StopCause::InstanceConflict), Ok(()), 0),
+            StopReport {
+                lines: vec![stderr(CONFLICT_LINE)],
+                result: Ok(3),
+            }
+        );
+        assert_eq!(
+            stop_report(Some(StopCause::OrphanTimeout), Ok(()), 900),
+            StopReport {
+                lines: vec![stderr("idoris: 无启动器登记超过 900 秒，已停止")],
+                result: Ok(4),
+            }
+        );
+    }
+
+    /// 信号停止（或没有记下原因）而排空失败：仍是「停止失败」，退出码 1（`real_main` 打印并退出），错误原样带出去，不写原因行。
+    /// 这是 §2.7.5 原本的行为，加上已知原因的例外之后它必须不变。
+    #[test]
+    fn a_failed_drain_after_a_signal_stop_is_still_a_stop_failure_that_exits_1() {
+        for cause in [Some(StopCause::Signal), None] {
+            let report = stop_report(cause, Err(shutdown_timeout_message()), 0);
+            assert_eq!(
+                report,
+                StopReport {
+                    lines: Vec::new(),
+                    result: Err(shutdown_timeout_message()),
+                }
+            );
+        }
+        assert_eq!(
+            stop_report(None, Err("data server exited unexpectedly".to_string()), 0).result,
+            Err("data server exited unexpectedly".to_string())
+        );
+    }
+
+    /// 已知原因（`instance_conflict`、孤儿超时）而排空超时：退出码仍是 3、4，原因行照写，另有一行说明排空超时。
+    /// launcher 把 1 当崩溃重启：3 变成 1，就是让后来者再撞一次冲突。
+    #[test]
+    fn a_drain_timeout_does_not_turn_a_known_stop_cause_into_exit_code_1() {
+        assert_eq!(
+            stop_report(
+                Some(StopCause::InstanceConflict),
+                Err(shutdown_timeout_message()),
+                0
+            ),
+            StopReport {
+                lines: vec![
+                    stderr(CONFLICT_LINE),
+                    stderr(
+                        "[idoris] 停止失败：优雅停机超过 10s，强制退出（停止原因已确定，退出码仍为 3）"
+                    ),
+                ],
+                result: Ok(3),
+            }
+        );
+        assert_eq!(
+            stop_report(
+                Some(StopCause::OrphanTimeout),
+                Err(shutdown_timeout_message()),
+                900
+            ),
+            StopReport {
+                lines: vec![
+                    stderr("idoris: 无启动器登记超过 900 秒，已停止"),
+                    stderr(
+                        "[idoris] 停止失败：优雅停机超过 10s，强制退出（停止原因已确定，退出码仍为 4）"
+                    ),
+                ],
+                result: Ok(4),
+            }
+        );
+    }
+
+    /// 排空失败也可能不是超时（订阅停不下来、服务报错）：同样不盖掉已知的原因；说明里是原来的错误文本。
+    #[test]
+    fn any_drain_failure_is_reported_next_to_a_known_cause_instead_of_replacing_it() {
+        let report = stop_report(
+            Some(StopCause::InstanceConflict),
+            Err("subscription shutdown failed: closed".to_string()),
+            0,
+        );
+        assert_eq!(report.result, Ok(3));
+        assert_eq!(
+            report.lines,
+            vec![
+                stderr(CONFLICT_LINE),
+                stderr(
+                    "[idoris] 停止失败：subscription shutdown failed: closed（停止原因已确定，退出码仍为 3）"
+                ),
+            ]
+        );
     }
 
     #[cfg(unix)]
