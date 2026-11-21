@@ -19,8 +19,8 @@
 //!
 //! # 副作用
 //!
-//! 写的只有 `--out-dir` 与它同级的 `.idoris-setup-*` 暂存目录（规范 §2.7「组件配置」行）：不创建状态目录或引擎的
-//! base 目录。探测只连 loopback；找端口、核对已装模型、查可执行文件都是本机文件系统与 loopback 套接字的操作，
+//! 写入的位置是 `--out-dir` 与它同级的 `.idoris-setup-*` 暂存目录（规范 §2.7「组件配置」行）；状态目录、引擎的
+//! base 目录都不创建。探测连 loopback；找端口、核对已装模型、查可执行文件都是本机文件系统与 loopback 套接字的操作，
 //! 不需要网络。
 //!
 //! # 输出
@@ -199,8 +199,8 @@ pub trait SetupEngine: Sync {
 }
 
 /// 引擎有 [`idoris_upstream::engine::EngineRecipe`]（规范 §2.12.1）时，[`SetupEngine`] 两个可执行文件方法的通用实现：
-/// `setup` 与引擎管理器共用同一份配方，去哪里找、怎么校验在配方里只定义一次。引擎进程管理只在 unix 上编译，
-/// 所以这个模块也只在 unix 上有；通用流程本身不依赖它。
+/// `setup` 与引擎管理器共用同一份配方，去哪里找、怎么校验在配方里定义一次。引擎进程管理在 unix 以外的平台没有，
+/// 所以这个模块也一样；通用流程本身不依赖它。
 #[cfg(unix)]
 pub mod recipe_backed {
     use idoris_upstream::engine::{
@@ -585,7 +585,10 @@ fn build_card<E: SetupEngine>(
             policy.admission = Admission::Coexist;
         }
     }
-    let mut extensions = card.extensions.take().unwrap_or_default();
+    let mut extensions = match card.extensions.take() {
+        Some(existing) => existing,
+        None => Map::new(),
+    };
     let mut degradation = Vec::new();
     if resolved.managed {
         extensions.insert(

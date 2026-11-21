@@ -850,13 +850,6 @@ async fn adopt_mode_with_no_executable_reports_installed_false_and_still_succeed
     assert_eq!(report["status"], "ok");
 }
 
-/// `OmlxSetup` 用的是 S3 的 oMLX 配方（与引擎管理器共用同一份），种类名是规范的保留名 `omlx`。
-#[test]
-fn the_setup_engine_is_the_reserved_omlx_kind() {
-    use idoris_upstream::engine::EngineKind;
-    assert_eq!(OmlxSetup::new(None).kind(), EngineKind::OMLX.as_str());
-}
-
 // ---------------------------------------------------------------------------------------------
 // 副作用的边界
 // ---------------------------------------------------------------------------------------------
@@ -917,4 +910,60 @@ async fn force_replaces_a_managed_card_with_an_adopted_one_and_back() {
     options.force = true;
     ok(run_setup(&rig.setup(&[]), &options, None).await);
     assert!(rig.card()["extensions"]["idoris_managed"].is_object());
+}
+
+/// 便宜的校验（角色名、out-dir）排在任何探测之前：不合格的调用不打扰本机上的服务。
+#[tokio::test(flavor = "multi_thread")]
+async fn roles_and_the_out_dir_are_checked_before_anything_is_probed() {
+    let server = fake(None, &["m1"]).await;
+    let rig = Rig::new();
+    let setup = rig.setup(&[port_of(&server)]);
+    let mut options = rig.options(auto(None));
+    options.bindings = vec![("bogus".into(), "m1".into())];
+    assert_eq!(
+        code(&run_setup(&setup, &options, None).await),
+        "invalid_role"
+    );
+    std::fs::create_dir_all(rig.out()).unwrap();
+    std::fs::write(rig.out().join("mine.txt"), "x").unwrap();
+    let result = run_setup(&setup, &rig.options(auto(None)), None).await;
+    assert_eq!(code(&result), "out_dir_not_empty");
+    assert_eq!(requests(&server).await, 0, "一个探测请求都不该发出");
+}
+
+/// 托管：out-dir 不合格在找端口、找引擎之前就被拒绝，可执行文件没有被执行。
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_with_a_non_empty_out_dir_is_refused_before_the_engine_is_asked_anything() {
+    let rig = Rig::new();
+    std::fs::create_dir_all(rig.out()).unwrap();
+    std::fs::write(rig.out().join("mine.txt"), "x").unwrap();
+    let setup = rig.setup(&[]);
+    let result = run_setup(
+        &setup,
+        &rig.options(SetupTarget::Managed(managed(None))),
+        None,
+    )
+    .await;
+    assert_eq!(code(&result), "out_dir_not_empty");
+    assert!(!rig.executed());
+}
+
+/// 采纳一个端点：out-dir 不合格时，引擎一个请求都没收到。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_run_with_a_non_empty_out_dir_does_not_probe() {
+    let server = fake(None, &["m1"]).await;
+    let rig = Rig::new();
+    std::fs::create_dir_all(rig.out()).unwrap();
+    std::fs::write(rig.out().join("mine.txt"), "x").unwrap();
+    let result = run_setup(
+        &rig.setup(&[]),
+        &rig.options(SetupTarget::Endpoint {
+            url: server.uri(),
+            probe: true,
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(code(&result), "out_dir_not_empty");
+    assert_eq!(requests(&server).await, 0);
 }

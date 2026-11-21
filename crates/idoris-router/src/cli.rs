@@ -27,7 +27,7 @@ pub enum ControlCommand {
     Bootstrap,
 }
 
-/// `idoris setup <engine>` 的选项（现在只有 `setup omlx`）：探测或托管一个本地推理引擎，生成组件目录。
+/// `idoris setup <engine>` 的选项（目前由 `setup omlx` 使用）：探测或托管一个本地推理引擎，生成组件目录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupOptions {
     pub target: SetupTarget,
@@ -124,7 +124,7 @@ fn parse_setup(args: &[OsString]) -> Result<SetupOptions, String> {
     if managed_port.is_some() && !managed {
         return Err(USAGE.to_string());
     }
-    // key 只用于探测：这次不会探测，给了 key 就是用法错误（不读 stdin 再悄悄丢掉）。
+    // key 用于探测：这次不探测，给了 key 就是用法错误（不读 stdin 再悄悄丢掉）。
     let probes = match &target {
         SetupTarget::Endpoint { probe, .. } => *probe,
         SetupTarget::Auto { .. } => true,

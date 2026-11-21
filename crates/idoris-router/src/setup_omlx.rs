@@ -1,5 +1,5 @@
 //! `idoris setup omlx`: oMLX 作为 [`crate::setup_engine::SetupEngine`] 的第一个实现。通用流程（采纳、自动探测、托管、
-//! 生成并校验组件目录）在 `setup_engine`；这里只有 oMLX 才有的东西：候选端口、怎么认出 oMLX（`/v1/models` 的列表加两个
+//! 生成并校验组件目录）在 `setup_engine`；这里放 oMLX 专属的内容：候选端口、怎么认出 oMLX（`/v1/models` 的列表加两个
 //! 生命周期状态接口）、卡的模板、`~/.omlx/models`、`oMLX.app` 的位置（经 [`OmlxRecipe`]）。
 //! The API key is used for probing only and is never persisted or
 //! echoed; at serve time it still comes from `IDORIS_OMLX_API_KEY`.

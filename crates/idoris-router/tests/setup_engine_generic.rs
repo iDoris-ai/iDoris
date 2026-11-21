@@ -95,7 +95,12 @@ struct FakeSetup {
     recipe: FakeRecipe,
     ports: Vec<u16>,
     installed: Vec<String>,
+    kind: &'static str,
     version_pin: &'static str,
+    /// 模板自己带了 `idoris_managed` 声明。
+    declares_management: bool,
+    /// 这个平台上不能托管（`discover_executable` 报 `Unsupported`）。
+    unsupported: bool,
 }
 
 impl FakeSetup {
@@ -106,14 +111,17 @@ impl FakeSetup {
             },
             ports,
             installed: vec!["fake-model".to_owned()],
+            kind: "fakeserve",
             version_pin: "fakeserve@1",
+            declares_management: false,
+            unsupported: false,
         }
     }
 }
 
 impl SetupEngine for FakeSetup {
     fn kind(&self) -> &str {
-        "fakeserve"
+        self.kind
     }
 
     fn display_name(&self) -> &'static str {
@@ -133,6 +141,9 @@ impl SetupEngine for FakeSetup {
     }
 
     async fn discover_executable(&self) -> Result<FoundExecutable, FindFailure> {
+        if self.unsupported {
+            return Err(FindFailure::Unsupported);
+        }
         recipe_backed::discover(&self.recipe, None).await
     }
 
@@ -182,6 +193,14 @@ impl SetupEngine for FakeSetup {
     fn card_template(&self) -> Result<ComponentCard, SetupError> {
         let mut card: ComponentCard = serde_yaml::from_str(FAKE_CARD).unwrap();
         card.version_pin = self.version_pin.to_owned();
+        if self.declares_management {
+            card.extensions = json!({
+                "_degradation": "d",
+                "idoris_managed": {"engine": "omlx", "mode": "auto"}
+            })
+            .as_object()
+            .cloned();
+        }
         Ok(card)
     }
 }
@@ -420,4 +439,61 @@ async fn force_replaces_only_the_files_this_engine_owns() {
         error.message
     );
     assert!(!error.message.contains("subscription.yaml"));
+}
+
+/// 卡的托管声明与这次 setup 的模式必须一致：采纳（没有 `idoris_managed`）却拿到一张自己声明了托管的模板，
+/// 在落盘之前就被拒绝。（这里借用保留名 `omlx` 让声明本身合法，单独考验「托管与否」这一项核对。）
+#[tokio::test(flavor = "multi_thread")]
+async fn a_template_that_already_declares_management_cannot_be_adopted() {
+    let server = fake_server(&["fake-model"]).await;
+    let tmp = TempDir::new().unwrap();
+    let mut engine = FakeSetup::new(tmp.path(), vec![]);
+    engine.kind = "omlx";
+    engine.version_pin = "omlx@1";
+    engine.declares_management = true;
+    let out = tmp.path().join("out");
+    let error = run_setup(
+        &engine,
+        &options(
+            &out,
+            SetupTarget::Endpoint {
+                url: server.uri(),
+                probe: true,
+            },
+        ),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "validation_failed");
+    assert!(error.message.contains("托管声明"), "{}", error.message);
+    assert!(!out.exists());
+}
+
+/// 这个平台不能托管引擎进程：说清楚是平台的原因，不是「没装」。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_platform_that_cannot_manage_engines_says_so() {
+    let tmp = TempDir::new().unwrap();
+    let mut engine = FakeSetup::new(tmp.path(), vec![]);
+    engine.unsupported = true;
+    let out = tmp.path().join("out");
+    let error = run_setup(
+        &engine,
+        &options(&out, SetupTarget::Managed(ManagedOptions::default())),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "engine_not_installed");
+    assert!(
+        error.message.contains("不能由 iDoris 托管"),
+        "{}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("installer"),
+        "不是没装：{}",
+        error.message
+    );
+    assert!(!out.exists());
 }
