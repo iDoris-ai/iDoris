@@ -2,6 +2,11 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// 起的真二进制用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+// 测试进程整个被 SIGKILL 时 `Drop` 不会跑；这个文件走旧的 `--admin-token-stdin`，没有 launcher 帧，加不了孤儿计时兜底。
+#[path = "support/child_guard.rs"]
+mod child_guard;
+
 use std::{
     fs,
     io::{Read, Write},
@@ -9,6 +14,8 @@ use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+
+use child_guard::{ChildGuard, SpawnGuarded};
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -67,11 +74,11 @@ impl Env {
         command
     }
 
-    fn serve(&self, port: u16, admin_port: u16) -> Child {
+    fn serve(&self, port: u16, admin_port: u16) -> ChildGuard {
         let mut child = self
             .command(port, admin_port)
             .args(["serve", "--admin-token-stdin"])
-            .spawn()
+            .spawn_guarded()
             .unwrap();
         child
             .stdin
@@ -180,7 +187,7 @@ async fn offline_key_issue_works_while_server_holds_the_lock() {
     let mut issue = env
         .command(port, admin)
         .args(["key", "issue", "--spec-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     issue
         .stdin
@@ -229,7 +236,7 @@ async fn symlinked_db_path_shares_the_same_instance_lock() {
         command.env("IDORIS_DB_PATH", db);
         let mut child = command
             .args(["serve", "--admin-token-stdin"])
-            .spawn()
+            .spawn_guarded()
             .unwrap();
         child
             .stdin

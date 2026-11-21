@@ -14,6 +14,10 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// 起的真二进制用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+#[path = "support/child_guard.rs"]
+mod child_guard;
+
 use std::{
     fs,
     io::{Read, Write},
@@ -31,6 +35,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use child_guard::{ChildGuard, SpawnGuarded};
 use idoris_router::{
     AppState,
     admin::{AdminSessionToken, SharedAdminToken, build_admin_app_with_token},
@@ -3019,6 +3024,9 @@ load_policy: {{ mode: on_demand, keepalive: {{ idle_ttl_s: 300 }}, admission: re
     )
 }
 
+/// 进程级测试默认的孤儿计时（秒）：见 `Env::frame`。
+const ORPHAN_NET_S: u64 = 600;
+
 struct Env {
     repo: PathBuf,
     components: tempfile::TempDir,
@@ -3058,13 +3066,18 @@ impl Env {
         self.run_dir.join("r.sock")
     }
 
-    /// 一帧：Admin token、发现文件、登记 socket；`extra` 里的字段覆盖或追加。
+    /// 一帧：Admin token、发现文件、登记 socket、兜底的孤儿计时；`extra` 里的字段覆盖或追加。
+    ///
+    /// 孤儿计时（`ORPHAN_NET_S`）是兜底：测试进程被 SIGKILL 时守卫的 `Drop` 不会跑，漏下的二进制没有登记会话，
+    /// 到时间自己以退出码 4 退出，不会永远占着端口。它比任何一条进程级测试都长得多，不影响它们断言的东西；
+    /// 要测孤儿计时的两条用 `extra` 覆盖。
     fn frame(&self, extra: Value) -> Value {
         let mut frame = json!({
             "v": 1,
             "admin_token": TOKEN,
             "discovery_path": self.discovery_path(),
             "register_socket": self.socket_path(),
+            "orphan_timeout_s": ORPHAN_NET_S,
         });
         for (key, value) in extra.as_object().unwrap() {
             frame[key] = value.clone();
@@ -3072,7 +3085,7 @@ impl Env {
         frame
     }
 
-    fn spawn(&self, frame: &Value) -> Child {
+    fn spawn(&self, frame: &Value) -> ChildGuard {
         let mut command = Command::new(env!("CARGO_BIN_EXE_idoris"));
         for (key, _) in
             std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("IDORIS_"))
@@ -3097,7 +3110,7 @@ impl Env {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().unwrap();
+        let mut child = command.spawn_guarded().unwrap();
         let mut stdin = child.stdin.take().unwrap();
         // launcher 写完就关 stdin（预期行为：EOF 不代表 launcher 不在）。
         let _ = stdin.write_all(format!("{frame}\n").as_bytes());

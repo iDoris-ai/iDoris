@@ -12,6 +12,13 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// 起的真二进制都用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+// 测试进程整个被 SIGKILL 时 `Drop` 不会跑；`register_uds.rs` 在帧里加了孤儿计时兜底，这个文件没有：这里的帧不带
+// `register_socket`，要加 `orphan_timeout_s` 就得连 `register_socket` 一起加，每条测试都会带着登记客户端跑，
+// 改变它们测的东西（日志、`/health`、退出路径）。
+#[path = "support/child_guard.rs"]
+mod child_guard;
+
 use std::{
     fs,
     io::{Read, Write},
@@ -25,6 +32,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use child_guard::{ChildGuard, SpawnGuarded};
 use idoris_router::{
     discovery::{DiscoveryError, DiscoveryRecord, DiscoveryTarget, RemoveOutcome},
     instance_nonce::InstanceNonce,
@@ -181,15 +189,15 @@ impl Env {
     }
 
     /// 以 `--launcher-stdin` 起一个实例（两个端口都是 0），写一帧并关闭 stdin（launcher 的预期行为）。
-    fn spawn_launcher(&self, frame: &Value) -> Child {
+    fn spawn_launcher(&self, frame: &Value) -> ChildGuard {
         self.spawn_launcher_bytes("0", "0", format!("{frame}\n").as_bytes())
     }
 
-    fn spawn_launcher_bytes(&self, port: &str, admin_port: &str, bytes: &[u8]) -> Child {
+    fn spawn_launcher_bytes(&self, port: &str, admin_port: &str, bytes: &[u8]) -> ChildGuard {
         let mut child = self
             .command(port, admin_port)
             .args(["serve", "--launcher-stdin"])
-            .spawn()
+            .spawn_guarded()
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
         // 子进程可能已经因为别的原因退出（例如第二实例），写失败不是这里要测的东西。
@@ -427,7 +435,10 @@ async fn discovery_file_has_the_specified_fields_permissions_and_launch_snapshot
     let env = Env::new();
     let mut command = env.command("0", "0");
     command.env("IDORIS_ALLOCATED_BUDGET_BYTES", "17179869184");
-    let mut child = command.args(["serve", "--launcher-stdin"]).spawn().unwrap();
+    let mut child = command
+        .args(["serve", "--launcher-stdin"])
+        .spawn_guarded()
+        .unwrap();
     child
         .stdin
         .take()
@@ -631,7 +642,10 @@ async fn health_reports_auth_required_and_auth_failed_and_stays_degraded_without
 
     let mut command = env.command("0", "0");
     command.env("IDORIS_OMLX_API_KEY", "a-wrong-key");
-    let mut child = command.args(["serve", "--launcher-stdin"]).spawn().unwrap();
+    let mut child = command
+        .args(["serve", "--launcher-stdin"])
+        .spawn_guarded()
+        .unwrap();
     child
         .stdin
         .take()
@@ -817,7 +831,7 @@ async fn the_legacy_admin_token_flag_writes_no_discovery_file_and_has_the_new_he
     let mut child = env
         .command(&port.to_string(), &admin.to_string())
         .args(["serve", "--admin-token-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     child
         .stdin
@@ -841,7 +855,7 @@ fn the_two_stdin_flags_together_are_a_usage_error_with_exit_code_1() {
         ["serve", "--launcher-stdin", "--admin-token-stdin"],
         ["serve", "--admin-token-stdin", "--launcher-stdin"],
     ] {
-        let mut child = env.command("0", "0").args(args).spawn().unwrap();
+        let mut child = env.command("0", "0").args(args).spawn_guarded().unwrap();
         drop(child.stdin.take());
         let status = wait_exit(&mut child, Duration::from_secs(10));
         let (stdout, stderr) = output_of(&mut child);
@@ -857,7 +871,7 @@ fn the_admin_cli_refuses_to_connect_to_the_dynamic_port_request_value() {
     let mut child = env
         .command("0", "0")
         .args(["admin", "status", "--token-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     child
         .stdin
@@ -1118,7 +1132,7 @@ async fn kill_9_leaves_a_recognizable_stale_file_and_a_new_instance_overwrites_i
     impostor.env("IDORIS_DB_PATH", other_state.path().join("other.sqlite3"));
     let mut impostor = impostor
         .args(["serve", "--admin-token-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     impostor
         .stdin
@@ -1191,7 +1205,7 @@ async fn second_instance_exits_3_before_reading_the_frame_and_never_touches_the_
     let mut second = env
         .command("0", "0")
         .args(["serve", "--launcher-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let held_open = second.stdin.take().unwrap();
     let status = wait_exit(&mut second, Duration::from_secs(30));
@@ -1506,7 +1520,7 @@ async fn nothing_is_served_while_waiting_for_the_frame_and_nothing_after_a_bad_o
     let mut child = env
         .command(&port.to_string(), &admin.to_string())
         .args(["serve", "--launcher-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let client = http();
@@ -1547,7 +1561,7 @@ fn a_launcher_that_never_writes_the_frame_times_out_after_10_seconds_with_exit_1
     let mut child = env
         .command("0", "0")
         .args(["serve", "--launcher-stdin"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     // 保持 stdin 开着、一个字节也不写。
     let held_open = child.stdin.take().unwrap();
