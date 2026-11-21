@@ -391,7 +391,11 @@ async fn the_real_binary_stops_starts_and_restarts_an_engine_and_chat_survives_e
     assert_eq!(status, 503, "{body}");
     assert_eq!(body["error"]["type"], "local_only_unavailable");
     assert_eq!(body["error"]["reason_code"], "supervisor_unavailable");
-    assert_eq!(fake.requests().len(), requests, "nothing reached the engine");
+    assert_eq!(
+        fake.requests().len(),
+        requests,
+        "nothing reached the engine"
+    );
     let stopped = api.upstream().await;
     assert_eq!(stopped["state"], "stopped");
     assert_eq!(stopped["restart_required"], false);
@@ -484,5 +488,8 @@ async fn the_real_binary_freezes_an_engine_that_was_not_there_when_it_started() 
         .args(["-TERM", &child.id().to_string()])
         .status()
         .unwrap();
-    assert_eq!(wait_exit(&mut child, Duration::from_secs(30)).code(), Some(0));
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(30)).code(),
+        Some(0)
+    );
 }

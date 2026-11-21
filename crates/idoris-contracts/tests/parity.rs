@@ -448,7 +448,10 @@ fn admin_v0_upstreams_corpus() {
     assert!(valid(&mutated("engine_kind", json!("unknown"))));
     assert!(valid(&mutated("engine_kind", json!("a".repeat(32)))));
     assert!(valid(&mutated("port", json!(65535))));
-    assert!(valid(&mutated("last_failure_at_ms", json!(1_763_625_330_123_u64))));
+    assert!(valid(&mutated(
+        "last_failure_at_ms",
+        json!(1_763_625_330_123_u64)
+    )));
 
     // Then parity with the schema file, element by element and inside the collection.
     let accepted = [managed.clone(), resident.clone(), failed];

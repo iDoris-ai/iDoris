@@ -424,8 +424,11 @@ mod tests {
     #[tokio::test]
     async fn get_is_the_health_snapshot_field_for_field_in_the_same_order() {
         let (app, secret) = app();
-        let (status, body, _) =
-            send(&app, request("GET", "/admin/api/v1/upstreams", Some(&secret))).await;
+        let (status, body, _) = send(
+            &app,
+            request("GET", "/admin/api/v1/upstreams", Some(&secret)),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         // 契约（Rust 一侧；TS 一侧由 `parity.test.ts` 钉住）。
         assert!(idoris_contracts::parse::<AdminUpstreamsResponse>(&body).is_ok());
@@ -464,8 +467,11 @@ mod tests {
     #[tokio::test]
     async fn without_an_engine_manager_an_element_has_only_the_health_facts_and_the_port() {
         let (app, secret) = app();
-        let (_, body, _) =
-            send(&app, request("GET", "/admin/api/v1/upstreams", Some(&secret))).await;
+        let (_, body, _) = send(
+            &app,
+            request("GET", "/admin/api/v1/upstreams", Some(&secret)),
+        )
+        .await;
         assert_eq!(
             element_by_id(&body, "lmstudio"),
             &json!({
@@ -495,8 +501,11 @@ mod tests {
     #[tokio::test]
     async fn an_element_never_carries_a_secret_and_the_response_never_echoes_the_token() {
         let (app, secret) = app();
-        let (_, body, text) =
-            send(&app, request("GET", "/admin/api/v1/upstreams", Some(&secret))).await;
+        let (_, body, text) = send(
+            &app,
+            request("GET", "/admin/api/v1/upstreams", Some(&secret)),
+        )
+        .await;
         let allowed: BTreeSet<&str> = [
             "id",
             "engine_kind",
@@ -542,7 +551,11 @@ mod tests {
         for (method, path) in &family() {
             for token in [None, Some(wrong.as_str())] {
                 let (status, _, text) = send(&app, request(method, path, token)).await;
-                assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path} {token:?}");
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {path} {token:?}"
+                );
                 assert!(!text.contains(&secret));
             }
             // 有 token 才进得去（这些请求的结果见别的测试）。
@@ -621,7 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_managed_upstream_whose_engine_is_not_ours_refuses_stop_and_restart_before_the_manager()
-    {
+     {
         // `omlx-b` 是托管卡，没有自己拥有的引擎（`absent`）：`stop`、`restart` 是 `not_owned`（没有管理器也一样：
         // 判定在管理器之前）。
         let (app, secret) = app();
@@ -739,7 +752,10 @@ mod tests {
         );
         // 已经在（重新）启动的 `restart` 是幂等（并发的两个只换一次引擎）；`stop` 在此时仍要求归属。
         for state in [AdminUpstreamState::Starting, AdminUpstreamState::Restarting] {
-            assert_eq!(precheck(Action::Restart, &plain_upstream(true, false, state)), None);
+            assert_eq!(
+                precheck(Action::Restart, &plain_upstream(true, false, state)),
+                None
+            );
             assert_eq!(
                 precheck(Action::Stop, &plain_upstream(true, false, state)),
                 Some(Ownership::NotOwned)
@@ -758,19 +774,63 @@ mod tests {
         for (method, path, expected) in [
             ("GET", "/admin/api/v1/upstreams", StatusCode::OK),
             // 路径对、方法不对：405。
-            ("POST", "/admin/api/v1/upstreams", StatusCode::METHOD_NOT_ALLOWED),
-            ("PUT", "/admin/api/v1/upstreams", StatusCode::METHOD_NOT_ALLOWED),
-            ("DELETE", "/admin/api/v1/upstreams", StatusCode::METHOD_NOT_ALLOWED),
-            ("GET", "/admin/api/v1/upstreams/omlx/stop", StatusCode::METHOD_NOT_ALLOWED),
-            ("PUT", "/admin/api/v1/upstreams/omlx/stop", StatusCode::METHOD_NOT_ALLOWED),
-            ("DELETE", "/admin/api/v1/upstreams/omlx/restart", StatusCode::METHOD_NOT_ALLOWED),
+            (
+                "POST",
+                "/admin/api/v1/upstreams",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                "PUT",
+                "/admin/api/v1/upstreams",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                "DELETE",
+                "/admin/api/v1/upstreams",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                "GET",
+                "/admin/api/v1/upstreams/omlx/stop",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                "PUT",
+                "/admin/api/v1/upstreams/omlx/stop",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                "DELETE",
+                "/admin/api/v1/upstreams/omlx/restart",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
             // 没有的路径：404（没有按 id 读、没有别的动作、没有 `make_default`：那是预留）。
             ("GET", "/admin/api/v1/upstreams/omlx", StatusCode::NOT_FOUND),
-            ("POST", "/admin/api/v1/upstreams/omlx", StatusCode::NOT_FOUND),
-            ("POST", "/admin/api/v1/upstreams/omlx/pause", StatusCode::NOT_FOUND),
-            ("POST", "/admin/api/v1/upstreams/omlx/make_default", StatusCode::NOT_FOUND),
-            ("POST", "/admin/api/v1/upstreams/omlx/stop/extra", StatusCode::NOT_FOUND),
-            ("POST", "/admin/api/v1/upstreams//stop", StatusCode::NOT_FOUND),
+            (
+                "POST",
+                "/admin/api/v1/upstreams/omlx",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "POST",
+                "/admin/api/v1/upstreams/omlx/pause",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "POST",
+                "/admin/api/v1/upstreams/omlx/make_default",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "POST",
+                "/admin/api/v1/upstreams/omlx/stop/extra",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "POST",
+                "/admin/api/v1/upstreams//stop",
+                StatusCode::NOT_FOUND,
+            ),
         ] {
             let (status, _, _) = send(&app, request(method, path, token)).await;
             assert_eq!(status, expected, "{method} {path}");
@@ -796,7 +856,7 @@ mod tests {
 
     #[test]
     fn a_managed_element_takes_state_reason_and_owned_from_the_managers_snapshot_and_adds_its_facts()
-    {
+     {
         // `/health` 的快照落后了一步（`ready`、自有）：管理器的快照是更新的，元素取它的，与 pid、restart_required 一致。
         let health = health_entry("omlx", "omlx", true, UpstreamState::Ready, None, true);
         let element = element(&state(), health, Some(&view()));
@@ -871,7 +931,14 @@ mod tests {
 
     #[test]
     fn an_upstream_without_a_card_has_no_port() {
-        let health = health_entry("ghost", "omlx", false, UpstreamState::Unavailable, None, false);
+        let health = health_entry(
+            "ghost",
+            "omlx",
+            false,
+            UpstreamState::Unavailable,
+            None,
+            false,
+        );
         let element = element(&AppState::default(), health, None);
         assert_eq!(element.port, None);
     }
@@ -879,7 +946,15 @@ mod tests {
     #[test]
     fn the_wire_strings_are_exactly_the_routers_own() {
         use UpstreamState::*;
-        for state in [Ready, Starting, Unavailable, Restarting, Failed, Stopped, Absent] {
+        for state in [
+            Ready,
+            Starting,
+            Unavailable,
+            Restarting,
+            Failed,
+            Stopped,
+            Absent,
+        ] {
             assert_eq!(state_wire(state).as_str(), state.as_str());
         }
         use UpstreamReason::*;
@@ -907,15 +982,21 @@ mod tests {
         let live = state.health_state.clone();
         let app = build_admin_app_with_token(state, token);
         let state_of = |body: &Value| element_by_id(body, "lmstudio")["state"].clone();
-        let (_, before, _) =
-            send(&app, request("GET", "/admin/api/v1/upstreams", Some(&secret))).await;
+        let (_, before, _) = send(
+            &app,
+            request("GET", "/admin/api/v1/upstreams", Some(&secret)),
+        )
+        .await;
         assert_eq!(state_of(&before), "ready");
         live.apply(
             "lmstudio",
             Observation::Unavailable(Some(UpstreamReason::AuthRequired)),
         );
-        let (_, after, _) =
-            send(&app, request("GET", "/admin/api/v1/upstreams", Some(&secret))).await;
+        let (_, after, _) = send(
+            &app,
+            request("GET", "/admin/api/v1/upstreams", Some(&secret)),
+        )
+        .await;
         assert_eq!(state_of(&after), "unavailable");
         assert_eq!(element_by_id(&after, "lmstudio")["reason"], "auth_required");
     }

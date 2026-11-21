@@ -528,7 +528,11 @@ pub async fn models(state: &AppState) -> AdminModelsResponse {
         }
         // 此刻没在服务的托管卡不探测（引擎没起来、被停下、在重启，或者那个端口上的东西没有通过属主校验，不能给它发 key）：
         // 如实报「不可用」。读此刻的状态（IDORIS-CORE S6，G1）。
-        if state.health_state.managed_failure(&card.provider.id).is_some() {
+        if state
+            .health_state
+            .managed_failure(&card.provider.id)
+            .is_some()
+        {
             sources.push(AdminModelSource {
                 provider_id: card.provider.id.clone(),
                 source: AdminModelSourceKind::HttpModelsEndpoint,

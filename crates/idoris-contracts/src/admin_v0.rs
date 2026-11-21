@@ -625,7 +625,9 @@ mod tests {
             assert!(is_engine_kind(good), "{good}");
         }
         assert!(is_engine_kind(&"a".repeat(32)));
-        for bad in ["", "1omlx", "_omlx", "OMLX", "omlx-x", "omlx x", "ömlx", "a.b"] {
+        for bad in [
+            "", "1omlx", "_omlx", "OMLX", "omlx-x", "omlx x", "ömlx", "a.b",
+        ] {
             assert!(!is_engine_kind(bad), "{bad}");
         }
         assert!(!is_engine_kind(&"a".repeat(33)));

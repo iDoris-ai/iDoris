@@ -643,7 +643,10 @@ async fn failures_are_counted_and_dated_and_a_failed_engine_reads_as_such() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    assert!((started..=now).contains(&last), "{started} <= {last} <= {now}");
+    assert!(
+        (started..=now).contains(&last),
+        "{started} <= {last} <= {now}"
+    );
     // 放行时它没就绪：冻结，要重启 iDoris。
     assert_eq!(failed["restart_required"], true);
     world.manager.shutdown(true).await;
@@ -676,7 +679,10 @@ async fn stop_is_accepted_stops_the_engine_and_is_idempotent() {
     wait_for("the engine to die", || !pid_alive(pid)).await;
     assert_eq!(world.rig.record_count(), 0, "its ownership record is gone");
     assert!(governed_endpoint(&world.rig.endpoint()).is_none());
-    assert_eq!(world.health.view().upstreams[0].state, UpstreamState::Stopped);
+    assert_eq!(
+        world.health.view().upstreams[0].state,
+        UpstreamState::Stopped
+    );
 
     // 幂等：已经停下，再 `stop` 仍是 202 加当前状态；没有第二个引擎，没有错误。
     let (status, body) = world.post("omlx", "stop").await;
@@ -745,7 +751,11 @@ async fn restart_replaces_the_engine_process_even_though_the_gate_is_open() {
         world.rig.fake.got_sigterm(first),
         "the old engine was stopped with SIGTERM (the full stop path), not killed"
     );
-    assert_ne!(first_key, world.rig.key(1), "a new engine has a new private key");
+    assert_ne!(
+        first_key,
+        world.rig.key(1),
+        "a new engine has a new private key"
+    );
     assert_eq!(
         governed_endpoint(&world.rig.endpoint()),
         Some(EndpointKey::Private(world.rig.key(1)))
@@ -779,16 +789,22 @@ async fn two_concurrent_stops_are_both_accepted_and_the_engine_is_stopped_once()
     )
     .await;
     let pid = world.rig.pid(0);
-    let ((first, _), (second, _)) = tokio::join!(
-        world.post("omlx", "stop"),
-        world.post("omlx", "stop")
-    );
+    let ((first, _), (second, _)) =
+        tokio::join!(world.post("omlx", "stop"), world.post("omlx", "stop"));
     assert_eq!(first, StatusCode::ACCEPTED);
     assert_eq!(second, StatusCode::ACCEPTED);
     world.until_state("stopped").await;
     wait_for("the engine to die", || !pid_alive(pid)).await;
-    assert_eq!(world.logged("收到命令 stop，已受理"), 2, "both were accepted");
-    assert_eq!(world.logged("：stopped"), 1, "but the engine went down once");
+    assert_eq!(
+        world.logged("收到命令 stop，已受理"),
+        2,
+        "both were accepted"
+    );
+    assert_eq!(
+        world.logged("：stopped"),
+        1,
+        "but the engine went down once"
+    );
     assert_eq!(world.rig.fake.launches(), 1);
     world.manager.shutdown(true).await;
 }
@@ -804,10 +820,8 @@ async fn two_concurrent_restarts_replace_the_engine_once_and_both_are_accepted()
     )
     .await;
     let first = world.rig.pid(0);
-    let ((a, _), (b, _)) = tokio::join!(
-        world.post("omlx", "restart"),
-        world.post("omlx", "restart")
-    );
+    let ((a, _), (b, _)) =
+        tokio::join!(world.post("omlx", "restart"), world.post("omlx", "restart"));
     assert_eq!((a, b), (StatusCode::ACCEPTED, StatusCode::ACCEPTED));
     world
         .until("the replacement engine", |element| {
@@ -846,7 +860,11 @@ async fn a_frozen_upstream_reads_restart_required_and_refuses_start_while_stop_a
     for action in ["stop", "restart"] {
         let (status, body) = world.post("omlx", action).await;
         assert_eq!(status, StatusCode::CONFLICT, "{action}");
-        assert_eq!(error_of(&body), ("upstream_not_owned", "not_owned"), "{action}");
+        assert_eq!(
+            error_of(&body),
+            ("upstream_not_owned", "not_owned"),
+            "{action}"
+        );
     }
     assert_eq!(world.rig.fake.launches(), 0, "nothing was launched");
     assert_eq!(world.element("omlx").await["state"], "absent");
@@ -862,10 +880,17 @@ async fn a_card_that_is_not_managed_and_an_unknown_id_are_refused_before_anythin
         assert_eq!(error_of(&body), ("upstream_not_owned", "not_managed"));
         let (status, body) = world.post("nope", action).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{action}");
-        assert_eq!(error_of(&body), ("upstream_not_found", "upstream_not_found"));
+        assert_eq!(
+            error_of(&body),
+            ("upstream_not_found", "upstream_not_found")
+        );
     }
     assert!(pid_alive(world.rig.pid(0)));
-    assert_eq!(world.logged("收到命令"), 0, "the manager never heard of them");
+    assert_eq!(
+        world.logged("收到命令"),
+        0,
+        "the manager never heard of them"
+    );
     world.manager.shutdown(true).await;
 }
 
@@ -907,7 +932,10 @@ async fn an_external_engine_is_never_signalled_stop_and_restart_are_not_owned_an
     let omlx = world.element("omlx").await;
     assert_eq!(omlx["state"], "ready");
     assert_eq!(omlx["managed"], true);
-    assert_eq!(omlx["owned"], false, "an adopted external engine is not ours");
+    assert_eq!(
+        omlx["owned"], false,
+        "an adopted external engine is not ours"
+    );
     assert!(omlx.get("pid").is_none());
     assert_eq!(omlx["restart_required"], false);
     for action in ["stop", "restart"] {
@@ -919,7 +947,11 @@ async fn an_external_engine_is_never_signalled_stop_and_restart_are_not_owned_an
     let (status, body) = world.post("omlx", "start").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert!(pid_alive(u64::from(external.pid())), "never signalled");
-    assert_eq!(world.rig.fake.launches(), 0, "nothing was spawned beside it");
+    assert_eq!(
+        world.rig.fake.launches(),
+        0,
+        "nothing was spawned beside it"
+    );
     world.manager.shutdown(true).await;
 }
 
@@ -931,8 +963,14 @@ async fn the_manager_logs_every_accepted_command_and_never_a_key() {
     world.until_state("stopped").await;
     assert_eq!(world.logged("引擎 omlx：收到命令 stop，已受理"), 1);
     for line in world.log.lock().unwrap().iter() {
-        assert!(!line.contains(&key), "the private key is in a log line: {line}");
-        assert!(!line.contains(&world.token), "the admin token is in a log line");
+        assert!(
+            !line.contains(&key),
+            "the private key is in a log line: {line}"
+        );
+        assert!(
+            !line.contains(&world.token),
+            "the admin token is in a log line"
+        );
     }
     world.manager.shutdown(true).await;
 }
@@ -942,7 +980,8 @@ async fn the_manager_logs_every_accepted_command_and_never_a_key() {
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn g2_the_private_key_stays_registered_until_the_engine_has_exited_and_only_then_is_released() {
+async fn g2_the_private_key_stays_registered_until_the_engine_has_exited_and_only_then_is_released()
+{
     // 引擎收到 SIGTERM 之后再服务一秒才退出：停止的这一秒里它还活着、还在监听。
     let world = World::start(
         Engine::Fake(Behavior {
@@ -970,7 +1009,10 @@ async fn g2_the_private_key_stays_registered_until_the_engine_has_exited_and_onl
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(samples_while_alive > 5, "the window was observed: {samples_while_alive}");
+    assert!(
+        samples_while_alive > 5,
+        "the window was observed: {samples_while_alive}"
+    );
     world.until_state("stopped").await;
     assert!(
         governed_endpoint(&world.rig.endpoint()).is_none(),
@@ -980,7 +1022,8 @@ async fn g2_the_private_key_stays_registered_until_the_engine_has_exited_and_onl
 }
 
 #[tokio::test]
-async fn g2_an_external_listener_that_disappears_loses_the_settings_key_at_once_and_gets_it_back_when_verified() {
+async fn g2_an_external_listener_that_disappears_loses_the_settings_key_at_once_and_gets_it_back_when_verified()
+ {
     let work = tempfile::tempdir().unwrap();
     let external = External::start(work.path(), &Behavior::default());
     let mut rig = Rig::new(&Behavior::default());
@@ -1023,7 +1066,8 @@ async fn g2_an_external_listener_that_disappears_loses_the_settings_key_at_once_
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn g3_start_on_an_alive_but_unresponsive_owned_engine_stops_it_gracefully_then_launches_a_new_one() {
+async fn g3_start_on_an_alive_but_unresponsive_owned_engine_stops_it_gracefully_then_launches_a_new_one()
+ {
     // 引擎收到 SIGTERM 就写标记并退出（优雅停止的证据）；SIGKILL（丢弃句柄）不会留下标记。
     let rig = Rig::new(&Behavior {
         trap_sigterm_secs: Some(0.0),
@@ -1150,12 +1194,13 @@ impl Full {
                         .filter(|card| !outcome.degraded.contains_key(&card.provider.id))
                         .cloned()
                         .collect();
-                    let runtimes = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
-                        &runtime_cards,
-                        &BTreeMap::new(),
-                        Some(16 * GIB),
-                        false,
-                    )?;
+                    let runtimes =
+                        RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
+                            &runtime_cards,
+                            &BTreeMap::new(),
+                            Some(16 * GIB),
+                            false,
+                        )?;
                     let state = AppState {
                         cards,
                         runtimes: runtimes.clone(),
@@ -1183,10 +1228,7 @@ impl Full {
     }
 
     async fn wait_open(&self) {
-        wait_for("the gate to open", || {
-            self.health.gate() == GateState::Open
-        })
-        .await;
+        wait_for("the gate to open", || self.health.gate() == GateState::Open).await;
     }
 
     async fn data(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -1267,7 +1309,10 @@ async fn b_after_a_restart_the_supervisors_ledger_is_rebuilt_and_the_next_chat_l
     // 第一个聊天：Supervisor 对（空的）新引擎加载模型，聊天 200。
     let (status, body) = full.chat().await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["choices"][0]["message"]["content"], "hello from the fake engine");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "hello from the fake engine"
+    );
     assert_eq!(full.rig.fake.model_loads(), 1);
     let before = full.runtime().await;
     assert_eq!(before["loaded"], json!(["fake-model"]));
@@ -1275,7 +1320,9 @@ async fn b_after_a_restart_the_supervisors_ledger_is_rebuilt_and_the_next_chat_l
 
     // Admin 重启：新进程，没有任何模型。Supervisor 的账本若还以为 `fake-model` 已加载，聊天就会白白发给一个没有它的引擎（假引擎对
     // 没加载的模型回 404 → 503）。
-    let (status, body) = full.admin("POST", "/admin/api/v1/upstreams/omlx/restart").await;
+    let (status, body) = full
+        .admin("POST", "/admin/api/v1/upstreams/omlx/restart")
+        .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     wait_for("the replacement engine", || {
         let view = full.health.view();
@@ -1287,8 +1334,15 @@ async fn b_after_a_restart_the_supervisors_ledger_is_rebuilt_and_the_next_chat_l
     // 复位之后下一次请求重新加载：新引擎真的收到了 `load`，聊天 200，账本与新进程一致。
     let (status, body) = full.chat().await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["choices"][0]["message"]["content"], "hello from the fake engine");
-    assert_eq!(full.rig.fake.model_loads(), 2, "the new process was told to load it");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "hello from the fake engine"
+    );
+    assert_eq!(
+        full.rig.fake.model_loads(),
+        2,
+        "the new process was told to load it"
+    );
     let after = full.runtime().await;
     assert_eq!(after["state"], "observed");
     assert_eq!(after["loaded"], json!(["fake-model"]));
@@ -1300,14 +1354,16 @@ async fn b_after_a_restart_the_supervisors_ledger_is_rebuilt_and_the_next_chat_l
 }
 
 #[tokio::test]
-async fn b_a_stopped_engine_is_a_503_with_a_reason_and_nothing_reaches_it_and_start_brings_chat_back() {
+async fn b_a_stopped_engine_is_a_503_with_a_reason_and_nothing_reaches_it_and_start_brings_chat_back()
+ {
     let rig = Rig::new(&stateful());
     let port = rig.port;
     let full = Full::start(rig, Scripted::claiming(port)).await;
     full.wait_open().await;
     assert_eq!(full.chat().await.0, StatusCode::OK);
 
-    full.admin("POST", "/admin/api/v1/upstreams/omlx/stop").await;
+    full.admin("POST", "/admin/api/v1/upstreams/omlx/stop")
+        .await;
     wait_for("stopped", || {
         full.health.view().upstreams[0].state == UpstreamState::Stopped
     })
@@ -1318,14 +1374,20 @@ async fn b_a_stopped_engine_is_a_503_with_a_reason_and_nothing_reaches_it_and_st
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"]["type"], "local_only_unavailable");
     assert_eq!(body["error"]["reason_code"], "supervisor_unavailable");
-    assert_eq!(full.rig.fake.requests().len(), requests_before, "nothing reached the engine");
+    assert_eq!(
+        full.rig.fake.requests().len(),
+        requests_before,
+        "nothing reached the engine"
+    );
     // 账本也跟着清空了（引擎已经没有了）：Admin 的 runtimes 不再说有模型加载着。
     let runtime = full.runtime().await;
     assert_eq!(runtime["loaded"], json!([]));
     assert_eq!(runtime["used_gb"], 0.0);
 
     // `start`：新引擎，账本复位，聊天回来。
-    let (status, body) = full.admin("POST", "/admin/api/v1/upstreams/omlx/start").await;
+    let (status, body) = full
+        .admin("POST", "/admin/api/v1/upstreams/omlx/start")
+        .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     wait_for("ready again", || {
         full.health.view().upstreams[0].state == UpstreamState::Ready
@@ -1356,7 +1418,8 @@ async fn b_g1_a_card_whose_port_changed_owner_is_a_503_at_run_time_and_nothing_i
     inspector.external_listener(external.port, std::process::id(), None);
     wait_for("failed/port_in_use", || {
         let upstream = &full.health.view().upstreams[0];
-        upstream.state == UpstreamState::Failed && upstream.reason == Some(UpstreamReason::PortInUse)
+        upstream.state == UpstreamState::Failed
+            && upstream.reason == Some(UpstreamReason::PortInUse)
     })
     .await;
     // ……而 Router 已经创建了、它的 Supervisor 与适配器早就存在：请求在运行期被挡住，503 带原因，没有一个字节发给那个端口。
@@ -1421,7 +1484,12 @@ async fn the_launch_is_logged_in_one_line_with_the_values_ps_cannot_show_and_no_
         ),
         format!(
             "base={:?}",
-            world.rig.state_dir().join("omlx-base").display().to_string()
+            world
+                .rig
+                .state_dir()
+                .join("omlx-base")
+                .display()
+                .to_string()
         ),
     ] {
         assert!(line.contains(&expected), "{expected} missing from {line}");
@@ -1450,7 +1518,279 @@ async fn the_launch_is_logged_in_one_line_with_the_values_ps_cannot_show_and_no_
     assert_eq!(lines.len(), 2, "{lines:?}");
     let second_key = world.rig.key(1);
     for line in &lines {
-        assert!(!line.contains(&key) && !line.contains(&second_key), "{line}");
+        assert!(
+            !line.contains(&key) && !line.contains(&second_key),
+            "{line}"
+        );
     }
     world.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn b_a_reset_that_cannot_sample_the_new_engine_keeps_it_out_of_service_until_it_can() {
+    // 第二个起的引擎进程能答 `/v1/models`，但 `/api/status` 回 500：Supervisor 采样不到它，账本复位不了。
+    let rig = Rig::new(&Behavior {
+        stateful_models: true,
+        api_status_fails_from_launch: Some(1),
+        ..Behavior::default()
+    });
+    let port = rig.port;
+    let full = Full::start(rig, Scripted::claiming(port)).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+
+    let (status, body) = full
+        .admin("POST", "/admin/api/v1/upstreams/omlx/restart")
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    // 一个账本没有对上新进程的引擎不放行：停掉，按一次失败算，退避重来；一直复位不了就熔断（上限 2，第三次是 `failed`）。
+    wait_for("the breaker", || {
+        let upstream = &full.health.view().upstreams[0];
+        upstream.state == UpstreamState::Failed
+            && upstream.reason == Some(UpstreamReason::CrashLoop)
+    })
+    .await;
+    assert!(
+        !full.health.view().upstreams[0].owned,
+        "it never held an engine that was let through"
+    );
+    // 一直没放行：数据面 503，每个被拒绝的引擎都停掉了，Admin 读到的账本是粘滞着采样错误的（`error`）。
+    let (status, body) = full.chat().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["reason_code"], "crash_loop");
+    for launch in full.rig.fake.all_launches().iter().skip(1) {
+        assert!(
+            !pid_alive(launch["pid"].as_u64().unwrap()),
+            "an engine the Supervisor could not be synced with was left running"
+        );
+    }
+    assert_eq!(full.runtime().await["state"], "error");
+    let (status, body) = full.admin("GET", "/admin/api/v1/upstreams").await;
+    assert_eq!(status, StatusCode::OK);
+    let element = &body["upstreams"][0];
+    assert_eq!(
+        element["restart_required"], false,
+        "not frozen: it can come back"
+    );
+    assert!(element["failure_count"].as_u64().unwrap() >= 3, "{element}");
+
+    // 引擎「修好」了（之后拉起的进程 `/api/status` 正常）：下一次半开重试复位成功，放行，聊天回来，账本也恢复。
+    full.rig.fake.set_behavior(&Behavior {
+        stateful_models: true,
+        ..Behavior::default()
+    });
+    wait_for("recovery through a half-open retry", || {
+        full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    let (status, body) = full.chat().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(full.runtime().await["state"], "observed");
+    full.stop().await;
+}
+
+#[tokio::test]
+async fn b_start_that_re_adopts_the_very_same_process_keeps_the_supervisors_ledger() {
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start(work.path(), &stateful());
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = external.port;
+    let inspector = Scripted::new();
+    inspector.external_listener(external.port, external.pid(), Some(TEAM));
+    let full = Full::start(rig, inspector).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(external.fake.model_loads(), 1);
+
+    // 外部引擎活着却不答了：`unavailable`。操作员按 `start`：重新走启动决策，认回的是同一个进程。
+    external.fake.force_status(503);
+    wait_for("unavailable", || {
+        full.health.view().upstreams[0].state == UpstreamState::Unavailable
+    })
+    .await;
+    let (status, body) = full
+        .admin("POST", "/admin/api/v1/upstreams/omlx/start")
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    external.fake.answer_normally();
+    wait_for("ready again", || {
+        full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    // 同一个进程：Supervisor 的账本没有过期，不复位。模型还在里面，聊天不再发 `load`；复位的话账本被忘掉，聊天会重新加载（`load` 两次）。
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(
+        external.fake.model_loads(),
+        1,
+        "the ledger was reset although the engine process never changed"
+    );
+    assert_eq!(full.runtime().await["loaded"], json!(["fake-model"]));
+    full.stop().await;
+}
+
+#[tokio::test]
+async fn after_the_manager_has_shut_down_a_command_is_a_503_idoris_stopping_not_a_hang_or_a_lie() {
+    let world = World::start(Engine::Fake(Behavior::default()), fast()).await;
+    world.manager.shutdown(true).await;
+    // 状态快照还说 `ready`（实例任务收尾时不再发布），管理器已经不收命令了。
+    for action in ["start", "stop"] {
+        let (status, body) = world.post("omlx", action).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{action}: {body}");
+        assert_eq!(error_of(&body), ("idoris_stopping", "idoris_stopping"));
+    }
+}
+
+#[tokio::test]
+async fn g2_shutdown_also_keeps_the_private_key_until_the_engine_has_exited() {
+    let world = World::start(
+        Engine::Fake(Behavior {
+            trap_sigterm_secs: Some(1.0),
+            ..Behavior::default()
+        }),
+        fast(),
+    )
+    .await;
+    let pid = world.rig.pid(0);
+    let key = world.rig.key(0);
+    let manager = world.manager.clone();
+    let shutdown = tokio::spawn(async move { manager.shutdown(true).await });
+    let mut samples_while_alive = 0;
+    let deadline = Instant::now() + PATIENT;
+    while pid_alive(pid) {
+        assert!(Instant::now() < deadline, "the engine never exited");
+        if world.rig.fake.got_sigterm(pid) {
+            assert_eq!(
+                governed_endpoint(&world.rig.endpoint()),
+                Some(EndpointKey::Private(key.clone())),
+                "released before the process was gone"
+            );
+            samples_while_alive += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(samples_while_alive > 5, "{samples_while_alive}");
+    shutdown.await.unwrap();
+    assert!(governed_endpoint(&world.rig.endpoint()).is_none());
+}
+
+/// 一个检查器，可以让「读进程的启动时间」失败：被认回的孤儿引擎的身份读不出来，停止就没有确认它消失（不发信号）。
+struct Unreadable {
+    inner: Arc<Scripted>,
+    unreadable: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl ProcessInspector for Unreadable {
+    fn pid_state(&self, pid: u32) -> PidState {
+        self.inner.pid_state(pid)
+    }
+    async fn start_time(&self, pid: u32) -> Result<String, InspectError> {
+        if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(InspectError::NoAnswer);
+        }
+        self.inner.start_time(pid).await
+    }
+    async fn command(&self, pid: u32) -> Result<String, InspectError> {
+        self.inner.command(pid).await
+    }
+    async fn process_group(&self, pid: u32) -> Result<u32, InspectError> {
+        self.inner.process_group(pid).await
+    }
+    async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
+        self.inner.listens_on(pid, port).await
+    }
+    async fn listeners_on(&self, port: u16) -> Result<Vec<u32>, InspectError> {
+        self.inner.listeners_on(port).await
+    }
+    async fn uid_of(&self, pid: u32) -> Result<u32, InspectError> {
+        self.inner.uid_of(pid).await
+    }
+    async fn signing_team(&self, pid: u32) -> Result<Option<String>, InspectError> {
+        self.inner.signing_team(pid).await
+    }
+}
+
+fn start_manager(
+    rig: &Rig,
+    inspector: Arc<dyn ProcessInspector>,
+    stop_on_exit: StopOnExit,
+) -> (Arc<EngineManager>, HealthState) {
+    let health = HealthState::with_upstreams(0, vec![upstream_status("omlx", "omlx", true)]);
+    let manager = Arc::new(EngineManager::start(
+        ManagerConfig {
+            state_dir: rig.state_dir(),
+            allocated_budget_bytes: Some(16 * GIB),
+            stop_on_exit,
+            executables: BTreeMap::from([("omlx".to_owned(), rig.fake.executable.clone())]),
+            launched_by: "test-instance".to_owned(),
+            timings: fast(),
+            inspector,
+            log: Arc::new(|_| {}),
+        },
+        vec![ManagedPlan {
+            id: "omlx".to_owned(),
+            endpoint: rig.endpoint(),
+            port: rig.port,
+            backend: omlx_backend(&rig.work.path().join("models")),
+        }],
+        health.clone(),
+    ));
+    (manager, health)
+}
+
+#[tokio::test]
+async fn g2_a_stop_that_cannot_confirm_the_process_is_gone_never_hands_the_endpoint_back_to_the_default_key_order()
+ {
+    let rig = Rig::new(&Behavior::default());
+    let scripted = Scripted::claiming(rig.port);
+    // 先留一个孤儿引擎（`stop_on_exit:"never"` 的正常退出）：之后的管理器认回它，句柄是「认回的」，停它要先读它的身份。
+    let (first, first_health) = start_manager(&rig, scripted.clone(), StopOnExit::Never);
+    wait_for("ready", || {
+        first_health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    first.shutdown(false).await;
+    let pid = rig.pid(0);
+    let key = rig.key(0);
+    assert!(pid_alive(pid), "never: the engine is left running");
+
+    let inspector = Arc::new(Unreadable {
+        inner: scripted,
+        unreadable: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (manager, health) = start_manager(&rig, inspector.clone(), StopOnExit::Owned);
+    wait_for("adopted", || {
+        let upstream = &health.view().upstreams[0];
+        upstream.state == UpstreamState::Ready && upstream.owned
+    })
+    .await;
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Private(key))
+    );
+
+    // 引擎的身份读不出来了：停止不发信号，没有确认它消失。
+    inspector
+        .unreadable
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    manager.stop_upstream("omlx").await.unwrap();
+    wait_for("stopped", || {
+        health.view().upstreams[0].state == UpstreamState::Stopped
+    })
+    .await;
+    assert!(
+        pid_alive(pid),
+        "an engine whose identity cannot be read is never signalled"
+    );
+    // 进程可能还在：登记不能撤销（那会按默认顺序把 `settings.json` 的 key 发给它）；私有 key 也不再发：外部、未验证。
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::External {
+            settings_key_verified: false
+        })
+    );
+    inspector
+        .unreadable
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    manager.shutdown(true).await;
 }

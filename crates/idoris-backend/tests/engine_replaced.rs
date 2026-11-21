@@ -249,7 +249,9 @@ async fn a_reset_waits_for_quiet_and_changes_nothing_while_work_of_the_old_engin
     rig.handle.load("a", 2.0, policy()).await.unwrap();
 
     // 一个进行中的聊天。
-    rig.engine.mock.set_chat_delay("a", Duration::from_millis(400));
+    rig.engine
+        .mock
+        .set_chat_delay("a", Duration::from_millis(400));
     let chat = {
         let handle = rig.handle.clone();
         tokio::spawn(async move { handle.chat(request("a"), CancellationToken::new()).await })
@@ -271,7 +273,9 @@ async fn a_reset_waits_for_quiet_and_changes_nothing_while_work_of_the_old_engin
     assert!(!rig.handle.is_ready("a").await.unwrap());
 
     // 一个进行中的加载。
-    rig.engine.mock.set_load_delay("b", Duration::from_millis(400));
+    rig.engine
+        .mock
+        .set_load_delay("b", Duration::from_millis(400));
     let load = {
         let handle = rig.handle.clone();
         tokio::spawn(async move { handle.load("b", 2.0, policy()).await })
@@ -308,10 +312,13 @@ where
 }
 
 #[tokio::test]
-async fn a_load_left_unconfirmed_by_the_old_engine_no_longer_blocks_its_model_after_the_replacement() {
+async fn a_load_left_unconfirmed_by_the_old_engine_no_longer_blocks_its_model_after_the_replacement()
+ {
     let rig = Rig::new(false);
     // 加载超过一次适配器调用的时限：结果未知，槽位留在 Error，围栏留着：这个模型被挡住了。
-    rig.engine.mock.set_load_delay("a", Duration::from_millis(1500));
+    rig.engine
+        .mock
+        .set_load_delay("a", Duration::from_millis(1500));
     let timed_out = rig.handle.load("a", 2.0, policy()).await.unwrap_err();
     assert_eq!(timed_out.reason_code(), "adapter_timed_out");
     rig.engine.mock.set_load_delay("a", Duration::ZERO);
@@ -418,4 +425,37 @@ async fn a_supervisor_that_never_probes_does_not_sample_on_reset_either() {
     engine.status_fails.store(true, Ordering::SeqCst);
     handle.engine_replaced(true).await.unwrap();
     assert!(ledger.snapshot().unwrap().allocations.is_empty());
+}
+
+#[tokio::test]
+async fn residency_the_new_process_came_up_with_is_adopted_even_beyond_the_shared_budget() {
+    // 观测不是请求：新进程里已经有 20 GB 的模型，哪怕共享账本的上限只有 4 GB，账本也要如实记下（和启动采样的 `adopt_observed` 同一条
+    // 规矩），不是按准入策略拒绝。
+    for exact in [false, true] {
+        let engine = Engine::new();
+        let ledger = Arc::new(if exact {
+            GlobalCapacityLedger::new_bytes(4 * GB)
+        } else {
+            GlobalCapacityLedger::new(4.0).unwrap()
+        });
+        let handle = Supervisor::spawn_with_startup_capacity_tracking(
+            engine.clone(),
+            config(),
+            ledger.clone(),
+            "r",
+        )
+        .unwrap();
+        engine.mock.preload("big");
+
+        handle.engine_replaced(true).await.unwrap();
+
+        assert_eq!(
+            ledger.snapshot().unwrap().allocations["runtime:r"],
+            20.0,
+            "exact={exact}"
+        );
+        let status = handle.status().await.unwrap();
+        assert_eq!(status.used_gb, 20.0, "exact={exact}");
+        assert_eq!(status.loaded, vec!["big".to_string()], "exact={exact}");
+    }
 }

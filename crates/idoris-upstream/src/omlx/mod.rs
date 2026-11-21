@@ -629,7 +629,8 @@ mod tests {
     /// construction is the old engine's private key after a restart (every request a 401) and still carries the
     /// old verification after the port changed hands.
     #[tokio::test]
-    async fn a_per_request_adapter_follows_the_registry_on_every_request_and_a_fixed_one_does_not() {
+    async fn a_per_request_adapter_follows_the_registry_on_every_request_and_a_fixed_one_does_not()
+    {
         let server = models_server().await;
         let endpoint = server.uri();
         let config = |key: &str| OmlxAdapterConfig {

@@ -35,6 +35,9 @@ pub struct Behavior {
     /// 会按需加载；这里故意不，这样账本过期的聊天会真的失败）。进程换了，已加载集合就空了。带 key 的 POST 也记进 `requests.log`
     /// （路径前加 `POST:`）。`false` = 只有 S5 的三个状态接口。
     pub stateful_models: bool,
+    /// 第 `n` 次（从 0 起）及以后拉起的进程，`GET /api/status` 回 500（引擎起来了、`/v1/models` 也答，但 Supervisor 采样它的
+    /// 驻留失败：模拟引擎换代之后账本复位采样不到新进程）。`None` = 从不。
+    pub api_status_fails_from_launch: Option<usize>,
 }
 
 /// 一个生成好的假引擎。
@@ -205,6 +208,7 @@ EXIT_AFTER = {exit_after}
 EXIT_IMMEDIATELY = {exit_now}
 TRAP_SIGTERM = {trap}
 STATEFUL = {stateful}
+STATUS_FAILS_FROM = {status_fails_from}
 MODEL = "fake-model"
 SIZE = 1000000000
 LOADED = set()
@@ -286,6 +290,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(200, {{"models": [{{"id": MODEL, "estimated_size": SIZE, "loaded": MODEL in LOADED, "pinned": False}}]}})
             return self.reply(200, {{"models": [{{"id": "fake-model", "estimated_size": 1000000000}}]}})
         if self.path == "/api/status":
+            if STATUS_FAILS_FROM is not None and index >= STATUS_FAILS_FROM:
+                return self.reply(500, {{"error": "status unavailable"}})
             if STATEFUL:
                 return self.reply(200, {{"loaded_models": sorted(LOADED), "model_memory_used": SIZE * len(LOADED), "model_memory_max": 17179869184, "pressure": "ok"}})
             return self.reply(200, {{"loaded_models": [], "model_memory_used": 0, "model_memory_max": 17179869184, "pressure": "ok"}})
@@ -361,6 +367,10 @@ server.serve_forever()
             "True"
         } else {
             "False"
+        },
+        status_fails_from = match behavior.api_status_fails_from_launch {
+            Some(launch) => launch.to_string(),
+            None => "None".to_owned(),
         },
     )
 }

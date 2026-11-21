@@ -1951,7 +1951,12 @@ async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cards: Vec<idoris_contracts::ComponentCard> = state
         .cards
         .iter()
-        .filter(|card| state.health_state.managed_failure(&card.provider.id).is_none())
+        .filter(|card| {
+            state
+                .health_state
+                .managed_failure(&card.provider.id)
+                .is_none()
+        })
         .cloned()
         .collect();
     match models::list_models_with_subscriptions(

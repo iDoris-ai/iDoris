@@ -916,9 +916,16 @@ mod tests {
             Some(Stopped)
         );
         health.set_managed("omlx", Ready, None, true);
-        assert_eq!(health.managed_failure("omlx"), None, "and it is served again once ready");
+        assert_eq!(
+            health.managed_failure("omlx"),
+            None,
+            "and it is served again once ready"
+        );
         // Not managed: never (the prober's cards keep their v0.5.0 path), however bad the state; unknown id: none.
-        health.apply("lmstudio", Observation::Unavailable(Some(UpstreamReason::AuthRequired)));
+        health.apply(
+            "lmstudio",
+            Observation::Unavailable(Some(UpstreamReason::AuthRequired)),
+        );
         assert_eq!(health.managed_failure("lmstudio"), None);
         assert_eq!(health.managed_failure("nope"), None);
     }

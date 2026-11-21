@@ -10,7 +10,9 @@ pub fn create_adapter(card: &ComponentCard) -> Result<Arc<dyn RuntimeAdapter>, B
     match card.provider.id.as_str() {
         "omlx" => {
             let config = super::OmlxAdapterConfig::for_base_url(card.endpoint.clone());
-            Ok(Arc::new(super::OmlxAdapter::new(config)?.with_per_request_key()))
+            Ok(Arc::new(
+                super::OmlxAdapter::new(config)?.with_per_request_key(),
+            ))
         }
         provider => Err(BackendError::invalid_request(format!(
             "no adapter for provider {provider}"

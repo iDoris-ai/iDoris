@@ -314,17 +314,27 @@ impl Shared {
     /// 实例任务 panic：按引擎失效发布成终局的 `failed`（失败计数沿用，再记一次）。
     pub fn publish_panicked(&self, id: &str) {
         self.publish_with(id, |previous| {
-            let (failures, last_failure_at_ms) =
-                previous.map_or((0, None), |status| (status.failures, status.last_failure_at_ms));
-            let counted = previous.is_none_or(|status| counts_as_failure(status.state, UpstreamState::Failed));
+            let (failures, last_failure_at_ms) = previous.map_or((0, None), |status| {
+                (status.failures, status.last_failure_at_ms)
+            });
+            let counted = previous
+                .is_none_or(|status| counts_as_failure(status.state, UpstreamState::Failed));
             Status {
                 state: UpstreamState::Failed,
                 reason: None,
                 owned: false,
                 terminal: true,
                 pid: None,
-                failures: if counted { failures.saturating_add(1) } else { failures },
-                last_failure_at_ms: if counted { Some(unix_millis_now()) } else { last_failure_at_ms },
+                failures: if counted {
+                    failures.saturating_add(1)
+                } else {
+                    failures
+                },
+                last_failure_at_ms: if counted {
+                    Some(unix_millis_now())
+                } else {
+                    last_failure_at_ms
+                },
             }
         });
     }
@@ -374,7 +384,10 @@ impl EngineManager {
             .iter()
             .map(|plan| (plan.id.clone(), plan.backend.kind().as_str().to_owned()))
             .collect();
-        let ports = plans.iter().map(|plan| (plan.id.clone(), plan.port)).collect();
+        let ports = plans
+            .iter()
+            .map(|plan| (plan.id.clone(), plan.port))
+            .collect();
         let shared = Arc::new(Shared {
             config,
             health,
@@ -733,9 +746,13 @@ mod tests {
         ];
         for previous in all {
             for next in all {
-                let expected = matches!(next, Restarting | Failed)
-                    && !matches!(previous, Restarting | Failed);
-                assert_eq!(counts_as_failure(previous, next), expected, "{previous:?} -> {next:?}");
+                let expected =
+                    matches!(next, Restarting | Failed) && !matches!(previous, Restarting | Failed);
+                assert_eq!(
+                    counts_as_failure(previous, next),
+                    expected,
+                    "{previous:?} -> {next:?}"
+                );
             }
         }
         // The two ways a crash is published back to back are one failure, not two.

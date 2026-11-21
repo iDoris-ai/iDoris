@@ -224,10 +224,10 @@ impl EngineBackend for OmlxBackend {
             (None, None) => "-".to_owned(),
         };
         let model_dir = value_after(args, "--model-dir").unwrap_or_else(|| "-".to_owned());
-        let base = launch
-            .env()
-            .get(OsStr::new(BASE_PATH_ENV))
-            .map_or_else(|| "-".to_owned(), |base| base.to_string_lossy().into_owned());
+        let base = launch.env().get(OsStr::new(BASE_PATH_ENV)).map_or_else(
+            || "-".to_owned(),
+            |base| base.to_string_lossy().into_owned(),
+        );
         format!(
             "program={:?} port={} memory_guard={guard} model_dir={model_dir:?} base={base:?}",
             launch.executable(),

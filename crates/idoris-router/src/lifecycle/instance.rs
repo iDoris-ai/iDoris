@@ -465,13 +465,9 @@ impl Actor {
                     | UpstreamState::Failed
                     | UpstreamState::Absent
                     | UpstreamState::Unavailable => {
-                        // 操作员显式要求：之前的失败不再计数。
+                        // 操作员显式要求：之前的失败不再计数。一个还活着的自有引擎（`unavailable`：活着却不答）由 `attempt()` 开头
+                        // 走完整的停止路径停掉，再重新走启动决策（G3）。
                         self.window.clear();
-                        // 一个还活着的自有引擎（`unavailable`：活着却不答）不能被丢弃：丢弃句柄就是 SIGKILL，绕过 `stop_engine`
-                        // 的优雅停止与私有 key 的撤销，也没有人知道引擎换了（G3）。走完整的停止路径，再重新走启动决策。
-                        if let Some(owned) = self.engine.take() {
-                            self.stop_engine(owned).await;
-                        }
                         Step::Attempt
                     }
                 }
@@ -539,7 +535,10 @@ impl Actor {
                 Synced::Retry => self.fail(Some(UpstreamReason::StartupLatched)).await,
                 // Supervisor 没有了：不会自己好，要重启 iDoris。
                 Synced::Permanent => {
-                    self.publish_terminal(UpstreamState::Failed, Some(UpstreamReason::StartupLatched));
+                    self.publish_terminal(
+                        UpstreamState::Failed,
+                        Some(UpstreamReason::StartupLatched),
+                    );
                     Step::Idle(Idle::Terminal)
                 }
             },
@@ -591,8 +590,8 @@ impl Actor {
     // -----------------------------------------------------------------------------------------
 
     async fn attempt(&mut self) -> Attempt {
-        // 不丢弃一个还活着的引擎句柄：丢弃就是 SIGKILL，绕过 `stop_engine`（优雅停止、撤销私有 key）。走到这里时命令分支已经把它
-        // 停掉了；万一还有（一个以后加进来的路径忘了），也走完整的停止路径（G3）。
+        // 不丢弃一个还活着的引擎句柄：丢弃就是 SIGKILL，绕过 `stop_engine`（优雅停止、撤销私有 key），也没有人知道引擎换了。
+        // 对一个还活着却不答的自有引擎 `start`（`unavailable`，G3）走到这里时它还在：走完整的停止路径，再重新走启动决策。
         if let Some(owned) = self.engine.take() {
             self.stop_engine(owned).await;
         }
@@ -1086,23 +1085,20 @@ impl Actor {
         self.shared.runtimes.get()?.get(&self.plan.id).cloned()
     }
 
-    /// 让 Supervisor 复位，忙就等：账本只在静止时才复位（有进行中的加载或聊天它回 `Busy`，什么也不改）。引擎已经换了，旧引擎上
-    /// 没做完的调用很快就会失败，所以这个等待很短；至多等一个启动超时。
+    /// 让 Supervisor 复位，忙就等，至多等一个启动超时（[`reset_when_quiet`]）。
     async fn reset_supervisor(
         &self,
         bound: &crate::dispatch::BoundSupervisor,
         sample: bool,
     ) -> Result<(), BackendError> {
         let deadline = Instant::now() + self.timings().startup_timeout;
-        let pause = self.timings().ready_initial_interval;
-        loop {
-            match bound.engine_replaced(sample).await {
-                Err(BackendError::Busy { .. }) if Instant::now() < deadline => {
-                    tokio::time::sleep(pause).await;
-                }
-                other => return other,
-            }
-        }
+        reset_when_quiet(
+            bound,
+            sample,
+            deadline,
+            self.timings().ready_initial_interval,
+        )
+        .await
     }
 
     /// 引擎换了一个进程（门控放行之后）：让 Supervisor 的账本对着新进程重建，**在发布 `ready` 之前**（之前这个上游对数据面
@@ -1135,12 +1131,7 @@ impl Actor {
                     self.stop_engine(owned).await;
                 }
                 self.external = None;
-                match error {
-                    BackendError::SupervisorUnavailable | BackendError::InvariantViolation { .. } => {
-                        Synced::Permanent
-                    }
-                    _ => Synced::Retry,
-                }
+                classify_reset_failure(&error)
             }
         }
     }
@@ -1332,6 +1323,35 @@ impl Actor {
 const BUSY_RETRIES: u32 = 50;
 const BUSY_PAUSE: Duration = Duration::from_millis(10);
 
+/// Supervisor 复位失败之后的出路：它没有了（actor 已退出，或者检测到自己的账本损坏而中毒：中毒的 actor 不被复位，每次都是同一个
+/// 回答）不会自己好，要重启 iDoris；别的（采样不到新进程、围栏还在、一直忙）一会儿再试。
+fn classify_reset_failure(error: &BackendError) -> Synced {
+    match error {
+        BackendError::SupervisorUnavailable | BackendError::InvariantViolation { .. } => {
+            Synced::Permanent
+        }
+        _ => Synced::Retry,
+    }
+}
+
+/// 让 Supervisor 复位，忙就等（`pause` 一次），到 `deadline` 还忙就把 `Busy` 交出去：账本只在静止时才复位（有进行中的加载或
+/// 聊天它回 `Busy`，什么也不改）。引擎已经换了，旧引擎上没做完的调用很快就会失败，所以这个等待很短。
+async fn reset_when_quiet(
+    bound: &crate::dispatch::BoundSupervisor,
+    sample: bool,
+    deadline: Instant,
+    pause: Duration,
+) -> Result<(), BackendError> {
+    loop {
+        match bound.engine_replaced(sample).await {
+            Err(BackendError::Busy { .. }) if Instant::now() < deadline => {
+                tokio::time::sleep(pause).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// 启动命令不合规的稳定原因码：额度、base 目录有（规范 §2.11.1），其余没有合适的码，只记日志。
 fn launch_reason(error: &LaunchError) -> Option<UpstreamReason> {
     match error {
@@ -1344,6 +1364,90 @@ fn launch_reason(error: &LaunchError) -> Option<UpstreamReason> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dead_or_poisoned_supervisor_is_final_and_everything_else_is_retried() {
+        for error in [
+            BackendError::supervisor_unavailable(),
+            BackendError::invariant_violation("ledger lost an entry"),
+        ] {
+            assert!(
+                matches!(classify_reset_failure(&error), Synced::Permanent),
+                "{error}"
+            );
+        }
+        for error in [
+            BackendError::busy("still in flight", None, None),
+            BackendError::Upstream {
+                message: "the engine is not answering".into(),
+            },
+            BackendError::internal("durable load fence is present"),
+            BackendError::adapter_timed_out("reset/status"),
+        ] {
+            assert!(
+                matches!(classify_reset_failure(&error), Synced::Retry),
+                "{error}"
+            );
+        }
+    }
+
+    /// A Supervisor with a chat in flight answers `Busy` to a reset; the wait retries until it is quiet, and a
+    /// deadline in the past hands the `Busy` back instead of waiting.
+    #[tokio::test]
+    async fn the_reset_waits_for_a_supervisor_that_is_busy_and_gives_up_at_its_deadline() {
+        use idoris_backend::{MockAdapter, ModelInfo, Supervisor, SupervisorConfig};
+        use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
+
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "a".into(),
+            memory_gb: 1.0,
+        }]));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        let card: idoris_contracts::ComponentCard =
+            serde_yaml::from_str(include_str!("../../../../config/components/omlx.yaml")).unwrap();
+        let bound = crate::dispatch::BoundSupervisor::new(&card, handle.clone());
+        let policy = LoadPolicy {
+            mode: LoadMode::OnDemand,
+            keepalive: Keepalive::IdleTtl { idle_ttl_s: 300 },
+            admission: Admission::Coexist,
+        };
+        handle.load("a", 1.0, policy).await.unwrap();
+        adapter.set_chat_delay("a", Duration::from_millis(600));
+        let chat = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                handle
+                    .chat(
+                        idoris_backend::ChatRequest {
+                            native: None,
+                            model: "a".into(),
+                            messages: Vec::new(),
+                        },
+                        tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        // The chat takes 600 ms; 100 ms in, it is certainly in flight.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // No patience: the deadline has passed, so the answer is the `Busy` itself.
+        let impatient =
+            reset_when_quiet(&bound, true, Instant::now(), Duration::from_millis(10)).await;
+        assert!(
+            matches!(impatient, Err(BackendError::Busy { .. })),
+            "{impatient:?}"
+        );
+        // With patience it waits out the chat and the reset goes through.
+        let patient = reset_when_quiet(
+            &bound,
+            true,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(patient.is_ok(), "{patient:?}");
+        chat.await.unwrap().unwrap();
+    }
 
     #[test]
     fn a_refused_launch_command_maps_to_the_stable_reason_codes_the_spec_has() {
