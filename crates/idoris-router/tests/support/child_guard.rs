@@ -16,15 +16,24 @@
 use std::{
     io,
     ops::{Deref, DerefMut},
-    process::{Child, Command},
+    process::{Child, Command, Output},
 };
 
 /// 被守卫的子进程；`Drop` 时若还活着就杀掉并收尸。
-pub struct ChildGuard(Child);
+/// 内部用 `Option`：`wait_with_output` 取走子进程（它按值消费 `Child`），取走之后 `Drop` 什么也不做。
+pub struct ChildGuard(Option<Child>);
 
 impl ChildGuard {
     pub fn new(child: Child) -> Self {
-        Self(child)
+        Self(Some(child))
+    }
+
+    /// 等它跑完并取走输出（`Child::wait_with_output` 的守卫版本）。`wait_with_output` 本身就收了尸，取走之后 `Drop` 不再杀。
+    pub fn wait_with_output(mut self) -> io::Result<Output> {
+        self.0
+            .take()
+            .expect("the child is only taken here")
+            .wait_with_output()
     }
 }
 
@@ -32,24 +41,27 @@ impl Deref for ChildGuard {
     type Target = Child;
 
     fn deref(&self) -> &Child {
-        &self.0
+        self.0.as_ref().expect("the child is only taken by value")
     }
 }
 
 impl DerefMut for ChildGuard {
     fn deref_mut(&mut self) -> &mut Child {
-        &mut self.0
+        self.0.as_mut().expect("the child is only taken by value")
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
         // `try_wait` 给出 `Some`：已经退出并收过尸，不用再杀（std 的 `kill` 对已收尸的子进程也不会发信号，pid 可能已被复用）。
         // 其余（还活着，或状态查不出来）：SIGKILL；然后 `wait` 收尸。
-        if !matches!(self.0.try_wait(), Ok(Some(_))) {
-            let _ = self.0.kill();
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = child.kill();
         }
-        let _ = self.0.wait();
+        let _ = child.wait();
     }
 }
 

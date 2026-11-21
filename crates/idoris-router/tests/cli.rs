@@ -1,5 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// 起的真二进制用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+#[path = "support/child_guard.rs"]
+mod child_guard;
+use child_guard::SpawnGuarded;
+
 use std::{
     fs,
     io::Write,
@@ -119,7 +124,7 @@ async fn occupied_admin_port_fails_before_data_health_is_served() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -171,7 +176,7 @@ async fn launcher_token_stdin_authenticates_admin_without_leaking_to_logs() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     child
         .stdin
@@ -263,7 +268,7 @@ async fn admin_readonly_cli_uses_stdin_token_for_every_published_resource() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     daemon
         .stdin
@@ -297,7 +302,7 @@ async fn admin_readonly_cli_uses_stdin_token_for_every_published_resource() {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut admin = admin.spawn().unwrap();
+        let mut admin = admin.spawn_guarded().unwrap();
         admin
             .stdin
             .take()
@@ -350,7 +355,7 @@ async fn malformed_launcher_token_fails_before_either_surface_serves() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     child
         .stdin

@@ -2,6 +2,11 @@
 //! 接口规范 §2.9：`GET /v1/recommendation`、`GET /v1/models/local` 与 CLI `idoris recommend` /
 //! `idoris models local`。全部使用临时 HOME / 模型目录，不碰真实 `~/.omlx`，不联网，不启动推理进程。
 
+// 起的真二进制用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
+#[path = "support/child_guard.rs"]
+mod child_guard;
+use child_guard::SpawnGuarded;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -346,7 +351,7 @@ fn run(mut command: Command) -> Output {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
