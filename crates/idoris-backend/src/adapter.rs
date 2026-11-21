@@ -49,6 +49,22 @@ pub trait RuntimeAdapter: Send + Sync {
     /// must return the same path across process restarts for the same engine.
     fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError>;
 
+    /// How long one [`Self::load`] call may legitimately take, when that is longer than an ordinary
+    /// management call (IDORIS-CORE S8, interface spec §2.11.2: a cold load of a large model takes far
+    /// longer than a `status` or `unload`). `None` — the default — means "no separate budget": the
+    /// Supervisor bounds `load` by [`crate::SupervisorConfig::adapter_call_timeout`], exactly as it
+    /// bounds every other management call.
+    ///
+    /// An implementation that returns `Some` promises to apply this same deadline inside `load` itself
+    /// (so its own timeout error, not the Supervisor's, is the one reported); the Supervisor only adds
+    /// a fixed margin on top as a backstop against an implementation that hangs anyway. The value
+    /// applies to the `load` call alone — `unload`, `status`, `probe_ready` and `list` keep their own,
+    /// shorter deadlines. A load that exceeds it is still an unknown outcome (the engine may keep
+    /// loading), handled exactly as before: the slot stays charged and the durable fence stays.
+    fn load_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Every model this engine instance *could* route to, whether or not it
     /// is currently loaded (mirrors `/v1/models`'s "list routable models"
     /// semantics per `docs/research/Rust基础选型-2026-09-27.md` §4).

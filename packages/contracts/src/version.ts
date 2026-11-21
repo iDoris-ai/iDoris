@@ -18,7 +18,11 @@
  * - v1.3.0（iDoris v0.6.0 的目标，**尚未生效**）：加法新增 —— `GET /health` 的 `phase`、`ready`、
  *   `started_at_ms`、`registered`、`upstreams[]`（含 `engine_kind`；接口规范修订 1.6 §2.11.1，
  *   IDORIS-CORE，由 Rust 实现承载；TS 参考实现不含这些字段，同 v1.2.0 的先例）。`status` 仍恒为
- *   `"ok"`，1.2.x 的字段和行为不变。
+ *   `"ok"`，1.2.x 的字段和行为不变。另有端点 `POST /v1/models/warmup`（接口规范 §2.11.2，IDORIS-CORE
+ *   切片 S8，由 Rust 实现承载；TS 参考实现不含这个端点，同 v1.2.0 的先例）：请求体只有 `model` 与
+ *   `timeout_ms`，让模型进入可用状态而不生成 token；200 应答 `{model, provider_id, state,
+ *   already_loaded, load_ms}`，错误沿用聊天的信封，另有 504 `warmup_timeout`。它没有 JSON Schema
+ *   （规范 §2.11.5），状态码矩阵由 Rust 集成测试 `crates/idoris-router/tests/warmup.rs` 锁定。
  *   **这些新字段从 IDORIS-CORE 切片 S1 起就出现在 Rust 实现的 `/health` 里，但本常量（以及
  *   `/health.contract_version`）要到 v0.6.0 发版才升到 1.3.0（切片 S11 统一升）：** 规范 §2.11
  *   写明发版前仍是 1.2.0，免得 warmup、embeddings 伴生卡、Admin `upstreams` 等 1.3.0 的功能还没

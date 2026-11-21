@@ -1219,6 +1219,40 @@ impl ChatProxy {
         Fut: std::future::Future<Output = Result<(), E>>,
         Completed: std::future::Future<Output = Result<(), E>>,
     {
+        self.forward_buffered_path_finalized_within(
+            endpoint,
+            path,
+            body,
+            opts,
+            None,
+            success_gate,
+            observers,
+        )
+        .await
+    }
+
+    /// [`Self::forward_buffered_path_finalized`] with this one call's own response-header deadline
+    /// (`Some`) instead of the path's default ([`Self::header_timeout_for`]): `POST /v1/models/warmup`
+    /// bounds its minimal request by the caller's `timeout_ms`, not by the chat path's 10 seconds
+    /// (IDORIS-CORE S8). `None` is exactly the default behaviour.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn forward_buffered_path_finalized_within<F, O, C, Fut, Completed, E>(
+        &self,
+        endpoint: &str,
+        path: BufferedUpstreamPath,
+        body: &Value,
+        opts: &ForwardOpts<'_>,
+        header_timeout: Option<Duration>,
+        success_gate: F,
+        observers: (O, C),
+    ) -> Result<ForwardOutcome, E>
+    where
+        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
+        O: FnOnce() -> Fut,
+        C: FnOnce(ForwardOutcome) -> Completed,
+        Fut: std::future::Future<Output = Result<(), E>>,
+        Completed: std::future::Future<Output = Result<(), E>>,
+    {
         // The observer is intentionally later than every knowable preflight
         // exit and earlier than the first reqwest send attempt. It therefore
         // runs once across retries.
@@ -1230,18 +1264,28 @@ impl ChatProxy {
             Err(_) => return Ok(Self::failure(503, 0)),
         };
         let mut outcome = self
-            .forward_buffered_inner_finalized(endpoint, path, body, opts, success_gate, observers)
+            .forward_buffered_inner_finalized(
+                endpoint,
+                path,
+                body,
+                opts,
+                header_timeout,
+                success_gate,
+                observers,
+            )
             .await?;
         outcome.body = with_permit(outcome.body, Arc::new(permit));
         Ok(outcome)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn forward_buffered_inner_finalized<F, O, C, Fut, Completed, E>(
         &self,
         endpoint: &str,
         path: BufferedUpstreamPath,
         body: &Value,
         opts: &ForwardOpts<'_>,
+        header_timeout: Option<Duration>,
         success_gate: F,
         observers: (O, C),
     ) -> Result<ForwardOutcome, E>
@@ -1253,6 +1297,7 @@ impl ChatProxy {
         Completed: std::future::Future<Output = Result<(), E>>,
     {
         let (observer, completed) = observers;
+        let header_timeout = header_timeout.unwrap_or_else(|| self.header_timeout_for(path));
         let mut payload = body.clone();
         if path.force_non_stream
             && let Some(obj) = payload.as_object_mut()
@@ -1273,7 +1318,7 @@ impl ChatProxy {
                     &url,
                     &payload,
                     opts,
-                    self.header_timeout_for(path),
+                    header_timeout,
                     &fingerprint,
                     &mut uncertain,
                     observer,
@@ -1371,7 +1416,7 @@ impl ChatProxy {
                 &url,
                 &payload,
                 opts,
-                self.header_timeout_for(path),
+                header_timeout,
                 &fingerprint,
                 &mut uncertain,
                 observer,

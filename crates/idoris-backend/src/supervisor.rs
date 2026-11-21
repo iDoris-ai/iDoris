@@ -52,7 +52,10 @@ pub struct SupervisorConfig {
     pub probe_max_attempts: u32,
     /// Bounds a single `load`/`unload`/`probe_ready` adapter call. Without
     /// this, a hanging call would hold `active_op` (the global load/evict
-    /// mutex) forever — llama-swap Issue #946's root cause.
+    /// mutex) forever — llama-swap Issue #946's root cause. The one
+    /// exception is `load` on an adapter that declares its own
+    /// [`RuntimeAdapter::load_timeout`]: that call is bounded by the
+    /// adapter's budget plus a fixed margin instead (never less than this).
     pub adapter_call_timeout: std::time::Duration,
     /// Outer deadline for one `chat` adapter call only (excludes queueing
     /// and loading, which stay under `adapter_call_timeout`). Generation
@@ -623,6 +626,28 @@ where
     }
 }
 
+/// Slack the Supervisor adds on top of an adapter's own [`RuntimeAdapter::load_timeout`] before its outer
+/// backstop fires, so the adapter's own timeout error is the one reported (same ordering as the generic
+/// management deadline: the adapter's 10 s call timeout fires before the Supervisor's 30 s).
+const ADAPTER_LOAD_BACKSTOP_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The outer deadline for one `adapter.load` call (IDORIS-CORE S8). An adapter without a separate load
+/// budget is bounded by [`SupervisorConfig::adapter_call_timeout`] like every other management call, so
+/// nothing changes for it. One that declares [`RuntimeAdapter::load_timeout`] gets that plus
+/// [`ADAPTER_LOAD_BACKSTOP_MARGIN`], never less than `adapter_call_timeout`. Only the `load` call itself
+/// uses this: `unload`, `status`, `probe_ready` and `list` stay under `adapter_call_timeout`.
+fn load_call_deadline(
+    adapter: &dyn RuntimeAdapter,
+    config: &SupervisorConfig,
+) -> std::time::Duration {
+    adapter
+        .load_timeout()
+        .map_or(config.adapter_call_timeout, |own| {
+            own.saturating_add(ADAPTER_LOAD_BACKSTOP_MARGIN)
+                .max(config.adapter_call_timeout)
+        })
+}
+
 /// K11/H3: require every target to be absent and enough capacity to remain.
 /// Missing/invalid evidence or exhausted polling fails closed.
 async fn confirm_memory_released(
@@ -803,12 +828,9 @@ async fn run_load_flow(
     }
 
     // OOM circuit breaker: exactly one self-healing retry, never more.
-    let mut attempt = with_adapter_timeout(
-        adapter.load(&id, Some(&policy)),
-        config.adapter_call_timeout,
-        &id,
-    )
-    .await;
+    let load_deadline = load_call_deadline(adapter.as_ref(), &config);
+    let mut attempt =
+        with_adapter_timeout(adapter.load(&id, Some(&policy)), load_deadline, &id).await;
     if let Err(err) = &attempt
         && err.is_oom()
     {
@@ -869,12 +891,7 @@ async fn run_load_flow(
         // failures must not restore its former Ready ledger entry.
         previous = None;
         tokio::time::sleep(config.oom_retry_backoff).await;
-        attempt = with_adapter_timeout(
-            adapter.load(&id, Some(&policy)),
-            config.adapter_call_timeout,
-            &id,
-        )
-        .await;
+        attempt = with_adapter_timeout(adapter.load(&id, Some(&policy)), load_deadline, &id).await;
     }
     if let Err(err) = attempt {
         let failure_outcome = resolve_load_failure(
@@ -4974,6 +4991,93 @@ mod tests {
         assert!(
             calls_in_window >= 2,
             "M11: confirm_memory_released must poll status() until release is confirmed between the OOM'd attempt and the retry, got {calls_in_window} call(s)"
+        );
+    }
+
+    /// `MockAdapter` that declares its own load budget (IDORIS-CORE S8).
+    struct DeclaresLoadBudget {
+        inner: MockAdapter,
+        budget: Option<std::time::Duration>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for DeclaresLoadBudget {
+        fn load_timeout(&self) -> Option<std::time::Duration> {
+            self.budget
+        }
+
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            self.inner.load_fence_path()
+        }
+
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            self.inner.list().await
+        }
+
+        async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            self.inner.load(id, policy).await
+        }
+
+        async fn unload(&self, id: &str) -> Result<(), BackendError> {
+            self.inner.unload(id).await
+        }
+
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            self.inner.status().await
+        }
+
+        async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+            self.inner.probe_ready(id).await
+        }
+
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            self.inner.chat(req, cancel).await
+        }
+    }
+
+    #[test]
+    fn the_load_deadline_is_the_declared_budget_plus_the_margin_and_never_below_the_generic_one() {
+        use std::time::Duration;
+        let declares = |budget| DeclaresLoadBudget {
+            inner: MockAdapter::new(Vec::new()),
+            budget,
+        };
+        let config = |generic| SupervisorConfig {
+            adapter_call_timeout: generic,
+            ..SupervisorConfig::default()
+        };
+        // No declared budget: exactly the generic deadline (every pre-S8 adapter).
+        assert_eq!(
+            load_call_deadline(&declares(None), &config(Duration::from_millis(200))),
+            Duration::from_millis(200)
+        );
+        // Declared: the budget plus the fixed margin, so the adapter's own timeout is the one reported.
+        assert_eq!(
+            load_call_deadline(
+                &declares(Some(Duration::from_secs(180))),
+                &config(Duration::from_secs(30))
+            ),
+            Duration::from_secs(180) + ADAPTER_LOAD_BACKSTOP_MARGIN
+        );
+        // A small budget does not shrink the deadline below the generic one.
+        assert_eq!(
+            load_call_deadline(
+                &declares(Some(Duration::from_millis(10))),
+                &config(Duration::from_secs(120))
+            ),
+            Duration::from_secs(120)
+        );
+        // Saturating, not overflowing.
+        assert_eq!(
+            load_call_deadline(
+                &declares(Some(Duration::MAX)),
+                &config(Duration::from_secs(30))
+            ),
+            Duration::MAX
         );
     }
 }

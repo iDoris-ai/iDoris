@@ -69,6 +69,52 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8088";
 /// single-flighted load/evict mutex) forever.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default deadline for `POST /v1/models/{id}/load` only (IDORIS-CORE S8, interface spec §2.11.2).
+/// Loading a model is not a management call: Qwen3-8B takes about 4 s cold (`spike/u0/U0-LOG.md`) and
+/// the 27B the 48 GiB+ tier recommends is expected to take much longer, but under
+/// [`DEFAULT_CALL_TIMEOUT`] such a load would be reported as an unknown outcome and leave the durable
+/// fence behind — exactly what a first-start warmup of a big model must not do. The adapter only uses
+/// this once [`OmlxAdapter::with_load_timeout`] opts in (the production factory does); without it a
+/// load keeps [`OmlxAdapterConfig::call_timeout`] as its deadline, as before. `status`, `unload`,
+/// `probe_ready`, `list` and the pin calls always keep `call_timeout`.
+pub const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Environment variable that overrides [`DEFAULT_LOAD_TIMEOUT`] for the production adapter
+/// (`factory::create_adapter`): a whole number of seconds, [`MIN_LOAD_TIMEOUT_SECS`] to
+/// [`MAX_LOAD_TIMEOUT_SECS`]. Unset or blank means the default; anything else that does not parse is an
+/// error at construction (start-up), never a silent fall-back to the default.
+pub const LOAD_TIMEOUT_ENV: &str = "IDORIS_LOAD_TIMEOUT_S";
+/// Lower bound of [`LOAD_TIMEOUT_ENV`].
+pub const MIN_LOAD_TIMEOUT_SECS: u64 = 1;
+/// Upper bound of [`LOAD_TIMEOUT_ENV`]: one load holds the Supervisor's single load/evict mutex for as
+/// long as it runs, so a typo must not be able to hold it for days.
+pub const MAX_LOAD_TIMEOUT_SECS: u64 = 3600;
+
+/// Parses the raw value of [`LOAD_TIMEOUT_ENV`] (`None` = not set).
+pub fn load_timeout_from_env(raw: Option<&std::ffi::OsStr>) -> Result<Duration, BackendError> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_LOAD_TIMEOUT);
+    };
+    let invalid = || {
+        BackendError::invalid_request(format!(
+            "{LOAD_TIMEOUT_ENV} 不是合法的加载超时：请设置为 {MIN_LOAD_TIMEOUT_SECS} 到 {MAX_LOAD_TIMEOUT_SECS} 之间的整数秒，或不设置以使用默认值 {} 秒",
+            DEFAULT_LOAD_TIMEOUT.as_secs()
+        ))
+    };
+    let text = raw.to_str().ok_or_else(invalid)?.trim();
+    if text.is_empty() {
+        return Ok(DEFAULT_LOAD_TIMEOUT);
+    }
+    if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let seconds: u64 = text.parse().map_err(|_| invalid())?;
+    if !(MIN_LOAD_TIMEOUT_SECS..=MAX_LOAD_TIMEOUT_SECS).contains(&seconds) {
+        return Err(invalid());
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 /// Default deadline for `POST /v1/chat/completions` only. Generation can
 /// legitimately take far longer than a management call, so chat is bounded
 /// separately (finite, never unlimited); load/status/pin keep
@@ -153,6 +199,8 @@ pub struct OmlxAdapter {
     base_url: String,
     api_key: Option<String>,
     call_timeout: Duration,
+    /// Deadline of the `POST .../load` call alone; `None` = use `call_timeout` (see [`DEFAULT_LOAD_TIMEOUT`]).
+    load_timeout: Option<Duration>,
     chat_timeout: Duration,
     client: reqwest::Client,
     admin_session: tokio::sync::Mutex<Option<reqwest::header::HeaderValue>>,
@@ -167,6 +215,7 @@ impl OmlxAdapter {
             base_url: config.base_url.trim_end_matches('/').to_string(),
             api_key: config.api_key,
             call_timeout: config.call_timeout,
+            load_timeout: None,
             chat_timeout: DEFAULT_CHAT_TIMEOUT,
             client,
             admin_session: tokio::sync::Mutex::new(None),
@@ -177,6 +226,16 @@ impl OmlxAdapter {
     /// Override the chat-only deadline (default [`DEFAULT_CHAT_TIMEOUT`]).
     pub fn with_chat_timeout(mut self, chat_timeout: Duration) -> Self {
         self.chat_timeout = chat_timeout;
+        self
+    }
+
+    /// Give `POST /v1/models/{id}/load` its own deadline, independent of `call_timeout` (IDORIS-CORE S8;
+    /// production uses [`DEFAULT_LOAD_TIMEOUT`]). Without this a load is bounded by `call_timeout` like
+    /// every other call. Only the load request itself uses it: the pin check or pin request that follows,
+    /// `status`, `unload`, `probe_ready` and `list` stay under `call_timeout`. A load that outlasts it is
+    /// still an unknown outcome ([`BackendError::LoadUnconfirmed`]) and keeps the durable fence.
+    pub fn with_load_timeout(mut self, load_timeout: Duration) -> Self {
+        self.load_timeout = Some(load_timeout);
         self
     }
 
@@ -273,7 +332,7 @@ impl OmlxAdapter {
             &self.base_url,
             &self.encoded_path("/v1/models/", id, "/load"),
             self.api_key(),
-            self.call_timeout,
+            self.load_timeout.unwrap_or(self.call_timeout),
             id,
         )
         .await?;
@@ -503,6 +562,10 @@ impl RuntimeAdapter for OmlxAdapter {
 
     async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
         Self::list(self).await
+    }
+
+    fn load_timeout(&self) -> Option<Duration> {
+        self.load_timeout
     }
 
     async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
