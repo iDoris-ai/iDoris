@@ -55,13 +55,15 @@ pub trait RuntimeAdapter: Send + Sync {
     /// Supervisor bounds `load` by [`crate::SupervisorConfig::adapter_call_timeout`], exactly as it
     /// bounds every other management call.
     ///
-    /// An implementation that returns `Some` promises to apply this same deadline inside `load`
-    /// itself (so its own timeout error, not the Supervisor's, is the one reported); the Supervisor
-    /// adds a fixed margin on top, never going below its generic `adapter_call_timeout`, as a
-    /// backstop against an implementation that hangs anyway. The value applies to the `load` call
-    /// alone: `unload`, `status`, `probe_ready` and `list` keep their own, shorter deadlines. A load
-    /// that exceeds it is still an unknown outcome (the engine may keep loading), handled exactly as
-    /// before: the slot stays charged and the durable fence stays.
+    /// An implementation that returns `Some` promises that its **whole** `load` call — including any
+    /// verification it does after the engine accepted the load (PR-Daemon's #634 review, W-3) — returns
+    /// within this deadline, so its own timeout error (an unknown outcome,
+    /// [`BackendError::LoadUnconfirmed`]), not the Supervisor's, is the one reported. The Supervisor adds
+    /// a fixed margin on top, never going below its generic `adapter_call_timeout`, as a backstop against
+    /// an implementation that hangs anyway; that backstop can only be a backstop if the promise holds.
+    /// The value applies to the `load` call alone: `unload`, `status`, `probe_ready` and `list` keep
+    /// their own, shorter deadlines. A load that exceeds it is still an unknown outcome (the engine may
+    /// keep loading), handled exactly as before: the slot stays charged and the durable fence stays.
     fn load_timeout(&self) -> Option<std::time::Duration> {
         None
     }

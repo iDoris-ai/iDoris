@@ -69,14 +69,15 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8088";
 /// single-flighted load/evict mutex) forever.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default deadline for `POST /v1/models/{id}/load` only (IDORIS-CORE S8, interface spec §2.11.2).
-/// Loading a model is not a management call: Qwen3-8B takes about 4 s cold (`spike/u0/U0-LOG.md`) and
-/// the 27B the 48 GiB+ tier recommends is expected to take much longer, but under
+/// Default deadline of one whole load (IDORIS-CORE S8, interface spec §2.11.2): the `POST /v1/models/{id}/load`
+/// **and** the pin and state verification that follow it, which must all finish inside it (PR-Daemon's #634
+/// review, W-3). Loading a model is not a management call: Qwen3-8B takes about 4 s cold
+/// (`spike/u0/U0-LOG.md`) and the 27B the 48 GiB+ tier recommends is expected to take much longer, but under
 /// [`DEFAULT_CALL_TIMEOUT`] such a load would be reported as an unknown outcome and leave the durable
 /// fence behind — exactly what a first-start warmup of a big model must not do. The adapter only uses
 /// this once [`OmlxAdapter::with_load_timeout`] opts in (the production factory does); without it a
 /// load keeps [`OmlxAdapterConfig::call_timeout`] as its deadline, as before. `status`, `unload`,
-/// `probe_ready`, `list` and the pin calls always keep `call_timeout`.
+/// `probe_ready` and `list` always keep `call_timeout`.
 pub const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Environment variable that overrides [`DEFAULT_LOAD_TIMEOUT`] for the production adapter
@@ -199,7 +200,9 @@ pub struct OmlxAdapter {
     base_url: String,
     api_key: Option<String>,
     call_timeout: Duration,
-    /// Deadline of the `POST .../load` call alone; `None` = use `call_timeout` (see [`DEFAULT_LOAD_TIMEOUT`]).
+    /// Deadline of one whole load (the `POST .../load` and the pin/state verification after it); `None` =
+    /// use `call_timeout` for the POST and, as before, `call_timeout` for each later call (see
+    /// [`DEFAULT_LOAD_TIMEOUT`]).
     load_timeout: Option<Duration>,
     chat_timeout: Duration,
     client: reqwest::Client,
@@ -229,11 +232,17 @@ impl OmlxAdapter {
         self
     }
 
-    /// Give `POST /v1/models/{id}/load` its own deadline, independent of `call_timeout` (IDORIS-CORE S8;
-    /// production uses [`DEFAULT_LOAD_TIMEOUT`]). Without this a load is bounded by `call_timeout` like
-    /// every other call. Only the load request itself uses it: the pin check or pin request that follows,
-    /// `status`, `unload`, `probe_ready` and `list` stay under `call_timeout`. A load that outlasts it is
-    /// still an unknown outcome ([`BackendError::LoadUnconfirmed`]) and keeps the durable fence.
+    /// Give a load its own deadline, independent of `call_timeout` (IDORIS-CORE S8; production uses
+    /// [`DEFAULT_LOAD_TIMEOUT`]). Without this a load is bounded by `call_timeout` like every other call.
+    ///
+    /// The deadline covers the **whole** load: the `POST /v1/models/{id}/load` and then the pin and state
+    /// verification (login, `PUT` settings, `GET` status) that confirm it. Each of those calls still has
+    /// its own `call_timeout`, but together with the POST they must fit in this one budget; the follow-up
+    /// gets what the POST left over. That is what lets the Supervisor's backstop (this budget plus a margin)
+    /// stay a backstop: the adapter's own answer always comes first, so a load whose outcome is unknown is
+    /// always reported as [`BackendError::LoadUnconfirmed`], never as the Supervisor's `adapter_timed_out`.
+    /// `status`, `unload`, `probe_ready` and `list` stay under `call_timeout`. A load that outlasts the
+    /// budget is an unknown outcome ([`BackendError::LoadUnconfirmed`]) and keeps the durable fence.
     pub fn with_load_timeout(mut self, load_timeout: Duration) -> Self {
         self.load_timeout = Some(load_timeout);
         self
@@ -326,20 +335,46 @@ impl OmlxAdapter {
     /// loaded state, the model may be resident and the error is
     /// [`BackendError::LoadUnconfirmed`]. Once loaded state is confirmed,
     /// deterministic policy failures use `LoadPostconditionFailed`.
+    ///
+    /// With a load budget ([`Self::with_load_timeout`]) the whole call — the POST and the confirmation
+    /// after it — returns within that budget, and running out of it is `LoadUnconfirmed` too.
     pub async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+        let budget = self.load_timeout.unwrap_or(self.call_timeout);
+        let started = tokio::time::Instant::now();
         http::post_load(
             &self.client,
             &self.base_url,
             &self.encoded_path("/v1/models/", id, "/load"),
             self.api_key(),
-            self.load_timeout.unwrap_or(self.call_timeout),
+            budget,
             id,
         )
         .await?;
-        let confirmed = if policy.map(|p| p.mode) == Some(LoadMode::Resident) {
-            self.pin(id).await
+        let confirm = async {
+            if policy.map(|p| p.mode) == Some(LoadMode::Resident) {
+                self.pin(id).await
+            } else {
+                self.check_not_unexpectedly_pinned(id).await
+            }
+        };
+        let confirmed = if self.load_timeout.is_some() {
+            // The follow-up gets what the POST left of the budget. Dropping it at the deadline is safe: the
+            // outcome is already "unknown", which is what we report (a half-sent admin PUT is exactly the
+            // `AdminRequestError::Unknown` case `pin` already treats this way).
+            match tokio::time::timeout(budget.saturating_sub(started.elapsed()), confirm).await {
+                Ok(confirmed) => confirmed,
+                Err(_) => {
+                    return Err(BackendError::load_unconfirmed(
+                        id,
+                        format!(
+                            "oMLX accepted the load of {id}, but pinning and verifying it did not finish \
+                             within the load budget of {budget:?}"
+                        ),
+                    ));
+                }
+            }
         } else {
-            self.check_not_unexpectedly_pinned(id).await
+            confirm.await
         };
         confirmed.map_err(|err| match err {
             BackendError::LoadPostconditionFailed { .. } => err,

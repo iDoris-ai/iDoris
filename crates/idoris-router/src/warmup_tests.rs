@@ -194,11 +194,12 @@ async fn wait_for_idle(proxy: &proxy::ChatProxy) {
 }
 
 #[tokio::test]
-async fn the_default_resident_warmup_deadline_is_180_seconds_and_is_not_the_chat_header_timeout() {
+async fn a_resident_warmup_may_wait_longer_than_any_ordinary_call_through_the_proxy() {
+    // 它有自己的期限，正是因为冷加载比普通调用慢：比聊天（缺省 10 秒）与 embeddings（缺省 30 秒）的响应头超时都长。具体取多少是
+    // 个取舍（规范里写的是 180 秒）；这里只守住「比普通调用长」这个关系，不把实现里的那个数再抄一遍。
     let proxy = proxy::ChatProxy::new(idoris_upstream::http_client().unwrap());
-    assert_eq!(proxy::WARMUP_HEADER_TIMEOUT, Duration::from_secs(180));
-    assert_eq!(proxy.warmup_header_timeout, Duration::from_secs(180));
-    assert_ne!(proxy.warmup_header_timeout, proxy.header_timeout);
+    assert!(proxy.warmup_header_timeout > proxy.header_timeout);
+    assert!(proxy.warmup_header_timeout > proxy.embeddings_header_timeout);
 }
 
 #[tokio::test]

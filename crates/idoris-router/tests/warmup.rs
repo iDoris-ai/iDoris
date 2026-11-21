@@ -33,6 +33,7 @@ use idoris_contracts::{ComponentCard, LoadPolicy};
 use idoris_router::readiness::{ManagedFailure, UpstreamReason, UpstreamState};
 use idoris_router::runtime::RuntimeRegistry;
 use idoris_router::{AppState, auth, build_app, build_starting_app};
+use idoris_tenancy::budget::{BudgetLedger, SpendGate};
 use idoris_tenancy::event_log::{EventLogEvent, EventLogQuery, EventLogStore, EventType};
 use idoris_tenancy::store::{RecordKind, TenantStore};
 use idoris_tenancy::virtual_key::MintedVirtualKey;
@@ -2275,6 +2276,123 @@ async fn a_client_that_hangs_up_does_not_cancel_the_resident_request_either_and_
     assert_eq!(audit.records(PERSONAL), 1);
 }
 
+// ---------------------------------------------------------------------------------------------
+// resident 预热的并发许可（#634 预审 W-1）：同一模型的并发预热合并，每把数据 key 自己发起的在途请求有上限
+// ---------------------------------------------------------------------------------------------
+
+/// 对预热的最小请求（里面的输入是 `warmup`）慢、对别的请求（聊天里的 `hi`）立刻答的假上游。
+struct SlowForWarmup(Duration);
+
+impl wiremock::Respond for SlowForWarmup {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let template = ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "x"}}],
+            "data": [{"object": "embedding", "index": 0, "embedding": [0.1]}]
+        }));
+        if String::from_utf8_lossy(&request.body).contains("\"warmup\"") {
+            template.set_delay(self.0)
+        } else {
+            template
+        }
+    }
+}
+
+async fn wait_for_upstream_requests(server: &MockServer, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while requests_of(server).await.len() < count {
+        assert!(
+            Instant::now() < deadline,
+            "the upstream never received {count} request(s)"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn one_key_over_its_in_flight_limit_is_rejected_while_other_keys_and_chat_are_unaffected() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(SlowForWarmup(Duration::from_millis(1_500)))
+        .mount(&server)
+        .await;
+    let ring = keyring(&[("a", ALL_ROLES, LOCAL), ("b", ALL_ROLES, LOCAL)]);
+    let (key_a, key_b) = (ring.secrets["a"].clone(), ring.secrets["b"].clone());
+    let authenticator = ring.authenticator.clone();
+    let app = resident_app_with(
+        vec![resident_card(
+            "lmstudio",
+            &server.uri(),
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        move |state| {
+            state.virtual_key_authenticator = Some(authenticator);
+            state.remote_bind_requires_auth = true;
+        },
+    );
+    let start = |model: &'static str, secret: &str| {
+        let (app, secret) = (app.clone(), secret.to_string());
+        tokio::spawn(async move { warm_as(&app, json!({"model": model}), &secret, &[]).await })
+    };
+
+    // 钥匙 A 同时有两个不同模型的预热在途：两个请求都到了上游，A 自己发起的在途请求数到了上限。
+    let a_one = start("model-one", &key_a);
+    let a_two = start("model-two", &key_a);
+    wait_for_upstream_requests(&server, 2).await;
+    // 第三个不同的模型：立刻 429，原因码说得清，什么也没发给上游。
+    let began = Instant::now();
+    let refused = warm_as(&app, json!({"model": "model-three"}), &key_a, &[]).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        refused.raw
+    );
+    assert_eq!(refused.error_type(), "warmup_in_flight_limited");
+    assert_eq!(refused.reason(), "warmup_in_flight_limited");
+    assert_eq!(refused.header("x-idoris-served-locality"), Some("loopback"));
+    assert!(
+        began.elapsed() < Duration::from_millis(1_000),
+        "refused at once, nothing was waited for: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(requests_of(&server).await.len(), 2);
+
+    // 别的钥匙不受影响：B 为同一个第三个模型领头，发出自己的请求；聊天照常。
+    let b_three = start("model-three", &key_b);
+    let chatted = send_raw(
+        &app,
+        "/v1/chat/completions",
+        json!({"model": "idoris/daily", "messages": [{"role": "user", "content": "hi"}]})
+            .to_string(),
+        &[],
+        Some(&key_b),
+    )
+    .await;
+    assert_eq!(chatted.status, StatusCode::OK, "{}", chatted.raw);
+    // A 并入自己已经在途的模型不占名额：不是 429，拿到那个请求的结果。
+    let joined = warm_as(&app, json!({"model": "model-one"}), &key_a, &[]).await;
+    assert_eq!(joined.status, StatusCode::OK, "{}", joined.raw);
+    for (name, handle) in [("a_one", a_one), ("a_two", a_two), ("b_three", b_three)] {
+        let reply = handle.await.unwrap();
+        assert_eq!(reply.status, StatusCode::OK, "{name}: {}", reply.raw);
+    }
+    // A 的请求都结束了：名额还回来，第三个模型现在可以领头。
+    let again = warm_as(&app, json!({"model": "model-three"}), &key_a, &[]).await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.raw);
+    // 上游一共收到：A 的两个、B 的第三个、A 之后的第三个，加上聊天的那一个——被拒绝的与并入的预热一个都没发。
+    let warmups = requests_of(&server)
+        .await
+        .iter()
+        .filter(|request| String::from_utf8_lossy(&request.body).contains("\"warmup\""))
+        .count();
+    assert_eq!(
+        warmups, 4,
+        "model-one, model-two, B's model-three, A's model-three"
+    );
+}
+
 #[tokio::test]
 async fn a_paid_resident_card_is_refused_before_anything_is_sent() {
     let server = upstream().await;
@@ -2722,6 +2840,197 @@ async fn a_warmup_writes_one_audit_event_with_intent_warmup_and_no_budget_or_usa
         StatusCode::OK
     );
     assert_eq!(stored(RecordKind::Usage).len(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 预算（#634 预审 W-2）：`SpendGate::All` 下余额不足也挡预热；只读的准入检查，不预留、不结算
+// ---------------------------------------------------------------------------------------------
+
+/// 一个接上账本的租户：`limit_minor` 与闸门由用例定；账本文件放在临时目录里，用例可以另开连接直接数预留行。
+struct Budget {
+    _dir: tempfile::TempDir,
+    ledger: Arc<BudgetLedger>,
+    file: PathBuf,
+}
+
+impl Budget {
+    fn new(limit_minor: i64, gate: SpendGate) -> Self {
+        Self::for_tenant(PERSONAL, limit_minor, gate)
+    }
+
+    fn for_tenant(tenant: &str, limit_minor: i64, gate: SpendGate) -> Self {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("budget.sqlite3");
+        let ledger = BudgetLedger::open(&file).unwrap();
+        ledger
+            .configure_tenant(tenant, limit_minor, "UTC", gate)
+            .unwrap();
+        Self {
+            _dir: dir,
+            ledger: Arc::new(ledger),
+            file,
+        }
+    }
+
+    fn install(&self) -> impl FnOnce(&mut AppState) {
+        let ledger = self.ledger.clone();
+        move |state| state.budget_ledger = Some(ledger)
+    }
+
+    /// 账本里的预留行数：另开一个连接直接数，不经账本的接口。
+    fn reservation_rows(&self) -> i64 {
+        Connection::open(&self.file)
+            .unwrap()
+            .query_row("SELECT count(*) FROM reservations", [], |row| row.get(0))
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn under_spend_gate_all_a_zero_balance_blocks_a_warmup_exactly_like_chat() {
+    let budget = Budget::new(0, SpendGate::All);
+    let rig = standard_with(budget.install());
+    let chatted = chat(&rig.app, "idoris/daily", &[]).await;
+    assert_eq!(
+        chatted.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        chatted.raw
+    );
+    let warmed = warm(&rig.app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(
+        warmed.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        warmed.raw
+    );
+    assert_eq!(warmed.error_type(), "budget_exceeded");
+    assert_eq!(warmed.reason(), "budget_exceeded");
+    assert_eq!(
+        warmed.body["error"], chatted.body["error"],
+        "the same 402 body as chat"
+    );
+    assert_eq!(warmed.header("x-idoris-served-locality"), Some("loopback"));
+    // 什么也没发生：没有加载、没有 token、账本里没有行。
+    assert_eq!(rig.adapter.inner.load_call_count("qwen-daily"), 0);
+    assert_eq!(rig.adapter.chats(), 0);
+    assert_eq!(budget.reservation_rows(), 0);
+}
+
+#[tokio::test]
+async fn under_spend_gate_all_a_zero_balance_blocks_a_resident_warmup_before_anything_is_sent() {
+    let server = upstream().await;
+    let budget = Budget::new(0, SpendGate::All);
+    let app = resident_app_with(
+        vec![resident_card(
+            "lmstudio",
+            &server.uri(),
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        budget.install(),
+    );
+    let warmed = warm(&app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(
+        warmed.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        warmed.raw
+    );
+    assert_eq!(warmed.error_type(), "budget_exceeded");
+    assert_eq!(
+        requests_of(&server).await.len(),
+        0,
+        "nothing reached the engine"
+    );
+    assert_eq!(budget.reservation_rows(), 0);
+}
+
+#[tokio::test]
+async fn a_warmup_the_budget_admits_reserves_and_spends_nothing_while_chat_reserves() {
+    // `All` 但余额为正：预热与聊天都放行。预热不留任何行、不动余额；聊天会预留并结算一行——所以上面的「零」说的是预热。
+    let budget = Budget::new(1_000, SpendGate::All);
+    let rig = standard_with(budget.install());
+    let warmed = warm(&rig.app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(warmed.status, StatusCode::OK, "{}", warmed.raw);
+    assert_eq!(budget.reservation_rows(), 0, "a warmup reserves nothing");
+    assert_eq!(budget.ledger.tenant_balance(PERSONAL).unwrap(), 1_000);
+    let chatted = chat(&rig.app, "idoris/daily", &[]).await;
+    assert_eq!(chatted.status, StatusCode::OK, "{}", chatted.raw);
+    assert_eq!(
+        budget.reservation_rows(),
+        1,
+        "chat reserves and settles a row"
+    );
+}
+
+#[tokio::test]
+async fn a_resident_warmup_the_budget_admits_sends_its_request_and_reserves_nothing() {
+    let server = upstream().await;
+    let budget = Budget::new(1_000, SpendGate::All);
+    let app = resident_app_with(
+        vec![resident_card(
+            "lmstudio",
+            &server.uri(),
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        budget.install(),
+    );
+    let warmed = warm(&app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(warmed.status, StatusCode::OK, "{}", warmed.raw);
+    assert_eq!(requests_of(&server).await.len(), 1);
+    assert_eq!(budget.reservation_rows(), 0);
+    assert_eq!(budget.ledger.tenant_balance(PERSONAL).unwrap(), 1_000);
+}
+
+#[tokio::test]
+async fn under_the_default_paid_only_gate_a_zero_balance_does_not_block_a_free_warmup() {
+    // 对照：默认的 `PaidOnly` 对免费调用放行，预热与聊天一样（没有账本的部署也一样：其余用例都没接账本）。
+    let budget = Budget::new(0, SpendGate::PaidOnly);
+    let rig = standard_with(budget.install());
+    let warmed = warm(&rig.app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(warmed.status, StatusCode::OK, "{}", warmed.raw);
+    let chatted = chat(&rig.app, "idoris/daily", &[]).await;
+    assert_eq!(chatted.status, StatusCode::OK, "{}", chatted.raw);
+    assert_eq!(budget.reservation_rows(), 1, "only chat left a row");
+}
+
+#[tokio::test]
+async fn in_tenant_mode_the_warmup_is_checked_against_the_callers_own_tenant() {
+    let ring = keyring_in(Some("acme"), &[("all", ALL_ROLES, LOCAL)]);
+    let secret = ring.secrets["all"].clone();
+    let authenticator = ring.authenticator.clone();
+    // 只有 acme 配了账本（`All`，余额 0）；个人租户没配：检查若取错了租户，会得到别的错误，不是 402。
+    let budget = Budget::for_tenant("acme", 0, SpendGate::All);
+    let install = budget.install();
+    let rig = rig_with(
+        vec![lifecycle_card(&[("daily", "qwen-daily")])],
+        &[("qwen-daily", 1.0)],
+        None,
+        move |state| {
+            state.deploy_mode = idoris_contracts::DeployMode::Tenant;
+            state.virtual_key_authenticator = Some(authenticator);
+            install(state);
+        },
+    );
+    let warmed = warm_as(
+        &rig.app,
+        json!({"model": "idoris/daily"}),
+        &secret,
+        &[("X-iDoris-Tenant", "acme")],
+    )
+    .await;
+    assert_eq!(
+        warmed.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        warmed.raw
+    );
+    assert_eq!(warmed.error_type(), "budget_exceeded");
+    assert_eq!(rig.adapter.inner.load_call_count("qwen-daily"), 0);
 }
 
 // ---------------------------------------------------------------------------------------------

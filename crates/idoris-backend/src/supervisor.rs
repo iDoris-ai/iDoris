@@ -5056,15 +5056,14 @@ mod tests {
             Duration::from_millis(200)
         );
         // Declared: the budget plus the fixed 30 s margin, strictly above the budget so the adapter's own
-        // timeout error is the one reported (the margin is pinned by value: comparing against the constant
-        // itself would pass for any margin, including none).
+        // timeout error is the one reported. The margin is pinned through the computed value (180 + 30):
+        // asserting the constant against its own literal would add nothing.
         let deadline = load_call_deadline(
             &declares(Some(Duration::from_secs(180))),
             &config(Duration::from_secs(30)),
         );
         assert_eq!(deadline, Duration::from_secs(210));
         assert!(deadline > Duration::from_secs(180));
-        assert_eq!(ADAPTER_LOAD_BACKSTOP_MARGIN, Duration::from_secs(30));
         // A small budget does not shrink the deadline below the generic one.
         assert_eq!(
             load_call_deadline(

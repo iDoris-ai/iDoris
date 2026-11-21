@@ -12,12 +12,16 @@
 //! - **resident 卡**：没有生命周期可管，按能力发一个最小的真实请求（chat：`max_tokens: 1`；embedding：输入 `"warmup"`），
 //!   请求在自己的任务里跑、有自己的响应头期限（[`crate::proxy::WARMUP_HEADER_TIMEOUT`]，不是聊天的 10 秒，也不是 `timeout_ms`）。
 //!   规范没有定义 rerank 的最小请求，rerank 的 resident 卡明确拒绝（400 `unsupported_field` / `unsupported_model`），什么也不发。
+//!   请求占着代理的一个并发许可（共 32 个，和聊天共用）直到结束，所以有两道限制（[`Registry`]）：同一模型的并发预热合并成一个请求，
+//!   每把数据 key 自己发起的在途请求有上限（429 `warmup_in_flight_limited`）。
 //! - **`timeout_ms` 到点只是放弃等待**：返回 504 `warmup_timeout`，**不取消、不缩短**任何东西。生命周期卡：Supervisor 的加载任务
 //!   与请求的 future 无关，照常跑完并清掉 `load.pending`，之后的预热或聊天直接看到「已就绪」。resident 卡：最小请求在它自己的
 //!   任务里，不被打断，直到上游答了或它自己的期限到点，代理照常结算熔断的准入（504 按既有规则计入提供方熔断）。客户端断开同理。
 //!   预热自己的 `timeout_ms` 与客户端断开不留围栏；引擎侧的超时（`RuntimeAdapter::load_timeout`，生产缺省 180 秒）或 panic 保持
 //!   既有的「结果未知」保护，围栏保留（行为同聊天，没有变）。
-//! - 不进用量与预算记录（本地免费；付费卡直接拒绝），写一条 `intent: warmup` 的审计事件（见 `record_id_middleware`）。请求被取消
+//! - **预算**：接了账本的部署里，`SpendGate::All` 下余额不足的租户聊天是 402，预热也一样（一次只读的 `check_admission`，不预留、
+//!   不结算），免费调用在默认的 `PaidOnly` 下放行。
+//! - 不进用量记录、不占用预算（本地免费；付费卡直接拒绝），写一条 `intent: warmup` 的审计事件（见 `record_id_middleware`）。请求被取消
 //!   （客户端断开）时中间件走不到那里，由 [`CancelAudit`] 补上：完成、`timeout_ms` 到点、取消各写恰好一条。
 
 use std::collections::HashMap;
