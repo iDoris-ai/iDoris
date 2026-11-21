@@ -68,12 +68,20 @@ impl BoundSupervisor {
         self.handle.is_ready(model_id).await
     }
 
+    /// 引擎进程被换掉了（IDORIS-CORE S6，引擎管理器调用）：让 Supervisor 的账本跟上，见
+    /// [`idoris_backend::SupervisorHandle::engine_replaced`]。
+    pub(crate) async fn engine_replaced(&self, sample: bool) -> Result<(), BackendError> {
+        self.handle.engine_replaced(sample).await
+    }
+
     /// Constructs the adapter from the same card used for the binding.
     pub fn spawn_omlx(card: &ComponentCard) -> Result<Self, String> {
         let adapter = idoris_upstream::OmlxAdapter::new(
             idoris_upstream::OmlxAdapterConfig::for_base_url(card.endpoint.clone()),
         )
-        .map_err(|err| format!("无法构造 oMLX 适配器（{}）：{err}", card.provider.id))?;
+        .map_err(|err| format!("无法构造 oMLX 适配器（{}）：{err}", card.provider.id))?
+        // 每个请求按引擎管理器此刻的登记取 key：引擎换了、停了、端口换了主人，之前读到的 key 都不能再用。
+        .with_per_request_key();
         let handle = idoris_backend::Supervisor::spawn(
             std::sync::Arc::new(adapter),
             idoris_backend::SupervisorConfig::default(),

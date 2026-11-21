@@ -352,11 +352,12 @@ pub struct AppState {
     /// `phase`、`ready`、`started_at_ms`、`registered`、`upstreams`。默认没有任何上游（库调用方与测试）；
     /// 启动时由 `idoris` 二进制按组件卡装配并起后台探测器（`readiness::spawn_prober`）。
     /// `/health` 只读它，O(1)，不做任何上游 I/O。
+    ///
+    /// 它也是数据面判断「这张托管卡现在能不能把请求交给引擎」的依据（[`readiness::HealthState::managed_failure`]，IDORIS-CORE
+    /// S6）：**每个请求读此刻的快照**，没有就绪的托管引擎（降级放行时就没起来的，或者运行期失败、被 Admin 停下、重启中、
+    /// 端口换了主人的）路由到它的请求不碰引擎，直接 503 `local_only_unavailable`，原因码是 `reason`（没有稳定原因码的失败
+    /// 沿用已有的 `supervisor_unavailable`），见 [`managed_unavailable_response`]。
     pub health_state: readiness::HealthState,
-    /// 门控降级放行时没有就绪的托管上游（接口规范 §2.7.6，勘误六）：上游 id → 状态与原因。路由到这些卡的请求不碰引擎，
-    /// 直接 503 `local_only_unavailable`，原因码是 `reason`（没有稳定原因码的失败沿用已有的 `supervisor_unavailable`），见
-    /// [`managed_unavailable_response`]。默认空：没有托管卡，或者托管引擎都就绪了。
-    pub managed_failures: Arc<std::collections::BTreeMap<String, readiness::ManagedFailure>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -406,7 +407,6 @@ impl std::fmt::Debug for AppState {
                 &self.cloud_tier.as_ref().map(|_| "configured"),
             )
             .field("health_state", &self.health_state)
-            .field("managed_failures", &self.managed_failures)
             .finish()
     }
 }
@@ -453,7 +453,6 @@ impl Default for AppState {
             cloud_ingress: None,
             cloud_tier: None,
             health_state: readiness::HealthState::default(),
-            managed_failures: Arc::default(),
             http_client,
         }
     }
@@ -1946,21 +1945,15 @@ async fn get_capabilities(State(state): State<Arc<AppState>>) -> Response {
 /// `provider.id`, matching `server.ts`). Delegates to [`models::list_models`];
 /// authentication failures surface as structured upstream errors.
 async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // 降级放行时没就绪的托管卡不探测（接口规范 §2.7.6，勘误六）：它的引擎没起来，或者那个端口上的东西没有通过属主校验、
-    // 不能给它发 key；探测只会得到错误（一个 401 就会把整个列表变成 502）。别的卡照常列出。
-    let cards: std::borrow::Cow<'_, [idoris_contracts::ComponentCard]> =
-        if state.managed_failures.is_empty() {
-            std::borrow::Cow::Borrowed(state.cards.as_slice())
-        } else {
-            std::borrow::Cow::Owned(
-                state
-                    .cards
-                    .iter()
-                    .filter(|card| !state.managed_failures.contains_key(&card.provider.id))
-                    .cloned()
-                    .collect(),
-            )
-        };
+    // 此刻没在服务的托管卡不探测（接口规范 §2.7.6，勘误六、勘误七）：它的引擎没起来、被停下了、在重启，或者那个端口上的东西没有
+    // 通过属主校验、不能给它发 key；探测只会得到错误（一个 401 就会把整个列表变成 502）。别的卡照常列出。
+    // 每次请求读此刻的状态，不用完整的 Router 创建时拍下的名单（IDORIS-CORE S6，G1）。
+    let cards: Vec<idoris_contracts::ComponentCard> = state
+        .cards
+        .iter()
+        .filter(|card| state.health_state.managed_failure(&card.provider.id).is_none())
+        .cloned()
+        .collect();
     match models::list_models_with_subscriptions(
         &state.http_client,
         &cards,
@@ -2227,17 +2220,22 @@ fn headroom_breach_confirmed(headers: &HeaderMap) -> bool {
     )
 }
 
-/// 路由到了一个没有就绪的托管引擎（门控降级放行，接口规范 §2.7.6，勘误六）：不碰引擎，直接 503 `local_only_unavailable`
-/// （和别的本地失败同一个 `type`），原因码是该上游在 `/health` 里的 `reason`（`engine_not_found`、`budget_zero`、
-/// `crash_loop`……都是已有的原因码，不新增错误码）；没有稳定原因码的失败（例如模型目录取不到）沿用这条路径上已有的
-/// `supervisor_unavailable`。这张卡不是没就绪的托管卡时返回 `None`。
+/// 路由到了一个此刻没在服务的托管引擎（降级放行时就没起来的，或者运行期失败、被 Admin 停下、重启中、端口换了主人的；接口规范
+/// §2.7.6 勘误六、勘误七）：不碰引擎，直接 503 `local_only_unavailable`（和别的本地失败同一个 `type`），原因码是该上游在
+/// `/health` 里的 `reason`（`engine_not_found`、`budget_zero`、`crash_loop`、`port_in_use`……都是已有的原因码，不新增错误码）；
+/// 没有稳定原因码的失败（例如模型目录取不到、被停下、重启中）沿用这条路径上已有的 `supervisor_unavailable`。这张卡不是
+/// 没在服务的托管卡时返回 `None`。
 ///
-/// 这一步在选定候选之后、转发之前：resident 的托管卡也走这里，所以**请求不会发给一个没有通过属主校验、或者根本没起来的端口**。
+/// **每个请求读此刻的状态**（[`readiness::HealthState::managed_failure`]），不用完整的 Router 创建时拍下的名单：名单在引擎
+/// 运行期失败之后就是错的（请求还会发给已经换了主人的端口）。这一步在选定候选之后、转发之前：resident 的托管卡也走这里，所以
+/// **请求不会发给一个没有通过属主校验、被停下、或者根本没起来的端口**。
 fn managed_unavailable_response(
     state: &AppState,
     selected: &dispatch::Selected,
 ) -> Option<Response> {
-    let failure = state.managed_failures.get(&selected.card.provider.id)?;
+    let failure = state
+        .health_state
+        .managed_failure(&selected.card.provider.id)?;
     let reason_code = failure
         .reason
         .map_or("supervisor_unavailable", readiness::UpstreamReason::as_str);
@@ -2246,7 +2244,7 @@ fn managed_unavailable_response(
         "local_only_unavailable",
         reason_code,
         format!(
-            "the managed {} engine behind \"{}\" is {} and does not serve requests until iDoris is restarted",
+            "the managed {} engine behind \"{}\" is {} and does not serve requests now",
             failure.engine_kind,
             selected.card.provider.id,
             failure.state.as_str()

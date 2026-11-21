@@ -27,6 +27,14 @@ pub struct Behavior {
     pub exit_after_secs: f64,
     /// 一启动就以这个退出码退出，不监听（模拟引擎起不来）；`None` = 正常。
     pub exit_immediately: Option<i32>,
+    /// 收到 SIGTERM 时先写一个标记文件（`sigterm-<pid>`，证明走的是优雅停止，不是 SIGKILL），再继续服务这么久才退出（0 = 立刻
+    /// 退出）；`None` = 不接管 SIGTERM（默认的终止行为）。
+    pub trap_sigterm_secs: Option<f64>,
+    /// 有状态的模型接口（IDORIS-CORE S6）：目录里一个模型 `fake-model`，`POST /v1/models/fake-model/load|unload` 改变**这个进程**
+    /// 里的已加载集合，`/v1/models/status`、`/api/status` 如实报告，`POST /v1/chat/completions` 只在它已加载时才 200（真的 oMLX
+    /// 会按需加载；这里故意不，这样账本过期的聊天会真的失败）。进程换了，已加载集合就空了。带 key 的 POST 也记进 `requests.log`
+    /// （路径前加 `POST:`）。`false` = 只有 S5 的三个状态接口。
+    pub stateful_models: bool,
 }
 
 /// 一个生成好的假引擎。
@@ -120,6 +128,19 @@ impl FakeOmlx {
             .collect()
     }
 
+    /// 第 `pid` 号引擎进程收到过 SIGTERM（它的 `trap_sigterm_secs` 写下的标记）。
+    pub fn got_sigterm(&self, pid: u64) -> bool {
+        self.record_dir.join(format!("sigterm-{pid}")).exists()
+    }
+
+    /// 有状态的引擎（[`Behavior::stateful_models`]）收到过几次 `POST /v1/models/<id>/load`。
+    pub fn model_loads(&self) -> usize {
+        self.requests()
+            .iter()
+            .filter(|(path, _)| path.starts_with("POST:/v1/models/") && path.ends_with("/load"))
+            .count()
+    }
+
     /// 请求记录：每行 `<路径> <none|ok|bad>`（有没有带 `Authorization`，带的是不是引擎的私有 key）。
     pub fn requests(&self) -> Vec<(String, String)> {
         std::fs::read_to_string(self.record_dir.join("requests.log"))
@@ -175,13 +196,18 @@ pub fn spawn_retrying(command: &mut Command) -> std::io::Result<ChildGuard> {
 
 fn python_source(behavior: &Behavior, record_dir: &Path) -> String {
     format!(
-        r#"import http.server, json, os, sys, threading, time
+        r#"import http.server, json, os, signal, sys, threading, time
 
 RECORDS = {records}
 LISTEN_DELAY = {delay}
 NEVER_LISTEN = {never}
 EXIT_AFTER = {exit_after}
 EXIT_IMMEDIATELY = {exit_now}
+TRAP_SIGTERM = {trap}
+STATEFUL = {stateful}
+MODEL = "fake-model"
+SIZE = 1000000000
+LOADED = set()
 
 def arg(name):
     args = sys.argv[1:]
@@ -211,6 +237,15 @@ if EXIT_IMMEDIATELY is not None:
 
 KEY = os.environ.get("OMLX_API_KEY")
 LOCK = threading.Lock()
+
+if TRAP_SIGTERM is not None:
+    def on_term(signum, frame):
+        with open(os.path.join(RECORDS, "sigterm-%d" % os.getpid()), "w") as marker:
+            marker.write("1")
+        if TRAP_SIGTERM <= 0:
+            os._exit(0)
+        threading.Timer(TRAP_SIGTERM, lambda: os._exit(0)).start()
+    signal.signal(signal.SIGTERM, on_term)
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -247,8 +282,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/v1/models":
             return self.reply(200, {{"object": "list", "data": [{{"id": "fake-model", "object": "model"}}]}})
         if self.path == "/v1/models/status":
+            if STATEFUL:
+                return self.reply(200, {{"models": [{{"id": MODEL, "estimated_size": SIZE, "loaded": MODEL in LOADED, "pinned": False}}]}})
             return self.reply(200, {{"models": [{{"id": "fake-model", "estimated_size": 1000000000}}]}})
         if self.path == "/api/status":
+            if STATEFUL:
+                return self.reply(200, {{"loaded_models": sorted(LOADED), "model_memory_used": SIZE * len(LOADED), "model_memory_max": 17179869184, "pressure": "ok"}})
             return self.reply(200, {{"loaded_models": [], "model_memory_used": 0, "model_memory_max": 17179869184, "pressure": "ok"}})
         return self.reply(404, {{"error": "not found"}})
 
@@ -256,6 +295,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length:
             self.rfile.read(length)
+        if not STATEFUL:
+            return self.reply(404, {{"error": "not found"}})
+        header = self.headers.get("Authorization")
+        if header is None:
+            auth = "none"
+        elif KEY is not None and header == "Bearer " + KEY:
+            auth = "ok"
+        else:
+            auth = "bad"
+        with LOCK:
+            with open(os.path.join(RECORDS, "requests.log"), "a") as f:
+                f.write("POST:%s %s\n" % (self.path, auth))
+        if KEY is not None and auth != "ok":
+            return self.reply(401, {{"error": {{"message": "invalid api key"}}}})
+        parts = self.path.strip("/").split("/")
+        if len(parts) == 4 and parts[0] == "v1" and parts[1] == "models" and parts[3] in ("load", "unload"):
+            if parts[2] != MODEL:
+                return self.reply(404, {{"error": {{"message": "unknown model"}}}})
+            if parts[3] == "load":
+                LOADED.add(MODEL)
+            else:
+                LOADED.discard(MODEL)
+            return self.reply(200, {{}})
+        if self.path == "/v1/chat/completions":
+            if MODEL in LOADED:
+                return self.reply(200, {{"model": MODEL, "choices": [{{"message": {{"content": "hello from the fake engine"}}}}]}})
+            return self.reply(404, {{"error": {{"message": "model not loaded"}}}})
         return self.reply(404, {{"error": "not found"}})
 
 if EXIT_AFTER > 0:
@@ -286,6 +352,15 @@ server.serve_forever()
         exit_now = match behavior.exit_immediately {
             Some(code) => code.to_string(),
             None => "None".to_owned(),
+        },
+        trap = match behavior.trap_sigterm_secs {
+            Some(seconds) => format!("{seconds:?}"),
+            None => "None".to_owned(),
+        },
+        stateful = if behavior.stateful_models {
+            "True"
+        } else {
+            "False"
         },
     )
 }

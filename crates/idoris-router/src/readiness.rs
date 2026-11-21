@@ -139,6 +139,24 @@ pub struct ManagedFailure {
     pub reason: Option<UpstreamReason>,
 }
 
+/// 一个托管上游处于这个状态与原因时，数据面是不是该把请求交给它（IDORIS-CORE S6，G1；接口规范 §2.7.6 勘误六（9）、勘误七）。
+///
+/// 只有就绪的才交；正在拉起（`starting`、`restarting`）、没有引擎（`absent`）、失败（`failed`，含外部引擎的端口换了主人：
+/// `port_in_use`）、被停下（`stopped`）的不交：请求不碰那个端口，直接 503 带原因。`unavailable` 要看有没有确定的原因：
+/// 有（要 key、key 被拒、围栏还在、Supervisor 粘滞、等不到就绪）是确定的失败，不交；没有（引擎活着、探测没答上来，例如 oMLX
+/// 正忙着加载大模型，`/v1/models` 变慢）还是交：那只是慢，Supervisor 自己的调用有超时，不能因为一次探测慢就让整张卡 503。
+pub fn upstream_serves(state: UpstreamState, reason: Option<UpstreamReason>) -> bool {
+    match state {
+        UpstreamState::Ready => true,
+        UpstreamState::Unavailable => reason.is_none(),
+        UpstreamState::Starting
+        | UpstreamState::Restarting
+        | UpstreamState::Failed
+        | UpstreamState::Stopped
+        | UpstreamState::Absent => false,
+    }
+}
+
 /// `/health.upstreams[]` 的元素。`reason` 出现时 `state` 不是 `ready`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpstreamStatus {
@@ -356,6 +374,24 @@ impl HealthState {
             upstream.reason = reason;
             upstream.owned = owned;
         }
+    }
+
+    /// 这个托管上游此刻没在服务就给出它的状态与原因（[`upstream_serves`]），否则（在服务、不是托管上游、没有这个 id）`None`。
+    /// **每次调用都读此刻的快照**：数据面据此在每个请求上决定要不要把它交给引擎，引擎在运行期失败、被 Admin 停下、重启中、
+    /// 端口换了主人，下一个请求就 503，不靠完整的 Router 创建时拍下的名单（IDORIS-CORE S6，G1）。
+    pub fn managed_failure(&self, id: &str) -> Option<ManagedFailure> {
+        self.inner
+            .upstreams
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|upstream| upstream.managed && upstream.id == id)
+            .filter(|upstream| !upstream_serves(upstream.state, upstream.reason))
+            .map(|upstream| ManagedFailure {
+                engine_kind: upstream.engine_kind.clone(),
+                state: upstream.state,
+                reason: upstream.reason,
+            })
     }
 
     pub fn view(&self) -> HealthView {
@@ -825,6 +861,66 @@ mod tests {
         health.apply("lmstudio", Observation::Ready);
         health.set_managed("omlx", Ready, None, true);
         assert_eq!(health.view().phase, Phase::Ready);
+    }
+
+    /// IDORIS-CORE S6 (G1): which managed states keep a request away from the engine.
+    #[test]
+    fn only_a_ready_engine_or_one_that_is_merely_slow_to_answer_is_handed_requests() {
+        use UpstreamReason::*;
+        use UpstreamState::*;
+        assert!(upstream_serves(Ready, None));
+        // Alive but the probe did not answer, no definite reason (oMLX busy loading a big model): still served.
+        assert!(upstream_serves(Unavailable, None));
+        // A definite reason for `unavailable` is a definite failure.
+        for reason in [
+            AuthRequired,
+            AuthFailed,
+            FencePending,
+            StartupLatched,
+            StartupTimeout,
+            PortInUse,
+        ] {
+            assert!(!upstream_serves(Unavailable, Some(reason)), "{reason:?}");
+        }
+        // Not running, or running a state that has not served yet: never, with or without a reason.
+        for state in [Starting, Restarting, Failed, Stopped, Absent] {
+            assert!(!upstream_serves(state, None), "{state:?}");
+            assert!(!upstream_serves(state, Some(CrashLoop)), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn managed_failure_reads_the_live_snapshot_for_managed_upstreams_only() {
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", Ready),
+                status("lmstudio", Ready, None),
+            ],
+        );
+        assert_eq!(health.managed_failure("omlx"), None, "ready: served");
+        // The engine fails at run time: the very next read says so (nothing was snapshotted at gate time).
+        health.set_managed("omlx", Failed, Some(UpstreamReason::PortInUse), false);
+        assert_eq!(
+            health.managed_failure("omlx"),
+            Some(ManagedFailure {
+                engine_kind: "omlx".to_owned(),
+                state: Failed,
+                reason: Some(UpstreamReason::PortInUse),
+            })
+        );
+        health.set_managed("omlx", Stopped, None, false);
+        assert_eq!(
+            health.managed_failure("omlx").map(|failure| failure.state),
+            Some(Stopped)
+        );
+        health.set_managed("omlx", Ready, None, true);
+        assert_eq!(health.managed_failure("omlx"), None, "and it is served again once ready");
+        // Not managed: never (the prober's cards keep their v0.5.0 path), however bad the state; unknown id: none.
+        health.apply("lmstudio", Observation::Unavailable(Some(UpstreamReason::AuthRequired)));
+        assert_eq!(health.managed_failure("lmstudio"), None);
+        assert_eq!(health.managed_failure("nope"), None);
     }
 
     #[test]

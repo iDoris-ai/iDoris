@@ -526,9 +526,9 @@ pub async fn models(state: &AppState) -> AdminModelsResponse {
         if card.form != idoris_contracts::component_card::Form::HttpService {
             continue;
         }
-        // 降级放行时没就绪的托管卡不探测（引擎没起来，或者那个端口上的东西没有通过属主校验，不能给它发 key）：
-        // 如实报「不可用」。
-        if state.managed_failures.contains_key(&card.provider.id) {
+        // 此刻没在服务的托管卡不探测（引擎没起来、被停下、在重启，或者那个端口上的东西没有通过属主校验，不能给它发 key）：
+        // 如实报「不可用」。读此刻的状态（IDORIS-CORE S6，G1）。
+        if state.health_state.managed_failure(&card.provider.id).is_some() {
             sources.push(AdminModelSource {
                 provider_id: card.provider.id.clone(),
                 source: AdminModelSourceKind::HttpModelsEndpoint,
@@ -933,6 +933,7 @@ mod tests {
             "/admin/api/v1/models",
             "/admin/api/v1/roles",
             "/admin/api/v1/runtimes",
+            "/admin/api/v1/upstreams",
             "/admin/api/v1/capacity",
             "/admin/",
         ] {
@@ -1117,7 +1118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_admin_router_exposes_only_the_five_read_routes() {
+    async fn authenticated_admin_router_exposes_the_five_read_routes_and_the_upstreams_read() {
         let token = AdminSessionToken::mint();
         let secret = token.expose_secret().to_string();
         let app = build_admin_app(AppState::default(), token);
@@ -1128,6 +1129,7 @@ mod tests {
             "/admin/api/v1/models",
             "/admin/api/v1/roles",
             "/admin/api/v1/runtimes",
+            "/admin/api/v1/upstreams",
         ] {
             let response = app
                 .clone()

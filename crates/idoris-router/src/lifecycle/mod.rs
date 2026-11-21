@@ -50,18 +50,23 @@
 //! `start`（[`CommandError::RestartRequired`]），要重启 iDoris：它们的 Supervisor 是放行时创建的，之后引擎好了也读不到
 //! （运行期引擎换代是 v0.6.1 / S10 的事）。退出码 5 的语义不变：只有放行时已经就绪的自有引擎，之后进程退出才触发。
 //!
-//! # 门控放行之后的命令（S6，规范 §2.11.4、勘误七）
+//! # 门控放行之后的命令与 Supervisor 的账本（S6，规范 §2.11.4、勘误七）
 //!
-//! Admin 的 `start`/`stop`/`restart` 经 [`EngineManager::start_upstream`] 等进来。**门控放行之后引擎不能换代**：Supervisor
-//! 在放行时对引擎采样一次（账本是当时已加载的模型），它的适配器在创建时抓住了引擎当时的私有 key（每次拉起都换一个新的）；
-//! 放行时没就绪的连 Supervisor 都没有。换代之后这些全部过期，而 Supervisor 没有复位、排空、关闭的接口（账本只迁移、不删除，
-//! 迟到的 `OpDone`/`ChatDone` 没有代际可分辨，围栏的 `.owner.lock` 一直被 actor 持有），安全地复位要的是 S10 那一整套
-//! （排空、代际、重建 actor 与适配器），不是一个小改动。所以：
+//! Admin 的 `start`/`stop`/`restart` 经 [`EngineManager::start_upstream`] 等进来。门控放行之后完整的 Router 里的 Supervisor 在放行时
+//! 对引擎采样了一次：账本里是当时已加载的模型。**引擎换了一个进程**（`restart`，或 `stop` 之后的 `start`），这份账本就过期了
+//! ——它以为 Ready 的模型已经不在引擎里，共享容量账本里还占着旧进程的内存；适配器每个请求按引擎管理器此刻的登记取 key
+//! （[`idoris_upstream::OmlxAdapter::with_per_request_key`]），不抓构造时的私有 key。所以引擎管理器在新引擎就绪、**发布 `ready`
+//! 之前**让 Supervisor 复位（`SupervisorHandle::engine_replaced`）：之前这个上游对数据面是 503（[`crate::readiness::upstream_serves`]），
+//! 没有请求会带着过期的账本进来；Supervisor 只在静止时复位（有进行中的加载或聊天回 `Busy`，管理器等），所以旧一代的完成消息
+//! 不可能落在重建的账本上。复位对着新进程重新采样（和启动采样同一套规矩），之后下一次请求发现模型没加载，就重新加载。
 //!
-//! - `restart`：一律 [`CommandError::RestartRequired`]。
-//! - `start`：还在被监管的实例（`ready`、`unavailable`……）什么也不做，是幂等；终局的实例（降级放行时冻结的、放行之后被 `stop`
-//!   停下的）[`CommandError::RestartRequired`]。
-//! - `stop`：照常可用。停引擎不换代，只是这个实例从此是终局；只有重启 iDoris 才会回来（[`ManagedView::restart_required`]）。
+//! - 引擎进程的身份（自有引擎：pid 加启动时间；外部引擎：校验通过的监听者 pid）没变（`start` 重新认回了同一个引擎）：账本没有过期，
+//!   不复位。
+//! - `stop`：进程确认消失之后，清空账本（不问引擎），共享容量账本里的占用放掉；私有 key 在这之后才撤销（G2）。
+//! - 复位失败（引擎答不上采样、围栏还在）：Supervisor 把错误粘滞住（fail closed），这个引擎不放行，停掉，按一次失败算，退避之后
+//!   重来；Supervisor 没有了（actor 退出，或检测到自己的账本损坏）是终局，要重启 iDoris。
+//! - **放行时没就绪的上游（降级放行）冻结**：完整的 Router 里根本没有它的 Supervisor，`start`、`restart`
+//!   [`CommandError::RestartRequired`]。这是 S5 起的已知限制，不是账本过期的问题。
 //!
 //! 门控放行之前这些命令照旧（真的 `start`、`restart`），但 Admin 的完整路由只在放行之后才有（放行之前除 `status` 外一律
 //! 503 `idoris_starting`），所以只有进程内的调用方用得到。

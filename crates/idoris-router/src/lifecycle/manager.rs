@@ -188,9 +188,9 @@ pub enum CommandError {
     NotOwned,
     /// 实例任务已经结束（管理器在停止）。
     Closed,
-    /// 门控放行之后，引擎不能在运行期换代（S6，规范勘误七）：完整的 Router 里的 Supervisor 在放行时对引擎采样一次，它的适配器
-    /// 抓着当时引擎的私有 key，账本里是当时已加载的模型；放行时没有就绪的（降级放行）连 Supervisor 都没有。引擎换代（`restart`，
-    /// 或终局之后的 `start`）之后这些都过期，修它是运行期引擎换代（v0.6.1 / S10）的事，所以 v0.6.0 要重启 iDoris。
+    /// 这个上游在门控放行时没有就绪（降级放行）：完整的 Router 里根本没有它的 Supervisor，之后即使引擎好了也读不到（给它建
+    /// Supervisor 要重建 Router，那是运行期引擎换代之外的事，S5 起就是已知限制）。放行时就绪的上游不冻结：引擎换代（`restart`、
+    /// `stop` 之后的 `start`）时它们的 Supervisor 复位（[`super::instance`] 的 `sync_supervisor`）。要重启 iDoris。
     RestartRequired,
 }
 
@@ -204,13 +204,6 @@ impl CommandError {
             Self::RestartRequired => "restart_required",
         }
     }
-}
-
-/// 门控放行之后，一个**终局**的实例（放行时没就绪而冻结的、之后被 Admin `stop` 停下的、自有引擎退出之后……）不再被监管，也不能
-/// 在运行期换代：只有重启 iDoris 才会回来（S6，规范勘误七）。门控放行之前不存在这回事（终局的实例仍可以被 `start`）。
-/// `GET /admin/api/v1/upstreams` 的 `restart_required` 与实例任务对 `start` 的回答都用它，口径只有这一处。
-pub(super) fn restart_required(gate_open: bool, terminal: bool) -> bool {
-    gate_open && terminal
 }
 
 /// 状态从 `previous` 变到 `next` 是不是一次新的失败：进入 `restarting` 或 `failed` 才算，而且是从不是这两个之一的状态进入（
@@ -233,7 +226,8 @@ pub struct ManagedView {
     pub port: u16,
     /// 自有引擎的进程号（`owned` 为真才有）。
     pub pid: Option<u32>,
-    /// 只有重启 iDoris 才能让这个上游回来（[`restart_required`]）。
+    /// 只有重启 iDoris 才能让这个上游回来：它在门控放行时没就绪（降级放行，冻结），完整的 Router 里没有它的 Supervisor
+    /// （[`CommandError::RestartRequired`]）。
     pub restart_required: bool,
     /// iDoris 启动以来这个实例失败过几次：状态进入 `restarting` 或 `failed` 的次数。
     pub failure_count: u32,
@@ -616,36 +610,34 @@ impl EngineManager {
         result
     }
 
-    /// 门控放行之前：从 `stopped`、`failed`、`absent`、`unavailable` 重新走启动决策；已经 `ready`、或正在启动时幂等。
-    /// **门控放行之后**（S6，勘误七）引擎不能换代：还在被监管的（`ready`、`unavailable`……）什么也不做，是幂等；终局的
-    /// （放行时没就绪而冻结的、被 `stop` 停下的）一律 [`CommandError::RestartRequired`]，要重启 iDoris。
+    /// 从 `stopped`、`failed`、`absent`、`unavailable` 重新走启动决策；已经 `ready`、或正在启动时幂等。一个还活着的自有引擎
+    /// （`unavailable`：活着却不答）先走完整的停止路径（优雅停止、撤销私有 key），不是丢弃句柄（G3）。门控放行之后引擎换了一个
+    /// 进程，Supervisor 的账本在发布 `ready` 之前复位（S6）；放行时没就绪而冻结的上游 [`CommandError::RestartRequired`]。
     pub async fn start_upstream(&self, id: &str) -> Result<(), CommandError> {
         self.command_logged(id, "start", Command::Start).await
     }
 
     /// 停止 iDoris 自己拥有的引擎，状态 `stopped`；不是自己的（外部引擎、没有引擎）一律 [`CommandError::NotOwned`]，
-    /// 已经 `stopped` 时幂等。**门控放行之后照样可用**：停掉引擎不换代，这个实例从此是终局（只有重启 iDoris 才会回来）。
-    /// 命令被接受时就回答，引擎停下之后状态才变成 `stopped`（至多 `stop_grace` 加一点余量）：调用方轮询 `/health` 或 Admin。
+    /// 已经 `stopped` 时幂等。命令被接受时就回答，引擎停下之后状态才变成 `stopped`（至多 `stop_grace` 加一点余量）：调用方轮询
+    /// `/health` 或 Admin。进程确认消失之后，私有 key 才撤销（G2），Supervisor 的账本也清空（引擎已经没有了）。
     pub async fn stop_upstream(&self, id: &str) -> Result<(), CommandError> {
         self.command_logged(id, "stop", Command::Stop).await
     }
 
-    /// 门控放行之前：`stop` 之后重新走启动决策；不是自己拥有的引擎同样 [`CommandError::NotOwned`]。
-    /// **门控放行之后一律 [`CommandError::RestartRequired`]**（S6，勘误七）：重启就是引擎换代，Supervisor 的账本与适配器
-    /// 抓着的私有 key 都会过期，v0.6.0 做不了（运行期引擎换代是 v0.6.1 / S10）。
+    /// `stop` 之后重新走启动决策；不是自己拥有的引擎同样 [`CommandError::NotOwned`]。门控放行之后新引擎就绪时，Supervisor 的
+    /// 账本在发布 `ready` 之前对着新进程重建（S6）；放行时没就绪而冻结的上游 [`CommandError::RestartRequired`]。
     pub async fn restart_upstream(&self, id: &str) -> Result<(), CommandError> {
         self.command_logged(id, "restart", Command::Restart).await
     }
 
     /// 每个托管上游此刻的只读快照（`GET /admin/api/v1/upstreams`，S6）。在管理器自己的状态表的锁里一次读完，所以每个实例的
-    /// 各个字段彼此一致；门控是否放行也在这把锁里读（[`Self::open_gate`] 在同一把锁里放行），所以 `restart_required` 与状态一致。
+    /// 各个字段彼此一致；冻结的名单只在 [`Self::open_gate`] 里同一把锁下写一次，所以 `restart_required` 与状态一致。
     pub fn views(&self) -> BTreeMap<String, ManagedView> {
         let statuses = self
             .shared
             .statuses
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let gate_open = self.shared.gate_open.load(Ordering::SeqCst);
         statuses
             .iter()
             .filter_map(|(id, status)| {
@@ -658,7 +650,7 @@ impl EngineManager {
                         owned: status.owned,
                         port,
                         pid: status.pid,
-                        restart_required: restart_required(gate_open, status.terminal),
+                        restart_required: self.shared.is_frozen(id),
                         failure_count: status.failures,
                         last_failure_at_ms: status.last_failure_at_ms,
                     },
@@ -728,12 +720,30 @@ mod tests {
     }
 
     #[test]
-    fn only_a_terminal_instance_after_the_gate_opened_needs_an_idoris_restart() {
-        // 门控放行之前，终局的实例仍可以被 `start`；放行之后，还在被监管的（非终局）也不需要重启 iDoris。
-        assert!(!restart_required(false, false));
-        assert!(!restart_required(false, true));
-        assert!(!restart_required(true, false));
-        assert!(restart_required(true, true));
+    fn only_entering_restarting_or_failed_from_something_else_is_a_new_failure() {
+        use UpstreamState::*;
+        let all = [
+            Ready,
+            Starting,
+            Unavailable,
+            Restarting,
+            Failed,
+            Stopped,
+            Absent,
+        ];
+        for previous in all {
+            for next in all {
+                let expected = matches!(next, Restarting | Failed)
+                    && !matches!(previous, Restarting | Failed);
+                assert_eq!(counts_as_failure(previous, next), expected, "{previous:?} -> {next:?}");
+            }
+        }
+        // The two ways a crash is published back to back are one failure, not two.
+        assert!(counts_as_failure(Ready, Failed));
+        assert!(!counts_as_failure(Failed, Restarting));
+        assert!(!counts_as_failure(Failed, Failed));
+        // `unavailable` flaps with the probe: never a failure.
+        assert!(!counts_as_failure(Ready, Unavailable));
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use idoris_backend::BackendError;
 use idoris_backend::load_fence::LoadFence;
 use idoris_upstream::engine::{
     DiscoveryError, EngineError, EngineInstance, EngineKey, EngineLaunch, EngineLaunchSpec,
@@ -18,9 +19,7 @@ use idoris_upstream::engine::{
 use tokio::sync::{mpsc, oneshot};
 
 use super::backoff::{CrashWindow, restart_delay};
-use super::manager::{
-    CommandError, EngineFailure, ManagedPlan, Shared, Status, counts_as_failure, restart_required,
-};
+use super::manager::{CommandError, EngineFailure, ManagedPlan, Shared, Status, counts_as_failure};
 use crate::readiness::{UpstreamReason, UpstreamState, unix_millis_now};
 
 /// 对实例的命令。
@@ -97,6 +96,26 @@ struct External {
     verifier: ListenerVerifier,
 }
 
+/// 一个引擎**进程**的身份：Supervisor 的账本是对着它建的（放行时采样一次；之后每次换代复位时再采样）。身份变了就是换了一个
+/// 进程，账本过期，要复位；没变（`start` 重新认回了同一个引擎）就什么都不用做（IDORIS-CORE S6）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EngineIdentity {
+    /// 自己拉起（或认回）的引擎：pid 加 `ps` 的启动时间（pid 被复用也分得开）。
+    Owned { pid: u32, started_at: String },
+    /// 外部引擎：端口上通过了属主校验的监听者的 pid（升序）。
+    External { pids: Vec<u32> },
+}
+
+/// [`Actor::sync_supervisor`] 的结果。
+enum Synced {
+    /// 账本跟上了，或者不需要跟（还没放行、没有 Supervisor、同一个进程）。
+    Done,
+    /// 等待期间失败了，一会儿再试（引擎已经停掉）。
+    Retry,
+    /// Supervisor 没有了（actor 已退出，或者检测到自己的账本损坏而中毒）：不会自己好，要重启 iDoris（引擎已经停掉）。
+    Permanent,
+}
+
 /// 实例任务 panic（一个 bug）时，不能让它无声地冻结在最后一个状态上（门控永远完不成，或者一个 `ready` 的谎话一直挂着）：
 /// 守卫在展开中被丢弃时把它当成引擎失效报出去，`bin` 以退出码 5 停止，由启动器重启。
 struct PanicReport {
@@ -137,6 +156,11 @@ pub(super) struct Actor {
     /// 状态进入 `restarting` 或 `failed` 的次数与最近一次的墙钟时间（Admin 的只读细节，见 [`Status::failures`]）。
     failures: u32,
     last_failure_at_ms: Option<u64>,
+    /// 最近一次发布 `ready` 时引擎进程的身份：Supervisor 的账本最后一次是对着它建（或复位）的。`None` = 还没有，或者引擎已经
+    /// 停了（下一个就绪的引擎一定要复位）。
+    identity: Option<EngineIdentity>,
+    /// 这一轮启动决策接管的外部引擎的监听者（校验通过时记下，就绪时变成 [`EngineIdentity::External`]）。
+    adopted_pids: Option<Vec<u32>>,
     /// 等待期间收到、还没有处理的命令。
     pending: Option<Request>,
 }
@@ -162,6 +186,8 @@ impl Actor {
             terminal: false,
             failures: 0,
             last_failure_at_ms: None,
+            identity: None,
+            adopted_pids: None,
             pending: None,
         }
     }
@@ -285,34 +311,8 @@ impl Actor {
         }
     }
 
-    /// 门控放行之后，`start` 与 `restart` 的回答（S6，规范勘误七）；门控还没放行是 `None`，命令照旧处理。
-    ///
-    /// 放行之后引擎不能在运行期换代：完整的 Router 里的 Supervisor 在放行时对引擎采样一次，它的账本是当时已加载的模型，它的
-    /// 适配器抓着当时引擎的私有 key（每次拉起都换一个新的）；放行时没就绪的（降级放行）连 Supervisor 都没有。换代之后这些都过期
-    /// （聊天会一直 401 或在账本之外加载），要重建 Supervisor 与 Router，那是 v0.6.1 / S10 的事。所以：
-    ///
-    /// - `restart` 就是换代：一律 [`CommandError::RestartRequired`]。
-    /// - `start`：还在被监管的实例（`ready`、`unavailable`……）没有什么可启动的，是幂等；终局的实例（降级放行时冻结的、之后被
-    ///   `stop` 停下的）只有重启 iDoris 才会回来，[`CommandError::RestartRequired`]。
-    fn after_the_gate(&self, command: &Command) -> Option<Result<(), CommandError>> {
-        if !self.shared.gate_open.load(Ordering::SeqCst) {
-            return None;
-        }
-        match command {
-            Command::Start if restart_required(true, self.terminal) => {
-                Some(Err(CommandError::RestartRequired))
-            }
-            Command::Start => Some(Ok(())),
-            Command::Restart => Some(Err(CommandError::RestartRequired)),
-            Command::Stop | Command::GiveUp | Command::Shutdown { .. } => None,
-        }
-    }
-
     /// 在当前状态下什么也改变不了的命令的回答（`None` = 这个命令要真的处理）。
     fn immediate_answer(&self, command: &Command) -> Option<Result<(), CommandError>> {
-        if let Some(answer) = self.after_the_gate(command) {
-            return Some(answer);
-        }
         match command {
             // 已经好了、或正在启动：幂等。
             Command::Start
@@ -325,6 +325,20 @@ impl Actor {
             }
             // 已经落定（就绪，或终局）：门控等的时间到了也不用再放弃它。
             Command::GiveUp if self.state == UpstreamState::Ready || self.terminal => Some(Ok(())),
+            // 降级放行之后，这个上游不再启动：放行时它没就绪，完整的 Router 里根本没有它的 Supervisor（要重启 iDoris）。放行时
+            // 就绪的上游不冻结：它们的 Supervisor 在引擎换代之后复位（[`Self::sync_supervisor`]）。
+            Command::Start | Command::Restart if self.frozen() => {
+                Some(Err(CommandError::RestartRequired))
+            }
+            // 已经在（重新）启动：幂等。并发的两个 `restart` 只换一次引擎，第二个并入第一个（Admin 也回 202）。
+            Command::Restart
+                if matches!(
+                    self.state,
+                    UpstreamState::Starting | UpstreamState::Restarting
+                ) =>
+            {
+                Some(Ok(()))
+            }
             // 已经停下了：幂等。
             Command::Stop if self.engine.is_none() && self.state == UpstreamState::Stopped => {
                 Some(Ok(()))
@@ -381,13 +395,29 @@ impl Actor {
         }
     }
 
-    /// 停掉并收尾一个引擎（宽限之后 SIGKILL，删记录）。失败只记日志：认不出的进程不发信号。
-    async fn stop_engine(&self, owned: Owned) {
-        self.plan.backend.release(&self.plan.endpoint);
+    /// 停掉并收尾一个引擎（SIGTERM 整组，宽限之后 SIGKILL，删记录），返回是不是**确认**它已经消失（认不出的进程不发信号，
+    /// 那时没有确认，只记日志）。
+    ///
+    /// 私有 key 的登记要等进程确认消失**之后**才撤销（G2）：停止的这几秒里引擎还活着、还在监听，发往它的请求仍然只用它的私有
+    /// key；先撤销就退回默认顺序，会把 `settings.json` 的 key 发给一个正在退出的引擎，进程退出之后端口上换了别的东西也一样。
+    /// 没有确认它消失时不能放回「没人管」的口径：登记成外部、没有验证，私有 key 与 `settings.json` 的 key 都不再发给它。
+    async fn stop_engine(&self, owned: Owned) -> bool {
         let grace = self.timings().stop_grace;
-        if let Err(error) = owned.engine.stop(grace).await {
-            self.log(&format!("停止引擎失败（{}）", error.reason_code()));
+        let confirmed = match owned.engine.stop(grace).await {
+            Ok(()) => true,
+            Err(error) => {
+                self.log(&format!("停止引擎失败（{}）", error.reason_code()));
+                false
+            }
+        };
+        if confirmed {
+            self.plan.backend.release(&self.plan.endpoint);
+        } else {
+            self.plan
+                .backend
+                .govern_external(&self.plan.endpoint, false);
         }
+        confirmed
     }
 
     // -----------------------------------------------------------------------------------------
@@ -402,11 +432,6 @@ impl Actor {
                 let _ = reply.send(result);
             }
         };
-        // 命令在等待期间收到、门控在这之后才放行：现在按放行之后的规矩回答（`immediate_answer` 只看收到那一刻）。
-        if let Some(result) = self.after_the_gate(&command) {
-            answer(result);
-            return current;
-        }
         match command {
             Command::Shutdown { stop_engine } => {
                 self.shutdown(stop_engine).await;
@@ -424,6 +449,11 @@ impl Actor {
                 answer(Ok(()));
                 Step::Idle(Idle::Terminal)
             }
+            // 命令在等待期间收到、门控在这之后才放行：现在按放行之后的规矩回答（`immediate_answer` 只看收到那一刻）。
+            Command::Start | Command::Restart if self.frozen() => {
+                answer(Err(CommandError::RestartRequired));
+                current
+            }
             Command::Start => {
                 answer(Ok(()));
                 match self.state {
@@ -437,6 +467,11 @@ impl Actor {
                     | UpstreamState::Unavailable => {
                         // 操作员显式要求：之前的失败不再计数。
                         self.window.clear();
+                        // 一个还活着的自有引擎（`unavailable`：活着却不答）不能被丢弃：丢弃句柄就是 SIGKILL，绕过 `stop_engine`
+                        // 的优雅停止与私有 key 的撤销，也没有人知道引擎换了（G3）。走完整的停止路径，再重新走启动决策。
+                        if let Some(owned) = self.engine.take() {
+                            self.stop_engine(owned).await;
+                        }
                         Step::Attempt
                     }
                 }
@@ -444,7 +479,11 @@ impl Actor {
             Command::Stop => {
                 if let Some(owned) = self.engine.take() {
                     answer(Ok(()));
-                    self.stop_engine(owned).await;
+                    let confirmed = self.stop_engine(owned).await;
+                    // 进程确认消失：账本里的模型都不在了，让 Supervisor 与共享容量账本也知道（不问引擎，它已经没有了）。
+                    if confirmed {
+                        self.forget_engine().await;
+                    }
                     self.publish_terminal(UpstreamState::Stopped, None);
                     Step::Idle(Idle::Stopped)
                 } else if self.state == UpstreamState::Stopped {
@@ -473,12 +512,14 @@ impl Actor {
     /// iDoris 停止：收尾。`stop_engine` 为真才停自己拥有的引擎。
     async fn shutdown(&mut self, stop_engine: bool) {
         self.external = None;
-        self.plan.backend.release(&self.plan.endpoint);
-        // `stop_engine` 为假：让它继续跑（`StopOnExit::Never` 拉起的，句柄丢弃时不杀进程组），所有权记录留给下一个 iDoris。
-        if let Some(owned) = self.engine.take()
-            && stop_engine
-        {
-            self.stop_engine(owned).await;
+        match self.engine.take() {
+            // 停掉自己拥有的引擎：先等进程退出，之后才撤销私有 key（G2，见 `stop_engine`）。
+            Some(owned) if stop_engine => {
+                self.stop_engine(owned).await;
+            }
+            // `stop_engine` 为假：让它继续跑（`StopOnExit::Never` 拉起的，句柄丢弃时不杀进程组），所有权记录留给下一个
+            // iDoris；这个 iDoris 不再给它发 key。没有自有引擎（外部的、没起来的）：同样撤销。
+            _ => self.plan.backend.release(&self.plan.endpoint),
         }
     }
 
@@ -489,10 +530,19 @@ impl Actor {
     async fn attempt_cycle(&mut self) -> Step {
         self.publish(UpstreamState::Starting, None);
         match self.attempt().await {
-            Attempt::Ready => {
-                self.publish(UpstreamState::Ready, None);
-                Step::Supervise
-            }
+            Attempt::Ready => match self.sync_supervisor().await {
+                Synced::Done => {
+                    self.publish(UpstreamState::Ready, None);
+                    Step::Supervise
+                }
+                // Supervisor 的账本没能跟上：这个引擎不能放行，停掉它（`sync_supervisor` 已经停了），按一次失败算，退避之后重来。
+                Synced::Retry => self.fail(Some(UpstreamReason::StartupLatched)).await,
+                // Supervisor 没有了：不会自己好，要重启 iDoris。
+                Synced::Permanent => {
+                    self.publish_terminal(UpstreamState::Failed, Some(UpstreamReason::StartupLatched));
+                    Step::Idle(Idle::Terminal)
+                }
+            },
             Attempt::Terminal { state, reason } => {
                 self.publish_terminal(state, reason);
                 Step::Idle(Idle::Terminal)
@@ -541,8 +591,13 @@ impl Actor {
     // -----------------------------------------------------------------------------------------
 
     async fn attempt(&mut self) -> Attempt {
-        self.engine = None;
+        // 不丢弃一个还活着的引擎句柄：丢弃就是 SIGKILL，绕过 `stop_engine`（优雅停止、撤销私有 key）。走到这里时命令分支已经把它
+        // 停掉了；万一还有（一个以后加进来的路径忘了），也走完整的停止路径（G3）。
+        if let Some(owned) = self.engine.take() {
+            self.stop_engine(owned).await;
+        }
         self.external = None;
+        self.adopted_pids = None;
         let inspector = self.shared.config.inspector.clone();
 
         // 1. 所有权记录，先于探测。
@@ -679,7 +734,7 @@ impl Actor {
         };
         let verifier = ListenerVerifier::new(self.shared.config.inspector.clone(), policy);
         match verifier.check(self.plan.port).await {
-            ListenerVerdict::Verified { .. } => {}
+            ListenerVerdict::Verified { pids } => self.adopted_pids = Some(pids),
             ListenerVerdict::NoListener => {
                 // 探测与校验之间监听者没了：再来一次。
                 return Attempt::Failure { reason: None };
@@ -998,6 +1053,109 @@ impl Actor {
     }
 
     // -----------------------------------------------------------------------------------------
+    // Supervisor 的账本跟着引擎换代（IDORIS-CORE S6）
+    // -----------------------------------------------------------------------------------------
+
+    /// 此刻引擎进程的身份（就绪之后才有）：自有引擎是 pid 加启动时间，外部引擎是校验通过的监听者的 pid。
+    fn current_identity(&self) -> Option<EngineIdentity> {
+        match &self.engine {
+            Some(owned) => {
+                let record = owned.engine.record();
+                Some(EngineIdentity::Owned {
+                    pid: record.pid,
+                    started_at: record.started_at.clone(),
+                })
+            }
+            None => self
+                .adopted_pids
+                .clone()
+                .map(|pids| EngineIdentity::External { pids }),
+        }
+    }
+
+    /// 完整的 Router 里这个上游的 Supervisor（门控放行之后才有；resident 的托管卡没有 Supervisor）。
+    fn supervisor(&self) -> Option<crate::dispatch::BoundSupervisor> {
+        if !self.shared.gate_open.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.shared.runtimes.get()?.get(&self.plan.id).cloned()
+    }
+
+    /// 让 Supervisor 复位，忙就等：账本只在静止时才复位（有进行中的加载或聊天它回 `Busy`，什么也不改）。引擎已经换了，旧引擎上
+    /// 没做完的调用很快就会失败，所以这个等待很短；至多等一个启动超时。
+    async fn reset_supervisor(
+        &self,
+        bound: &crate::dispatch::BoundSupervisor,
+        sample: bool,
+    ) -> Result<(), BackendError> {
+        let deadline = Instant::now() + self.timings().startup_timeout;
+        let pause = self.timings().ready_initial_interval;
+        loop {
+            match bound.engine_replaced(sample).await {
+                Err(BackendError::Busy { .. }) if Instant::now() < deadline => {
+                    tokio::time::sleep(pause).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// 引擎换了一个进程（门控放行之后）：让 Supervisor 的账本对着新进程重建，**在发布 `ready` 之前**（之前这个上游对数据面
+    /// 是 503，所以没有请求会带着过期的账本进来）。账本是对着旧进程建的：以为已加载的模型已经不在，适配器抓着的私有 key 也换了。
+    ///
+    /// 什么都不用做：门控还没放行（Supervisor 还不存在，放行时对此刻的引擎采样）、没有 Supervisor（resident 的托管卡）、
+    /// 还是同一个进程（`start` 重新认回了同一个引擎：账本没有过期，也不能清掉它对未确认的加载的记忆）。
+    async fn sync_supervisor(&mut self) -> Synced {
+        let identity = self.current_identity();
+        let changed = identity != self.identity;
+        let supervisor = if changed { self.supervisor() } else { None };
+        let Some(bound) = supervisor else {
+            self.identity = identity;
+            return Synced::Done;
+        };
+        match self.reset_supervisor(&bound, true).await {
+            Ok(()) => {
+                self.identity = identity;
+                Synced::Done
+            }
+            Err(error) => {
+                // 引擎不能放行：账本的状态不明（粘滞着采样的错误，或者根本没动），也没有人确认它对得上这个进程。停掉引擎；
+                // 下一个就绪的引擎一定要再复位。
+                self.log(&format!(
+                    "引擎换代之后复位 Supervisor 失败（{}）",
+                    error.reason_code()
+                ));
+                self.identity = None;
+                if let Some(owned) = self.engine.take() {
+                    self.stop_engine(owned).await;
+                }
+                self.external = None;
+                match error {
+                    BackendError::SupervisorUnavailable | BackendError::InvariantViolation { .. } => {
+                        Synced::Permanent
+                    }
+                    _ => Synced::Retry,
+                }
+            }
+        }
+    }
+
+    /// 自有引擎被停下了（进程确认消失）：Supervisor 账本里的模型都不在了。清空它，不问引擎（它已经没有了），共享容量账本里的
+    /// 占用也跟着放掉。失败只记日志：`stopped` 的上游不接受请求，下一次 `start` 之后的就绪会再复位。
+    async fn forget_engine(&mut self) {
+        self.identity = None;
+        let Some(bound) = self.supervisor() else {
+            return;
+        };
+        if let Err(error) = self.reset_supervisor(&bound, false).await {
+            self.log(&format!(
+                "引擎停止之后清空 Supervisor 的账本失败（{}）",
+                error.reason_code()
+            ));
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
     // 监管
     // -----------------------------------------------------------------------------------------
 
@@ -1123,6 +1281,9 @@ impl Actor {
                 backend.govern_external(&self.plan.endpoint, true);
             }
             ListenerVerdict::NoListener => {
+                // 没有监听者了：这一刻起 `settings.json` 的 key 不能再发给端口上之后出现的东西（它还没有通过校验），不等下一个
+                // 周期的校验（G2）。
+                backend.govern_external(&self.plan.endpoint, false);
                 self.publish(UpstreamState::Unavailable, None);
                 return;
             }

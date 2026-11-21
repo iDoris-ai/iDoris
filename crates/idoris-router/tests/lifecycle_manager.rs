@@ -1790,7 +1790,10 @@ async fn an_external_listener_that_turns_into_another_service_is_failed_with_por
 async fn an_external_listener_that_stops_passing_the_owner_check_is_failed_and_the_settings_key_goes_off()
  {
     // 接管之后，端口上换了一个没通过属主校验的监听者（另一个进程，没有签名团队）：`failed` + `port_in_use`；`settings.json` 的 key
-    // 立刻不再允许（之后任何走这个端点的请求都不会带它），也不再有任何请求发给它。
+    // 立刻不再允许（登记表里是「未验证」）。**这里只钉管理器这一层**：key 登记表的口径与管理器自己的探测次数。数据面的请求怎么
+    // 办是另一层的事，在 `lifecycle_admin.rs` 的 `b_g1_…` 里用真的 Router 钉：Router 创建之后才失败的卡，请求在运行期被挡住，
+    // 503 带 `port_in_use`，没有一个字节发给那个端口；已经存在的适配器每个请求都按登记表此刻的口径取 key（`OmlxAdapter::
+    // with_per_request_key`，在 `idoris-upstream` 的单元测试里钉）。
     let work = tempfile::tempdir().unwrap();
     let external = External::start(work.path(), Some("ext-secret"));
     let rig = rig_for(&external);
@@ -1823,7 +1826,7 @@ async fn an_external_listener_that_stops_passing_the_owner_check_is_failed_and_t
     assert_eq!(
         external.fake.requests().len(),
         before,
-        "nothing more is sent to the engine once its listener failed the check"
+        "the manager sends no more probes to a listener that failed the check"
     );
     assert!(pid_alive(u64::from(external.pid())), "never signalled");
     h.manager.shutdown(true).await;

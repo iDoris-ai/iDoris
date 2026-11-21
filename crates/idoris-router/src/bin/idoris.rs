@@ -993,7 +993,8 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
                 );
                 Box::new(move |outcome: &lifecycle::GateOutcome| {
                     // 降级放行（有托管引擎终局失败，接口规范 §2.7.6 勘误六）：没就绪的托管卡不建 Supervisor——它会去采样一个没起来、
-                    // 或者没通过属主校验的端点；路由到这些卡的请求由 `managed_failures` 直接 503（带原因），别的卡照常服务。
+                    // 或者没通过属主校验的端点；路由到这些卡的请求由 `/health` 的实时快照（`HealthState::managed_failure`）直接
+                    // 503（带原因），别的卡照常服务。
                     let runtime_cards: Vec<_> = state
                         .cards
                         .iter()
@@ -1008,7 +1009,6 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
                             remote_kill_switch,
                         )?;
                     state.runtimes = runtimes.clone();
-                    state.managed_failures = Arc::new(outcome.degraded.clone());
                     state.capabilities = capabilities_inputs.take().map(|(catalog, facts)| {
                         Arc::new(
                             LiveCapabilitiesProvider::new(catalog, facts, runtimes.clone())
