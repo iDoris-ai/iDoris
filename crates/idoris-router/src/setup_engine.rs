@@ -16,12 +16,14 @@
 //!   必须找到可执行文件（[`SetupEngine::discover_executable`]，含签名校验），找不到是 `engine_not_installed`。
 //!   这里只生成卡片：拉起引擎、准备引擎的 base 目录是后面的引擎管理器的事（S5）。
 //! - `--auto --managed` 找到了外部引擎时取保守的一边：采纳它，不托管（规范 §2.7.8，待 owner 确认）。
+//! - `--auto` 遇到要 API key 的候选（没给 key，或给了被拒）：没有别的候选合格时报 `auth_required` 或 `auth_failed`，
+//!   带 `--managed` 也一样，不在一个可能是同一种引擎的服务旁边再起一个（规范没写这一种情形，待 owner 确认）。
 //!
 //! # 副作用
 //!
 //! 写入的位置是 `--out-dir` 与它同级的 `.idoris-setup-*` 暂存目录（规范 §2.7「组件配置」行）；状态目录、引擎的
-//! base 目录都不创建。探测连 loopback；找端口、核对已装模型、查可执行文件都是本机文件系统与 loopback 套接字的操作，
-//! 不需要网络。
+//! base 目录都不创建。探测连 loopback；找端口、核对已装模型、查可执行文件都是本机的操作（文件系统、loopback 套接字，
+//! 托管模式还会运行 codesign 与引擎自己的 `--version`），不需要网络。
 //!
 //! # 输出
 //!
@@ -199,7 +201,7 @@ pub trait SetupEngine: Sync {
 }
 
 /// 引擎有 [`idoris_upstream::engine::EngineRecipe`]（规范 §2.12.1）时，[`SetupEngine`] 两个可执行文件方法的通用实现：
-/// `setup` 与引擎管理器共用同一份配方，去哪里找、怎么校验在配方里定义一次。引擎进程管理在 unix 以外的平台没有，
+/// 配方是引擎管理器（S5）也要用的那一份，去哪里找、怎么校验在配方里定义一次。引擎进程管理在 unix 以外的平台没有，
 /// 所以这个模块也一样；通用流程本身不依赖它。
 #[cfg(unix)]
 pub mod recipe_backed {

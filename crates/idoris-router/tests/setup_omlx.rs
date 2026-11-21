@@ -675,3 +675,32 @@ async fn managed_fails_on_an_uninstalled_model_or_a_busy_port_before_looking_for
     assert!(!out.exists());
     drop(held);
 }
+
+/// stdin 上的 key 行不合规（含空白）：只给固定的错误码与说明，key 的内容不出现在任何输出里；
+/// 这一步排在一切探测与写入之前。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_key_line_is_rejected_without_being_echoed() {
+    let server = fake(Some(KEY), &["m1"]).await;
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("comp");
+    let secretish = "not-a-key with spaces and secret-part-zzz";
+    let o = setup(
+        &server.uri(),
+        &out,
+        &["--api-key-stdin"],
+        Some(&format!("{secretish}\n")),
+    )
+    .await;
+    assert_eq!(err_code(&o), "invalid_api_key_input");
+    for part in ["not-a-key", "spaces", "secret-part-zzz"] {
+        assert!(
+            !o.stdout.contains(part) && !o.stderr.contains(part),
+            "{part}"
+        );
+    }
+    assert!(!out.exists());
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "key 行不合规：连探测都不发"
+    );
+}
