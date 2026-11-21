@@ -22,7 +22,11 @@
 /// `1.3.0` (the target of iDoris v0.6.0, **not yet in force**): additive only (interface spec
 /// revision 1.6 §2.11, IDORIS-CORE). `GET /health` gains `phase`, `ready`, `started_at_ms`,
 /// `registered` and `upstreams[]` (each with `engine_kind`); `status` stays `"ok"`, every 1.2.x
-/// field and behavior is unchanged. The launcher-hosting additions of the same revision (the
+/// field and behavior is unchanged. It also adds the endpoint `POST /v1/models/warmup` (§2.11.2,
+/// IDORIS-CORE slice S8): a body of only `model` and `timeout_ms` that makes a model usable without
+/// generating a token; a 200 answers `{model, provider_id, state, already_loaded, load_ms}`, errors
+/// reuse the chat envelope, and `504 warmup_timeout` is new. It has no JSON Schema (§2.11.5); its
+/// status-code matrix is locked by `crates/idoris-router/tests/warmup.rs`. The launcher-hosting additions of the same revision (the
 /// `--launcher-stdin` frame, dynamic ports, the discovery file) are launcher contract (§2.7),
 /// not HTTP wire.
 ///
