@@ -1,6 +1,12 @@
-//! Read-only Admin API v0 facts plus its authenticated router/listener contract.
+//! Admin API v0 facts plus its authenticated router/listener contract.
 //! The Admin router is separate from the data plane and callers must bind it
 //! through [`AdminBindConfig`], which is fixed to IPv4 loopback.
+//!
+//! Admin is read-only except for one restricted family (interface spec §2.11.4,
+//! IDORIS-CORE S6): `GET /admin/api/v1/upstreams` and `POST
+//! /admin/api/v1/upstreams/{id}/start|stop|restart`, implemented in [`upstreams`].
+
+mod upstreams;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, RwLock};
@@ -14,13 +20,14 @@ use axum::{
     },
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::lifecycle::EngineManager;
 use idoris_contracts::admin_v0::{
     AdminAdmissionStatus, AdminBackend, AdminBackendsResponse, AdminCapacityEntry,
     AdminCapacitySnapshot, AdminCapacityState, AdminModelSource, AdminModelSourceError,
@@ -214,6 +221,8 @@ impl std::fmt::Debug for SharedAdminToken {
 struct AdminHttpState {
     app: Arc<AppState>,
     token: SharedAdminToken,
+    /// 引擎管理器（有托管卡时才有）：`upstreams` 的写接口经它下命令，读接口从它取只读细节。
+    engines: Option<Arc<EngineManager>>,
 }
 
 /// Build the Admin listener router. Its static console shell carries no privileged
@@ -228,10 +237,25 @@ pub fn build_admin_app(state: AppState, token: AdminSessionToken) -> Router {
 
 /// Like [`build_admin_app`], but the token lives in a shared slot another task can replace
 /// (接口规范 §2.10.6): every request is authenticated against the token current at the time it starts.
+///
+/// No engine manager: `upstreams` is readable (from `state.health_state`) and every write answers as for
+/// an upstream iDoris does not manage. Use [`build_admin_app_with_engines`] when a card is managed.
 pub fn build_admin_app_with_token(state: AppState, token: SharedAdminToken) -> Router {
+    build_admin_app_with_engines(state, token, None)
+}
+
+/// Like [`build_admin_app_with_token`], with the engine manager behind the `upstreams` writes
+/// (接口规范 §2.11.4): `POST /admin/api/v1/upstreams/{id}/start|stop|restart` command it, and
+/// `GET /admin/api/v1/upstreams` reads its snapshot next to `/health`'s.
+pub fn build_admin_app_with_engines(
+    state: AppState,
+    token: SharedAdminToken,
+    engines: Option<Arc<EngineManager>>,
+) -> Router {
     let state = AdminHttpState {
         app: Arc::new(state),
         token,
+        engines,
     };
     let api = Router::new()
         .route("/status", get(admin_status))
@@ -239,6 +263,10 @@ pub fn build_admin_app_with_token(state: AppState, token: SharedAdminToken) -> R
         .route("/models", get(admin_models))
         .route("/roles", get(admin_roles))
         .route("/runtimes", get(admin_runtimes))
+        .route("/upstreams", get(upstreams::list))
+        .route("/upstreams/{id}/start", post(upstreams::start))
+        .route("/upstreams/{id}/stop", post(upstreams::stop))
+        .route("/upstreams/{id}/restart", post(upstreams::restart))
         .fallback(StatusCode::NOT_FOUND)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -259,6 +287,7 @@ pub fn build_admin_starting_app(state: AppState, token: SharedAdminToken) -> Rou
     let state = AdminHttpState {
         app: Arc::new(state),
         token,
+        engines: None,
     };
     let api = Router::new()
         .route("/status", get(admin_status))
@@ -1825,6 +1854,7 @@ mod tests {
         let state = AdminHttpState {
             app: Arc::new(AppState::default()),
             token: shared.clone(),
+            engines: None,
         };
         let app = Router::new()
             .route("/slow", get(slow))

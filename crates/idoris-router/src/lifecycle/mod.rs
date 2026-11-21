@@ -49,6 +49,22 @@
 //! `startup_timeout`），不等熔断（熔断最坏要近 10 分钟）。降级放行之后，没就绪的托管引擎**冻结**：不再半开重试，不再接受
 //! `start`（[`CommandError::RestartRequired`]），要重启 iDoris：它们的 Supervisor 是放行时创建的，之后引擎好了也读不到
 //! （运行期引擎换代是 v0.6.1 / S10 的事）。退出码 5 的语义不变：只有放行时已经就绪的自有引擎，之后进程退出才触发。
+//!
+//! # 门控放行之后的命令（S6，规范 §2.11.4、勘误七）
+//!
+//! Admin 的 `start`/`stop`/`restart` 经 [`EngineManager::start_upstream`] 等进来。**门控放行之后引擎不能换代**：Supervisor
+//! 在放行时对引擎采样一次（账本是当时已加载的模型），它的适配器在创建时抓住了引擎当时的私有 key（每次拉起都换一个新的）；
+//! 放行时没就绪的连 Supervisor 都没有。换代之后这些全部过期，而 Supervisor 没有复位、排空、关闭的接口（账本只迁移、不删除，
+//! 迟到的 `OpDone`/`ChatDone` 没有代际可分辨，围栏的 `.owner.lock` 一直被 actor 持有），安全地复位要的是 S10 那一整套
+//! （排空、代际、重建 actor 与适配器），不是一个小改动。所以：
+//!
+//! - `restart`：一律 [`CommandError::RestartRequired`]。
+//! - `start`：还在被监管的实例（`ready`、`unavailable`……）什么也不做，是幂等；终局的实例（降级放行时冻结的、放行之后被 `stop`
+//!   停下的）[`CommandError::RestartRequired`]。
+//! - `stop`：照常可用。停引擎不换代，只是这个实例从此是终局；只有重启 iDoris 才会回来（[`ManagedView::restart_required`]）。
+//!
+//! 门控放行之前这些命令照旧（真的 `start`、`restart`），但 Admin 的完整路由只在放行之后才有（放行之前除 `status` 外一律
+//! 503 `idoris_starting`），所以只有进程内的调用方用得到。
 
 mod backend;
 mod backoff;
@@ -59,6 +75,6 @@ mod manager;
 pub use backend::{EngineBackend, OmlxBackend, PrepareFailure};
 pub use backoff::{CrashWindow, Timings, restart_delay};
 pub use manager::{
-    CommandError, EngineFailure, EngineManager, GateOutcome, ManagedPlan, ManagerConfig, PlanError,
-    plan_managed, plan_managed_with,
+    CommandError, EngineFailure, EngineManager, GateOutcome, ManagedPlan, ManagedView,
+    ManagerConfig, PlanError, plan_managed, plan_managed_with,
 };

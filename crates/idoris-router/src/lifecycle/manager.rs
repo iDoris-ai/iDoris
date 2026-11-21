@@ -14,7 +14,9 @@ use tokio::time::Instant;
 use super::backend::{EngineBackend, OmlxBackend};
 use super::backoff::Timings;
 use super::instance::{Actor, Command, Request};
-use crate::readiness::{HealthState, ManagedFailure, UpstreamPlan, UpstreamReason, UpstreamState};
+use crate::readiness::{
+    HealthState, ManagedFailure, UpstreamPlan, UpstreamReason, UpstreamState, unix_millis_now,
+};
 use crate::register::LogSink;
 use crate::runtime::RuntimeRegistry;
 
@@ -186,9 +188,57 @@ pub enum CommandError {
     NotOwned,
     /// 实例任务已经结束（管理器在停止）。
     Closed,
-    /// 这个上游在门控放行时就没有就绪（降级放行）：完整的 Router 里它的 Supervisor 看到的是一个失败的引擎，之后即使引擎好了
-    /// 也读不到（运行期引擎换代是 v0.6.1 / S10 的事）。保守起见降级放行之后不再重试也不接受 `start`，要重启 iDoris。
+    /// 门控放行之后，引擎不能在运行期换代（S6，规范勘误七）：完整的 Router 里的 Supervisor 在放行时对引擎采样一次，它的适配器
+    /// 抓着当时引擎的私有 key，账本里是当时已加载的模型；放行时没有就绪的（降级放行）连 Supervisor 都没有。引擎换代（`restart`，
+    /// 或终局之后的 `start`）之后这些都过期，修它是运行期引擎换代（v0.6.1 / S10）的事，所以 v0.6.0 要重启 iDoris。
     RestartRequired,
+}
+
+impl CommandError {
+    /// 稳定的短名字，给日志与测试用（Admin 的错误码另在 `admin` 里定）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::NotOwned => "not_owned",
+            Self::Closed => "closed",
+            Self::RestartRequired => "restart_required",
+        }
+    }
+}
+
+/// 门控放行之后，一个**终局**的实例（放行时没就绪而冻结的、之后被 Admin `stop` 停下的、自有引擎退出之后……）不再被监管，也不能
+/// 在运行期换代：只有重启 iDoris 才会回来（S6，规范勘误七）。门控放行之前不存在这回事（终局的实例仍可以被 `start`）。
+/// `GET /admin/api/v1/upstreams` 的 `restart_required` 与实例任务对 `start` 的回答都用它，口径只有这一处。
+pub(super) fn restart_required(gate_open: bool, terminal: bool) -> bool {
+    gate_open && terminal
+}
+
+/// 状态从 `previous` 变到 `next` 是不是一次新的失败：进入 `restarting` 或 `failed` 才算，而且是从不是这两个之一的状态进入（
+/// `restarting` 之后又 `failed`、`failed` 之后又发布一次终局的 `failed`，是同一次失败）。`unavailable` 不算：它可能是引擎忙，
+/// 探测恢复就回到 `ready`。
+pub(super) fn counts_as_failure(previous: UpstreamState, next: UpstreamState) -> bool {
+    let failing = |state| matches!(state, UpstreamState::Restarting | UpstreamState::Failed);
+    failing(next) && !failing(previous)
+}
+
+/// Admin 看到的一个托管实例：只读快照，**不含任何 key、token、nonce**（`GET /admin/api/v1/upstreams`，S6）。
+/// `state`、`reason`、`owned` 与 `/health.upstreams[]` 里同一个实例的值同源：管理器发布状态时在同一把锁里同时写这里和
+/// `/health` 的快照，所以这个快照自己是一致的。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedView {
+    pub state: UpstreamState,
+    pub reason: Option<UpstreamReason>,
+    pub owned: bool,
+    /// 卡的 endpoint 里的 loopback 端口。
+    pub port: u16,
+    /// 自有引擎的进程号（`owned` 为真才有）。
+    pub pid: Option<u32>,
+    /// 只有重启 iDoris 才能让这个上游回来（[`restart_required`]）。
+    pub restart_required: bool,
+    /// iDoris 启动以来这个实例失败过几次：状态进入 `restarting` 或 `failed` 的次数。
+    pub failure_count: u32,
+    /// 最近一次失败的墙钟时间（Unix 毫秒）；没失败过是 `None`。
+    pub last_failure_at_ms: Option<u64>,
 }
 
 /// 门控放行的结果：放行时没有就绪的托管上游（降级放行）。空 = 全部就绪。
@@ -207,6 +257,12 @@ pub(super) struct Status {
     /// 终局：这个实例不会自己再往就绪走了（`Idle::Terminal`、熔断、被 `stop`、被放弃）。和 `state` 分开记：
     /// `owned_engine_exited` 在重启之前会短暂发布一次 `failed`，那不是终局，门控不能把它当成「落定」。
     pub terminal: bool,
+    /// 自有引擎的进程号（`owned` 为真才有）：Admin 的只读细节（[`ManagedView::pid`]）。
+    pub pid: Option<u32>,
+    /// 状态进入 `restarting` 或 `failed` 的次数（[`ManagedView::failure_count`]）。
+    pub failures: u32,
+    /// 最近一次失败的墙钟时间（Unix 毫秒）。
+    pub last_failure_at_ms: Option<u64>,
 }
 
 impl Status {
@@ -226,6 +282,8 @@ pub(super) struct Shared {
     statuses: Mutex<BTreeMap<String, Status>>,
     /// 上游 id → 引擎种类（`GateOutcome` 要带）。
     kinds: BTreeMap<String, String>,
+    /// 上游 id → 卡的 endpoint 里的 loopback 端口（`ManagedView` 要带）。
+    ports: BTreeMap<String, u16>,
     /// 门控放行时没有就绪的实例，只在 [`EngineManager::open_gate`] 里写一次（持有 `statuses` 的锁时写，所以与状态一致）。
     /// 这些实例「冻结」：不再半开重试，不再接受 `start`（见 [`CommandError::RestartRequired`]）。
     degraded: Mutex<BTreeMap<String, ManagedFailure>>,
@@ -245,12 +303,36 @@ impl Shared {
     /// 发布一个实例的状态：管理器自己的表（门控判据）与 `/health` 的快照一起更新，在同一把锁里，所以
     /// [`EngineManager::open_gate`] 看到的与 `/health` 说的一致。
     pub fn publish(&self, id: &str, status: Status) {
+        self.publish_with(id, |_| status);
+    }
+
+    /// 同 [`Self::publish`]，新的状态由旧的（没有就是 `None`）算出来，读旧值与写新值在同一把锁里。
+    pub fn publish_with(&self, id: &str, next: impl FnOnce(Option<&Status>) -> Status) {
         let mut statuses = self.statuses.lock().unwrap_or_else(PoisonError::into_inner);
+        let status = next(statuses.get(id));
         statuses.insert(id.to_owned(), status);
         self.health
             .set_managed(id, status.state, status.reason, status.owned);
         drop(statuses);
         self.changed.send_modify(|version| *version += 1);
+    }
+
+    /// 实例任务 panic：按引擎失效发布成终局的 `failed`（失败计数沿用，再记一次）。
+    pub fn publish_panicked(&self, id: &str) {
+        self.publish_with(id, |previous| {
+            let (failures, last_failure_at_ms) =
+                previous.map_or((0, None), |status| (status.failures, status.last_failure_at_ms));
+            let counted = previous.is_none_or(|status| counts_as_failure(status.state, UpstreamState::Failed));
+            Status {
+                state: UpstreamState::Failed,
+                reason: None,
+                owned: false,
+                terminal: true,
+                pid: None,
+                failures: if counted { failures.saturating_add(1) } else { failures },
+                last_failure_at_ms: if counted { Some(unix_millis_now()) } else { last_failure_at_ms },
+            }
+        });
     }
 
     /// 每个实例都落定了（就绪，或终局）。
@@ -298,12 +380,14 @@ impl EngineManager {
             .iter()
             .map(|plan| (plan.id.clone(), plan.backend.kind().as_str().to_owned()))
             .collect();
+        let ports = plans.iter().map(|plan| (plan.id.clone(), plan.port)).collect();
         let shared = Arc::new(Shared {
             config,
             health,
             gate_open: AtomicBool::new(false),
             statuses: Mutex::new(BTreeMap::new()),
             kinds,
+            ports,
             degraded: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             changed,
@@ -325,6 +409,9 @@ impl EngineManager {
                     reason: None,
                     owned: false,
                     terminal: false,
+                    pid: None,
+                    failures: 0,
+                    last_failure_at_ms: None,
                 },
             );
             senders.insert(plan.id.clone(), sender);
@@ -509,20 +596,75 @@ impl EngineManager {
         answer.await.map_err(|_| CommandError::Closed)?
     }
 
-    /// 从 `stopped`、`failed`、`absent`、`unavailable` 重新走启动决策；已经 `ready`、或正在启动时幂等。
+    /// 下命令并留一行日志（谁的、什么命令、结果；没有 token、key：只有上游 id 与命令名）。不认识的 id 不进日志：它来自调用方，
+    /// 不能让它往日志里写东西。
+    async fn command_logged(
+        &self,
+        id: &str,
+        name: &str,
+        command: Command,
+    ) -> Result<(), CommandError> {
+        let result = self.command(id, command).await;
+        if result != Err(CommandError::NotFound) {
+            let outcome = match result {
+                Ok(()) => "已受理".to_owned(),
+                Err(error) => format!("拒绝（{}）", error.as_str()),
+            };
+            self.shared
+                .log(&format!("[idoris] 引擎 {id}：收到命令 {name}，{outcome}"));
+        }
+        result
+    }
+
+    /// 门控放行之前：从 `stopped`、`failed`、`absent`、`unavailable` 重新走启动决策；已经 `ready`、或正在启动时幂等。
+    /// **门控放行之后**（S6，勘误七）引擎不能换代：还在被监管的（`ready`、`unavailable`……）什么也不做，是幂等；终局的
+    /// （放行时没就绪而冻结的、被 `stop` 停下的）一律 [`CommandError::RestartRequired`]，要重启 iDoris。
     pub async fn start_upstream(&self, id: &str) -> Result<(), CommandError> {
-        self.command(id, Command::Start).await
+        self.command_logged(id, "start", Command::Start).await
     }
 
     /// 停止 iDoris 自己拥有的引擎，状态 `stopped`；不是自己的（外部引擎、没有引擎）一律 [`CommandError::NotOwned`]，
-    /// 已经 `stopped` 时幂等。
+    /// 已经 `stopped` 时幂等。**门控放行之后照样可用**：停掉引擎不换代，这个实例从此是终局（只有重启 iDoris 才会回来）。
+    /// 命令被接受时就回答，引擎停下之后状态才变成 `stopped`（至多 `stop_grace` 加一点余量）：调用方轮询 `/health` 或 Admin。
     pub async fn stop_upstream(&self, id: &str) -> Result<(), CommandError> {
-        self.command(id, Command::Stop).await
+        self.command_logged(id, "stop", Command::Stop).await
     }
 
-    /// `stop` 之后重新走启动决策；不是自己拥有的引擎同样 [`CommandError::NotOwned`]。
+    /// 门控放行之前：`stop` 之后重新走启动决策；不是自己拥有的引擎同样 [`CommandError::NotOwned`]。
+    /// **门控放行之后一律 [`CommandError::RestartRequired`]**（S6，勘误七）：重启就是引擎换代，Supervisor 的账本与适配器
+    /// 抓着的私有 key 都会过期，v0.6.0 做不了（运行期引擎换代是 v0.6.1 / S10）。
     pub async fn restart_upstream(&self, id: &str) -> Result<(), CommandError> {
-        self.command(id, Command::Restart).await
+        self.command_logged(id, "restart", Command::Restart).await
+    }
+
+    /// 每个托管上游此刻的只读快照（`GET /admin/api/v1/upstreams`，S6）。在管理器自己的状态表的锁里一次读完，所以每个实例的
+    /// 各个字段彼此一致；门控是否放行也在这把锁里读（[`Self::open_gate`] 在同一把锁里放行），所以 `restart_required` 与状态一致。
+    pub fn views(&self) -> BTreeMap<String, ManagedView> {
+        let statuses = self
+            .shared
+            .statuses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let gate_open = self.shared.gate_open.load(Ordering::SeqCst);
+        statuses
+            .iter()
+            .filter_map(|(id, status)| {
+                let port = *self.shared.ports.get(id)?;
+                Some((
+                    id.clone(),
+                    ManagedView {
+                        state: status.state,
+                        reason: status.reason,
+                        owned: status.owned,
+                        port,
+                        pid: status.pid,
+                        restart_required: restart_required(gate_open, status.terminal),
+                        failure_count: status.failures,
+                        last_failure_at_ms: status.last_failure_at_ms,
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// iDoris 停止时调用：各实例收尾。`stop_engines` 为真就停掉自己拉起的引擎（SIGTERM 整组，宽限之后 SIGKILL，
@@ -579,6 +721,30 @@ mod tests {
             reason: None,
             owned: false,
             terminal,
+            pid: None,
+            failures: 0,
+            last_failure_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn only_a_terminal_instance_after_the_gate_opened_needs_an_idoris_restart() {
+        // 门控放行之前，终局的实例仍可以被 `start`；放行之后，还在被监管的（非终局）也不需要重启 iDoris。
+        assert!(!restart_required(false, false));
+        assert!(!restart_required(false, true));
+        assert!(!restart_required(true, false));
+        assert!(restart_required(true, true));
+    }
+
+    #[test]
+    fn command_errors_have_stable_short_names() {
+        for (error, name) in [
+            (CommandError::NotFound, "not_found"),
+            (CommandError::NotOwned, "not_owned"),
+            (CommandError::Closed, "closed"),
+            (CommandError::RestartRequired, "restart_required"),
+        ] {
+            assert_eq!(error.as_str(), name);
         }
     }
 

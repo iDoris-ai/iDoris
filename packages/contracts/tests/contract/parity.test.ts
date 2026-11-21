@@ -5,6 +5,8 @@ import adminV0ModelsJson from "../../schema/admin-v0-models.schema.json";
 import adminV0RolesJson from "../../schema/admin-v0-roles.schema.json";
 import adminV0RuntimesJson from "../../schema/admin-v0-runtimes.schema.json";
 import adminV0StatusJson from "../../schema/admin-v0-status.schema.json";
+import adminV0UpstreamJson from "../../schema/admin-v0-upstream.schema.json";
+import adminV0UpstreamsJson from "../../schema/admin-v0-upstreams.schema.json";
 import adapterManifestJson from "../../schema/adapter-manifest.schema.json";
 import componentCardJson from "../../schema/component-card.schema.json";
 import inspectRequestJson from "../../schema/inspect-request.schema.json";
@@ -20,11 +22,17 @@ import { adminV0ModelsResponseSchema } from "../../src/generated/admin-v0-models
 import { adminV0RolesResponseSchema } from "../../src/generated/admin-v0-roles.js";
 import { adminV0RuntimesResponseSchema } from "../../src/generated/admin-v0-runtimes.js";
 import { adminV0StatusResponseSchema } from "../../src/generated/admin-v0-status.js";
+import { adminV0UpstreamSchema } from "../../src/generated/admin-v0-upstream.js";
+import { adminV0UpstreamsResponseSchema } from "../../src/generated/admin-v0-upstreams.js";
 import { adapterManifestSchema } from "../../src/adapter-manifest.js";
 import { componentCardSchema } from "../../src/component-card.js";
 import { inspectRequestSchema } from "../../src/generated/inspect-request.js";
 import { inspectResponseSchema } from "../../src/generated/inspect-response.js";
-import { inspectResponseSchema as publicInspectResponseSchema } from "../../src/index.js";
+import {
+  adminV0UpstreamSchema as publicAdminV0UpstreamSchema,
+  adminV0UpstreamsResponseSchema as publicAdminV0UpstreamsResponseSchema,
+  inspectResponseSchema as publicInspectResponseSchema,
+} from "../../src/index.js";
 import { loadPolicySchema } from "../../src/load-policy.js";
 import { providerDescriptorSchema } from "../../src/provider.js";
 import { roleSchema } from "../../src/role.js";
@@ -39,6 +47,8 @@ const jsonByName = {
   "admin-v0-roles": adminV0RolesJson,
   "admin-v0-runtimes": adminV0RuntimesJson,
   "admin-v0-status": adminV0StatusJson,
+  "admin-v0-upstream": adminV0UpstreamJson,
+  "admin-v0-upstreams": adminV0UpstreamsJson,
   "adapter-manifest": adapterManifestJson,
   "inspect-request": inspectRequestJson,
   "inspect-response": inspectResponseJson,
@@ -55,6 +65,8 @@ const zodByName: Record<Name, { safeParse: (d: unknown) => { success: boolean } 
   "admin-v0-roles": adminV0RolesResponseSchema,
   "admin-v0-runtimes": adminV0RuntimesResponseSchema,
   "admin-v0-status": adminV0StatusResponseSchema,
+  "admin-v0-upstream": adminV0UpstreamSchema,
+  "admin-v0-upstreams": adminV0UpstreamsResponseSchema,
   "adapter-manifest": adapterManifestSchema,
   "inspect-request": inspectRequestSchema,
   "inspect-response": inspectResponseSchema,
@@ -93,6 +105,66 @@ const validInspect = {
   findings: [{ kind: "cn_resident_id", span: { start: 4, length: 18 } }, { kind: "input_limit_exceeded" }],
   action: "BLOCK",
 };
+
+// Admin `upstreams` (规范 §2.11.4、勘误七): the element is the `/health.upstreams[]` fields plus Admin-only read facts.
+const managedUpstream = {
+  id: "omlx", engine_kind: "omlx", state: "ready", managed: true, owned: true,
+  port: 19731, pid: 51234, restart_required: false, failure_count: 0,
+};
+const residentUpstream = {
+  id: "lmstudio", engine_kind: "openai_compat", state: "ready", managed: false, owned: false,
+  port: 1234, restart_required: false,
+};
+const without = (item: Record<string, unknown>, ...keys: string[]): Record<string, unknown> =>
+  Object.fromEntries(Object.entries(item).filter(([key]) => !keys.includes(key)));
+function adminV0UpstreamCorpus(): Array<[Name, unknown]> {
+  const entries: Array<[Name, unknown]> = [
+    ["admin-v0-upstreams", { upstreams: [managedUpstream, residentUpstream] }],
+    ["admin-v0-upstreams", { upstreams: [] }],
+    ["admin-v0-upstreams", { upstreams: [{ ...without(managedUpstream, "pid"), state: "failed", reason: "crash_loop", owned: false, restart_required: true, failure_count: 6, last_failure_at_ms: 1763625330123 }] }],
+    ["admin-v0-upstreams", {}],
+    ["admin-v0-upstreams", { upstreams: {} }],
+    ["admin-v0-upstreams", { upstreams: [managedUpstream], default: "omlx" }],
+    ["admin-v0-upstreams", { upstreams: [without(managedUpstream, "restart_required")] }],
+  ];
+  const element: Array<unknown> = [
+    managedUpstream,
+    residentUpstream,
+    { ...managedUpstream, engine_kind: "unknown" },
+    { ...without(managedUpstream, "pid"), state: "stopped", owned: false, restart_required: true },
+    { ...without(managedUpstream, "pid"), state: "absent", reason: "engine_not_found", owned: false, restart_required: true },
+    { ...managedUpstream, state: "stopping" },
+    { ...managedUpstream, state: "Ready" },
+    { ...managedUpstream, reason: "nope" },
+    { ...managedUpstream, reason: null },
+    { ...managedUpstream, id: "" },
+    { ...managedUpstream, engine_kind: "" },
+    { ...managedUpstream, engine_kind: "OMLX" },
+    { ...managedUpstream, engine_kind: "1omlx" },
+    { ...managedUpstream, engine_kind: "a".repeat(33) },
+    { ...managedUpstream, engine_kind: "a".repeat(32) },
+    { ...managedUpstream, managed: "yes" },
+    { ...managedUpstream, owned: 1 },
+    without(managedUpstream, "restart_required"),
+    without(managedUpstream, "id"),
+    without(managedUpstream, "state"),
+    { ...managedUpstream, port: 0 },
+    { ...managedUpstream, port: 65535 },
+    { ...managedUpstream, port: 65536 },
+    { ...managedUpstream, port: 1.5 },
+    { ...managedUpstream, pid: 0 },
+    { ...managedUpstream, pid: -3 },
+    { ...managedUpstream, failure_count: -1 },
+    { ...managedUpstream, failure_count: 2.5 },
+    { ...managedUpstream, last_failure_at_ms: -1 },
+    { ...managedUpstream, last_failure_at_ms: 1763625330123 },
+    // 响应里不会有任何 key、token、nonce：多出来的字段一律被拒（严格模式）。
+    { ...managedUpstream, api_key: "secret" },
+    { ...managedUpstream, instance_nonce: "secret" },
+    { ...managedUpstream, endpoint: "http://127.0.0.1:19731" },
+  ];
+  return [...entries, ...element.map((item): [Name, unknown] => ["admin-v0-upstream", item])];
+}
 
 const corpus: Array<[Name, unknown]> = [
   ["inspect-request", { input: "身份证 110105194912310021" }],
@@ -145,6 +217,7 @@ const corpus: Array<[Name, unknown]> = [
     instance_id: "instance-1", components: 0, runtimes: 0, subscriptions: 0,
     budget_configured: false, audit_configured: false, capacity: { state: "error" },
   }],
+  ...adminV0UpstreamCorpus(),
   ["training-sample", validSample],
   ["training-sample", { ...validSample, data_class: "nope" }],
   ["training-sample", { ...validSample, messages: [{ role: "user", content: "hi" }] }],
@@ -227,6 +300,39 @@ describe("inspect response independent expected verdicts", () => {
     });
     it(`${name}: public Zod`, () => {
       expect(publicInspectResponseSchema.safeParse(data).success).toBe(expected);
+    });
+  }
+});
+
+// 独立的期望判定（不靠「两边一致」）：Admin `upstreams` 的元素没有任何 key、token、nonce 的位置，也不接受 `/health` 之外随手加的字段。
+const adminUpstreamCases: Array<[string, unknown, boolean]> = [
+  ["managed, owned, ready", managedUpstream, true],
+  ["resident, not managed", residentUpstream, true],
+  ["engine kinds are an open set", { ...managedUpstream, engine_kind: "lmstudio" }, true],
+  ["a failed managed engine with a reason and its failure facts", { ...without(managedUpstream, "pid"), state: "failed", reason: "crash_loop", owned: false, restart_required: true, failure_count: 6, last_failure_at_ms: 1763625330123 }, true],
+  ["restart_required is mandatory", without(managedUpstream, "restart_required"), false],
+  ["a state outside the frozen seven", { ...managedUpstream, state: "stopping" }, false],
+  ["a reason outside the frozen ten", { ...managedUpstream, reason: "disk_full" }, false],
+  ["no secret-bearing field is allowed: api_key", { ...managedUpstream, api_key: "k" }, false],
+  ["no secret-bearing field is allowed: token", { ...managedUpstream, token: "t" }, false],
+  ["no secret-bearing field is allowed: instance_nonce", { ...managedUpstream, instance_nonce: "n" }, false],
+  ["port 0 is not a port", { ...managedUpstream, port: 0 }, false],
+  ["a pid is a positive integer", { ...managedUpstream, pid: 0 }, false],
+];
+
+describe("admin upstream independent expected verdicts", () => {
+  for (const [name, data, expected] of adminUpstreamCases) {
+    it(`${name}: raw schema`, () => {
+      expect(ajvOk("admin-v0-upstream", data)).toBe(expected);
+    });
+    it(`${name}: generated Zod`, () => {
+      expect(adminV0UpstreamSchema.safeParse(data).success).toBe(expected);
+    });
+    it(`${name}: public Zod`, () => {
+      expect(publicAdminV0UpstreamSchema.safeParse(data).success).toBe(expected);
+    });
+    it(`${name}: inside the collection`, () => {
+      expect(publicAdminV0UpstreamsResponseSchema.safeParse({ upstreams: [data] }).success).toBe(expected);
     });
   }
 });

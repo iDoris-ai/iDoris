@@ -18,8 +18,10 @@ use idoris_upstream::engine::{
 use tokio::sync::{mpsc, oneshot};
 
 use super::backoff::{CrashWindow, restart_delay};
-use super::manager::{CommandError, EngineFailure, ManagedPlan, Shared, Status};
-use crate::readiness::{UpstreamReason, UpstreamState};
+use super::manager::{
+    CommandError, EngineFailure, ManagedPlan, Shared, Status, counts_as_failure, restart_required,
+};
+use crate::readiness::{UpstreamReason, UpstreamState, unix_millis_now};
 
 /// 对实例的命令。
 #[derive(Debug)]
@@ -111,15 +113,7 @@ impl Drop for PanicReport {
             "[idoris] 引擎 {}：实例任务 panic，按引擎失效处理（iDoris 将以退出码 5 停止）",
             self.id
         ));
-        self.shared.publish(
-            &self.id,
-            Status {
-                state: UpstreamState::Failed,
-                reason: None,
-                owned: false,
-                terminal: true,
-            },
-        );
+        self.shared.publish_panicked(&self.id);
         self.shared.signal_failure(EngineFailure {
             upstream_id: self.id.clone(),
         });
@@ -140,6 +134,9 @@ pub(super) struct Actor {
     reason: Option<UpstreamReason>,
     /// 当前发布的状态是不是终局（见 [`Status::terminal`]）。
     terminal: bool,
+    /// 状态进入 `restarting` 或 `failed` 的次数与最近一次的墙钟时间（Admin 的只读细节，见 [`Status::failures`]）。
+    failures: u32,
+    last_failure_at_ms: Option<u64>,
     /// 等待期间收到、还没有处理的命令。
     pending: Option<Request>,
 }
@@ -163,6 +160,8 @@ impl Actor {
             state: UpstreamState::Starting,
             reason: None,
             terminal: false,
+            failures: 0,
+            last_failure_at_ms: None,
             pending: None,
         }
     }
@@ -218,6 +217,10 @@ impl Actor {
 
     fn emit(&mut self, state: UpstreamState, reason: Option<UpstreamReason>, terminal: bool) {
         let changed = self.state != state || self.reason != reason;
+        if counts_as_failure(self.state, state) {
+            self.failures = self.failures.saturating_add(1);
+            self.last_failure_at_ms = Some(unix_millis_now());
+        }
         self.state = state;
         self.reason = reason;
         self.terminal = terminal;
@@ -228,6 +231,9 @@ impl Actor {
                 reason,
                 owned: self.engine.is_some(),
                 terminal,
+                pid: self.engine.as_ref().map(|owned| owned.engine.pid()),
+                failures: self.failures,
+                last_failure_at_ms: self.last_failure_at_ms,
             },
         );
         if changed {
@@ -279,8 +285,34 @@ impl Actor {
         }
     }
 
+    /// 门控放行之后，`start` 与 `restart` 的回答（S6，规范勘误七）；门控还没放行是 `None`，命令照旧处理。
+    ///
+    /// 放行之后引擎不能在运行期换代：完整的 Router 里的 Supervisor 在放行时对引擎采样一次，它的账本是当时已加载的模型，它的
+    /// 适配器抓着当时引擎的私有 key（每次拉起都换一个新的）；放行时没就绪的（降级放行）连 Supervisor 都没有。换代之后这些都过期
+    /// （聊天会一直 401 或在账本之外加载），要重建 Supervisor 与 Router，那是 v0.6.1 / S10 的事。所以：
+    ///
+    /// - `restart` 就是换代：一律 [`CommandError::RestartRequired`]。
+    /// - `start`：还在被监管的实例（`ready`、`unavailable`……）没有什么可启动的，是幂等；终局的实例（降级放行时冻结的、之后被
+    ///   `stop` 停下的）只有重启 iDoris 才会回来，[`CommandError::RestartRequired`]。
+    fn after_the_gate(&self, command: &Command) -> Option<Result<(), CommandError>> {
+        if !self.shared.gate_open.load(Ordering::SeqCst) {
+            return None;
+        }
+        match command {
+            Command::Start if restart_required(true, self.terminal) => {
+                Some(Err(CommandError::RestartRequired))
+            }
+            Command::Start => Some(Ok(())),
+            Command::Restart => Some(Err(CommandError::RestartRequired)),
+            Command::Stop | Command::GiveUp | Command::Shutdown { .. } => None,
+        }
+    }
+
     /// 在当前状态下什么也改变不了的命令的回答（`None` = 这个命令要真的处理）。
     fn immediate_answer(&self, command: &Command) -> Option<Result<(), CommandError>> {
+        if let Some(answer) = self.after_the_gate(command) {
+            return Some(answer);
+        }
         match command {
             // 已经好了、或正在启动：幂等。
             Command::Start
@@ -293,10 +325,6 @@ impl Actor {
             }
             // 已经落定（就绪，或终局）：门控等的时间到了也不用再放弃它。
             Command::GiveUp if self.state == UpstreamState::Ready || self.terminal => Some(Ok(())),
-            // 降级放行之后，这个上游不再启动：它的 Supervisor 已经在放行时看过一个失败的引擎（要重启 iDoris）。
-            Command::Start | Command::Restart if self.frozen() => {
-                Some(Err(CommandError::RestartRequired))
-            }
             // 已经停下了：幂等。
             Command::Stop if self.engine.is_none() && self.state == UpstreamState::Stopped => {
                 Some(Ok(()))
@@ -374,6 +402,11 @@ impl Actor {
                 let _ = reply.send(result);
             }
         };
+        // 命令在等待期间收到、门控在这之后才放行：现在按放行之后的规矩回答（`immediate_answer` 只看收到那一刻）。
+        if let Some(result) = self.after_the_gate(&command) {
+            answer(result);
+            return current;
+        }
         match command {
             Command::Shutdown { stop_engine } => {
                 self.shutdown(stop_engine).await;
@@ -390,10 +423,6 @@ impl Actor {
                 self.publish_terminal(UpstreamState::Failed, Some(UpstreamReason::StartupTimeout));
                 answer(Ok(()));
                 Step::Idle(Idle::Terminal)
-            }
-            Command::Start | Command::Restart if self.frozen() => {
-                answer(Err(CommandError::RestartRequired));
-                current
             }
             Command::Start => {
                 answer(Ok(()));
