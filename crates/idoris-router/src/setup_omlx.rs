@@ -1,85 +1,34 @@
-//! `idoris setup omlx`: probe an oMLX endpoint and write a components
-//! directory that the server's own loader ([`crate::components::load_components`])
-//! accepts. The API key is used for probing only and is never persisted or
+//! `idoris setup omlx`: oMLX 作为 [`crate::setup_engine::SetupEngine`] 的第一个实现。通用流程（采纳、自动探测、托管、
+//! 生成并校验组件目录）在 `setup_engine`；这里只有 oMLX 才有的东西：候选端口、怎么认出 oMLX（`/v1/models` 的列表加两个
+//! 生命周期状态接口）、卡的模板、`~/.omlx/models`、`oMLX.app` 的位置（经 [`OmlxRecipe`]）。
+//! The API key is used for probing only and is never persisted or
 //! echoed; at serve time it still comes from `IDORIS_OMLX_API_KEY`.
 
-use std::io::{BufRead, Read};
-use std::path::{Path, PathBuf};
+use std::ops::RangeInclusive;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use idoris_contracts::{ComponentCard, load_policy::LoadMode};
-use serde_json::{Value, json};
+use idoris_contracts::ComponentCard;
+use idoris_recommender::local_models::{default_models_dir, scan_local_models};
+#[cfg(unix)]
+use idoris_upstream::omlx::engine::OmlxRecipe;
+use serde_json::Value;
 
-use crate::cli::SetupOmlxOptions;
+use crate::cli::SetupOptions;
+#[cfg(unix)]
+use crate::setup_engine::recipe_backed;
+use crate::setup_engine::{
+    FindFailure, FoundExecutable, MANAGED_PORT_RANGE, Probed, SetupEngine, run_setup,
+};
+pub use crate::setup_engine::{SetupError, read_api_key};
 
 const OMLX_CARD: &str = include_str!("../../../config/components/omlx.yaml");
 const SUBSCRIPTION_CARD: &str = include_str!("../../../config/components/subscription.yaml");
-const MANAGED: [&str; 2] = ["omlx.yaml", "subscription.yaml"];
-const MAX_KEY_BYTES: u64 = 4096;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "[::1]", "localhost"];
 
-#[derive(Debug)]
-pub struct SetupError {
-    pub code: &'static str,
-    pub message: String,
-}
-
-impl SetupError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-        }
-    }
-
-    pub fn to_json(&self) -> Value {
-        json!({"status": "error", "code": self.code, "message": self.message})
-    }
-}
-
-/// Reads one bounded line (the API key). The key is never part of an error.
-pub fn read_api_key(reader: &mut impl Read) -> Result<String, SetupError> {
-    let bad = || {
-        SetupError::new(
-            "invalid_api_key_input",
-            "stdin 必须提供单行、非空、无空白的 API key",
-        )
-    };
-    let mut line = String::new();
-    std::io::BufReader::new(reader.take(MAX_KEY_BYTES + 1))
-        .read_line(&mut line)
-        .map_err(|_| bad())?;
-    let key = line.trim_end_matches(['\n', '\r']);
-    if key.is_empty()
-        || line.len() as u64 > MAX_KEY_BYTES
-        || key.chars().any(|c| c.is_whitespace() || c.is_control())
-    {
-        return Err(bad());
-    }
-    Ok(key.to_string())
-}
-
-fn normalize_endpoint(raw: &str) -> Result<String, SetupError> {
-    let bad = |why: &str| SetupError::new("invalid_endpoint", format!("endpoint 无效：{why}"));
-    let url = reqwest::Url::parse(raw).map_err(|_| bad("无法解析"))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(bad("仅支持 http/https"));
-    }
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || url.path() != "/"
-    {
-        return Err(bad("不得包含凭据、路径、查询或片段"));
-    }
-    if !url.host_str().is_some_and(|h| LOOPBACK_HOSTS.contains(&h)) {
-        return Err(bad("必须是 loopback（127.0.0.1 / [::1] / localhost）"));
-    }
-    Ok(url.as_str().trim_end_matches('/').to_string())
-}
+/// `--auto` 依次探测的 loopback 端口（接口规范 §2.7.8；Agent24 原来在自己代码里探测的同一组）。
+pub const AUTO_PORTS: [u16; 3] = [8088, 8000, 8001];
 
 enum Reply {
     Ok(Value),
@@ -113,12 +62,8 @@ async fn get(client: &reqwest::Client, url: &str, key: Option<&str>) -> Result<R
         .map_err(|_| not_omlx())
 }
 
-/// Returns `(model ids, auth required)`.
-async fn probe(
-    base: &str,
-    key: Option<&str>,
-    mode: LoadMode,
-) -> Result<(Vec<String>, bool), SetupError> {
+/// `lifecycle` 为真时还要求 `/v1/models/status` 与 `/api/status`（oMLX 生命周期适配器用的两个接口）。
+async fn probe(base: &str, key: Option<&str>, lifecycle: bool) -> Result<Probed, SetupError> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -156,7 +101,7 @@ async fn probe(
                 .collect::<Option<Vec<_>>>()
         })
         .ok_or_else(|| SetupError::new("not_omlx", "endpoint 的响应不像 oMLX"))?;
-    if mode == LoadMode::OnDemand {
+    if lifecycle {
         // The lifecycle adapter needs these two; their absence means this is
         // not an oMLX the on_demand mode can drive.
         for (path, shape) in [("/v1/models/status", "models"), ("/api/status", "")] {
@@ -173,266 +118,201 @@ async fn probe(
             }
         }
     }
-    Ok((ids, auth_required))
+    Ok(Probed {
+        models: ids,
+        auth_required,
+    })
 }
 
-fn build_card(
-    endpoint: &str,
-    mode: LoadMode,
-    bindings: &[(String, String)],
-) -> Result<String, SetupError> {
-    let internal = |e: &dyn std::fmt::Display| {
-        SetupError::new("validation_failed", format!("生成组件卡失败：{e}"))
-    };
-    let mut card: ComponentCard = serde_yaml::from_str(OMLX_CARD).map_err(|e| internal(&e))?;
-    card.endpoint = endpoint.to_string();
-    if let Some(policy) = card.load_policy.as_mut() {
-        policy.mode = mode;
-        if mode == LoadMode::Resident {
-            // The card contract ties resident to pinned keepalive.
-            policy.keepalive = idoris_contracts::load_policy::Keepalive::Pinned { pinned: true };
-            policy.admission = idoris_contracts::load_policy::Admission::Coexist;
+/// oMLX 的 `setup`：宿主相关的位置（家目录）与测试要换掉的参数都在实例里。
+#[derive(Debug, Clone)]
+pub struct OmlxSetup {
+    #[cfg(unix)]
+    recipe: OmlxRecipe,
+    models_dir: Option<PathBuf>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    explicit_executable: Option<PathBuf>,
+    auto_ports: Vec<u16>,
+    managed_ports: RangeInclusive<u16>,
+}
+
+impl OmlxSetup {
+    /// 取 `HOME`：`~/Applications/oMLX.app` 这个发现位置与 `~/.omlx/models`。
+    pub fn from_env() -> Self {
+        Self::new(std::env::var_os("HOME").map(PathBuf::from))
+    }
+
+    /// `home` 为 `None`、为空或不是绝对路径时，没有家目录下的发现位置，也没有模型目录。
+    pub fn new(home: Option<PathBuf>) -> Self {
+        let home = home.filter(|home| home.is_absolute());
+        #[cfg(unix)]
+        let recipe = match &home {
+            Some(home) => OmlxRecipe::new().with_home(home),
+            None => OmlxRecipe::new(),
+        };
+        Self {
+            #[cfg(unix)]
+            recipe,
+            models_dir: home.as_deref().map(default_models_dir),
+            explicit_executable: None,
+            auto_ports: AUTO_PORTS.to_vec(),
+            managed_ports: MANAGED_PORT_RANGE,
         }
     }
-    if !bindings.is_empty() {
-        let models: serde_json::Map<String, Value> = bindings
-            .iter()
-            .map(|(r, m)| (r.clone(), json!(m)))
-            .collect();
-        card.extensions = Some(
-            [
-                (
-                    "_degradation".to_string(),
-                    json!("Removing these bindings disables role aliases on this backend."),
-                ),
-                ("idoris_role_models".to_string(), Value::Object(models)),
-            ]
-            .into_iter()
-            .collect(),
-        );
+
+    /// 显式给定可执行文件（只看它，不回退；规范 §2.7.8 没有对应的命令行旗标）。
+    pub fn with_explicit_executable(mut self, path: impl Into<PathBuf>) -> Self {
+        self.explicit_executable = Some(path.into());
+        self
     }
-    serde_yaml::to_string(&card).map_err(|e| internal(&e))
+
+    /// 换掉 `--auto` 的候选端口。
+    pub fn with_auto_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.auto_ports = ports.into_iter().collect();
+        self
+    }
+
+    /// 换掉托管缺省端口的候选范围。
+    pub fn with_managed_port_range(mut self, range: RangeInclusive<u16>) -> Self {
+        self.managed_ports = range;
+        self
+    }
+
+    /// 换掉离线核对 `--bind` 用的模型目录。
+    pub fn with_models_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.models_dir = Some(dir.into());
+        self
+    }
+}
+
+impl SetupEngine for OmlxSetup {
+    fn kind(&self) -> &str {
+        "omlx"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "oMLX"
+    }
+
+    fn install_hint(&self) -> &'static str {
+        "请先安装 oMLX（把 oMLX.app 放进 /Applications 或 ~/Applications），再重新运行"
+    }
+
+    fn key_env(&self) -> &'static str {
+        KEY_ENV
+    }
+
+    async fn locate_executable(&self) -> Option<PathBuf> {
+        #[cfg(unix)]
+        {
+            recipe_backed::locate(&self.recipe, self.explicit_executable.as_deref()).await
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    async fn discover_executable(&self) -> Result<FoundExecutable, FindFailure> {
+        #[cfg(unix)]
+        {
+            recipe_backed::discover(&self.recipe, self.explicit_executable.as_deref()).await
+        }
+        #[cfg(not(unix))]
+        {
+            Err(FindFailure::Unsupported)
+        }
+    }
+
+    fn auto_ports(&self) -> &[u16] {
+        &self.auto_ports
+    }
+
+    fn managed_port_range(&self) -> RangeInclusive<u16> {
+        self.managed_ports.clone()
+    }
+
+    fn installed_models(&self) -> Option<Vec<String>> {
+        let dir = self.models_dir.as_deref()?;
+        Some(
+            scan_local_models(dir, &[])
+                .into_iter()
+                .map(|model| model.omlx_id)
+                .collect(),
+        )
+    }
+
+    async fn probe(
+        &self,
+        endpoint: &str,
+        key: Option<&str>,
+        lifecycle: bool,
+    ) -> Result<Probed, SetupError> {
+        probe(endpoint, key, lifecycle).await
+    }
+
+    fn card_file(&self) -> &'static str {
+        "omlx.yaml"
+    }
+
+    fn card_template(&self) -> Result<ComponentCard, SetupError> {
+        serde_yaml::from_str(OMLX_CARD)
+            .map_err(|e| SetupError::new("validation_failed", format!("生成组件卡失败：{e}")))
+    }
+
+    fn static_files(&self) -> &'static [(&'static str, &'static str)] {
+        &[("subscription.yaml", SUBSCRIPTION_CARD)]
+    }
 }
 
 /// Entry point. `api_key` is used only for probing.
-pub async fn run(options: &SetupOmlxOptions, api_key: Option<&str>) -> Result<Value, SetupError> {
-    let endpoint = normalize_endpoint(&options.endpoint)?;
-    for (role, _) in &options.bindings {
-        if !idoris_policy::ROLES.iter().any(|r| r.as_str() == role) {
-            return Err(SetupError::new(
-                "invalid_role",
-                format!("未知角色 {role:?}"),
-            ));
-        }
-    }
-    check_out_dir(&options.out_dir, options.force, None)?;
-    let (models, auth_required) = probe(&endpoint, api_key, options.load_mode).await?;
-    for (role, model) in &options.bindings {
-        if !models.contains(model) {
-            return Err(SetupError::new(
-                "model_not_found",
-                format!("角色 {role} 绑定的模型不在 oMLX 的模型列表中"),
-            ));
-        }
-    }
-    let card = build_card(&endpoint, options.load_mode, &options.bindings)?;
-    let dir = write_validated(&options.out_dir, options.force, &card)?;
-    let bindings: serde_json::Map<String, Value> = options
-        .bindings
-        .iter()
-        .map(|(r, m)| (r.clone(), json!(m)))
-        .collect();
-    let mut next = json!({"env": {"IDORIS_COMPONENTS_DIR": dir.display().to_string()}});
-    if auth_required {
-        next["needs_env"] = json!([crate::setup_omlx::KEY_ENV]);
-    }
-    Ok(json!({
-        "status": "ok", "endpoint": endpoint,
-        "auth": if auth_required { "required" } else { "none" },
-        "models": models, "bindings": bindings,
-        "components_dir": dir.display().to_string(), "next": next,
-    }))
+pub async fn run(options: &SetupOptions, api_key: Option<&str>) -> Result<Value, SetupError> {
+    run_setup(&OmlxSetup::from_env(), options, api_key).await
 }
 
 pub const KEY_ENV: &str = idoris_upstream::omlx::OMLX_API_KEY_ENV;
 
-/// `own_stage` is this run's staging dir: with `--out-dir .` it sits inside
-/// `dir` and must not count as a foreign file.
-fn check_out_dir(
-    dir: &Path,
-    force: bool,
-    own_stage: Option<&std::ffi::OsStr>,
-) -> Result<(), SetupError> {
-    let not_empty = |m: &str| SetupError::new("out_dir_not_empty", m.to_string());
-    if !dir.exists() {
-        return Ok(());
-    }
-    let entries = std::fs::read_dir(dir).map_err(|_| not_empty("out-dir 不是可读目录"))?;
-    let names: Vec<_> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.file_name())
-        .filter(|name| Some(name.as_os_str()) != own_stage)
-        .collect();
-    if names.is_empty() {
-        return Ok(());
-    }
-    if force && names.iter().all(|n| MANAGED.iter().any(|m| n == m)) {
-        return Ok(());
-    }
-    Err(not_empty(
-        "out-dir 非空；--force 只允许覆盖 omlx.yaml / subscription.yaml",
-    ))
-}
-
-/// Stage in a sibling dir, run the server's loader on it, then move into
-/// place. Nothing in `out_dir` changes unless validation passed, and replacing
-/// an existing dir is all-or-nothing: the old managed files are renamed aside
-/// first and restored if any later step fails. `out_dir` is re-checked right
-/// before replacing (the probe may have taken seconds), so a dir that gained
-/// foreign files meanwhile is not clobbered. Write failures are `write_failed`.
-fn write_validated(out_dir: &Path, force: bool, card: &str) -> Result<PathBuf, SetupError> {
-    let io = |e: std::io::Error| SetupError::new("write_failed", format!("写入失败：{e}"));
-    let parent = match out_dir.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    std::fs::create_dir_all(&parent).map_err(io)?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let stage = parent.join(format!(".idoris-setup-{}-{nanos}", std::process::id()));
-    std::fs::create_dir(&stage).map_err(io)?;
-    let result = (|| {
-        std::fs::write(stage.join("omlx.yaml"), card).map_err(io)?;
-        std::fs::write(stage.join("subscription.yaml"), SUBSCRIPTION_CARD).map_err(io)?;
-        crate::components::load_components(&stage, false).map_err(|e| {
-            SetupError::new(
-                "validation_failed",
-                e.to_string()
-                    .replace(&stage.display().to_string(), "<staging>"),
-            )
-        })?;
-        check_out_dir(out_dir, force, stage.file_name())?;
-        if out_dir.exists() {
-            replace_managed(&stage, out_dir).map_err(io)?;
-        } else {
-            std::fs::rename(&stage, out_dir).map_err(io)?;
-        }
-        out_dir.canonicalize().map_err(io)
-    })();
-    let _ = std::fs::remove_dir_all(&stage);
-    result
-}
-
-/// Moves the staged managed files into an existing `out_dir`, all or nothing.
-fn replace_managed(stage: &Path, out_dir: &Path) -> std::io::Result<()> {
-    let tag = format!(".idoris-bak-{}", std::process::id());
-    let mut backed_up: Vec<&str> = Vec::new();
-    let mut placed: Vec<&str> = Vec::new();
-    let attempt = (|| {
-        for name in MANAGED {
-            let target = out_dir.join(name);
-            if target.exists() {
-                std::fs::rename(&target, out_dir.join(format!("{name}{tag}")))?;
-                backed_up.push(name);
-            }
-        }
-        for name in MANAGED {
-            std::fs::rename(stage.join(name), out_dir.join(name))?;
-            placed.push(name);
-        }
-        Ok(())
-    })();
-    let Err(err) = attempt else {
-        for name in &backed_up {
-            let _ = std::fs::remove_file(out_dir.join(format!("{name}{tag}")));
-        }
-        return Ok(());
-    };
-    for name in &placed {
-        let _ = std::fs::rename(out_dir.join(name), stage.join(name));
-    }
-    let stranded: Vec<String> = backed_up
-        .iter()
-        .filter(|name| {
-            std::fs::rename(out_dir.join(format!("{name}{tag}")), out_dir.join(name)).is_err()
-        })
-        .map(|name| format!("{name}{tag}"))
-        .collect();
-    if stranded.is_empty() {
-        return Err(err);
-    }
-    Err(std::io::Error::other(format!(
-        "{err}；回滚未完成，旧文件保留为 {}",
-        stranded.join("、")
-    )))
-}
-
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-
     use super::*;
+    use idoris_upstream::engine::EngineRecipe;
 
-    fn card() -> String {
-        build_card("http://127.0.0.1:8000", LoadMode::OnDemand, &[]).unwrap()
+    const USER_APP: &str = "Applications/oMLX.app/Contents/MacOS/omlx-cli";
+
+    /// 家目录传到了配方上：`~/Applications/oMLX.app` 是发现位置之一（规范 §2.7.6 的发现顺序（3））。
+    /// 系统级的 `/Applications/oMLX.app` 在这台机器上有没有不影响这里：断言的是配方的计划，不是磁盘上的结果。
+    #[test]
+    fn the_home_directory_reaches_the_recipe_and_the_models_dir() {
+        let home = PathBuf::from("/Users/someone");
+        let setup = OmlxSetup::new(Some(home.clone()));
+        let apps = setup.recipe.discovery_plan().app_executables;
+        assert!(apps.contains(&home.join(USER_APP)), "{apps:?}");
+        assert_eq!(setup.models_dir, Some(home.join(".omlx/models")));
+    }
+
+    /// 没有家目录（缺失或不是绝对路径）就没有家目录下的发现位置，也没有模型目录：不回退到相对路径。
+    #[test]
+    fn a_missing_or_relative_home_means_no_user_level_locations() {
+        for home in [
+            None,
+            Some(PathBuf::from("relative/home")),
+            Some(PathBuf::new()),
+        ] {
+            let setup = OmlxSetup::new(home.clone());
+            let apps = setup.recipe.discovery_plan().app_executables;
+            assert_eq!(apps.len(), 1, "{home:?}: {apps:?}");
+            assert!(setup.models_dir.is_none(), "{home:?}");
+        }
     }
 
     #[test]
-    fn foreign_file_appearing_after_the_first_check_is_not_clobbered() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = tmp.path().join("comp");
-        std::fs::create_dir(&out).unwrap();
-        // Simulates a dir populated while the probe was in flight.
-        std::fs::write(out.join("mine.txt"), "keep").unwrap();
-        std::fs::write(out.join("omlx.yaml"), "old").unwrap();
-        let err = write_validated(&out, true, &card()).unwrap_err();
-        assert_eq!(err.code, "out_dir_not_empty");
+    fn the_setup_engine_is_the_reserved_omlx_kind_and_the_specs_candidate_order() {
+        let setup = OmlxSetup::new(None);
         assert_eq!(
-            std::fs::read_to_string(out.join("mine.txt")).unwrap(),
-            "keep"
+            setup.kind(),
+            idoris_upstream::engine::EngineKind::OMLX.as_str()
         );
-        assert_eq!(
-            std::fs::read_to_string(out.join("omlx.yaml")).unwrap(),
-            "old"
-        );
-    }
-
-    #[test]
-    fn mid_replace_failure_restores_the_previous_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = tmp.path().join("comp");
-        let stage = tmp.path().join("stage");
-        std::fs::create_dir(&out).unwrap();
-        std::fs::create_dir(&stage).unwrap();
-        std::fs::write(out.join("omlx.yaml"), "old-omlx").unwrap();
-        std::fs::write(out.join("subscription.yaml"), "old-sub").unwrap();
-        std::fs::write(stage.join("omlx.yaml"), "new-omlx").unwrap();
-        // subscription.yaml missing from the stage: the second move fails
-        // after omlx.yaml was already replaced.
-        replace_managed(&stage, &out).unwrap_err();
-        assert_eq!(
-            std::fs::read_to_string(out.join("omlx.yaml")).unwrap(),
-            "old-omlx"
-        );
-        assert_eq!(
-            std::fs::read_to_string(out.join("subscription.yaml")).unwrap(),
-            "old-sub"
-        );
-        let mut names: Vec<_> = std::fs::read_dir(&out)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        assert_eq!(names, ["omlx.yaml", "subscription.yaml"]);
-    }
-
-    #[test]
-    fn io_failure_is_write_failed_not_validation_failed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let blocker = tmp.path().join("file");
-        std::fs::write(&blocker, "x").unwrap();
-        let err = write_validated(&blocker.join("comp"), false, &card()).unwrap_err();
-        assert_eq!(err.code, "write_failed");
+        assert_eq!(setup.auto_ports(), [8088, 8000, 8001]);
+        assert_eq!(setup.managed_port_range(), 19000..=19999);
     }
 }
