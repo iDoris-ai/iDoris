@@ -190,7 +190,7 @@ pub enum CommandError {
     Closed,
     /// 这个上游在门控放行时没有就绪（降级放行）：完整的 Router 里根本没有它的 Supervisor，之后即使引擎好了也读不到（给它建
     /// Supervisor 要重建 Router，那是运行期引擎换代之外的事，S5 起就是已知限制）。放行时就绪的上游不冻结：引擎换代（`restart`、
-    /// `stop` 之后的 `start`）时它们的 Supervisor 复位（[`super::instance`] 的 `sync_supervisor`）。要重启 iDoris。
+    /// `stop` 之后的 `start`）时它们的 Supervisor 复位（`instance` 模块的 `sync_supervisor`）。要重启 iDoris。
     RestartRequired,
 }
 
@@ -661,8 +661,10 @@ impl EngineManager {
     }
 
     /// 停止 iDoris 自己拥有的引擎，状态 `stopped`；不是自己的（外部引擎、没有引擎）一律 [`CommandError::NotOwned`]，
-    /// 已经 `stopped` 时幂等。命令被接受时就回答，引擎停下之后状态才变成 `stopped`（至多 `stop_grace` 加一点余量）：调用方轮询
-    /// `/health` 或 Admin。进程确认消失之后，私有 key 才撤销（G2），Supervisor 的账本也清空（引擎已经没有了）。
+    /// 已经 `stopped` 时幂等。命令被接受**之前**已经关了 Supervisor 的门、发布了 `stopped`（不可服务：数据面立刻 503，Supervisor 不再
+    /// 准入新的加载与聊天）；之后才排空在途的、停进程（至多一个 `stop_grace` 加排空的上限）：这几秒里引擎还握在手里，`owned`、`pid`
+    /// 还在，进程确认消失之后才是 `owned: false`，调用方轮询 `/health` 或 Admin。进程确认消失之后，端点才被封上（G2，不是撤销登记），
+    /// Supervisor 的账本也清空（引擎已经没有了）。
     pub async fn stop_upstream(&self, id: &str) -> Result<(), CommandError> {
         self.command_logged(id, "stop", Command::Stop).await
     }

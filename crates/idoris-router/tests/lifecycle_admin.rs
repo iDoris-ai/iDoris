@@ -2121,7 +2121,7 @@ async fn c3_a_load_in_flight_when_the_engine_is_replaced_never_reaches_the_new_e
 async fn c4_an_accepted_stop_is_unservable_at_once_and_the_door_stays_shut_while_the_engine_is_still_exiting()
  {
     let rig = Rig::new(&Behavior {
-        trap_sigterm_secs: Some(1.5),
+        trap_sigterm_secs: Some(2.5),
         ..stateful()
     });
     let port = rig.port;
@@ -2141,7 +2141,7 @@ async fn c4_an_accepted_stop_is_unservable_at_once_and_the_door_stays_shut_while
     })
     .await;
 
-    // 引擎在退出的这一秒多里：进程还在、还是我们的（`owned`、`pid`），状态是 `stopped`；数据面 503，没有请求到引擎。
+    // 引擎在退出的这几秒里：进程还在、还是我们的（`owned`、`pid`），状态是 `stopped`；数据面 503，没有请求到引擎。
     assert!(pid_alive(old));
     let element = full.element("omlx").await;
     assert_eq!(element["state"], "stopped", "{element}");
@@ -2226,6 +2226,13 @@ async fn c6_a_restart_enqueued_while_the_reset_is_waiting_is_merged_and_the_engi
         full.rig.fake.launches() == 2 && full.rig.fake.requests_of("/api/status") > samples
     })
     .await;
+    // 复位还没做完：状态是 `restarting`（Agent24 对它有界等待；操作员的重启从受理到就绪一直是它），不是 `starting`，更不是 `ready`：
+    // 这时进来的请求会带着过期的账本。
+    assert_eq!(
+        full.element("omlx").await["state"],
+        "restarting",
+        "the engine is not ready until its ledger was rebuilt"
+    );
     // 第二个 `restart` 此刻到达：管理器正卡在复位里，命令排在队里。
     let second = {
         let full = full.clone();
@@ -2419,7 +2426,7 @@ async fn c10_a_managed_endpoint_is_blocked_from_the_first_instant_and_stays_so_u
 /// 在状态还是 `ready` 的时候过了那一关的。
 async fn a_request_past_the_state_gate_is_refused_by_the_closed_admission(uri: &str, body: Value) {
     let rig = Rig::new(&Behavior {
-        trap_sigterm_secs: Some(1.5),
+        trap_sigterm_secs: Some(2.5),
         ..stateful()
     });
     let port = rig.port;
@@ -2514,4 +2521,118 @@ async fn c12_an_external_process_that_reuses_the_pid_of_the_one_that_left_is_a_d
         2,
         "a recycled pid is a different process: the ledger was rebuilt, so the next chat confirmed the model with a load"
     );
+}
+
+#[tokio::test]
+async fn c13_after_the_drain_runs_out_the_old_generation_sends_nothing_more_to_the_engine_it_is_stopping()
+ {
+    // 旧引擎收到 SIGTERM 之后还继续服务 2.5 秒（它已经接受的与新来的连接都答）：这一段里旧一代的任务要是还能发请求，就会发给一个
+    // 正在退出的引擎。排空到点就切断旧一代的凭证，所以它们之后发的每个请求都在适配器就被拒绝，一个字节也没发出去。
+    let rig = Rig::new(&Behavior {
+        trap_sigterm_secs: Some(2.5),
+        ..stateful()
+    });
+    let port = rig.port;
+    let mut timings = fast();
+    timings.drain_timeout = Duration::from_millis(300);
+    let full = Arc::new(Full::start_with(rig, Scripted::claiming(port), timings).await);
+    full.wait_open().await;
+    let old = full.rig.pid(0);
+
+    // 一个加载已经发给旧引擎、还没做完。
+    full.rig.fake.hold(Hold::Load);
+    let in_flight = {
+        let full = full.clone();
+        tokio::spawn(async move { full.chat().await })
+    };
+    wait_for("the load to reach the old engine", || {
+        full.rig.fake.model_loads() == 1
+    })
+    .await;
+    let status_reads = full.rig.fake.requests_of("/v1/models/status");
+
+    let (status, _) = full
+        .admin("POST", "/admin/api/v1/upstreams/omlx/restart")
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    // 排空到点（300 毫秒）：旧一代被切断，然后才是 SIGTERM；引擎接着还服务 2.5 秒。
+    wait_for("the old engine to get SIGTERM", || {
+        full.rig.fake.got_sigterm(old)
+    })
+    .await;
+    // 旧引擎这时还活着，放开它的加载：加载做完了，那个操作接着要发的下一个请求（确认模型的状态）被拒绝。
+    assert!(pid_alive(old));
+    full.rig.fake.release(Hold::Load);
+    let (status, body) = in_flight.await.unwrap();
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "the old generation's operation went on talking to the engine: {body}"
+    );
+    assert_eq!(
+        full.rig.fake.requests_of("/v1/models/status"),
+        status_reads,
+        "nothing more was sent for the old generation once it was cut off"
+    );
+}
+
+#[tokio::test]
+async fn c14_while_the_old_load_is_in_flight_its_fence_stays_and_no_second_engine_is_started() {
+    let rig = Rig::new(&stateful_with_term_marker());
+    let port = rig.port;
+    let fence =
+        idoris_upstream::omlx::load_fence_path_in(&rig.state_dir(), &rig.endpoint()).unwrap();
+    let full = Arc::new(Full::start(rig, Scripted::claiming(port)).await);
+    full.wait_open().await;
+    let old = full.rig.pid(0);
+
+    full.rig.fake.hold(Hold::Load);
+    let in_flight = {
+        let full = full.clone();
+        tokio::spawn(async move { full.chat().await })
+    };
+    wait_for("the load to reach the old engine", || {
+        full.rig.fake.model_loads() == 1
+    })
+    .await;
+    assert!(fence.exists(), "an admitted load leaves its durable fence");
+
+    let (status, _) = full
+        .admin("POST", "/admin/api/v1/upstreams/omlx/restart")
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    // 排空在等这个加载（上限 5 秒）：这半秒里什么都不变。旧引擎活着、没收到信号；围栏还在（它说的是这个还没做完的加载，旧引擎
+    // 没消失之前不能清）；没有第二个引擎。
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(pid_alive(old));
+    assert!(
+        !full.rig.fake.got_sigterm(old),
+        "signalled before it drained"
+    );
+    assert!(
+        fence.exists(),
+        "the fence was cleared while its load was still running"
+    );
+    assert_eq!(
+        full.rig.fake.launches(),
+        1,
+        "a second engine was started early"
+    );
+
+    // 加载做完，围栏随之清掉；这之后旧引擎才被停掉，新引擎换上。这个请求的加载是在关门之前准入的，做完了；它接着要来的聊天是
+    // 关门之后才到的，被拒绝（503，`supervisor_unavailable`），不是发给一个正在被替换的引擎。
+    full.rig.fake.release(Hold::Load);
+    let (status, body) = in_flight.await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"]["reason_code"], "supervisor_unavailable",
+        "{body}"
+    );
+    wait_for("the replacement to be ready", || {
+        full.rig.fake.launches() == 2
+            && full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    assert!(full.rig.fake.got_sigterm(old));
+    assert!(!fence.exists());
 }
