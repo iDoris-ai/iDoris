@@ -209,19 +209,27 @@ impl OmlxAdapter {
         self
     }
 
-    fn api_key(&self) -> Option<String> {
-        if self.per_request_key {
-            key::resolve_omlx_api_key_for(&self.base_url)
-        } else {
-            self.api_key.clone()
+    /// The credential for the request about to be made — the **one place** this adapter resolves one.
+    ///
+    /// In per-request mode the request's engine generation (bound by the Supervisor at admission, see
+    /// [`idoris_backend::generation`]) is checked against the endpoint's current one in the same read that
+    /// yields the key: work admitted for an engine that has since been replaced is **refused**, and so is
+    /// anything aimed at a blocked endpoint — nothing is sent, so neither the new engine's credentials nor
+    /// the request body (a prompt) can reach a process the work was not admitted for. An adapter with a
+    /// fixed key is unchanged.
+    fn api_key(&self) -> Result<Option<String>, BackendError> {
+        if !self.per_request_key {
+            return Ok(self.api_key.clone());
         }
+        key::resolve_omlx_api_key_checked(&self.base_url, idoris_backend::pinned_generation())
+            .map_err(|refusal| upstream_error(refusal.to_string()))
     }
 
     // Thin wrappers binding `http`'s free functions to this instance's
     // client/base_url/api_key/call_timeout — every call site below reads
     // as just "GET/POST/PUT `path`" instead of repeating all four fields.
     async fn get(&self, path: &str) -> Result<serde_json::Value, BackendError> {
-        let key = self.api_key();
+        let key = self.api_key()?;
         http::get_json(
             &self.client,
             &self.base_url,
@@ -233,7 +241,7 @@ impl OmlxAdapter {
     }
 
     async fn post(&self, path: &str) -> Result<(), BackendError> {
-        let key = self.api_key();
+        let key = self.api_key()?;
         http::post_empty(
             &self.client,
             &self.base_url,
@@ -250,7 +258,7 @@ impl OmlxAdapter {
         body: &serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, BackendError> {
-        let key = self.api_key();
+        let key = self.api_key()?;
         http::post_and_parse(
             &self.client,
             &self.base_url,
@@ -296,7 +304,7 @@ impl OmlxAdapter {
     /// [`BackendError::LoadUnconfirmed`]. Once loaded state is confirmed,
     /// deterministic policy failures use `LoadPostconditionFailed`.
     pub async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
-        let key = self.api_key();
+        let key = self.api_key()?;
         http::post_load(
             &self.client,
             &self.base_url,
@@ -511,6 +519,14 @@ fn is_ready(raw: &serde_json::Value, id: &str) -> bool {
 /// shadowing rule silently doing the right thing.
 #[async_trait::async_trait]
 impl RuntimeAdapter for OmlxAdapter {
+    /// In per-request mode: the generation of the engine behind this endpoint *now* (the engine manager
+    /// bumps it whenever the credentials it registered for the endpoint change). The Supervisor binds
+    /// every admitted operation to it; see [`Self::api_key`].
+    fn engine_generation(&self) -> Option<u64> {
+        self.per_request_key
+            .then(|| key::endpoint_generation(&self.base_url))
+    }
+
     fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
         if let Some(path) = &self.load_fence_path {
             return Ok(path.clone());

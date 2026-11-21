@@ -34,8 +34,9 @@ pub fn pinned_generation() -> Option<u64> {
     PINNED.try_with(|generation| *generation).ok()
 }
 
-/// Runs `future` bound to `generation` (`None` = unbound: it runs as it is).
-pub(crate) async fn scoped<F: Future>(generation: Option<u64>, future: F) -> F::Output {
+/// Runs `future` bound to `generation` (`None` = unbound: it runs as it is). The Supervisor does this for
+/// every operation it admits; a test of a generation-aware adapter calls it to stand in for the Supervisor.
+pub async fn scoped<F: Future>(generation: Option<u64>, future: F) -> F::Output {
     match generation {
         Some(generation) => PINNED.scope(generation, future).await,
         None => future.await,

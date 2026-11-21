@@ -17,6 +17,12 @@
 //! - **引擎管理器接管的端点**（IDORIS-CORE S5，规范 §2.7.7）：[`govern_endpoint`] 登记之后，iDoris 自己拉起的引擎只用它的
 //!   私有 key（[`EndpointKey::Private`]，优先于上面的顺序）；外部引擎的 `settings.json` key 要等端口属主校验通过
 //!   （[`EndpointKey::External`]，#619）。没有登记的端点（非托管的卡）按上面的顺序，与以前完全一样。
+//! - **封上的端点**（IDORIS-CORE S6，Codex 预审 3）：托管的端点在引擎管理器启动时就先登记成 [`EndpointKey::Blocked`]，引擎停了、
+//!   正在被替换、外部引擎的监听者没了的时候也回到它：**什么凭证都不发**（环境变量、`settings.json`、私有 key 都不发），
+//!   上面那条回退链**从不适用于托管的端点**；直到下一个监听者通过校验、被登记成私有或外部的口径。
+//! - **代际**：每个端点的登记有一个只增的代际，口径每变一次（换了私有 key、验证状态变了、封上、撤销）加一。按请求取凭证的
+//!   调用方把请求准入时的代际带进来（[`resolve_omlx_api_key_checked`]），代际不是当前的就拒绝：属于已经被换掉的引擎的请求，
+//!   拿不到新引擎的凭证。
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -99,6 +105,10 @@ pub enum EndpointKey {
     /// 的 key 是 iDoris 自己读来的，**只在这个端口的监听者通过属主校验之后**才发
     /// （`settings_key_verified`，[#619](https://github.com/iDoris-ai/iDoris/issues/619)）。
     External { settings_key_verified: bool },
+    /// **不发任何凭证**：这个端点是托管的，但此刻没有一个我们认得的引擎在它后面（引擎停了、正在被替换、监听者没了、端口上换了
+    /// 别的东西）。没有环境变量的 key，没有 `settings.json` 的 key，没有私有 key，也不退回 §2.9 的顺序（那条回退链是给没人管的
+    /// 端点用的）。按请求取凭证的适配器遇到它直接拒绝请求，什么都不发（请求体里有用户的提示词）。
+    Blocked,
 }
 
 impl std::fmt::Debug for EndpointKey {
@@ -111,13 +121,23 @@ impl std::fmt::Debug for EndpointKey {
                 .debug_struct("External")
                 .field("settings_key_verified", settings_key_verified)
                 .finish(),
+            Self::Blocked => f.write_str("Blocked"),
         }
     }
 }
 
+/// 一个端点在登记表里的状态：此刻的口径（`None` = 没人管）与它的**代际**。代际只增不减，口径每变一次加一，所以「这个请求
+/// 是在哪一代准入的」能和「现在是哪一代」比较。条目从不删除（撤销只是把口径清成 `None`，代际照加）：同一个端点的代际
+/// 永远不会重复。
+#[derive(Clone)]
+struct Governance {
+    generation: u64,
+    key: Option<EndpointKey>,
+}
+
 /// 进程里被引擎管理器接管的端点（键是 [`endpoint_identity`]）。进程全局：三个调用点（适配器、代理、模型列表）各自
 /// 按 URL 解析 key，没有一条共同的对象能把表传下去。没有登记的端点（非托管的卡）行为与以前完全一样。
-static GOVERNED: RwLock<BTreeMap<String, EndpointKey>> = RwLock::new(BTreeMap::new());
+static GOVERNED: RwLock<BTreeMap<String, Governance>> = RwLock::new(BTreeMap::new());
 
 /// 端点的规范标识 `scheme://host[:port]`（host 小写），不含路径、凭据、查询、片段；不是 http(s) URL 时没有。
 /// `http://127.0.0.1:19731`、`http://127.0.0.1:19731/` 与带路径的写法是同一个端点。
@@ -133,37 +153,118 @@ pub fn endpoint_identity(base_url: &str) -> Option<String> {
     })
 }
 
-/// 登记（或更新）一个端点的 key 口径。`base_url` 不是 http(s) URL 时什么也不做，返回 `false`。
+/// 登记（或更新）一个端点的 key 口径。口径变了（与此刻登记的不相等）代际加一；登记同一个口径不变。`base_url` 不是
+/// http(s) URL 时什么也不做，返回 `false`。
 pub fn govern_endpoint(base_url: &str, policy: EndpointKey) -> bool {
     let Some(identity) = endpoint_identity(base_url) else {
         return false;
     };
-    GOVERNED
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(identity, policy);
+    let mut governed = GOVERNED.write().unwrap_or_else(PoisonError::into_inner);
+    let slot = governed.entry(identity).or_insert(Governance {
+        generation: 0,
+        key: None,
+    });
+    if slot.key.as_ref() != Some(&policy) {
+        slot.key = Some(policy);
+        slot.generation += 1;
+    }
     true
 }
 
-/// 撤销登记：之后这个端点回到没人管的状态（按 §2.9 的顺序）。私有 key 在引擎停止、换代、失效时必须撤销，
-/// 否则旧 key 会一直留在进程内存里，发给之后占着这个端口的别的东西。
+/// 封上一个端点：之后什么凭证都不发（[`EndpointKey::Blocked`]）。**引擎停了、正在被替换、监听者没了时用它，不是
+/// [`release_endpoint`]**：撤销登记会让回退链（环境变量、`settings.json`）重新适用于这个端点，把用户的 key 发给之后占着
+/// 这个端口、还没通过校验的别的东西。
+pub fn block_endpoint(base_url: &str) -> bool {
+    govern_endpoint(base_url, EndpointKey::Blocked)
+}
+
+/// 撤销登记：之后这个端点回到没人管的状态（按 §2.9 的顺序）。**只用在端点不再是托管的时候**（v0.6.0 里托管的端点永远不会
+/// 变成非托管，引擎管理器用 [`block_endpoint`]）；代际加一。
 pub fn release_endpoint(base_url: &str) {
     if let Some(identity) = endpoint_identity(base_url) {
-        GOVERNED
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&identity);
+        let mut governed = GOVERNED.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = governed.get_mut(&identity)
+            && slot.key.take().is_some()
+        {
+            slot.generation += 1;
+        }
     }
 }
 
 /// 一个端点当前的登记口径。
 pub fn governed_endpoint(base_url: &str) -> Option<EndpointKey> {
-    let identity = endpoint_identity(base_url)?;
+    governance_of(base_url).0
+}
+
+/// 一个端点此刻的代际：口径每变一次加一，没登记过的端点是 0。
+pub fn endpoint_generation(base_url: &str) -> u64 {
+    governance_of(base_url).1
+}
+
+/// 同一次读里的口径与代际（两者一致）。
+fn governance_of(base_url: &str) -> (Option<EndpointKey>, u64) {
+    let Some(identity) = endpoint_identity(base_url) else {
+        return (None, 0);
+    };
     GOVERNED
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .get(&identity)
-        .cloned()
+        .map_or((None, 0), |slot| (slot.key.clone(), slot.generation))
+}
+
+/// 为什么一个请求拿不到凭证（[`resolve_omlx_api_key_checked`]）。说明里没有任何 key。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRefusal {
+    /// 请求准入时绑定的引擎代际不是当前的：它属于一个已经被换掉的引擎进程，不能拿新引擎的凭证，请求体也不能发给它。
+    StaleGeneration { admitted: u64, current: u64 },
+    /// 端点被封上了（[`EndpointKey::Blocked`]）：没有一个通过校验的引擎在它后面，什么都不发。
+    Blocked,
+}
+
+impl std::fmt::Display for KeyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaleGeneration { admitted, current } => write!(
+                f,
+                "the engine behind this endpoint was replaced (this request was admitted for generation {admitted}, the current one is {current}): the request was not sent"
+            ),
+            Self::Blocked => f.write_str(
+                "no verified engine is behind this endpoint right now (it is blocked): the request was not sent",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for KeyRefusal {}
+
+/// 按请求取 key，并核对准入时的代际（IDORIS-CORE S6）：`admitted_generation` 是这个请求所属的操作被准入时端点的代际
+/// （`None` = 不绑定，按此刻的口径）。代际不是当前的、或端点被封上时拒绝（`Err`），什么凭证都不给；否则 `Ok(key)`
+/// （`None` = 不带 key）。口径与代际在同一次读里取，所以「核对通过」与「给出的 key」一致。
+pub fn resolve_omlx_api_key_checked(
+    base_url: &str,
+    admitted_generation: Option<u64>,
+) -> Result<Option<String>, KeyRefusal> {
+    let (governed, generation) = governance_of(base_url);
+    if let Some(admitted) = admitted_generation
+        && admitted != generation
+    {
+        return Err(KeyRefusal::StaleGeneration {
+            admitted,
+            current: generation,
+        });
+    }
+    if governed == Some(EndpointKey::Blocked) {
+        return Err(KeyRefusal::Blocked);
+    }
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    Ok(resolve_for_endpoint(
+        std::env::var_os(OMLX_API_KEY_ENV),
+        home.as_deref().map(Path::new),
+        is_loopback_base_url(base_url),
+        governed.as_ref(),
+    )
+    .and_then(|key| key.into_string().ok()))
 }
 
 /// 纯解析：在 [`resolve_from_for`] 之上加「端点被引擎管理器接管」的口径（`governed`）。
@@ -175,6 +276,8 @@ pub fn resolve_for_endpoint(
     governed: Option<&EndpointKey>,
 ) -> Option<OsString> {
     match governed {
+        // 封上的端点：什么都不发，回退链（环境变量、`settings.json`）不适用。
+        Some(EndpointKey::Blocked) => None,
         Some(EndpointKey::Private(key)) => Some(OsString::from(key)),
         Some(EndpointKey::External {
             settings_key_verified,
