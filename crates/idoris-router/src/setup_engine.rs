@@ -251,8 +251,9 @@ pub enum FindFailure {
 /// `--out-dir` 的用法：整个目录由这次 setup 生成，还是往一个已有的组件目录里加一张卡。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutDirUse {
-    /// 整个目录由这次 setup 生成（卡加 [`SetupEngine::static_files`]，`setup omlx`）：目录要是空的，`--force` 只允许
-    /// 整体替换这些文件。
+    /// 这次 setup 生成一组自己的文件（卡、[`SetupEngine::static_files`]、伴生卡，`setup omlx`）：目录要是空的；
+    /// 非空时要 `--force`，而它只替换这些文件，目录里别的卡与文件原样保留（#626）。保留下来的卡与新卡一起过加载器，
+    /// 有冲突（重复的 `provider.id`、保留的卡本身加载不了、多张默认卡）就整体失败，目录一个字节不变。
     Owned,
     /// 往一个已有的组件目录里加一张卡（`setup upstream`）：写 [`SetupEngine::card_file`] 这一个文件，目录里别的文件
     /// 都不动，`--force` 替换的也是这一个文件。整个目录（现有的卡加新卡）过服务启动时的加载器之后才放进去。
@@ -274,6 +275,19 @@ pub trait SetupEngine: Sync {
 
     /// 运行期提供引擎 API key 的环境变量名；探测发现要鉴权时写进输出的 `next.needs_env`。
     fn key_env(&self) -> &'static str;
+
+    /// 落盘事务的测试挂钩（[`CommitHook`]）。生产路径恒为 `None`。
+    fn commit_hook(&self) -> Option<CommitHook> {
+        None
+    }
+
+    /// 写进 `next.key_note` 的一句人话：key 是可选的，运行期按什么顺序取。默认只说环境变量；引擎还有别的来源时覆盖它。
+    fn key_note(&self) -> String {
+        format!(
+            "API key 可选：运行期取环境变量 {}，没有就不带鉴权连接",
+            self.key_env()
+        )
+    }
 
     /// 采纳模式：位置上有没有可执行文件。只做文件检查，不校验签名、不执行它：采纳不需要拉起它，
     /// 校验签名要读整个 `.app`，在这里是白花时间。
@@ -497,11 +511,13 @@ pub async fn run_setup<E: SetupEngine>(
             if let Some((file, companion_yaml)) = &companion {
                 files.push((file.as_str(), companion_yaml.as_str()));
             }
-            write_validated_with(
+            let hook = engine.commit_hook();
+            write_validated_hooked(
                 &options.out_dir,
                 options.force,
                 &files,
                 engine.companion_files(),
+                hook.as_ref(),
             )?
         }
         OutDirUse::AddCard if companion.is_some() => {
@@ -537,7 +553,9 @@ pub async fn run_setup<E: SetupEngine>(
     let companion_file = companion.map(|(file, _)| file);
     let mut next = json!({"env": {"IDORIS_COMPONENTS_DIR": dir.display().to_string()}});
     if auth_required {
+        // `needs_env` 的形状不变（它是优先级最高的那个变量名）；`key_note` 说明它其实是可选的、有哪些回退来源。
         next["needs_env"] = json!([engine.key_env()]);
+        next["key_note"] = json!(engine.key_note());
     }
     let mut engine_json = json!({
         "engine_kind": engine.kind(),
@@ -932,19 +950,16 @@ fn check_out_dir(
         return Ok(());
     }
     let entries = std::fs::read_dir(dir).map_err(|_| not_empty("out-dir 不是可读目录"))?;
-    let names: Vec<_> = entries
+    let any = entries
         .filter_map(Result::ok)
-        .map(|e| e.file_name())
-        .filter(|name| Some(name.as_os_str()) != own_stage)
-        .collect();
-    if names.is_empty() {
-        return Ok(());
-    }
-    if force && names.iter().all(|n| managed.iter().any(|m| n == m)) {
+        .any(|e| Some(e.file_name().as_os_str()) != own_stage);
+    // 目录非空时：不带 `--force` 一律拒绝；带 `--force` 放行，替换的只有 `managed` 这些文件，目录里别的卡与文件
+    // 原样保留（保留下来的卡是否与新卡相容，由暂存目录里的整体校验判定，#626）。
+    if !any || force {
         return Ok(());
     }
     Err(not_empty(&format!(
-        "out-dir 非空；--force 只允许覆盖 {}",
+        "out-dir 非空；加 --force 只替换 {}，目录里别的卡原样保留",
         managed.join(" / ")
     )))
 }
@@ -966,13 +981,219 @@ fn create_stage(out_dir: &Path) -> Result<PathBuf, SetupError> {
     Ok(stage)
 }
 
+/// 事务进行到哪一步（只给测试挂钩用，生产路径不传钩子）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitPhase {
+    /// 暂存目录已经校验通过，还没有对 out-dir 做最后一次核对与落盘：测试在这里改动被保留的卡，证明会被发现。
+    Validated,
+    /// 要被替换的旧文件已经挪进事务目录，新文件还没有放进 out-dir：测试在这里让放入或恢复失败。
+    BackedUp,
+}
+
+/// 测试挂钩：`(阶段, out-dir)`。
+pub type CommitHook = std::sync::Arc<dyn Fn(CommitPhase, &Path) + Send + Sync>;
+
+fn fire(hook: Option<&CommitHook>, phase: CommitPhase, out_dir: &Path) {
+    if let Some(hook) = hook {
+        hook(phase, out_dir);
+    }
+}
+
+/// 对一个组件目录的独占建议锁（`flock`）。拿着它的期间，别的 `setup omlx` / `setup upstream` 对同一个目录的写入会排队，
+/// 所以「快照保留的卡、校验、落盘」这一整段不会和另一次 setup 交错。Drop 时释放。
+///
+/// 只防「同一用户并发跑 setup」与手滑造成的改动，不防恶意写入者：建议锁对不遵守它的进程没有约束力，
+/// 而最后一次核对与落盘（`hard_link`、`rename`）之间仍有一个很短的窗口，恶意写入者可以在窗口里动手。
+/// setup 是用户自己运行的命令行，这个剩余风险是接受的。
+pub struct DirLock {
+    #[cfg(unix)]
+    _flock: nix::fcntl::Flock<std::fs::File>,
+}
+
+/// 锁 `out_dir`（已存在时）；还不存在时锁它的父目录（先建出来），拿到锁之后再看一眼：期间被别人建出来了，
+/// 就放掉父目录的锁、改锁 `out_dir` 本身。目录本身当锁文件：不在用户目录里留下任何锁文件。
+#[cfg(unix)]
+pub fn lock_out_dir(out_dir: &Path) -> Result<DirLock, SetupError> {
+    use nix::fcntl::{Flock, FlockArg};
+    let io = |e: &dyn std::fmt::Display| {
+        SetupError::new("write_failed", format!("无法锁定 out-dir（{e}）"))
+    };
+    loop {
+        let (target, is_dir) = if out_dir.is_dir() {
+            (out_dir.to_path_buf(), true)
+        } else {
+            let parent = match out_dir.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            std::fs::create_dir_all(&parent).map_err(|e| io(&e))?;
+            (parent, false)
+        };
+        let file = std::fs::File::open(&target).map_err(|e| io(&e))?;
+        let flock = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, e)| io(&e))?;
+        if is_dir || !out_dir.is_dir() {
+            return Ok(DirLock { _flock: flock });
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn lock_out_dir(_out_dir: &Path) -> Result<DirLock, SetupError> {
+    Ok(DirLock {})
+}
+
+/// 目录里一个「加载器会读的文件」的状态：类型、身份（设备、inode）、大小、mtime、符号链接的指向与目标的身份、内容的 SHA-256。
+/// 校验时读到的内容就是这里哈希的内容；落盘前重新取一遍，任何一项不同都说明目录在校验之后被改过。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EntryState {
+    kind: u8,
+    identity: (u64, u64, u64, i128),
+    link: Option<PathBuf>,
+    target_identity: Option<(u64, u64, u64, i128)>,
+    hash: Option<Vec<u8>>,
+}
+
+type Snapshot = std::collections::BTreeMap<std::ffi::OsString, EntryState>;
+
+fn identity(meta: &std::fs::Metadata) -> (u64, u64, u64, i128) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            meta.dev(),
+            meta.ino(),
+            meta.size(),
+            i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos() as i128);
+        (0, 0, meta.len(), mtime)
+    }
+}
+
+/// 读一个条目：跟随符号链接读内容（和加载器一样，`read_to_string` 跟随链接），所以指向卡的符号链接按卡算；
+/// 指向不存在的目标的链接、名字像卡的目录，内容读不出来，返回错误。
+fn read_entry(path: &Path) -> (EntryState, std::io::Result<Vec<u8>>) {
+    let meta = std::fs::symlink_metadata(path);
+    let (kind, id) = match &meta {
+        Ok(m) => (
+            if m.file_type().is_symlink() {
+                1
+            } else if m.is_dir() {
+                2
+            } else if m.is_file() {
+                0
+            } else {
+                3
+            },
+            identity(m),
+        ),
+        Err(_) => (9, (0, 0, 0, 0)),
+    };
+    let link = if kind == 1 {
+        std::fs::read_link(path).ok()
+    } else {
+        None
+    };
+    let target_identity = if kind == 1 {
+        std::fs::metadata(path).ok().map(|m| identity(&m))
+    } else {
+        None
+    };
+    let content = std::fs::read(path);
+    let hash = content.as_ref().ok().map(|bytes| {
+        ring::digest::digest(&ring::digest::SHA256, bytes)
+            .as_ref()
+            .to_vec()
+    });
+    (
+        EntryState {
+            kind,
+            identity: id,
+            link,
+            target_identity,
+            hash,
+        },
+        content,
+    )
+}
+
+/// 取 `dir` 里加载器会读的文件的快照（`skip` 里的名字除外：它们要被替换）。`copy_to` 有值时顺便把内容复制进暂存目录，
+/// 校验用的就是这份内容；读不了的条目（断掉的符号链接、名字像卡的目录）是 `validation_failed`。
+/// 不是卡的文件（没有 `.yaml` / `.yml` 扩展名）不在快照里，也不会被碰。
+fn snapshot_cards(
+    dir: &Path,
+    skip: &[&str],
+    copy_to: Option<&Path>,
+) -> Result<Snapshot, SetupError> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|_| SetupError::new("out_dir_not_empty", "out-dir 不是可读目录"))?;
+    let mut snapshot = Snapshot::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name();
+        if !crate::components::is_card_file(&path) || skip.iter().any(|s| name == *s) {
+            continue;
+        }
+        let (state, content) = read_entry(&path);
+        if let Some(stage) = copy_to {
+            let bytes = content.map_err(|e| {
+                SetupError::new(
+                    "validation_failed",
+                    format!(
+                        "out-dir 里已有的 {} 读不了（{}）",
+                        name.to_string_lossy(),
+                        e.kind()
+                    ),
+                )
+            })?;
+            std::fs::write(stage.join(&name), bytes)
+                .map_err(|e| SetupError::new("write_failed", format!("写入失败：{e}")))?;
+        }
+        snapshot.insert(name, state);
+    }
+    Ok(snapshot)
+}
+
+/// 落盘前的最后一次核对：被保留的卡与校验时相比，条目集合、文件身份、大小、mtime、内容哈希都没变。
+/// 变了就整体放弃（`validation_failed`，什么也没写），说明里点名变了的文件。
+fn recheck_kept(dir: &Path, skip: &[&str], before: &Snapshot) -> Result<(), SetupError> {
+    let now = snapshot_cards(dir, skip, None)?;
+    if &now == before {
+        return Ok(());
+    }
+    let mut changed: Vec<String> = before
+        .keys()
+        .chain(now.keys())
+        .filter(|name| before.get(*name) != now.get(*name))
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
+    changed.sort();
+    changed.dedup();
+    Err(SetupError::new(
+        "validation_failed",
+        format!(
+            "out-dir 在 setup 运行期间被改动（{}）：为了不写出一个没校验过的目录，什么也没写，请确认后重新运行",
+            changed.join("、")
+        ),
+    ))
+}
+
 /// Stage in a sibling dir, run the server's loader on it, then move into
 /// place. Nothing in `out_dir` changes unless validation passed, and replacing
-/// an existing dir is all-or-nothing: the old managed files are renamed aside
-/// first and restored if any later step fails. `out_dir` is re-checked right
-/// before replacing (the probe may have taken seconds), so a dir that gained
-/// foreign files meanwhile is not clobbered. Write failures are `write_failed`.
-/// `files` 是 `(文件名, 内容)`；它们的文件名就是 `--force` 允许覆盖的集合。
+/// an existing dir is all-or-nothing: the old managed files are moved into a
+/// private backup directory first and restored if any later step fails.
+/// Write failures are `write_failed`.
+///
+/// 整段（快照保留的卡、校验、落盘）在 `out_dir` 的独占锁里（[`lock_out_dir`]）；落盘前核对被保留的卡没有变
+/// （[`recheck_kept`]）。备份放在暂存目录里独占创建的 0700 子目录，不往用户目录里放任何可能撞名的备份文件。
+/// `files` 是 `(文件名, 内容)`；它们的文件名就是 `--force` 替换的集合，目录里别的卡原样保留。
 pub fn write_validated(
     out_dir: &Path,
     force: bool,
@@ -981,13 +1202,24 @@ pub fn write_validated(
     write_validated_with(out_dir, force, files, &[])
 }
 
-/// [`write_validated`]，另有 `also_managed`：这次不写、但属于 `--force` 整体替换范围的文件名（伴生卡）。
+/// [`write_validated`]，另有 `also_managed`：这次不写、但属于 `--force` 替换范围的文件名（伴生卡）。
 /// 它们在目标目录里已经有时一并清掉（和别的被替换的文件一样先挪开，失败时整体恢复），不留旧版本。
 pub fn write_validated_with(
     out_dir: &Path,
     force: bool,
     files: &[(&str, &str)],
     also_managed: &[&str],
+) -> Result<PathBuf, SetupError> {
+    write_validated_hooked(out_dir, force, files, also_managed, None)
+}
+
+/// [`write_validated_with`]，带测试挂钩（生产路径传 `None`）。
+pub fn write_validated_hooked(
+    out_dir: &Path,
+    force: bool,
+    files: &[(&str, &str)],
+    also_managed: &[&str],
+    hook: Option<&CommitHook>,
 ) -> Result<PathBuf, SetupError> {
     let io = |e: std::io::Error| SetupError::new("write_failed", format!("写入失败：{e}"));
     let names: Vec<&str> = files.iter().map(|(name, _)| *name).collect();
@@ -998,78 +1230,163 @@ pub fn write_validated_with(
         .filter(|name| !names.contains(name))
         .collect();
     let scope: Vec<&str> = names.iter().chain(clear_only.iter()).copied().collect();
+    let _lock = lock_out_dir(out_dir)?;
     let stage = create_stage(out_dir)?;
+    let keep_stage = std::cell::Cell::new(false);
     let result = (|| {
+        // `--force` 在非空目录上只替换 `scope` 里的文件：别的卡原样留在 `out_dir`，但它们要和新卡一起过加载器，
+        // 所以先快照并复制进暂存目录。目录不存在时没有保留的卡。
+        let kept = if force && out_dir.is_dir() {
+            snapshot_cards(out_dir, &scope, Some(&stage))?
+        } else {
+            Snapshot::new()
+        };
         for (name, content) in files {
             std::fs::write(stage.join(name), content).map_err(io)?;
         }
-        crate::components::load_components(&stage, false).map_err(|e| {
+        // 说明里的暂存目录路径换成 `out_dir`：暂存目录里的文件名与 `out_dir` 里的一一对应，保留下来的卡出问题时点得到名。
+        let cards = crate::components::load_components(&stage, false).map_err(|e| {
             SetupError::new(
                 "validation_failed",
                 e.to_string()
-                    .replace(&stage.display().to_string(), "<staging>"),
+                    .replace(&stage.display().to_string(), &out_dir.display().to_string()),
             )
         })?;
+        // 最终的集合（保留的加新的）里至多一张默认卡。
+        check_at_most_one_default(&cards)?;
+        fire(hook, CommitPhase::Validated, out_dir);
         check_out_dir(out_dir, force, stage.file_name(), &scope)?;
         if out_dir.exists() {
-            replace_managed(&stage, out_dir, &names, &clear_only).map_err(io)?;
+            recheck_kept(out_dir, &scope, &kept)?;
+            let backup = stage.join(BACKUP_DIR);
+            make_private_dir(&backup).map_err(io)?;
+            replace_managed(&stage, out_dir, &names, &clear_only, &backup, hook).map_err(
+                |failure| {
+                    keep_stage.set(!failure.stranded.is_empty());
+                    failure.into_setup_error()
+                },
+            )?;
         } else {
             std::fs::rename(&stage, out_dir).map_err(io)?;
         }
         out_dir.canonicalize().map_err(io)
     })();
-    let _ = std::fs::remove_dir_all(&stage);
+    // 回滚没做完时，暂存目录里的备份子目录是用户手工恢复的依据，不能删。
+    if !keep_stage.get() {
+        let _ = std::fs::remove_dir_all(&stage);
+    }
     result
 }
 
+/// 暂存目录里放备份的子目录名。加载器只读 `*.yaml` / `*.yml` 文件，这个目录不会被当成卡。
+const BACKUP_DIR: &str = ".idoris-backup";
+
+/// 独占创建（已存在就失败）、只有属主可进入的目录。
+fn make_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// 替换失败。`stranded` 为空表示已经全部恢复；否则每一项说明一个没能放回原处的文件在哪里（路径，不含任何内容）。
+#[derive(Debug)]
+struct CommitFailure {
+    error: std::io::Error,
+    stranded: Vec<String>,
+}
+
+impl CommitFailure {
+    fn into_setup_error(self) -> SetupError {
+        if self.stranded.is_empty() {
+            return SetupError::new("write_failed", format!("写入失败：{}", self.error));
+        }
+        SetupError::new(
+            "write_failed",
+            format!(
+                "写入失败：{}；回滚没有完成，下面这些文件不在原处，请按说明手工恢复：{}",
+                self.error,
+                self.stranded.join("；")
+            ),
+        )
+    }
+}
+
 /// Moves the staged managed files into an existing `out_dir`, all or nothing.
-/// `names` 必须都在暂存目录里；`clear_only` 只在目标目录里挪开（成功后删除），不从暂存目录放入。
+/// `names` 必须都在暂存目录里；`clear_only` 只在目标目录里挪开（成功后随暂存目录一起删除），不从暂存目录放入。
+///
+/// 旧文件先挪进 `backup`（独占创建的私有目录，名字不会和用户目录里的任何文件相撞），再用 `hard_link` 放入新文件：
+/// 目标名上若又冒出了别的文件，放入失败而不是被覆盖。失败时：删掉已放入的新文件，再把旧文件放回原处（普通文件用
+/// `hard_link`，不覆盖；别的类型先确认目标名空着再 `rename`）。每一步的失败都记下来；有任何文件没能放回，
+/// 就返回它们现在的确切位置，调用方保留 `backup` 所在的暂存目录。
 fn replace_managed(
     stage: &Path,
     out_dir: &Path,
     names: &[&str],
     clear_only: &[&str],
-) -> std::io::Result<()> {
-    let tag = format!(".idoris-bak-{}", std::process::id());
+    backup: &Path,
+    hook: Option<&CommitHook>,
+) -> Result<(), CommitFailure> {
     let mut backed_up: Vec<&str> = Vec::new();
     let mut placed: Vec<&str> = Vec::new();
     let attempt = (|| {
         for name in names.iter().chain(clear_only.iter()).copied() {
             let target = out_dir.join(name);
-            if target.exists() {
-                std::fs::rename(&target, out_dir.join(format!("{name}{tag}")))?;
-                backed_up.push(name);
+            match std::fs::symlink_metadata(&target) {
+                Ok(_) => {
+                    std::fs::rename(&target, backup.join(name))?;
+                    backed_up.push(name);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             }
         }
+        fire(hook, CommitPhase::BackedUp, out_dir);
         for name in names.iter().copied() {
-            std::fs::rename(stage.join(name), out_dir.join(name))?;
+            std::fs::hard_link(stage.join(name), out_dir.join(name))?;
             placed.push(name);
         }
         Ok(())
     })();
-    let Err(err) = attempt else {
-        for name in &backed_up {
-            let _ = std::fs::remove_file(out_dir.join(format!("{name}{tag}")));
-        }
+    let Err(error) = attempt else {
         return Ok(());
     };
+    let mut stranded: Vec<String> = Vec::new();
     for name in &placed {
-        let _ = std::fs::rename(out_dir.join(name), stage.join(name));
+        let path = out_dir.join(name);
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            stranded.push(format!(
+                "本次新写的 {} 没能删掉（{e}），它还在 out-dir 里",
+                path.display()
+            ));
+        }
     }
-    let stranded: Vec<String> = backed_up
-        .iter()
-        .filter(|name| {
-            std::fs::rename(out_dir.join(format!("{name}{tag}")), out_dir.join(name)).is_err()
-        })
-        .map(|name| format!("{name}{tag}"))
-        .collect();
-    if stranded.is_empty() {
-        return Err(err);
+    for name in &backed_up {
+        let (from, to) = (backup.join(name), out_dir.join(name));
+        let restored = match std::fs::symlink_metadata(&from) {
+            Ok(meta) if meta.is_file() => std::fs::hard_link(&from, &to).map(|()| {
+                let _ = std::fs::remove_file(&from);
+            }),
+            _ => match std::fs::symlink_metadata(&to) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::rename(&from, &to),
+                _ => Err(std::io::Error::other("原位置上已经有别的文件")),
+            },
+        };
+        if let Err(e) = restored {
+            stranded.push(format!(
+                "原有的 {} 没能放回 {}（{e}），它的原内容在 {}",
+                name,
+                to.display(),
+                from.display()
+            ));
+        }
     }
-    Err(std::io::Error::other(format!(
-        "{err}；回滚未完成，旧文件保留为 {}",
-        stranded.join("、")
-    )))
+    Err(CommitFailure { error, stranded })
 }
 
 /// 卡的文件名要是一个纯文件名（没有路径分隔符，不以 `.` 开头），并且带加载器会读的扩展名：不带的话卡写出去也不会被加载。
@@ -1116,7 +1433,8 @@ fn check_add_target(dir: &Path, force: bool, file: &str) -> Result<(), SetupErro
 ///
 /// 在与 `out_dir` 同级的暂存目录里放「`out_dir` 里现有的卡（加载器读的那些文件，除了要被替换的同名卡）加上新卡」，
 /// 用服务启动时同一个加载器校验这个整体：重复的 `provider.id`、现有的卡本身加载不了，都在这里失败，`out_dir` 一个字节
-/// 不变。新卡要当默认（`idoris_default: true`）时，还核对目录里没有别的默认卡（规范 §2.12.3：至多一张）。
+/// 不变。最终的集合里默认卡（`idoris_default: true`）超过一张也失败（规范 §2.12.3：至多一张）。
+/// 整段在 `out_dir` 的独占锁里（与 `setup omlx` 同一把，[`lock_out_dir`]），落盘前核对现有的卡没有变。
 ///
 /// 通过之后：`out_dir` 不存在就把暂存目录整个改名过去；存在的话，`force` 时用 `rename` 原子替换这一个文件，
 /// 否则用 `hard_link`（目标已存在就失败，不会盖掉刚出现的同名文件）。
@@ -1127,64 +1445,61 @@ pub fn write_added(
     content: &str,
     card: &ComponentCard,
 ) -> Result<PathBuf, SetupError> {
+    write_added_hooked(out_dir, force, file, content, card, None)
+}
+
+/// [`write_added`]，带测试挂钩（生产路径传 `None`）。
+pub fn write_added_hooked(
+    out_dir: &Path,
+    force: bool,
+    file: &str,
+    content: &str,
+    card: &ComponentCard,
+    hook: Option<&CommitHook>,
+) -> Result<PathBuf, SetupError> {
     let io = |e: std::io::Error| SetupError::new("write_failed", format!("写入失败：{e}"));
     check_card_file_name(file)?;
+    let _lock = lock_out_dir(out_dir)?;
     let stage = create_stage(out_dir)?;
     let result = (|| {
-        if out_dir.is_dir() {
-            mirror_cards(out_dir, &stage, file)?;
-        }
+        let kept = if out_dir.is_dir() {
+            snapshot_cards(out_dir, &[file], Some(&stage))?
+        } else {
+            Snapshot::new()
+        };
         std::fs::write(stage.join(file), content).map_err(io)?;
         let cards = crate::components::load_components(&stage, false)
             .map_err(|e| added_load_failure(e, &stage, out_dir, &card.provider.id))?;
-        check_single_default(&cards, card)?;
+        check_at_most_one_default(&cards)?;
+        fire(hook, CommitPhase::Validated, out_dir);
         if !out_dir.exists() {
             // 没有现有的卡可镜像，暂存目录里只有新卡。
             std::fs::rename(&stage, out_dir).map_err(io)?;
-        } else if force {
-            std::fs::rename(stage.join(file), out_dir.join(file)).map_err(io)?;
         } else {
-            std::fs::hard_link(stage.join(file), out_dir.join(file)).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    SetupError::new(
-                        "id_conflict",
-                        format!(
-                            "out-dir 里刚刚出现了 {file}：要替换它就加 --force，否则换一个 --id"
-                        ),
-                    )
-                } else {
-                    io(e)
-                }
-            })?;
+            if out_dir.is_dir() {
+                recheck_kept(out_dir, &[file], &kept)?;
+            }
+            if force {
+                std::fs::rename(stage.join(file), out_dir.join(file)).map_err(io)?;
+            } else {
+                std::fs::hard_link(stage.join(file), out_dir.join(file)).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        SetupError::new(
+                            "id_conflict",
+                            format!(
+                                "out-dir 里刚刚出现了 {file}：要替换它就加 --force，否则换一个 --id"
+                            ),
+                        )
+                    } else {
+                        io(e)
+                    }
+                })?;
+            }
         }
         out_dir.canonicalize().map_err(io)
     })();
     let _ = std::fs::remove_dir_all(&stage);
     result
-}
-
-/// 把 `from` 里加载器会读的文件复制进暂存目录，`skip`（要被替换的同名卡）除外。
-fn mirror_cards(from: &Path, stage: &Path, skip: &str) -> Result<(), SetupError> {
-    let entries = std::fs::read_dir(from)
-        .map_err(|_| SetupError::new("out_dir_not_empty", "out-dir 不是可读目录"))?;
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        let name = entry.file_name();
-        if !crate::components::is_card_file(&path) || name == skip {
-            continue;
-        }
-        std::fs::copy(&path, stage.join(&name)).map_err(|e| {
-            SetupError::new(
-                "validation_failed",
-                format!(
-                    "out-dir 里已有的 {} 读不了（{}）",
-                    name.to_string_lossy(),
-                    e.kind()
-                ),
-            )
-        })?;
-    }
-    Ok(())
 }
 
 /// 整个目录加载失败：别的文件里已经有同一个 `provider.id` 是 `id_conflict`，其余是 `validation_failed`。
@@ -1216,27 +1531,23 @@ fn added_load_failure(
     )
 }
 
-/// 新卡要当默认时，目录里不能已经有别的默认卡（规范 §2.12.3：至多一张卡带 `idoris_default`）。新卡不当默认时不查：
-/// 目录里本来就有几张默认卡，不是这次加卡造成的。
-fn check_single_default(cards: &[ComponentCard], new: &ComponentCard) -> Result<(), SetupError> {
-    if !crate::engine_kind::declares_default(new) {
-        return Ok(());
-    }
-    let others: Vec<&str> = cards
+/// 最终的卡集合（保留的加新写的）里至多一张默认卡（规范 §2.12.3：至多一张卡带 `idoris_default`）。
+/// 数的是整个集合，不只看新卡：目录里手写出两张默认卡，这次写入也不放行，要先改掉多余的。
+fn check_at_most_one_default(cards: &[ComponentCard]) -> Result<(), SetupError> {
+    let defaults: Vec<&str> = cards
         .iter()
-        .filter(|card| {
-            card.provider.id != new.provider.id && crate::engine_kind::declares_default(card)
-        })
+        .filter(|card| crate::engine_kind::declares_default(card))
         .map(|card| card.provider.id.as_str())
         .collect();
-    if others.is_empty() {
+    if defaults.len() <= 1 {
         return Ok(());
     }
     Err(SetupError::new(
         "validation_failed",
         format!(
-            "out-dir 里已经有默认上游 {}（extensions.idoris_default）：至多一张卡可以是默认，先把那张改掉，或者不加 --default",
-            others.join("、")
+            "out-dir 里有 {} 张默认上游 {}（extensions.idoris_default）：至多一张卡可以是默认，先把多余的改掉，或者不加 --default",
+            defaults.len(),
+            defaults.join("、")
         ),
     ))
 }
@@ -1266,13 +1577,24 @@ mod tests {
         // Simulates a dir populated while the probe was in flight.
         std::fs::write(out.join("mine.txt"), "keep").unwrap();
         std::fs::write(out.join("omlx.yaml"), "old").unwrap();
-        let err = write_validated(&out, true, &files()).unwrap_err();
+        // 不带 --force：非空就拒绝，什么也不变。
+        let err = write_validated(&out, false, &files()).unwrap_err();
         assert_eq!(err.code, "out_dir_not_empty");
         assert_eq!(
             std::fs::read_to_string(out.join("mine.txt")).unwrap(),
             "keep"
         );
         assert_eq!(
+            std::fs::read_to_string(out.join("omlx.yaml")).unwrap(),
+            "old"
+        );
+        // 带 --force：只替换自己的文件，别的文件不碰（#626）。
+        write_validated(&out, true, &files()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.join("mine.txt")).unwrap(),
+            "keep"
+        );
+        assert_ne!(
             std::fs::read_to_string(out.join("omlx.yaml")).unwrap(),
             "old"
         );
@@ -1290,7 +1612,17 @@ mod tests {
         std::fs::write(stage.join("omlx.yaml"), "new-omlx").unwrap();
         // subscription.yaml missing from the stage: the second move fails
         // after omlx.yaml was already replaced.
-        replace_managed(&stage, &out, &["omlx.yaml", "subscription.yaml"], &[]).unwrap_err();
+        let backup = stage.join(BACKUP_DIR);
+        make_private_dir(&backup).unwrap();
+        replace_managed(
+            &stage,
+            &out,
+            &["omlx.yaml", "subscription.yaml"],
+            &[],
+            &backup,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(
             std::fs::read_to_string(out.join("omlx.yaml")).unwrap(),
             "old-omlx"
@@ -1330,7 +1662,17 @@ mod tests {
             names
         };
         let (_tmp, out, stage) = setup();
-        replace_managed(&stage, &out, &["omlx.yaml"], &["omlx-embed.yaml"]).unwrap();
+        let backup = stage.join(BACKUP_DIR);
+        make_private_dir(&backup).unwrap();
+        replace_managed(
+            &stage,
+            &out,
+            &["omlx.yaml"],
+            &["omlx-embed.yaml"],
+            &backup,
+            None,
+        )
+        .unwrap();
         assert_eq!(listing(&out), ["omlx.yaml"]);
         assert_eq!(
             std::fs::read_to_string(out.join("omlx.yaml")).unwrap(),
@@ -1339,11 +1681,15 @@ mod tests {
 
         let (_tmp, out, stage) = setup();
         // 暂存目录里缺 subscription.yaml：放入阶段失败，两个旧文件都要回来。
+        let backup = stage.join(BACKUP_DIR);
+        make_private_dir(&backup).unwrap();
         replace_managed(
             &stage,
             &out,
             &["omlx.yaml", "subscription.yaml"],
             &["omlx-embed.yaml"],
+            &backup,
+            None,
         )
         .unwrap_err();
         assert_eq!(listing(&out), ["omlx-embed.yaml", "omlx.yaml"]);
@@ -1368,16 +1714,18 @@ mod tests {
 
     /// `--force` 放行的文件名由调用方传入：别的引擎的 setup 有自己的名字，不沿用 oMLX 的。
     #[test]
-    fn force_covers_the_names_the_caller_passes_and_no_others() {
+    fn force_lets_a_non_empty_dir_through_and_without_force_nothing_existing_does() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("omlx.yaml"), "x").unwrap();
+        // --force：不管目录里是什么都放行（只替换调用方给的文件名，别的保留，整体校验另算）。
         assert!(check_out_dir(tmp.path(), true, None, &["omlx.yaml", "subscription.yaml"]).is_ok());
-        let err = check_out_dir(tmp.path(), true, None, &["fakeserve.yaml"]).unwrap_err();
+        assert!(check_out_dir(tmp.path(), true, None, &["fakeserve.yaml"]).is_ok());
+        // 没有 --force：任何已有文件都不行，说明里点出会被替换的文件名。
+        let err = check_out_dir(tmp.path(), false, None, &["fakeserve.yaml"]).unwrap_err();
         assert_eq!(err.code, "out_dir_not_empty");
         assert!(err.message.contains("fakeserve.yaml"), "{}", err.message);
-        // 没有 --force：任何已有文件都不行。
-        let err = check_out_dir(tmp.path(), false, None, &["omlx.yaml"]).unwrap_err();
-        assert_eq!(err.code, "out_dir_not_empty");
+        // 自己的暂存目录不算已有文件。
+        assert!(check_out_dir(tmp.path(), false, Some("omlx.yaml".as_ref()), &[]).is_ok());
     }
 
     fn listener() -> (TcpListener, u16) {
