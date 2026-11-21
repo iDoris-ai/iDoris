@@ -15,9 +15,13 @@
 //!   端点取 `--managed-port`，缺省在私有端口范围里挑一个此刻空闲的。托管模式不连引擎（引擎还没起），
 //!   必须找到可执行文件（[`SetupEngine::discover_executable`]，含签名校验），找不到是 `engine_not_installed`。
 //!   这里只生成卡片：拉起引擎、准备引擎的 base 目录是后面的引擎管理器的事（S5）。
-//! - `--auto --managed` 找到了外部引擎时取保守的一边：采纳它，不托管（规范 §2.7.8，待 owner 确认）。
-//! - `--auto` 遇到要 API key 的候选（没给 key，或给了被拒）：没有别的候选合格时报 `auth_required` 或 `auth_failed`，
-//!   带 `--managed` 也一样，不在一个可能是同一种引擎的服务旁边再起一个（规范没写这一种情形，待 owner 确认）。
+//! - `--auto --managed` 找到了外部引擎时取保守的一边：采纳它，不托管（规范 §2.7.8）。
+//! - `--auto` 只发匿名请求：候选端口是猜的，端口属主校验（#619）落地之前不把 key 发给它们，所以命令行拒绝
+//!   `--auto` 与 `--api-key-stdin` 并用，库调用方给了 key 也拒绝（`invalid_api_key_input`）。候选要求 API key
+//!   时，没有别的候选合格就报 `auth_required`，错误 JSON 带 `endpoint`（那个候选的地址），调用方改用
+//!   `--endpoint <该地址> --api-key-stdin`；带 `--managed` 也一样，不在一个可能是同一种引擎的服务旁边再起一个。
+//! - 托管引擎的模型目录是 [`SetupEngine::managed_models_dir`]（S5 拉起时显式传 `--model-dir`），离线核对 `--bind`
+//!   读的也是它。
 //!
 //! # 副作用
 //!
@@ -59,6 +63,8 @@ const MAX_KEY_BYTES: u64 = 4096;
 pub struct SetupError {
     pub code: &'static str,
     pub message: String,
+    /// 与错误相关的端点：`--auto` 遇到要 API key 的候选时是那个候选的地址，调用方据此改用 `--endpoint`。
+    pub endpoint: Option<String>,
 }
 
 impl SetupError {
@@ -66,11 +72,21 @@ impl SetupError {
         Self {
             code,
             message: message.into(),
+            endpoint: None,
         }
     }
 
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = Some(endpoint.into());
+        self
+    }
+
     pub fn to_json(&self) -> Value {
-        json!({"status": "error", "code": self.code, "message": self.message})
+        let mut value = json!({"status": "error", "code": self.code, "message": self.message});
+        if let Some(endpoint) = &self.endpoint {
+            value["endpoint"] = json!(endpoint);
+        }
+        value
     }
 }
 
@@ -176,8 +192,14 @@ pub trait SetupEngine: Sync {
         MANAGED_PORT_RANGE
     }
 
-    /// 本机已装的模型 id（离线核对 `--bind` 用）；`None` 表示定位不到模型目录。
+    /// 本机已装的模型 id（离线核对 `--bind` 用）；`None` 表示定位不到模型目录。读的是
+    /// [`SetupEngine::managed_models_dir`] 的那个目录。
     fn installed_models(&self) -> Option<Vec<String>>;
+
+    /// 托管引擎的模型目录：拉起时显式传给引擎的 `--model-dir`（引擎管理器 S5 直接用这个函数），也是离线核对
+    /// `--bind` 的目录。取运行用户的约定位置；定位不到、或这个路径引擎吃不了时报错，托管模式在找端口、找引擎
+    /// 之前就拒绝。
+    fn managed_models_dir(&self) -> Result<PathBuf, SetupError>;
 
     /// 探测 `endpoint`。`lifecycle` 为真时还要求对端有生命周期状态接口（该引擎的完整形状，而不只是「OpenAI 兼容」）。
     /// 对端要鉴权时：没给 key 是 `auth_required`，给了 key 被拒是 `auth_failed`；不像这个引擎的错误码由引擎自己定。
@@ -379,8 +401,16 @@ async fn resolve<E: SetupEngine>(
             })
         }
         SetupTarget::Auto { managed } => {
+            // 命令行在解析期就拒绝 `--auto` 带 key（用法错误）；库调用方给了 key 也拒绝，不静默丢弃：
+            // 候选端口是猜的，端口属主校验（#619）落地之前，探测只发匿名请求。
+            if api_key.is_some() {
+                return Err(SetupError::new(
+                    "invalid_api_key_input",
+                    "--auto 探测的端口是猜的，不发送 API key；要鉴权的引擎请用 --endpoint 加 --api-key-stdin",
+                ));
+            }
             precheck(engine, options)?;
-            match scan(engine, api_key).await {
+            match scan(engine).await {
                 Scan::Found { endpoint, probed } => Ok(Resolved {
                     endpoint,
                     probed: Some(probed),
@@ -416,6 +446,8 @@ fn managed_target<E: SetupEngine>(
     engine: &E,
     managed: ManagedOptions,
 ) -> Result<Resolved, SetupError> {
+    // 托管引擎拉起时要显式传模型目录：先确认它定位得到、引擎吃得了，再选端口（两步都没有副作用）。
+    engine.managed_models_dir()?;
     let port = match managed.port {
         Some(port) if port_is_free(port) => port,
         Some(port) => {
@@ -461,28 +493,26 @@ fn port_is_free(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, PORT_CONNECT_TIMEOUT).is_err()
 }
 
-/// `--auto`：按引擎给的顺序探测候选端口，取第一个形状是这种引擎的。
-/// 要鉴权的候选记下来：没有一个合格时，它们比「没找到」更接近真相。
-async fn scan<E: SetupEngine>(engine: &E, api_key: Option<&str>) -> Scan {
+/// `--auto`：按引擎给的顺序探测候选端口，取第一个形状是这种引擎的。探测只发匿名请求（不带 key）。
+/// 要鉴权的候选记下来（匿名请求被拒）：没有一个合格时，它们比「没找到」更接近真相，错误里带上它的地址。
+async fn scan<E: SetupEngine>(engine: &E) -> Scan {
     let mut denied: Option<SetupError> = None;
     for port in engine.auto_ports() {
         let endpoint = format!("http://127.0.0.1:{port}");
-        match engine.probe(&endpoint, api_key, true).await {
+        match engine.probe(&endpoint, None, true).await {
             Ok(probed) => return Scan::Found { endpoint, probed },
-            Err(error) if matches!(error.code, "auth_required" | "auth_failed") => {
+            Err(error) if error.code == "auth_required" => {
                 if denied.is_none() {
-                    let advice = if error.code == "auth_failed" {
-                        "拒绝了提供的 API key"
-                    } else {
-                        "要求 API key，请用 --api-key-stdin 提供"
-                    };
-                    denied = Some(SetupError::new(
-                        error.code,
-                        format!(
-                            "127.0.0.1:{port} 上的服务{advice}；如果它不是 {}，去掉 --auto，改用 --endpoint 或 --managed",
-                            engine.display_name()
-                        ),
-                    ));
+                    denied = Some(
+                        SetupError::new(
+                            "auth_required",
+                            format!(
+                                "{endpoint} 上的服务要求 API key，--auto 不发送 API key：如果它是 {name}，请改用 --endpoint {endpoint} --api-key-stdin；如果不是，去掉 --auto，改用别的 --endpoint 或 --managed",
+                                name = engine.display_name()
+                            ),
+                        )
+                        .with_endpoint(endpoint),
+                    );
                 }
             }
             Err(_) => {}

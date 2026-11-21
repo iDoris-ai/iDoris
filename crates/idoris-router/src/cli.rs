@@ -124,13 +124,10 @@ fn parse_setup(args: &[OsString]) -> Result<SetupOptions, String> {
     if managed_port.is_some() && !managed {
         return Err(USAGE.to_string());
     }
-    // key 用于探测：这次不探测，给了 key 就是用法错误（不读 stdin 再悄悄丢掉）。
-    let probes = match &target {
-        SetupTarget::Endpoint { probe, .. } => *probe,
-        SetupTarget::Auto { .. } => true,
-        SetupTarget::Managed(_) => false,
-    };
-    if api_key_stdin && !probes {
+    // key 只给一个确定的端点：`--auto` 探测的端口是猜的，端口属主校验（#619）落地之前不把 key 发给它们；
+    // 不探测的运行用不上 key。两种情形给了 key 都是用法错误（不读 stdin 再悄悄丢掉）。
+    let key_allowed = matches!(&target, SetupTarget::Endpoint { probe: true, .. });
+    if api_key_stdin && !key_allowed {
         return Err(USAGE.to_string());
     }
     Ok(SetupOptions {
@@ -731,17 +728,15 @@ mod tests {
             SetupTarget::Managed(managed(None))
         );
         // 其余选项与目标无关。
-        let both = setup(&[
-            "--auto",
-            "--out-dir",
-            "o",
-            "--api-key-stdin",
-            "--bind",
-            "daily=m",
-        ])
-        .unwrap();
-        assert!(both.api_key_stdin);
+        let both = setup(&["--auto", "--out-dir", "o", "--force", "--bind", "daily=m"]).unwrap();
+        assert!(both.force && !both.api_key_stdin);
         assert_eq!(both.bindings, [("daily".into(), "m".into())]);
+        // key 只配一个确定的、要探测的端点。
+        assert!(
+            setup(&["--endpoint", "e", "--out-dir", "o", "--api-key-stdin"])
+                .unwrap()
+                .api_key_stdin
+        );
     }
 
     /// 每一种不合法的组合都是用法错误，不是静默取其一。
@@ -769,7 +764,9 @@ mod tests {
                 "19731",
             ],
             vec!["--out-dir", "o", "--auto", "--managed-port", "19731"],
-            // key 只用于探测：不探测时给了 key 是用法错误。
+            // key 只配一个确定的、要探测的端点：`--auto`（端口是猜的，#619 之前不发 key）、托管、不探测都不行。
+            vec!["--out-dir", "o", "--auto", "--api-key-stdin"],
+            vec!["--out-dir", "o", "--api-key-stdin", "--auto", "--managed"],
             vec!["--out-dir", "o", "--managed", "--api-key-stdin"],
             vec![
                 "--out-dir",

@@ -13,6 +13,7 @@
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -101,9 +102,17 @@ struct FakeSetup {
     declares_management: bool,
     /// 这个平台上不能托管（`discover_executable` 报 `Unsupported`）。
     unsupported: bool,
+    /// `managed_models_dir` 报错的原因（`None` = 给出 `<search_dir>/models`）。
+    models_dir_error: Option<&'static str>,
+    /// `discover_executable` 被调用的次数。
+    discover_calls: AtomicUsize,
 }
 
 impl FakeSetup {
+    fn recipe_dir(&self) -> &Path {
+        &self.recipe.search_dir
+    }
+
     fn new(search_dir: &Path, ports: Vec<u16>) -> Self {
         Self {
             recipe: FakeRecipe {
@@ -115,6 +124,8 @@ impl FakeSetup {
             version_pin: "fakeserve@1",
             declares_management: false,
             unsupported: false,
+            models_dir_error: None,
+            discover_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -141,6 +152,7 @@ impl SetupEngine for FakeSetup {
     }
 
     async fn discover_executable(&self) -> Result<FoundExecutable, FindFailure> {
+        self.discover_calls.fetch_add(1, Ordering::SeqCst);
         if self.unsupported {
             return Err(FindFailure::Unsupported);
         }
@@ -153,6 +165,13 @@ impl SetupEngine for FakeSetup {
 
     fn installed_models(&self) -> Option<Vec<String>> {
         Some(self.installed.clone())
+    }
+
+    fn managed_models_dir(&self) -> Result<PathBuf, SetupError> {
+        match self.models_dir_error {
+            Some(why) => Err(SetupError::new("validation_failed", why)),
+            None => Ok(self.recipe_dir().join("models")),
+        }
     }
 
     async fn probe(
@@ -496,4 +515,46 @@ async fn a_platform_that_cannot_manage_engines_says_so() {
         error.message
     );
     assert!(!out.exists());
+}
+
+/// 托管引擎拉起时要显式传模型目录：这个目录取不到或引擎吃不了，托管在找引擎之前就拒绝，
+/// 引擎的发现一次也没有被调用；采纳一个端点不拉起引擎，用不着这个目录。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_managed_engine_without_a_usable_model_directory_is_refused_before_it_is_looked_for() {
+    let server = fake_server(&["fake-model"]).await;
+    let tmp = TempDir::new().unwrap();
+    let mut engine = FakeSetup::new(tmp.path(), vec![]);
+    engine.models_dir_error = Some("the models directory cannot be used");
+    let out = tmp.path().join("out");
+    let error = run_setup(
+        &engine,
+        &options(&out, SetupTarget::Managed(ManagedOptions::default())),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "validation_failed");
+    assert!(
+        error.message.contains("models directory"),
+        "{}",
+        error.message
+    );
+    assert_eq!(engine.discover_calls.load(Ordering::SeqCst), 0);
+    assert!(!out.exists());
+    // 采纳一个端点：照常。
+    let adopt_out = tmp.path().join("adopt");
+    run_setup(
+        &engine,
+        &options(
+            &adopt_out,
+            SetupTarget::Endpoint {
+                url: server.uri(),
+                probe: true,
+            },
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(adopt_out.join("fakeserve.yaml").exists());
 }

@@ -574,6 +574,15 @@ async fn contradictory_setup_flags_are_a_usage_error_before_anything_runs() {
         vec!["--out-dir", out_str, "--managed-port", "19731"],
         vec!["--out-dir", out_str, "--managed", "--managed-port", "0"],
         vec!["--out-dir", out_str, "--managed", "--api-key-stdin"],
+        // `--auto` 探测的端口是猜的：端口属主校验（#619）落地之前不发 key，要鉴权的引擎用 `--endpoint`。
+        vec!["--out-dir", out_str, "--auto", "--api-key-stdin"],
+        vec![
+            "--out-dir",
+            out_str,
+            "--auto",
+            "--managed",
+            "--api-key-stdin",
+        ],
     ] {
         let o = cli(&args, None, Some(&format!("{KEY}\n"))).await;
         assert_eq!(o.code, 1, "{args:?}");
@@ -703,4 +712,23 @@ async fn an_invalid_key_line_is_rejected_without_being_echoed() {
         server.received_requests().await.unwrap().is_empty(),
         "key 行不合规：连探测都不发"
     );
+}
+
+/// 托管引擎的模型目录（运行用户的 `~/.omlx/models`）路径含逗号：oMLX 会把 `--model-dir` 按逗号拆开，
+/// 托管在找端口、找引擎之前就失败（所以不依赖这台机器上有没有 oMLX，也不执行任何东西）。
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_with_a_comma_in_the_models_path_is_refused_before_looking_for_the_engine() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home,with,commas");
+    fs::create_dir_all(&home).unwrap();
+    let out = tmp.path().join("comp");
+    let o = cli(
+        &["--out-dir", out.to_str().unwrap(), "--managed"],
+        Some(&home),
+        None,
+    )
+    .await;
+    assert_eq!(err_code(&o), "validation_failed");
+    assert!(o.json["message"].as_str().unwrap().contains("逗号"));
+    assert!(!out.exists());
 }

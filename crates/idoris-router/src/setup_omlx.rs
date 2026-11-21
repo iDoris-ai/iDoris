@@ -5,7 +5,7 @@
 //! echoed; at serve time it still comes from `IDORIS_OMLX_API_KEY`.
 
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use idoris_contracts::ComponentCard;
@@ -124,6 +124,24 @@ async fn probe(base: &str, key: Option<&str>, lifecycle: bool) -> Result<Probed,
     })
 }
 
+/// 托管引擎的模型目录要能原样交给 `omlx serve --model-dir`：绝对路径；不含逗号（oMLX 把这个值按逗号拆成多个目录，
+/// 路径里的逗号会把一个目录拆成两个，S3 的 `omlx/engine.rs` 记过这一点）。
+fn check_model_dir_path(dir: &Path) -> Result<(), SetupError> {
+    if !dir.is_absolute() {
+        return Err(SetupError::new(
+            "validation_failed",
+            "oMLX 的模型目录必须是绝对路径",
+        ));
+    }
+    if dir.to_string_lossy().contains(',') {
+        return Err(SetupError::new(
+            "validation_failed",
+            "oMLX 的模型目录路径含逗号：oMLX 会把 --model-dir 按逗号拆成多个目录，托管引擎不能用这个路径",
+        ));
+    }
+    Ok(())
+}
+
 /// oMLX 的 `setup`：宿主相关的位置（家目录）与测试要换掉的参数都在实例里。
 #[derive(Debug, Clone)]
 pub struct OmlxSetup {
@@ -232,6 +250,17 @@ impl SetupEngine for OmlxSetup {
         self.managed_ports.clone()
     }
 
+    fn managed_models_dir(&self) -> Result<PathBuf, SetupError> {
+        let dir = self.models_dir.clone().ok_or_else(|| {
+            SetupError::new(
+                "validation_failed",
+                "无法定位 oMLX 的模型目录（HOME 未设置或不是绝对路径）：托管引擎拉起时要显式传 --model-dir",
+            )
+        })?;
+        check_model_dir_path(&dir)?;
+        Ok(dir)
+    }
+
     fn installed_models(&self) -> Option<Vec<String>> {
         let dir = self.models_dir.as_deref()?;
         Some(
@@ -274,6 +303,8 @@ pub const KEY_ENV: &str = idoris_upstream::omlx::OMLX_API_KEY_ENV;
 
 #[cfg(all(test, unix))]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
     use idoris_upstream::engine::EngineRecipe;
 
@@ -303,6 +334,66 @@ mod tests {
             assert_eq!(apps.len(), 1, "{home:?}: {apps:?}");
             assert!(setup.models_dir.is_none(), "{home:?}");
         }
+    }
+
+    fn install(home: &Path, id: &str) {
+        let dir = home.join(".omlx/models").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        std::fs::write(dir.join("model.safetensors"), b"w").unwrap();
+    }
+
+    /// 托管引擎的模型目录是运行用户的 `~/.omlx/models`（规范 §2.7.6），离线核对 `--bind` 读的是同一个目录：
+    /// 两处一起换，核对读的就是托管引擎拿到的那个。
+    #[test]
+    fn the_managed_model_dir_is_the_users_dot_omlx_models_and_the_offline_check_reads_the_same_one()
+    {
+        let home = tempfile::tempdir().unwrap();
+        install(home.path(), "m1");
+        let setup = OmlxSetup::new(Some(home.path().to_path_buf()));
+        assert_eq!(
+            setup.managed_models_dir().unwrap(),
+            home.path().join(".omlx/models")
+        );
+        assert_eq!(setup.installed_models().unwrap(), ["m1"]);
+
+        let other = tempfile::tempdir().unwrap();
+        let moved = OmlxSetup::new(Some(home.path().to_path_buf())).with_models_dir(other.path());
+        assert_eq!(moved.managed_models_dir().unwrap(), other.path());
+        assert!(moved.installed_models().unwrap().is_empty());
+    }
+
+    /// 引擎吃不了的模型目录：取不到、相对路径、路径里有逗号（oMLX 把 `--model-dir` 按逗号拆成多个目录）。
+    #[test]
+    fn a_model_dir_the_engine_cannot_take_is_refused() {
+        for (setup, why) in [
+            (OmlxSetup::new(None), "没有家目录"),
+            (
+                OmlxSetup::new(Some("relative/home".into())),
+                "家目录不是绝对路径",
+            ),
+            (
+                OmlxSetup::new(Some("/Users/a,b".into())),
+                "家目录路径含逗号",
+            ),
+            (
+                OmlxSetup::new(Some("/Users/a".into())).with_models_dir("/Volumes/m,n/models"),
+                "显式给的模型目录含逗号",
+            ),
+            (
+                OmlxSetup::new(Some("/Users/a".into())).with_models_dir("models"),
+                "显式给的模型目录是相对路径",
+            ),
+        ] {
+            let error = setup.managed_models_dir().unwrap_err();
+            assert_eq!(error.code, "validation_failed", "{why}");
+        }
+        // 对照：普通的绝对路径。
+        assert!(
+            OmlxSetup::new(Some("/Users/a".into()))
+                .managed_models_dir()
+                .is_ok()
+        );
     }
 
     #[test]

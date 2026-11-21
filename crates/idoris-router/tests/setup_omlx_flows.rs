@@ -200,10 +200,7 @@ impl Rig {
 
     /// `~/.omlx/models/<id>`：一个完整的模型目录（`config.json` 加一个权重文件）。
     fn install_model(&self, id: &str) {
-        let dir = self.home().join(".omlx/models").join(id);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.json"), r#"{"model_type":"bert"}"#).unwrap();
-        std::fs::write(dir.join("model.safetensors"), b"weights").unwrap();
+        install_model_in(&self.home(), id);
     }
 
     /// 默认的 setup：家目录是台架的、候选端口是给定的、可执行文件是假的。
@@ -254,6 +251,14 @@ impl Rig {
         out.sort();
         out
     }
+}
+
+/// `<home>/.omlx/models/<id>`：一个完整的模型目录。
+fn install_model_in(home: &Path, id: &str) {
+    let dir = home.join(".omlx/models").join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), r#"{"model_type":"bert"}"#).unwrap();
+    std::fs::write(dir.join("model.safetensors"), b"weights").unwrap();
 }
 
 fn auto(managed: Option<ManagedOptions>) -> SetupTarget {
@@ -424,25 +429,43 @@ async fn auto_reports_a_candidate_that_wants_a_key_instead_of_pretending_nothing
     let protected = fake(Some(KEY), &["m1"]).await;
     let rig = Rig::new();
     let setup = rig.setup(&[port_of(&protected)]);
-    // 没给 key。有 --managed 也一样：不能在一个可能是 oMLX 的服务旁边悄悄再起一个。
+    let address = format!("http://127.0.0.1:{}", port_of(&protected));
+    // 有 --managed 也一样：不能在一个可能是 oMLX 的服务旁边悄悄再起一个。
     for target in [auto(None), auto(Some(managed(None)))] {
         let result = run_setup(&setup, &rig.options(target), None).await;
         assert_eq!(code(&result), "auth_required");
-        let message = &result.as_ref().unwrap_err().message;
-        assert!(message.contains("--api-key-stdin"), "{message}");
+        let error = result.as_ref().unwrap_err();
+        // 说明里指路：要鉴权的引擎用 `--endpoint <地址> --api-key-stdin`；错误 JSON 带这个地址，调用方不必解析文字。
         assert!(
-            message.contains(&port_of(&protected).to_string()),
-            "{message}"
+            error.message.contains("--endpoint") && error.message.contains("--api-key-stdin"),
+            "{}",
+            error.message
         );
+        assert!(error.message.contains(&address), "{}", error.message);
+        assert_eq!(error.endpoint.as_deref(), Some(address.as_str()));
+        assert_eq!(error.to_json()["endpoint"], address);
         assert!(!rig.out().exists());
     }
-    // 给了错的 key。
-    let result = run_setup(&setup, &rig.options(auto(None)), Some("wrong-key")).await;
-    assert_eq!(code(&result), "auth_failed");
-    let message = &result.as_ref().unwrap_err().message;
-    assert!(!message.contains("wrong-key"), "{message}");
-    // 给了对的 key：采纳，输出说明要鉴权，key 不落盘不回显。
-    let report = ok(run_setup(&setup, &rig.options(auto(None)), Some(KEY)).await);
+    // 探测只发了匿名请求。
+    for request in protected.received_requests().await.unwrap() {
+        assert!(
+            request.headers.get("authorization").is_none(),
+            "{} 带了 Authorization 头",
+            request.url
+        );
+    }
+    // 照说明改用 --endpoint 加 key：采纳，输出说明要鉴权，key 不落盘不回显。
+    let report = ok(run_setup(
+        &setup,
+        &rig.options(SetupTarget::Endpoint {
+            url: address.clone(),
+            probe: true,
+        }),
+        Some(KEY),
+    )
+    .await);
+    assert_eq!(report["mode"], "adopt");
+    assert_eq!(report["endpoint"], address);
     assert_eq!(report["auth"], "required");
     assert_eq!(report["next"]["needs_env"], json!(["IDORIS_OMLX_API_KEY"]));
     assert!(!report.to_string().contains(KEY));
@@ -465,13 +488,42 @@ async fn auto_continues_past_a_candidate_that_wants_a_key_to_a_good_one() {
     );
 }
 
-/// 自动探测的端口是猜的：key 只在匿名请求被拒之后才发给那个端口，对不要求鉴权的服务一个字节都不发。
+/// `--auto` 探测的端口是猜的：端口属主校验（#619）落地之前不发 key。命令行在解析期就拒绝（cli 单元测试与进程级的
+/// 用法测试）；库调用方给了 key 也拒绝，不静默丢弃，而且一个探测请求都不发。
 #[tokio::test(flavor = "multi_thread")]
-async fn auto_never_sends_the_key_to_a_candidate_that_did_not_ask_for_one() {
+async fn auto_refuses_an_api_key_and_sends_no_request() {
+    let open = fake(None, &["m1"]).await;
+    let protected = fake(Some(KEY), &["m2"]).await;
+    let rig = Rig::new();
+    let setup = rig.setup(&[port_of(&open), port_of(&protected)]);
+    for target in [auto(None), auto(Some(managed(None)))] {
+        let result = run_setup(&setup, &rig.options(target), Some(KEY)).await;
+        assert_eq!(code(&result), "invalid_api_key_input");
+        let message = &result.as_ref().unwrap_err().message;
+        assert!(
+            message.contains("--endpoint") && !message.contains(KEY),
+            "{message}"
+        );
+        assert!(!rig.out().exists());
+    }
+    assert_eq!(requests(&open).await, 0);
+    assert_eq!(requests(&protected).await, 0);
+}
+
+/// 采纳一个确定的端点：key 在匿名请求被拒之后才带上，对不要求鉴权的服务一个字节都不发。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_run_sends_the_key_only_after_the_anonymous_request_was_denied() {
     let open = fake(None, &["m1"]).await;
     let rig = Rig::new();
-    let setup = rig.setup(&[port_of(&open)]);
-    ok(run_setup(&setup, &rig.options(auto(None)), Some(KEY)).await);
+    ok(run_setup(
+        &rig.setup(&[]),
+        &rig.options(SetupTarget::Endpoint {
+            url: open.uri(),
+            probe: true,
+        }),
+        Some(KEY),
+    )
+    .await);
     let seen = open.received_requests().await.unwrap();
     assert!(!seen.is_empty());
     for request in seen {
@@ -481,6 +533,26 @@ async fn auto_never_sends_the_key_to_a_candidate_that_did_not_ask_for_one() {
             request.url
         );
     }
+    // 对照：要鉴权的服务，匿名请求被拒之后带 key 重试。
+    let protected = fake(Some(KEY), &["m1"]).await;
+    let mut options = rig.options(SetupTarget::Endpoint {
+        url: protected.uri(),
+        probe: true,
+    });
+    options.force = true;
+    let report = ok(run_setup(&rig.setup(&[]), &options, Some(KEY)).await);
+    assert_eq!(report["auth"], "required");
+    let seen = protected.received_requests().await.unwrap();
+    assert!(
+        seen.iter()
+            .any(|r| r.headers.get("authorization").is_none()),
+        "第一个请求是匿名的"
+    );
+    assert!(
+        seen.iter()
+            .any(|r| r.headers.get("authorization").is_some()),
+        "被拒之后带 key 重试"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -760,21 +832,80 @@ async fn every_offline_binding_is_checked_not_just_the_first() {
 async fn offline_bindings_without_a_home_cannot_be_checked_and_are_refused() {
     let rig = Rig::new();
     let setup = OmlxSetup::new(None).with_explicit_executable(rig.fake_executable());
-    let mut options = rig.options(SetupTarget::Managed(managed(None)));
+    // 采纳一个端点、不探测：绑定只能对照本机已装的模型，家目录没有就核对不了。
+    let mut options = rig.options(SetupTarget::Endpoint {
+        url: "http://127.0.0.1:1".into(),
+        probe: false,
+    });
     options.bindings = vec![("daily".into(), "have".into())];
     let result = run_setup(&setup, &options, None).await;
     assert_eq!(code(&result), "model_not_installed");
     assert!(result.as_ref().unwrap_err().message.contains("模型目录"));
-    // 没有绑定就不需要模型目录：HOME 缺失不影响没有 --bind 的托管。
-    ok(run_setup(
+    // 没有绑定就不需要模型目录：采纳不受 HOME 缺失影响。
+    options.bindings.clear();
+    ok(run_setup(&setup, &options, None).await);
+    // 家目录不是绝对路径等于没有。
+    let relative = OmlxSetup::new(Some("relative/home".into()));
+    assert!(relative.installed_models().is_none());
+}
+
+/// 托管引擎拉起时要显式传模型目录（运行用户的 `~/.omlx/models`，规范 §2.7.6）：HOME 缺失就定位不到，
+/// 托管在找端口、找引擎之前拒绝（没有绑定也一样）。
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_without_a_home_has_no_model_directory_and_is_refused_before_the_engine_is_looked_for()
+ {
+    let rig = Rig::new();
+    let setup = OmlxSetup::new(None).with_explicit_executable(rig.fake_executable());
+    let result = run_setup(
         &setup,
         &rig.options(SetupTarget::Managed(managed(None))),
         None,
     )
-    .await);
-    // 家目录不是绝对路径等于没有。
-    let relative = OmlxSetup::new(Some("relative/home".into()));
-    assert!(relative.installed_models().is_none());
+    .await;
+    assert_eq!(code(&result), "validation_failed");
+    assert!(result.as_ref().unwrap_err().message.contains("模型目录"));
+    assert!(!rig.executed());
+    assert!(!rig.out().exists());
+}
+
+/// 路径含逗号：oMLX 把 `--model-dir` 按逗号拆成多个目录，托管引擎不能用这个路径，setup 报错；
+/// `--managed` 与 `--auto --managed` 没找到时的托管都一样，都在找引擎之前。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comma_in_the_model_directory_path_refuses_managed_before_the_engine_is_looked_for() {
+    let rig = Rig::new();
+    let comma_home = rig.root.path().join("home,with,commas");
+    std::fs::create_dir_all(&comma_home).unwrap();
+    let setup = OmlxSetup::new(Some(comma_home))
+        .with_explicit_executable(rig.fake_executable())
+        .with_auto_ports([closed_port()]);
+    for target in [
+        SetupTarget::Managed(managed(None)),
+        auto(Some(managed(None))),
+    ] {
+        let result = run_setup(&setup, &rig.options(target), None).await;
+        assert_eq!(code(&result), "validation_failed");
+        let message = &result.as_ref().unwrap_err().message;
+        assert!(message.contains("逗号"), "{message}");
+        assert!(!rig.out().exists());
+    }
+    assert!(!rig.executed());
+}
+
+/// 逗号只碍着托管（引擎要吃这个路径）：采纳一个端点时 iDoris 只是读这个目录，照常工作。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comma_in_the_model_directory_path_does_not_matter_when_the_engine_is_adopted() {
+    let rig = Rig::new();
+    let comma_home = rig.root.path().join("home,with,commas");
+    install_model_in(&comma_home, "have");
+    let setup = OmlxSetup::new(Some(comma_home)).with_explicit_executable(rig.fake_executable());
+    let mut options = rig.options(SetupTarget::Endpoint {
+        url: "http://127.0.0.1:1".into(),
+        probe: false,
+    });
+    options.bindings = vec![("daily".into(), "have".into())];
+    let report = ok(run_setup(&setup, &options, None).await);
+    assert_eq!(report["mode"], "adopt");
+    assert_eq!(report["bindings"], json!({"daily": "have"}));
 }
 
 #[tokio::test(flavor = "multi_thread")]
