@@ -651,7 +651,7 @@ pub enum RetryReason {
     ChallengeTimeout,
     AckTimeout,
     WriteFailed,
-    /// 服务端关闭了连接（EOF）。
+    /// 服务端关闭了连接：EOF，或对端带着没读的数据关闭时 Linux 给的 `ECONNRESET`（同样处理）。
     Disconnected,
     IoError,
     /// 服务端的帧不合规（[`Fault`]）。
@@ -1165,7 +1165,9 @@ mod client {
     /// 读到的一帧，或读不下去的原因。
     enum Read {
         Frame(ServerFrame),
+        /// 对端关闭了连接：EOF，或 `ECONNRESET`（对端带着没读的数据关闭，见 [`FrameReader::next`]），两者同样处理。
         Eof,
+        /// 其余的读错误。
         Io,
         /// 帧不合规（超长、非 UTF-8、非对象、`v` 不对、必填字段不对……）：全部按 `bad_frame` 处理，不区分细节。
         Bad,
@@ -1173,9 +1175,9 @@ mod client {
 
     /// 带缓冲的帧读取器：一行一帧，每帧（含 LF）≤ 16384 字节。`next` 可取消（半帧留在缓冲里，下次接着读）。
     ///
-    /// 对读端泛型：生产里就是 UDS 的读半边；单元测试（`register_tests.rs`）注入一个会出错的读端。真实的 UDS 上没法稳定地造出
-    /// 读错误（Linux 上要对端带着没读的数据关闭才会 ECONNRESET，macOS 上不会；`register` 发出之前我们也没写过字节，对端
-    /// 没有未读的数据），而 `Read::Io` 在握手里的两个分支都必须有测试钉住。
+    /// 对读端泛型：生产里就是 UDS 的读半边；单元测试（`register_tests.rs`）注入一个会出错的读端。真实的 UDS 上没法在 macOS 上
+    /// 造出读错误：`ECONNRESET` 要 Linux 上对端带着没读的数据关闭才有（见 `next`），而 `register` 发出之前我们没写过字节，
+    /// 对端也没有未读的数据；其余的读错误没有已知的触发办法。每一种读错误在握手里的两个读点都要有测试钉住，所以注入读端。
     pub(super) struct FrameReader<R = OwnedReadHalf> {
         half: R,
         buf: Vec<u8>,
@@ -1189,6 +1191,10 @@ mod client {
             }
         }
 
+        /// 读下一帧。`ECONNRESET` 与 EOF 同样处理：Linux 的 AF_UNIX 在对端带着没读的数据关闭时，让这一端读到 `ECONNRESET`
+        /// 而不是 EOF（macOS 给 EOF）。规范 §2.10.7 对「任何读写错误，或 EOF」的处理本来就一样（判失联、重连），原因码记
+        /// `disconnected`，比 `io_error` 对运维更准确：对端确实是自己关掉的。读端见不到 `EPIPE`（那是写的错误），所以只认
+        /// `ConnectionReset`。
         async fn next(&mut self) -> Read {
             loop {
                 if let Some(end) = self.buf.iter().position(|byte| *byte == b'\n') {
@@ -1210,6 +1216,9 @@ mod client {
                 match self.half.read_buf(&mut self.buf).await {
                     Ok(0) => return Read::Eof,
                     Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                        return Read::Eof;
+                    }
                     Err(_) => return Read::Io,
                 }
             }

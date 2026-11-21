@@ -698,10 +698,10 @@ mod handshake_reads {
         Duration::from_secs(n)
     }
 
-    /// 读端的一步：给出这些字节（只给一次），或者读错误（一直重复）。脚本用完之后读端永远 `Pending`。
+    /// 读端的一步：给出这些字节（只给一次），或者这种读错误（一直重复）。脚本用完之后读端永远 `Pending`。
     enum Step {
         Bytes(Vec<u8>),
-        Error,
+        Error(io::ErrorKind),
     }
 
     /// 按脚本一步步给出读结果的读端。每隔一次轮询先让出一次（`Pending` 并唤醒自己）：去掉守卫之后，握手循环会在一个一直
@@ -734,9 +734,7 @@ mod handshake_reads {
             self.yielded = false;
             match self.steps.front_mut() {
                 None => Poll::Pending,
-                Some(Step::Error) => {
-                    Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)))
-                }
+                Some(Step::Error(kind)) => Poll::Ready(Err(io::Error::from(*kind))),
                 Some(Step::Bytes(bytes)) => {
                     let n = bytes.len().min(buf.remaining());
                     buf.put_slice(&bytes[..n]);
@@ -817,7 +815,8 @@ mod handshake_reads {
     }
 
     /// `challenge` 之前读出错：这次尝试立即结束、按 `io_error` 重连；不是接着读下去直到 5 秒的超时（那是 `Read::Io => {}`
-    /// 的样子：循环在出错的读端上空转到超时才结束）。对照：同一个读端装置读得到一帧 `challenge`。
+    /// 的样子：循环在出错的读端上空转到超时才结束）。对照：同一个读端装置读得到一帧 `challenge`。注入的错误不是
+    /// `ConnectionReset`（那一种按 EOF 处理，见 `a_connection_reset_is_a_disconnect_not_an_io_error`）。
     #[tokio::test]
     async fn a_read_error_before_the_challenge_ends_the_attempt_at_once() {
         let (mut conn, _peer) = scripted([Step::Bytes(challenge_frame())]);
@@ -829,7 +828,7 @@ mod handshake_reads {
             Ok((CONN_ID.to_string(), CHALLENGE_NONCE.to_string()))
         );
 
-        let (mut conn, _peer) = scripted([Step::Error]);
+        let (mut conn, _peer) = scripted([Step::Error(io::ErrorKind::Other)]);
         let ended = tokio::time::timeout(secs(2), Supervisor::read_challenge(&mut conn))
             .await
             .expect("a read error before the challenge must end the attempt at once");
@@ -852,7 +851,7 @@ mod handshake_reads {
             "the harness must be able to deliver a valid ack"
         );
 
-        let (mut conn, _peer) = scripted([Step::Error]);
+        let (mut conn, _peer) = scripted([Step::Error(io::ErrorKind::Other)]);
         let ended = tokio::time::timeout(
             secs(2),
             supervisor.read_ack(&mut conn, CONN_ID, CHALLENGE_NONCE),
@@ -863,6 +862,35 @@ mod handshake_reads {
             Err(Handshake::Retry(plan)) => assert_eq!(plan, Plan::backoff(RetryReason::IoError)),
             Err(_) => panic!("expected a retry"),
             Ok(_) => panic!("a read error is not an ack"),
+        }
+    }
+
+    /// `ECONNRESET`（Linux 的 AF_UNIX 在对端带着没读的数据关闭时给的，macOS 给 EOF）与 EOF 同样处理：这次尝试立即结束，
+    /// 原因码是 `disconnected` 而不是 `io_error`。`challenge` 之前与 `ack` 之前两个读点各一次；会话里的读点用的是同一个
+    /// `FrameReader::next`，它 `Read::Eof` 一臂的原因码由真实 EOF 的集成测试钉住（`a_closed_connection_is_retried_at_once_…`）。
+    /// 对照：别的读错误仍然是 `io_error`（上面两条）。
+    #[tokio::test]
+    async fn a_connection_reset_is_a_disconnect_not_an_io_error() {
+        let (mut conn, _peer) = scripted([Step::Error(io::ErrorKind::ConnectionReset)]);
+        let ended = tokio::time::timeout(secs(2), Supervisor::read_challenge(&mut conn))
+            .await
+            .expect("a reset before the challenge must end the attempt at once");
+        assert_eq!(ended, Err(Plan::backoff(RetryReason::Disconnected)));
+
+        let supervisor = supervisor(Timings::default());
+        let (mut conn, _peer) = scripted([Step::Error(io::ErrorKind::ConnectionReset)]);
+        let ended = tokio::time::timeout(
+            secs(2),
+            supervisor.read_ack(&mut conn, CONN_ID, CHALLENGE_NONCE),
+        )
+        .await
+        .expect("a reset while waiting for the ack must end the attempt at once");
+        match ended {
+            Err(Handshake::Retry(plan)) => {
+                assert_eq!(plan, Plan::backoff(RetryReason::Disconnected));
+            }
+            Err(_) => panic!("expected a retry"),
+            Ok(_) => panic!("a reset is not an ack"),
         }
     }
 
