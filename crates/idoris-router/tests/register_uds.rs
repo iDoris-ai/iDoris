@@ -1518,11 +1518,17 @@ async fn a_closed_connection_is_retried_at_once_and_a_restarted_server_gets_a_fr
             matches!(e, Event::SessionLost { .. })
         })
         .await;
-    assert_eq!(
-        lost,
-        Event::SessionLost {
-            reason: RetryReason::Disconnected
-        }
+    // 对端关闭连接有两种合法的观察方式：读到 EOF（`Disconnected`），或恰好到点的心跳先写到了已关闭的 socket
+    // （`WriteFailed`；会话循环里 `Beat` 排在读之前，谁先被看到取决于调度，不取决于被测行为）。两者都走同一条
+    // 「首次立即重连」的计划；除此之外的原因（心跳超时、IO 错误、握手类原因）仍然不被接受。
+    assert!(
+        matches!(
+            lost,
+            Event::SessionLost {
+                reason: RetryReason::Disconnected | RetryReason::WriteFailed
+            }
+        ),
+        "a closed connection ends the session as disconnected or write_failed: {lost:?}"
     );
     let scheduled = rig
         .events
