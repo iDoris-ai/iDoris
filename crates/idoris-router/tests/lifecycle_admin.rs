@@ -98,6 +98,8 @@ struct Scripted {
     claims: Mutex<Vec<u16>>,
     listeners: Mutex<BTreeMap<u16, Vec<u32>>>,
     teams: Mutex<BTreeMap<u32, String>>,
+    /// `start_time(pid)`：编排过的 pid 报这个启动时间（造「pid 被回收给了另一个进程」），没编排的读真的 `ps`。
+    start_times: Mutex<BTreeMap<u32, String>>,
 }
 
 impl Scripted {
@@ -107,7 +109,15 @@ impl Scripted {
             claims: Mutex::new(Vec::new()),
             listeners: Mutex::new(BTreeMap::new()),
             teams: Mutex::new(BTreeMap::new()),
+            start_times: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    fn pretend_start_time(&self, pid: u32, start_time: &str) {
+        self.start_times
+            .lock()
+            .unwrap()
+            .insert(pid, start_time.to_owned());
     }
 
     /// 自有引擎的端口：`listens_on` 一律是真。
@@ -135,6 +145,9 @@ impl ProcessInspector for Scripted {
         self.real.pid_state(pid)
     }
     async fn start_time(&self, pid: u32) -> Result<String, InspectError> {
+        if let Some(start_time) = self.start_times.lock().unwrap().get(&pid) {
+            return Ok(start_time.clone());
+        }
         self.real.start_time(pid).await
     }
     async fn command(&self, pid: u32) -> Result<String, InspectError> {
@@ -2398,4 +2411,107 @@ async fn c10_a_managed_endpoint_is_blocked_from_the_first_instant_and_stays_so_u
     );
     manager.shutdown(true).await;
     assert_eq!(governed_endpoint(&endpoint), Some(EndpointKey::Blocked));
+}
+
+/// 一个请求已经过了数据面的状态检查、停在 Supervisor 的准入之前（它读模型目录的那一步被引擎扣着）；这时 `restart` 到来，旧引擎进入
+/// 退出的宽限期（还在服务它已经接受的连接）。目录读取被放开之后，这个请求走到 Supervisor 的准入：门是关着的，所以被拒绝
+/// （`supervisor_unavailable`），一个加载也没有发给旧引擎。不关门的话，它会被准入，把加载发给正在退出的引擎。状态检查挡不住它：它是
+/// 在状态还是 `ready` 的时候过了那一关的。
+async fn a_request_past_the_state_gate_is_refused_by_the_closed_admission(uri: &str, body: Value) {
+    let rig = Rig::new(&Behavior {
+        trap_sigterm_secs: Some(1.5),
+        ..stateful()
+    });
+    let port = rig.port;
+    let full = Arc::new(Full::start(rig, Scripted::claiming(port)).await);
+    full.wait_open().await;
+    let old = full.rig.pid(0);
+
+    full.rig.fake.hold(Hold::List);
+    let listings = full.rig.fake.requests_of("/v1/models/status");
+    let in_flight = {
+        let (full, uri) = (full.clone(), uri.to_owned());
+        tokio::spawn(async move { full.data("POST", &uri, Some(body)).await })
+    };
+    wait_for("the catalog read to reach the engine", || {
+        full.rig.fake.requests_of("/v1/models/status") == listings + 1
+    })
+    .await;
+
+    let (status, _) = full
+        .admin("POST", "/admin/api/v1/upstreams/omlx/restart")
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    wait_for("the old engine to get SIGTERM", || {
+        full.rig.fake.got_sigterm(old)
+    })
+    .await;
+    full.rig.fake.release(Hold::List);
+
+    let (status, body) = in_flight.await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"]["reason_code"], "supervisor_unavailable",
+        "refused by the closed admission, not by a dying engine: {body}"
+    );
+    assert_eq!(
+        full.rig.fake.model_loads(),
+        0,
+        "no load was sent to the engine that was being replaced"
+    );
+}
+
+#[tokio::test]
+async fn c11_a_chat_past_the_state_gate_is_refused_by_the_closed_admission_when_the_engine_is_being_replaced()
+ {
+    a_request_past_the_state_gate_is_refused_by_the_closed_admission(
+        "/v1/chat/completions",
+        json!({"model": "idoris/fast", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn c11_a_warmup_goes_through_the_same_admission_and_is_refused_the_same_way() {
+    a_request_past_the_state_gate_is_refused_by_the_closed_admission(
+        "/v1/models/warmup",
+        json!({"model": "idoris/fast"}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn c12_an_external_process_that_reuses_the_pid_of_the_one_that_left_is_a_different_process() {
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start_on(work.path(), "external-a", &stateful(), free_port());
+    let port = external.port;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let inspector = Scripted::new();
+    inspector.external_listener(port, external.pid(), Some(TEAM));
+    let full = Full::start(rig, inspector.clone()).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(external.fake.model_loads(), 1);
+    assert_eq!(loaded_models(&full).await, json!(["fake-model"]));
+
+    // 监听者没了；之后端口上又出现了一个监听者，pid 一样、启动时间不一样（pid 被回收给了另一个进程）。pid 相同不等于同一个进程：
+    // 按 pid 加启动时间对账，所以这是另一个进程，账本要对着它重建。
+    inspector.forget_listener(port);
+    full.until_unavailable().await;
+    inspector.pretend_start_time(external.pid(), "Sat Nov 21 23:59:59 2026");
+    inspector.external_listener(port, external.pid(), Some(TEAM));
+    wait_for("ready again", || {
+        full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    // 账本是对着「新进程」重建的：它的采样里模型还在（其实还是同一个真进程，假引擎里 `LOADED` 没变），作为继承来的驻留进账本，
+    // 要经加载流程确认之后才算就绪，所以下一个聊天会发一次加载。没有对账（pid 相同就当还是它）的话，账本里的模型是就绪的，
+    // 聊天不会再发加载：这是 c9（同一个进程回来）与这里的区别。
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(
+        external.fake.model_loads(),
+        2,
+        "a recycled pid is a different process: the ledger was rebuilt, so the next chat confirmed the model with a load"
+    );
 }

@@ -49,6 +49,8 @@ pub enum Hold {
     Load,
     /// `GET /api/status`：Supervisor 的复位采样（引擎起来之后对账本重建的那一次读）。
     Status,
+    /// `GET /v1/models/status`：模型目录（聊天、预热在加载之前读的那一步）。
+    List,
 }
 
 impl Hold {
@@ -57,6 +59,7 @@ impl Hold {
             Self::Chat => "hold-chat",
             Self::Load => "hold-load",
             Self::Status => "hold-status",
+            Self::List => "hold-list",
         }
     }
 }
@@ -329,6 +332,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/v1/models":
             return self.reply(200, {{"object": "list", "data": [{{"id": "fake-model", "object": "model"}}]}})
         if self.path == "/v1/models/status":
+            hold("hold-list")
             if STATEFUL:
                 return self.reply(200, {{"models": [{{"id": MODEL, "estimated_size": SIZE, "loaded": MODEL in LOADED, "pinned": False}}]}})
             return self.reply(200, {{"models": [{{"id": "fake-model", "estimated_size": 1000000000}}]}})
