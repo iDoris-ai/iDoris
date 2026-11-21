@@ -45,7 +45,9 @@ pub async fn run_version_command(
         .kill_on_drop(true);
     // 自己的进程组：超时时整组杀掉（包装脚本可能 fork）。
     command.as_std_mut().process_group(0);
-    let mut child = command.spawn().map_err(|_| VersionError::Spawn)?;
+    let mut child = super::inspect::retry_exec_busy(|| command.spawn())
+        .await
+        .map_err(|_| VersionError::Spawn)?;
     let group = child.id().and_then(|pid| i32::try_from(pid).ok());
     let Some(mut stdout) = child.stdout.take() else {
         return Err(VersionError::Failed);

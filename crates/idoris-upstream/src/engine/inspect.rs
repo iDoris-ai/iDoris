@@ -185,6 +185,31 @@ impl ProcessInspector for SystemInspector {
     }
 }
 
+/// Upper bound on [`retry_exec_busy`] attempts; with [`EXEC_BUSY_PAUSE`] this caps the wait at ~0.5 s.
+const EXEC_BUSY_ATTEMPTS: u32 = 50;
+const EXEC_BUSY_PAUSE: Duration = Duration::from_millis(10);
+
+/// Runs `spawn`, retrying only on `ETXTBSY` (`ExecutableFileBusy`) a bounded number of times.
+/// A just-written executable can transiently be "text file busy" when another thread forks while
+/// the write fd is still open; every other error is returned at once.
+pub(super) async fn retry_exec_busy<T>(
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut attempt = 1;
+    loop {
+        match spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt < EXEC_BUSY_ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(EXEC_BUSY_PAUSE).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 pub(super) struct ToolOutput {
     pub(super) code: Option<i32>,
     pub(super) stdout: String,
@@ -198,7 +223,8 @@ pub(super) async fn run_tool(
     args: &[OsString],
     timeout: Duration,
 ) -> Result<ToolOutput, InspectError> {
-    let child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .env_clear()
         .env("PATH", TOOL_PATH)
@@ -208,15 +234,14 @@ pub(super) async fn run_tool(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // 超时丢弃 future 时一并杀掉工具。
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                InspectError::ToolMissing
-            } else {
-                InspectError::NoAnswer
-            }
-        })?;
+        .kill_on_drop(true);
+    let child = retry_exec_busy(|| command.spawn()).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            InspectError::ToolMissing
+        } else {
+            InspectError::NoAnswer
+        }
+    })?;
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
         .map_err(|_| InspectError::TimedOut)?
@@ -252,6 +277,48 @@ mod tests {
     fn with_fake_tools(ps: impl Into<PathBuf>, lsof: impl Into<PathBuf>) -> SystemInspector {
         SystemInspector::with_tools(ps, lsof)
             .with_timeouts(Duration::from_secs(60), Duration::from_secs(60))
+    }
+
+    fn busy() -> std::io::Error {
+        std::io::ErrorKind::ExecutableFileBusy.into()
+    }
+
+    #[tokio::test]
+    async fn retry_exec_busy_recovers_after_transient_busy() {
+        let mut calls = 0;
+        let result = retry_exec_busy(|| {
+            calls += 1;
+            if calls <= 3 { Err(busy()) } else { Ok(calls) }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn retry_exec_busy_does_not_retry_other_errors() {
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry_exec_busy(|| {
+            calls += 1;
+            Err(std::io::ErrorKind::NotFound.into())
+        })
+        .await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_exec_busy_gives_up_when_always_busy() {
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry_exec_busy(|| {
+            calls += 1;
+            Err(busy())
+        })
+        .await;
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::ExecutableFileBusy
+        );
+        assert_eq!(calls, EXEC_BUSY_ATTEMPTS);
     }
 
     #[tokio::test]
