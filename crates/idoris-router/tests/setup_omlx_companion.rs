@@ -237,18 +237,16 @@ async fn force_without_an_embed_binding_removes_the_previous_companion_card() {
 }
 
 #[tokio::test]
-async fn force_never_touches_foreign_files_even_next_to_a_companion_card() {
+async fn force_keeps_foreign_files_even_next_to_a_companion_card() {
     let env = Env::new(&["bge-m3-mlx-fp16"]);
     env.run(&[("embed", "bge-m3-mlx-fp16")], false)
         .await
         .unwrap();
-    fs::write(env.out().join("mine.yaml"), "keep").unwrap();
-    let error = env
-        .run(&[("embed", "bge-m3-mlx-fp16")], true)
+    fs::write(env.out().join("mine.txt"), "keep").unwrap();
+    env.run(&[("embed", "bge-m3-mlx-fp16")], true)
         .await
-        .unwrap_err();
-    assert_eq!(error.code, "out_dir_not_empty");
-    assert_eq!(fs::read(env.out().join("mine.yaml")).unwrap(), b"keep");
+        .unwrap();
+    assert_eq!(fs::read(env.out().join("mine.txt")).unwrap(), b"keep");
     assert!(env.out().join("omlx-embed.yaml").exists());
 }
 

@@ -234,7 +234,8 @@ pub async fn list_models(
     // `fetch_models_body` attaches a key only to loopback oMLX cards, so the
     // settings.json key (loopback-only) is safe to resolve here.
     let api_key = idoris_upstream::omlx::key::resolve_omlx_api_key_os(true);
-    let mut data = Vec::new();
+    // 每条 (端点, 条目)：端点相同的卡列出同一批上游模型（主卡与伴生卡），后面按规则去重。
+    let mut listed: Vec<(String, ModelEntry)> = Vec::new();
     for card in cards {
         let id = &card.provider.id;
         if card.form != Form::HttpService {
@@ -250,7 +251,8 @@ pub async fn list_models(
         match list_one(client, card, api_key.as_deref(), remote_kill_switch).await? {
             OneList::Entries(entries) => {
                 health.record(id, true, Instant::now());
-                data.extend(entries);
+                let endpoint = endpoint_key(&card.endpoint);
+                listed.extend(entries.into_iter().map(|entry| (endpoint.clone(), entry)));
             }
             OneList::Unavailable => health.record(id, false, Instant::now()),
             OneList::Suppressed => {}
@@ -258,8 +260,66 @@ pub async fn list_models(
     }
     Ok(ModelsResponse {
         object: "list",
-        data,
+        data: dedupe_same_endpoint(listed),
     })
+}
+
+/// 端点的比较形式，按请求实际的发法来：请求是 `<endpoint 去掉末尾 '/'>/v1/models`，由 reqwest 解析成 URL，
+/// 所以这里同样解析，只把 URL 规范化里本来就不分大小写的部分合并：scheme 与主机转小写、默认端口补全（`http` 的 80、
+/// `https` 的 443）；用户信息、路径、查询保持原样（路径区分大小写），路径末尾的 `/` 去掉。`localhost` 与 `127.0.0.1`
+/// 不做等价判断（当成两个端点，各列各的）。解析不了的端点只去末尾 `/`，不改大小写。
+fn endpoint_key(endpoint: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    let Ok(url) = reqwest::Url::parse(trimmed) else {
+        return trimmed.to_string();
+    };
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return trimmed.to_string();
+    };
+    format!(
+        "{}://{}{}:{}{}{}",
+        url.scheme(),
+        if url.username().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{}{}@",
+                url.username(),
+                url.password().map_or(String::new(), |p| format!(":{p}"))
+            )
+        },
+        host,
+        port,
+        url.path().trim_end_matches('/'),
+        url.query().map_or(String::new(), |q| format!("?{q}")),
+    )
+}
+
+/// 同一个端点、同一个模型 id 只列一次（主卡 `omlx` 与伴生卡 `omlx-embed` 指向同一个引擎时，上游的模型不重复出现）。
+/// 规则（确定性，与卡的加载顺序无关）：`provider.id` 字典序最小的卡胜出，所以主卡 `omlx` 压过 `omlx-embed`；
+/// 条目的相对顺序保持原样。端点不同的卡各列各的，哪怕模型 id 相同：那是两个不同的引擎。
+fn dedupe_same_endpoint(listed: Vec<(String, ModelEntry)>) -> Vec<ModelEntry> {
+    let mut winner: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    for (endpoint, entry) in &listed {
+        winner
+            .entry((endpoint.clone(), entry.id.clone()))
+            .and_modify(|best| {
+                if entry.owned_by < *best {
+                    best.clone_from(&entry.owned_by);
+                }
+            })
+            .or_insert_with(|| entry.owned_by.clone());
+    }
+    let mut seen = std::collections::HashSet::new();
+    listed
+        .into_iter()
+        .filter(|(endpoint, entry)| {
+            let key = (endpoint.clone(), entry.id.clone());
+            winner.get(&key) == Some(&entry.owned_by) && seen.insert(key)
+        })
+        .map(|(_, entry)| entry)
+        .collect()
 }
 
 pub async fn list_models_with_subscriptions(
@@ -345,6 +405,189 @@ mod tests {
             assert_eq!(m.object, "model");
             assert_eq!(m.owned_by, "omlx");
         }
+    }
+
+    async fn models_server(ids: &[&str]) -> MockServer {
+        let server = MockServer::start().await;
+        let data: Vec<_> = ids.iter().map(|id| serde_json::json!({"id": id})).collect();
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": data})),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn owners(resp: &ModelsResponse) -> Vec<(String, String)> {
+        resp.data
+            .iter()
+            .map(|m| (m.id.clone(), m.owned_by.clone()))
+            .collect()
+    }
+
+    /// 主卡与伴生卡指向同一个端点：同一个模型 id 只出现一次。无论卡的加载顺序如何，`provider.id` 最小的卡（主卡）胜出。
+    #[tokio::test]
+    async fn main_and_companion_on_one_endpoint_list_each_model_once_and_the_main_card_wins() {
+        let server = models_server(&["a", "b"]).await;
+        let main = card("omlx", &server.uri(), Form::HttpService);
+        let companion = card("omlx-embed", &server.uri(), Form::HttpService);
+        for cards in [
+            vec![main.clone(), companion.clone()],
+            vec![companion.clone(), main.clone()],
+        ] {
+            let resp = list_models(
+                &reqwest::Client::new(),
+                &cards,
+                &HealthTracker::default(),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                owners(&resp),
+                [("a".into(), "omlx".into()), ("b".into(), "omlx".into())]
+            );
+        }
+    }
+
+    /// 端点写法只差末尾的 `/` 也算同一个端点。
+    #[tokio::test]
+    async fn a_trailing_slash_does_not_make_a_different_endpoint() {
+        let server = models_server(&["a"]).await;
+        let cards = vec![
+            card("omlx", &server.uri(), Form::HttpService),
+            card(
+                "omlx-embed",
+                &format!("{}/", server.uri()),
+                Form::HttpService,
+            ),
+        ];
+        let resp = list_models(
+            &reqwest::Client::new(),
+            &cards,
+            &HealthTracker::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(owners(&resp), [("a".into(), "omlx".into())]);
+    }
+
+    /// 端点不同的卡各列各的，哪怕模型 id 相同；同一端点上两张卡各自独有的模型都保留。
+    #[tokio::test]
+    async fn separate_endpoints_still_list_separately_and_unique_models_survive() {
+        let one = models_server(&["shared", "only-one"]).await;
+        let two = models_server(&["shared"]).await;
+        let cards = vec![
+            card("omlx", &one.uri(), Form::HttpService),
+            card("lmstudio", &two.uri(), Form::HttpService),
+        ];
+        let resp = list_models(
+            &reqwest::Client::new(),
+            &cards,
+            &HealthTracker::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            owners(&resp),
+            [
+                ("shared".into(), "omlx".into()),
+                ("only-one".into(), "omlx".into()),
+                ("shared".into(), "lmstudio".into()),
+            ]
+        );
+    }
+
+    /// 端点比较：scheme、主机大小写与默认端口合并，末尾 `/` 去掉；路径的大小写、端口、用户信息、主机本身不同则不合并。
+    #[test]
+    fn endpoint_key_merges_host_case_and_default_ports_but_not_path_case() {
+        let same = [
+            ("http://127.0.0.1:8088", "HTTP://127.0.0.1:8088/"),
+            ("http://LocalHost:8088", "http://localhost:8088"),
+            ("http://example.test", "http://EXAMPLE.test:80/"),
+            ("https://example.test/x", "https://example.test:443/x/"),
+        ];
+        for (a, b) in same {
+            assert_eq!(endpoint_key(a), endpoint_key(b), "{a} {b}");
+        }
+        let different = [
+            ("http://example.test/Api", "http://example.test/api"),
+            ("http://example.test:8088", "http://example.test:8089"),
+            ("http://example.test", "https://example.test"),
+            ("http://127.0.0.1:8088", "http://localhost:8088"),
+            ("http://a@example.test", "http://b@example.test"),
+        ];
+        for (a, b) in different {
+            assert_ne!(endpoint_key(a), endpoint_key(b), "{a} {b}");
+        }
+        // 解析不了：只去末尾斜杠，大小写保持原样。
+        assert_eq!(endpoint_key("Not A Url//"), "Not A Url");
+    }
+
+    /// 主机大小写不同的两张卡指向同一个端点：合并；路径大小写不同的是两个端点：不合并（各自请求各自的路径）。
+    #[tokio::test]
+    async fn host_case_merges_in_the_listing_and_path_case_does_not() {
+        let server = models_server(&["a"]).await;
+        let upper = server.uri().replace("http://", "HTTP://");
+        let cards = vec![
+            card("omlx", &server.uri(), Form::HttpService),
+            card("omlx-embed", &upper, Form::HttpService),
+        ];
+        let resp = list_models(
+            &reqwest::Client::new(),
+            &cards,
+            &HealthTracker::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(owners(&resp), [("a".into(), "omlx".into())]);
+
+        // 路径不同的端点：两个 id 相同的条目都在（直接用去重函数，模拟两个路径下的上游各自返回同一个模型 id）。
+        let entry = |endpoint: &str, owner: &str| {
+            (
+                endpoint_key(endpoint),
+                ModelEntry {
+                    id: "m".into(),
+                    object: "model",
+                    owned_by: owner.into(),
+                },
+            )
+        };
+        let out = dedupe_same_endpoint(vec![
+            entry("http://example.test/Api", "p1"),
+            entry("http://example.test/api", "p2"),
+        ]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn dedupe_keeps_a_model_only_one_card_lists_and_drops_a_repeat_inside_one_card() {
+        let entry = |id: &str, owner: &str| {
+            (
+                "http://x".to_string(),
+                ModelEntry {
+                    id: id.into(),
+                    object: "model",
+                    owned_by: owner.into(),
+                },
+            )
+        };
+        let out = dedupe_same_endpoint(vec![
+            entry("a", "omlx-embed"),
+            entry("only-embed", "omlx-embed"),
+            entry("a", "omlx"),
+            entry("a", "omlx"),
+        ]);
+        let got: Vec<_> = out
+            .iter()
+            .map(|m| (m.id.as_str(), m.owned_by.as_str()))
+            .collect();
+        assert_eq!(got, [("only-embed", "omlx-embed"), ("a", "omlx")]);
     }
 
     #[tokio::test]
