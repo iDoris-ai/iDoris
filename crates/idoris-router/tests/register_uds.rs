@@ -1968,7 +1968,7 @@ async fn repeated_self_heal_rewrites_are_logged_for_the_first_and_every_tenth_ti
             record: record.clone(),
         }),
         ..StartOptions::new(Timings {
-            self_heal_interval: ms(5),
+            self_heal_interval: ms(20),
             ..fast()
         })
     });
@@ -2002,20 +2002,85 @@ async fn repeated_self_heal_rewrites_are_logged_for_the_first_and_every_tenth_ti
     registration.finish().await;
 
     let lines = rewrite_lines();
-    // 第一行没有次数，之后每一行的次数都是 10 的倍数。
+    // 按连续段校验：自愈核对到文件完好就把计数清零（生产语义），负载高时删除线程可能被拖过一轮，
+    // 所以日志里会出现多段。每条不带次数的行开启新的一段；段内后续行的次数必须依次是 10、20、30…
+    assert!(!lines.is_empty(), "{lines:?}");
     assert!(!lines[0].contains("连续第"), "{lines:?}");
-    for line in &lines[1..] {
-        let number: u64 = line
-            .split("连续第 ")
-            .nth(1)
-            .and_then(|rest| rest.split(' ').next())
-            .and_then(|number| number.parse().ok())
-            .unwrap_or_else(|| panic!("a repeated rewrite line without a count: {line}"));
-        assert!(number.is_multiple_of(10), "{lines:?}");
+    let mut expected_next: u64 = 10;
+    let mut longest_run: u64 = 1;
+    for line in &lines {
+        match line.split("连续第 ").nth(1) {
+            None => {
+                expected_next = 10;
+            }
+            Some(rest) => {
+                let number: u64 = rest
+                    .split(' ')
+                    .next()
+                    .and_then(|number| number.parse().ok())
+                    .unwrap_or_else(|| panic!("unparsable repeat count: {line}"));
+                assert!(number.is_multiple_of(10), "{lines:?}");
+                assert_eq!(number, expected_next, "{lines:?}");
+                longest_run = number;
+                expected_next += 10;
+            }
+        }
     }
+    assert!(longest_run >= 10, "{lines:?}");
     // 路径与 nonce 不在日志里。
     rig.logs
         .assert_no_secret(&[rig.nonce_hex.as_str(), "idoris.json"]);
+}
+
+/// 确定性：核对到文件完好就把连续计数清零。删一次、等它被重写，再等若干轮（至少一轮核对到完好），再删一次：
+/// 两次重写都是各自的“第 1 次”，所以是两条不带次数的行（不清零的话第二次是第 2 次，根本不记）。
+#[tokio::test]
+async fn self_heal_rewrite_count_resets_after_an_intact_check() {
+    let rig = Rig::new();
+    let (target, record) = discovery_for(&rig);
+    target.publish(&record).unwrap();
+    let path = rig.dir_path.join("idoris.json");
+    let registration = rig.start_with(StartOptions {
+        with_socket: false,
+        discovery: Some(SelfHeal {
+            target: target.clone(),
+            record: record.clone(),
+        }),
+        ..StartOptions::new(Timings {
+            self_heal_interval: ms(20),
+            ..fast()
+        })
+    });
+    let rewrite_count = {
+        let logs = rig.logs.clone();
+        move || {
+            logs.lines()
+                .into_iter()
+                .filter(|line| line.contains("已按原子发布重写"))
+                .count()
+        }
+    };
+    fs::remove_file(&path).unwrap();
+    wait_until("the first rewrite to be logged", secs(30), || {
+        rewrite_count() == 1
+    })
+    .await;
+    // 等 10 轮自愈间隔：其间必有核对到完好的一轮。
+    tokio::time::sleep(ms(200)).await;
+    fs::remove_file(&path).unwrap();
+    wait_until("the second rewrite to be logged", secs(30), || {
+        rewrite_count() == 2
+    })
+    .await;
+    registration.finish().await;
+    let lines: Vec<String> = rig
+        .logs
+        .lines()
+        .into_iter()
+        .filter(|line| line.contains("已按原子发布重写"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines.iter().all(|l| !l.contains("连续第")), "{lines:?}");
 }
 
 fn discovery_for(rig: &Rig) -> (Arc<DiscoveryTarget>, Arc<DiscoveryRecord>) {
