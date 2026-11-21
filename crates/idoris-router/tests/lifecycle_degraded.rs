@@ -64,6 +64,7 @@ fn fast() -> Timings {
         crash_limit: 2,
         half_open_interval: Duration::from_millis(400),
         stop_grace: Duration::from_secs(3),
+        drain_timeout: Duration::from_secs(5),
         unverifiable_retries: 2,
         unverifiable_pause: Duration::from_millis(20),
     }

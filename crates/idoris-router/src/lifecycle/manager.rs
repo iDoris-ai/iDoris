@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -278,6 +278,9 @@ pub(super) struct Shared {
     kinds: BTreeMap<String, String>,
     /// 上游 id → 卡的 endpoint 里的 loopback 端口（`ManagedView` 要带）。
     ports: BTreeMap<String, u16>,
+    /// 上游 id → 已经入队的命令的序号（从 1 起）：[`EngineManager::command`] 在**入队时**盖章，`Actor::restart_cover` 据此把
+    /// 一次 `restart` 进行期间到达的 `restart` 并进它的结果里（IDORIS-CORE S6，Codex 预审 5）。
+    enqueued: BTreeMap<String, AtomicU64>,
     /// 门控放行时没有就绪的实例，只在 [`EngineManager::open_gate`] 里写一次（持有 `statuses` 的锁时写，所以与状态一致）。
     /// 这些实例「冻结」：不再半开重试，不再接受 `start`（见 [`CommandError::RestartRequired`]）。
     degraded: Mutex<BTreeMap<String, ManagedFailure>>,
@@ -352,6 +355,20 @@ impl Shared {
             .contains_key(id)
     }
 
+    /// 给下一个入队的命令盖章：这个上游已入队命令的序号加一。
+    pub fn next_seq(&self, id: &str) -> u64 {
+        self.enqueued
+            .get(id)
+            .map_or(0, |counter| counter.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    /// 此刻已盖出的最大序号：序号不大于它的命令都是在这一刻之前入队的。
+    pub fn seq_now(&self, id: &str) -> u64 {
+        self.enqueued
+            .get(id)
+            .map_or(0, |counter| counter.load(Ordering::SeqCst))
+    }
+
     /// 自有引擎失效：通知 `bin` 去走退出码 5 的停止路径。只记第一个。
     pub fn signal_failure(&self, failure: EngineFailure) {
         self.failure.send_if_modified(|current| {
@@ -388,6 +405,10 @@ impl EngineManager {
             .iter()
             .map(|plan| (plan.id.clone(), plan.port))
             .collect();
+        let enqueued = plans
+            .iter()
+            .map(|plan| (plan.id.clone(), AtomicU64::new(0)))
+            .collect();
         let shared = Arc::new(Shared {
             config,
             health,
@@ -395,6 +416,7 @@ impl EngineManager {
             statuses: Mutex::new(BTreeMap::new()),
             kinds,
             ports,
+            enqueued,
             degraded: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             changed,
@@ -407,6 +429,9 @@ impl EngineManager {
         let mut senders = BTreeMap::new();
         let mut tasks = Vec::new();
         for plan in plans {
+            // 托管的端点从一开始就封上：在引擎管理器登记出一个通过校验的监听者之前，没有任何凭证发往它，环境变量与
+            // `settings.json` 的回退链从不适用于托管的端点（IDORIS-CORE S6，Codex 预审 3）。
+            plan.backend.block(&plan.endpoint);
             let (sender, receiver) = mpsc::channel(8);
             // 先登记 `starting`：门控判据与 `/health` 一开始就有这个实例。
             shared.publish(
@@ -552,6 +577,7 @@ impl EngineManager {
             let request = Request {
                 command: Command::GiveUp,
                 reply: Some(reply),
+                seq: 0,
             };
             if sender.send(request).await.is_ok() {
                 waits.push(answer);
@@ -593,10 +619,14 @@ impl EngineManager {
     async fn command(&self, id: &str, command: Command) -> Result<(), CommandError> {
         let sender = self.senders.get(id).ok_or(CommandError::NotFound)?;
         let (reply, answer) = oneshot::channel();
+        // 入队时盖章（先盖章、后入队）：序号不大于某次操作完成时的 `seq_now` 的 `restart`，都是在那次操作进行期间（或之前）到达的，
+        // 它们并进那次操作的结果，不再换第二次引擎（见 `Actor::restart_cover`）。
+        let seq = self.shared.next_seq(id);
         sender
             .send(Request {
                 command,
                 reply: Some(reply),
+                seq,
             })
             .await
             .map_err(|_| CommandError::Closed)?;
@@ -684,6 +714,7 @@ impl EngineManager {
                     stop_engine: stop_engines,
                 },
                 reply: Some(reply),
+                seq: 0,
             };
             if sender.send(request).await.is_ok() {
                 waits.push(answer);

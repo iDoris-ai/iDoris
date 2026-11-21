@@ -17,7 +17,7 @@ use idoris_upstream::omlx::engine::{
     BASE_PATH_ENV, OMLX_TEAM_ID, OmlxRecipe, base_path_in, prepare_base_dir,
 };
 use idoris_upstream::omlx::key::{
-    EndpointKey, govern_endpoint, release_endpoint, resolve_omlx_api_key_for,
+    EndpointKey, block_endpoint, govern_endpoint, resolve_omlx_api_key_for,
 };
 
 use crate::readiness::UpstreamReason;
@@ -57,8 +57,11 @@ pub trait EngineBackend: Send + Sync + std::fmt::Debug {
     /// 登记：这个 endpoint 上是外部引擎。`settings_key_verified` 为 true 时，才可以把读来的 `settings.json` key 发给它。
     fn govern_external(&self, endpoint: &str, settings_key_verified: bool);
 
-    /// 撤销登记（引擎停了、换了、失效了）：旧的私有 key 不能留在进程里。
-    fn release(&self, endpoint: &str);
+    /// **封上**这个 endpoint：什么凭证都不发（私有 key、环境变量的 key、`settings.json` 的 key 都不发），直到下一个监听者通过校验、
+    /// 被登记成私有或外部的口径（IDORIS-CORE S6，Codex 预审 3）。托管的 endpoint 在管理器启动时就先封上；引擎停了、正在被替换、
+    /// 外部引擎的监听者没了、端口上换了别的东西的时候都回到它。**不是撤销登记**：撤销会让回退链（环境变量、`settings.json`）重新
+    /// 适用于这个 endpoint，把用户的 key 发给之后占着这个端口、还没通过校验的别的东西；旧的私有 key 也随封上被换掉，不留在进程里。
+    fn block(&self, endpoint: &str);
 
     /// 现在发往这个 endpoint 的 key（私有 key，或外部引擎按这种引擎自己的顺序解析出来的）。
     fn current_key(&self, endpoint: &str) -> Option<String>;
@@ -202,8 +205,8 @@ impl EngineBackend for OmlxBackend {
         );
     }
 
-    fn release(&self, endpoint: &str) {
-        release_endpoint(endpoint);
+    fn block(&self, endpoint: &str) {
+        block_endpoint(endpoint);
     }
 
     fn current_key(&self, endpoint: &str) -> Option<String> {
@@ -328,7 +331,7 @@ mod tests {
         }
         fn govern_private(&self, _endpoint: &str, _key: &EngineKey) {}
         fn govern_external(&self, _endpoint: &str, _settings_key_verified: bool) {}
-        fn release(&self, _endpoint: &str) {}
+        fn block(&self, _endpoint: &str) {}
         fn current_key(&self, _endpoint: &str) -> Option<String> {
             None
         }

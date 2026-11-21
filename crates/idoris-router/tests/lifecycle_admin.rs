@@ -238,6 +238,7 @@ fn fast() -> Timings {
         crash_limit: 2,
         half_open_interval: Duration::from_millis(400),
         stop_grace: Duration::from_secs(3),
+        drain_timeout: Duration::from_secs(5),
         unverifiable_retries: 2,
         unverifiable_pause: Duration::from_millis(20),
     }
@@ -554,6 +555,15 @@ impl World {
         self.until(state, |element| element["state"] == state).await
     }
 
+    /// 停止做完了：`stopped` 而且 `owned: false`。受理时状态就已经是 `stopped`（不可服务），进程还在退出的那几秒 `owned` 还是
+    /// true、`pid` 还在；进程没了、账本清空之后才是 `owned: false`。
+    async fn until_gone(&self) -> Value {
+        self.until("the engine to be gone", |element| {
+            element["state"] == "stopped" && element["owned"] == false
+        })
+        .await
+    }
+
     fn logged(&self, needle: &str) -> usize {
         self.log
             .lock()
@@ -693,7 +703,9 @@ async fn stop_is_accepted_stops_the_engine_and_is_idempotent() {
         "the 202 body is one upstream element: {body}"
     );
 
-    let stopped = world.until_state("stopped").await;
+    // 受理的那一刻状态已经是 `stopped`（不可服务）；进程是不是已经没了看 `owned` 与 `pid`。
+    assert_eq!(body["state"], "stopped", "{body}");
+    let stopped = world.until_gone().await;
     assert_eq!(stopped["owned"], false);
     assert!(stopped.get("pid").is_none());
     assert!(stopped.get("reason").is_none());
@@ -705,7 +717,11 @@ async fn stop_is_accepted_stops_the_engine_and_is_idempotent() {
     );
     wait_for("the engine to die", || !pid_alive(pid)).await;
     assert_eq!(world.rig.record_count(), 0, "its ownership record is gone");
-    assert!(governed_endpoint(&world.rig.endpoint()).is_none());
+    // 端点被封上（什么凭证都不发），不是撤销登记（Codex 预审 3）。
+    assert_eq!(
+        governed_endpoint(&world.rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
     assert_eq!(
         world.health.view().upstreams[0].state,
         UpstreamState::Stopped
@@ -726,7 +742,7 @@ async fn after_a_stop_start_brings_a_fresh_engine_back_with_a_new_private_key() 
     let first_key = world.rig.key(0);
     let failures_before = failures_of(&world.element("omlx").await);
     world.post("omlx", "stop").await;
-    world.until_state("stopped").await;
+    world.until_gone().await;
 
     let (status, body) = world.post("omlx", "start").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -833,7 +849,7 @@ async fn two_concurrent_stops_are_both_accepted_and_the_engine_is_stopped_once()
         tokio::join!(world.post("omlx", "stop"), world.post("omlx", "stop"));
     assert_eq!(first, StatusCode::ACCEPTED);
     assert_eq!(second, StatusCode::ACCEPTED);
-    world.until_state("stopped").await;
+    world.until_gone().await;
     wait_for("the engine to die", || !pid_alive(pid)).await;
     assert_eq!(
         world.logged("收到命令 stop，已受理"),
@@ -999,7 +1015,7 @@ async fn the_manager_logs_every_accepted_command_and_never_a_key() {
     let world = World::start(Engine::Fake(Behavior::default()), fast()).await;
     let key = world.rig.key(0);
     world.post("omlx", "stop").await;
-    world.until_state("stopped").await;
+    world.until_gone().await;
     assert_eq!(world.logged("引擎 omlx：收到命令 stop，已受理"), 1);
     for line in world.log.lock().unwrap().iter() {
         assert!(
@@ -1019,8 +1035,8 @@ async fn the_manager_logs_every_accepted_command_and_never_a_key() {
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn g2_the_private_key_stays_registered_until_the_engine_has_exited_and_only_then_is_released()
-{
+async fn g2_the_private_key_stays_registered_until_the_engine_has_exited_and_only_then_the_endpoint_is_blocked()
+ {
     // 引擎收到 SIGTERM 之后再服务一秒才退出：停止的这一秒里它还活着、还在监听。
     let world = World::start(
         Engine::Fake(Behavior {
@@ -1042,7 +1058,7 @@ async fn g2_the_private_key_stays_registered_until_the_engine_has_exited_and_onl
             assert_eq!(
                 governed_endpoint(&world.rig.endpoint()),
                 Some(EndpointKey::Private(key.clone())),
-                "released before the process was gone"
+                "replaced before the process was gone"
             );
             samples_while_alive += 1;
         }
@@ -1052,10 +1068,11 @@ async fn g2_the_private_key_stays_registered_until_the_engine_has_exited_and_onl
         samples_while_alive > 5,
         "the window was observed: {samples_while_alive}"
     );
-    world.until_state("stopped").await;
-    assert!(
-        governed_endpoint(&world.rig.endpoint()).is_none(),
-        "released once it was gone"
+    world.until_gone().await;
+    assert_eq!(
+        governed_endpoint(&world.rig.endpoint()),
+        Some(EndpointKey::Blocked),
+        "blocked (not released) once it was gone"
     );
     world.manager.shutdown(true).await;
 }
@@ -1078,15 +1095,13 @@ async fn g2_an_external_listener_that_disappears_loses_the_settings_key_at_once_
             settings_key_verified: true
         })
     );
-    // 端口上不再有监听者：`unavailable`，同时 `settings.json` 的 key 立刻不再允许（端口上之后出现的东西还没有通过校验）。
+    // 端口上不再有监听者：`unavailable`，同时什么凭证都立刻不再发（端口上之后出现的东西还没有通过校验；连环境变量的 key 也不发）。
     inspector.forget_listener(external.port);
     world.until_state("unavailable").await;
     assert_eq!(
         governed_endpoint(&endpoint),
-        Some(EndpointKey::External {
-            settings_key_verified: false
-        }),
-        "the verification is withdrawn the moment the listener is gone"
+        Some(EndpointKey::Blocked),
+        "no credential goes out the moment the listener is gone"
     );
     // 监听者回来并通过校验：重新允许。
     inspector.external_listener(external.port, external.pid(), Some(TEAM));
@@ -1403,8 +1418,9 @@ async fn b_a_stopped_engine_is_a_503_with_a_reason_and_nothing_reaches_it_and_st
 
     full.admin("POST", "/admin/api/v1/upstreams/omlx/stop")
         .await;
-    wait_for("stopped", || {
-        full.health.view().upstreams[0].state == UpstreamState::Stopped
+    wait_for("the engine to be gone", || {
+        let upstream = &full.health.view().upstreams[0];
+        upstream.state == UpstreamState::Stopped && !upstream.owned
     })
     .await;
     // 数据面读实时状态：路由到这张卡的请求不碰引擎，直接 503，原因码沿用 `supervisor_unavailable`（被停下没有稳定原因码）。
@@ -1709,7 +1725,10 @@ async fn g2_shutdown_also_keeps_the_private_key_until_the_engine_has_exited() {
     }
     assert!(samples_while_alive > 5, "{samples_while_alive}");
     shutdown.await.unwrap();
-    assert!(governed_endpoint(&world.rig.endpoint()).is_none());
+    assert_eq!(
+        governed_endpoint(&world.rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
 }
 
 /// 一个检查器，可以让「读进程的启动时间」失败：被认回的孤儿引擎的身份读不出来，停止就没有确认它消失（不发信号）。
@@ -1808,25 +1827,26 @@ async fn g2_a_stop_that_cannot_confirm_the_process_is_gone_never_hands_the_endpo
         Some(EndpointKey::Private(key))
     );
 
-    // 引擎的身份读不出来了：停止不发信号，没有确认它消失。
+    // 引擎的身份读不出来了：停止不发信号，没有确认它消失。受理时状态已经是 `stopped`（不可服务）；没能确认进程消失，就不能说它
+    // 停了：收尾是 `unavailable` + `port_in_use`（进程可能还占着端口），围栏不动。
     inspector
         .unreadable
         .store(true, std::sync::atomic::Ordering::SeqCst);
     manager.stop_upstream("omlx").await.unwrap();
-    wait_for("stopped", || {
-        health.view().upstreams[0].state == UpstreamState::Stopped
+    wait_for("the unconfirmed stop to be reported", || {
+        let upstream = &health.view().upstreams[0];
+        upstream.state == UpstreamState::Unavailable
+            && upstream.reason == Some(UpstreamReason::PortInUse)
     })
     .await;
     assert!(
         pid_alive(pid),
         "an engine whose identity cannot be read is never signalled"
     );
-    // 进程可能还在：登记不能撤销（那会按默认顺序把 `settings.json` 的 key 发给它）；私有 key 也不再发：外部、未验证。
+    // 进程可能还在：登记不能撤销（那会按默认顺序把 `settings.json` 的 key 发给它）；私有 key 也不再发：端点封上，什么都不发。
     assert_eq!(
         governed_endpoint(&rig.endpoint()),
-        Some(EndpointKey::External {
-            settings_key_verified: false
-        })
+        Some(EndpointKey::Blocked)
     );
     inspector
         .unreadable

@@ -74,6 +74,22 @@ impl BoundSupervisor {
         self.handle.engine_replaced(sample).await
     }
 
+    /// 关 Supervisor 的门（引擎管理器在停止、替换引擎之前调用）：之后新的加载、卸载、聊天一律被拒绝，已经准入的做到完。见
+    /// [`idoris_backend::SupervisorHandle::close_admission`]。
+    pub(crate) async fn close_admission(&self) -> Result<(), BackendError> {
+        self.handle.close_admission().await
+    }
+
+    /// 开门（账本复位之后）。见 [`idoris_backend::SupervisorHandle::reopen_admission`]。
+    pub(crate) async fn reopen_admission(&self) -> Result<(), BackendError> {
+        self.handle.reopen_admission().await
+    }
+
+    /// 没有在途的加载与聊天了吗（关门之后才算「排空」）。见 [`idoris_backend::SupervisorHandle::is_quiescent`]。
+    pub(crate) async fn is_quiescent(&self) -> Result<bool, BackendError> {
+        self.handle.is_quiescent().await
+    }
+
     /// Constructs the adapter from the same card used for the binding.
     pub fn spawn_omlx(card: &ComponentCard) -> Result<Self, String> {
         let adapter = idoris_upstream::OmlxAdapter::new(

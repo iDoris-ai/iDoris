@@ -33,6 +33,9 @@ pub struct Timings {
     pub half_open_interval: Duration,
     /// 停止自有引擎的宽限：SIGTERM 之后等整组消失，到点还在就 SIGKILL（规范：8 秒）。
     pub stop_grace: Duration,
+    /// 排空的上限（IDORIS-CORE S6）：`stop`、`restart`（以及 `start` 一个还活着却不答的引擎）先关 Supervisor 的门，再等已经在
+    /// 进行的加载、聊天做完，最多等这么久；到点还没做完就切断旧一代的凭证、照样停进程（它们之后发的每个请求都被拒绝）。
+    pub drain_timeout: Duration,
     /// 身份读不出来的记录（`Recovery::Unverifiable`）：重读几次、每次隔多久，之后按失败处理。
     pub unverifiable_retries: u32,
     pub unverifiable_pause: Duration,
@@ -55,6 +58,7 @@ impl Default for Timings {
             crash_limit: 5,
             half_open_interval: Duration::from_secs(60),
             stop_grace: Duration::from_secs(8),
+            drain_timeout: Duration::from_secs(30),
             unverifiable_retries: 3,
             unverifiable_pause: Duration::from_millis(500),
         }
