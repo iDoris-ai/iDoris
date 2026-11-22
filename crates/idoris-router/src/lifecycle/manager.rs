@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
-use idoris_upstream::engine::{ProcessInspector, StopOnExit};
+use idoris_upstream::engine::{EngineKind, ProcessInspector, StopOnExit};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -113,37 +113,68 @@ pub fn plan_managed(upstreams: &[UpstreamPlan]) -> Result<Vec<ManagedPlan>, Plan
     })
 }
 
+/// 本版本能托管的引擎种类到 backend 种类的对应（v0.6.0 只有 oMLX）。纯函数：不构造 backend、不碰环境。
+/// `plan_managed` 与 `setup` 的落盘前校验（[`crate::preflight`]）共用它。
+pub fn managed_backend_kind(engine_kind: &str) -> Option<EngineKind> {
+    match engine_kind {
+        "omlx" => Some(EngineKind::OMLX),
+        _ => None,
+    }
+}
+
+/// 托管卡的**纯配置校验**（不构造 backend、不读环境、不碰文件系统）：endpoint 形状、引擎种类有对应的管理器、端口不重复、
+/// 每种引擎只有一个托管实例。`plan_managed_with`（serve 启动）与 `setup` 在落盘前对暂存目录做的校验用的是同一个函数，
+/// 所以 setup 放行的目录，serve 不会再因为这些原因退出 1。返回按卡顺序排列的 `(上游 id, 端口)`。
+pub fn validate_managed_plan(
+    upstreams: &[UpstreamPlan],
+    backend_kind_for: impl Fn(&str) -> Option<EngineKind>,
+) -> Result<Vec<(String, u16)>, PlanError> {
+    let mut seen: Vec<(String, u16, EngineKind)> = Vec::new();
+    for upstream in upstreams.iter().filter(|plan| plan.identity.managed) {
+        let id = upstream.id.clone();
+        let port = managed_port(&upstream.card().endpoint)
+            .ok_or_else(|| PlanError::EndpointNotManageable { id: id.clone() })?;
+        let kind = backend_kind_for(&upstream.identity.engine_kind).ok_or_else(|| {
+            PlanError::NoBackend {
+                id: id.clone(),
+                engine_kind: upstream.identity.engine_kind.clone(),
+            }
+        })?;
+        if let Some((other, _, _)) = seen.iter().find(|(_, seen_port, _)| *seen_port == port) {
+            return Err(PlanError::PortShared {
+                id,
+                other: other.clone(),
+            });
+        }
+        if let Some((other, _, _)) = seen.iter().find(|(_, _, seen_kind)| *seen_kind == kind) {
+            return Err(PlanError::SecondOfKind {
+                id,
+                other: other.clone(),
+                engine_kind: upstream.identity.engine_kind.clone(),
+            });
+        }
+        seen.push((id, port, kind));
+    }
+    Ok(seen.into_iter().map(|(id, port, _)| (id, port)).collect())
+}
+
 /// 同上，引擎种类到 backend 的对应由调用方给（测试里换假的 backend）。
 pub fn plan_managed_with(
     upstreams: &[UpstreamPlan],
     backend_for: impl Fn(&str) -> Option<Arc<dyn EngineBackend>>,
 ) -> Result<Vec<ManagedPlan>, PlanError> {
-    let mut plans: Vec<ManagedPlan> = Vec::new();
-    for upstream in upstreams.iter().filter(|plan| plan.identity.managed) {
-        let id = upstream.id.clone();
-        let port = managed_port(&upstream.card().endpoint)
-            .ok_or_else(|| PlanError::EndpointNotManageable { id: id.clone() })?;
+    let checked = validate_managed_plan(upstreams, |kind| backend_for(kind).map(|b| b.kind()))?;
+    let mut plans: Vec<ManagedPlan> = Vec::with_capacity(checked.len());
+    for (upstream, (id, port)) in upstreams
+        .iter()
+        .filter(|plan| plan.identity.managed)
+        .zip(checked)
+    {
         let backend =
             backend_for(&upstream.identity.engine_kind).ok_or_else(|| PlanError::NoBackend {
                 id: id.clone(),
                 engine_kind: upstream.identity.engine_kind.clone(),
             })?;
-        if let Some(other) = plans.iter().find(|plan| plan.port == port) {
-            return Err(PlanError::PortShared {
-                id,
-                other: other.id.clone(),
-            });
-        }
-        if let Some(other) = plans
-            .iter()
-            .find(|plan| plan.backend.kind() == backend.kind())
-        {
-            return Err(PlanError::SecondOfKind {
-                id,
-                other: other.id.clone(),
-                engine_kind: upstream.identity.engine_kind.clone(),
-            });
-        }
         plans.push(ManagedPlan {
             id,
             endpoint: format!("http://127.0.0.1:{port}"),

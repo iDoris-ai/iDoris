@@ -1378,6 +1378,8 @@ pub fn write_validated_hooked(
         })?;
         // 最终的集合（保留的加新的）里至多一张默认卡。
         check_at_most_one_default(&cards)?;
+        // serve 启动时还会做的纯配置校验（托管卡的计划、引擎种类）：在发布之前先过一遍，免得 setup 成功而 serve 起不来。
+        check_serve_preflight(&cards)?;
         fire(hook, CommitPhase::Validated, out_dir);
         check_out_dir(out_dir, force, stage.file_name(), &scope)?;
         if out_dir.exists() {
@@ -1599,6 +1601,7 @@ pub fn write_added_hooked(
         let cards = crate::components::load_components(&stage, false)
             .map_err(|e| added_load_failure(e, &stage, out_dir, &card.provider.id))?;
         check_at_most_one_default(&cards)?;
+        check_serve_preflight(&cards)?;
         fire(hook, CommitPhase::Validated, out_dir);
         if !out_dir.exists() {
             // 没有现有的卡可镜像，暂存目录里只有新卡。
@@ -1657,6 +1660,16 @@ fn added_load_failure(
             .to_string()
             .replace(&stage.display().to_string(), &out_dir.display().to_string()),
     )
+}
+
+/// serve 启动时对卡集合做的纯配置校验（[`crate::preflight`]）：不过就是 `validation_failed`，说明就是 serve 会报的那一句。
+fn check_serve_preflight(cards: &[ComponentCard]) -> Result<(), SetupError> {
+    crate::preflight::validate_card_set(cards).map_err(|why| {
+        SetupError::new(
+            "validation_failed",
+            format!("这个目录里的卡放在一起，iDoris 启动时会失败，所以没有写入：{why}"),
+        )
+    })
 }
 
 /// 最终的卡集合（保留的加新写的）里至多一张默认卡（规范 §2.12.3：至多一张卡带 `idoris_default`）。

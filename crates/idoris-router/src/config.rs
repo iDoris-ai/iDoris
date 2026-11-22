@@ -9,7 +9,9 @@ pub fn resolve_path(
     default_relative: &str,
     executable: &Path,
 ) -> Result<PathBuf, String> {
-    if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+    // `trim` 只用来判断是不是整个都是空白；非空的路径原样使用，不去掉首尾空白（#L1：路径末尾的空格是路径的一部分，
+    // `setup` 输出的 `next.env.IDORIS_COMPONENTS_DIR` 原样交给 serve 就要能找到同一个目录）。
+    if let Some(value) = explicit.filter(|value| !value.trim().is_empty()) {
         return Ok(PathBuf::from(value));
     }
     let parent = executable
@@ -27,11 +29,7 @@ pub fn resolve_env(name: &str, default_relative: &str) -> Result<PathBuf, String
                 .map_err(|_| format!("环境变量 {name} 不是有效的 Unicode 路径"))
         })
         .transpose()?;
-    if let Some(value) = explicit
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(value) = explicit.as_deref().filter(|value| !value.trim().is_empty()) {
         return Ok(PathBuf::from(value));
     }
     let executable =
@@ -65,12 +63,30 @@ mod tests {
         let exe = Path::new("/bundle/bin/idoris");
         assert_eq!(
             resolve_path(Some(" custom/components "), "config/components", exe).unwrap(),
-            PathBuf::from("custom/components")
+            PathBuf::from(" custom/components ")
         );
         assert_eq!(
             resolve_path(Some("/opt/idoris/policy.yaml"), "config/policy.yaml", exe).unwrap(),
             PathBuf::from("/opt/idoris/policy.yaml")
         );
+    }
+
+    /// #L1：`trim` 只用来判断是不是整个都是空白；非空的路径原样保留，首尾的空格是路径的一部分。
+    #[test]
+    fn a_non_blank_path_is_kept_exactly_including_surrounding_spaces() {
+        let exe = Path::new("/bundle/bin/idoris");
+        for raw in [
+            "/opt/my dir /",
+            "/opt/trailing ",
+            " /opt/leading",
+            "\t/opt/tab\t",
+        ] {
+            assert_eq!(
+                resolve_path(Some(raw), "config/components", exe).unwrap(),
+                PathBuf::from(raw),
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]

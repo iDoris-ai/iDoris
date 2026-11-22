@@ -33,21 +33,38 @@ pub const DEFAULT_COMPONENTS_DIR: &str = "config/components";
 /// executable's directory before loading, while explicit paths keep this
 /// cwd-relative behavior.
 pub fn resolve_components_dir(raw: Option<&str>) -> PathBuf {
-    let value = match raw.map(str::trim) {
-        None | Some("") => DEFAULT_COMPONENTS_DIR,
-        Some(v) => v,
-    };
-    PathBuf::from(value)
+    // `trim` 只用来判断是不是整个都是空白；非空的路径原样保留（路径末尾的空格是路径的一部分，#L1）。
+    match raw {
+        Some(value) if !value.trim().is_empty() => PathBuf::from(value),
+        _ => PathBuf::from(DEFAULT_COMPONENTS_DIR),
+    }
 }
 
 #[derive(Debug)]
 pub enum LoadError {
     NotADirectory(String),
-    Io { file: String, message: String },
-    Parse { file: String, message: String },
-    Invalid { file: String, message: String },
+    Io {
+        file: String,
+        message: String,
+    },
+    Parse {
+        file: String,
+        message: String,
+    },
+    Invalid {
+        file: String,
+        message: String,
+    },
     Registration(RegistrationError),
-    SubscriptionCard { id: String, message: String },
+    SubscriptionCard {
+        id: String,
+        message: String,
+    },
+    /// 等 `setup` 放开组件目录的锁等了 `waited_secs` 秒仍没等到（#M2）。
+    DirLocked {
+        dir: String,
+        waited_secs: u64,
+    },
 }
 
 impl std::fmt::Display for LoadError {
@@ -67,6 +84,10 @@ impl std::fmt::Display for LoadError {
             LoadError::SubscriptionCard { id, message } => write!(
                 f,
                 "subscription provider {id} failed its fixed card boundary: {message}"
+            ),
+            LoadError::DirLocked { dir, waited_secs } => write!(
+                f,
+                "组件目录 \"{dir}\" 正被 `idoris setup` 改写，等了 {waited_secs} 秒仍没有放开：为了不读到改了一半的卡，启动失败；等 setup 结束后重试"
             ),
         }
     }
@@ -108,6 +129,69 @@ fn placeholder_card(component: ComponentCard) -> Card {
         estimated_cost_minor: Some(0),
         admission_status: AdmissionStatus::Ready,
     }
+}
+
+/// serve 等 `setup` 放开组件目录的锁的上限。`setup` 的落盘只是几次改名，正常情况下几毫秒；等不到说明 setup 卡住了。
+pub const DIR_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 读到的卡的一致性保证（#M2）：先对组件目录拿**共享** `flock`（与 `setup` 的独占锁是同一把，`setup_engine::lock_out_dir`），
+/// 拿着它枚举并读完所有卡再放开。`setup` 落盘时持有独占锁，所以这里读到的要么是落盘前完整的旧集合，要么是落盘后完整的
+/// 新集合，不会是 `setup` 一个一个挪动文件的中间状态。拿不到锁就等，最多 `wait`，超时是启动失败（[`LoadError::DirLocked`]）。
+///
+/// 只在启动时读一次卡的 serve 用它；其他调用方仍用 [`load_components`]。建议锁约束不了不遵守它的写入者（手工改文件），
+/// 那一类改动不在这个保证里。目录不存在或不是目录时不拿锁，原样交给 [`load_components`] 报错。
+pub fn load_components_locked(
+    dir: &Path,
+    allow_mock_env: bool,
+    wait: std::time::Duration,
+) -> Result<Vec<ComponentCard>, LoadError> {
+    let _shared = lock_shared(dir, wait)?;
+    load_components(dir, allow_mock_env)
+}
+
+/// 共享锁的持有者；Drop 时释放。
+struct SharedDirLock {
+    #[cfg(unix)]
+    _flock: nix::fcntl::Flock<fs::File>,
+}
+
+#[cfg(unix)]
+fn lock_shared(dir: &Path, wait: std::time::Duration) -> Result<Option<SharedDirLock>, LoadError> {
+    use nix::errno::Errno;
+    use nix::fcntl::{Flock, FlockArg};
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let io = |message: String| LoadError::Io {
+        file: dir.display().to_string(),
+        message,
+    };
+    let mut file = fs::File::open(dir).map_err(|e| io(e.to_string()))?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match Flock::lock(file, FlockArg::LockSharedNonblock) {
+            Ok(flock) => return Ok(Some(SharedDirLock { _flock: flock })),
+            Err((back, Errno::EWOULDBLOCK)) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(LoadError::DirLocked {
+                        dir: dir.display().to_string(),
+                        waited_secs: wait.as_secs(),
+                    });
+                }
+                file = back;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err((_, errno)) => return Err(io(format!("无法锁定组件目录：{errno}"))),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_shared(
+    _dir: &Path,
+    _wait: std::time::Duration,
+) -> Result<Option<SharedDirLock>, LoadError> {
+    Ok(None)
 }
 
 /// Loads every `*.yaml`/`*.yml` file directly under `dir` (sorted by
@@ -192,6 +276,19 @@ mod tests {
                 PathBuf::from(DEFAULT_COMPONENTS_DIR)
             );
         }
+    }
+
+    /// #L1：非空的路径原样保留（末尾空格是路径的一部分），整个是空白才用默认。
+    #[test]
+    fn resolve_components_dir_keeps_a_non_blank_path_exactly() {
+        assert_eq!(
+            resolve_components_dir(Some("custom/dir ")),
+            PathBuf::from("custom/dir ")
+        );
+        assert_eq!(
+            resolve_components_dir(Some(" lead")),
+            PathBuf::from(" lead")
+        );
     }
 
     #[test]

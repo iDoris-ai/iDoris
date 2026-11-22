@@ -516,12 +516,15 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     let components_dir =
         config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
     let allow_mock = env_flag("IDORIS_ALLOW_MOCK");
-    let cards = components::load_components(&components_dir, allow_mock).map_err(|err| {
-        format!(
-            "无法加载组件目录 \"{}\"（IDORIS_COMPONENTS_DIR）：{err}",
-            components_dir.display()
-        )
-    })?;
+    // 对组件目录拿共享锁再读（与 `idoris setup` 的独占锁同一把）：不会读到 setup 落盘到一半的卡集合。
+    let cards =
+        components::load_components_locked(&components_dir, allow_mock, components_lock_wait())
+            .map_err(|err| {
+                format!(
+                    "无法加载组件目录 \"{}\"（IDORIS_COMPONENTS_DIR）：{err}",
+                    components_dir.display()
+                )
+            })?;
     let subscription_config = SubscriptionConfig::snapshot(
         std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref(),
         std::env::var("IDORIS_ENABLE_SUBSCRIPTION").ok().as_deref(),
@@ -1282,6 +1285,15 @@ impl ManagedEngines {
 }
 
 /// 发现文件的 `launch`：启动输入快照（接口规范 §2.7.3）。
+/// serve 等 `idoris setup` 放开组件目录锁的上限：默认 [`components::DIR_LOCK_WAIT`]；
+/// `IDORIS_COMPONENTS_LOCK_WAIT_MS`（毫秒，诊断与测试用）可以缩短或延长。
+fn components_lock_wait() -> std::time::Duration {
+    std::env::var("IDORIS_COMPONENTS_LOCK_WAIT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(components::DIR_LOCK_WAIT, std::time::Duration::from_millis)
+}
+
 fn launch_snapshot(
     components_dir: &std::path::Path,
     allocated_budget_bytes: Option<u64>,
