@@ -31,8 +31,11 @@
 //!   `[valid_from, valid_until)`（左闭右开，按花费的归属时间判断）；「存在之后」看**提交顺序**：额度创建那一刻账本里最后一条
 //!   分录的号记在 `ledger_allocation_marks`（迁移 0004），分录号大于它的花费才是它存在之后的。迟发的、起点倒填的额度不会回头替
 //!   更早的花费还债；
-//! * 一笔花费（一个预留在这个账户上的全部分录：预留、结算、释放、过期；先后看它**第一条**分录的号，迟到的结算是另一笔新的花费）
-//!   先用此刻生效的桶里**先到期**的；额度之外的部分 `U` 先用自有资金（全部充值：充值不过期，所以不分先后，只看总数），
+//! * 一笔花费先用**自己归属时刻**生效的桶里**先到期**的。花费有两种：预留本身（这个预留在这个账户上的预留、结算、释放、过期分录，
+//!   归属时刻是预留创建的时刻，先后看预留**第一条**分录的号）；和结算那一刻才发生的花费（迟到的结算整笔，没迟到的结算只有超出预留的
+//!   部分 overage，分录种类 `late_settle`，归属时刻是结算的时刻，先后看这次结算自己的号）。超出预留的部分不是预留的一部分：
+//!   结算时算「担保人能吸收多少」读的是结算那一刻的额度，这部分就记在结算那一刻、用结算自己的提交序号，吸收过的额度不会再被花一次
+//!   （Codex 复审 2026-11-22 High 1）。额度之外的部分 `U` 先用自有资金（全部充值：充值不过期，所以不分先后，只看总数），
 //!   用完才记成授信债务。所以同一个请求先用免费额度，再用自有资金，最后才动授信；
 //! * **授信债务 = `max(全期 U 之和 − 全部充值, 0)`**（已花加在途预留）。它不因新额度的窗口而重置，不因额度到期（哪怕一分没花）
 //!   而勾销，也不因授信被重设、关掉再开而勾销。债务只因上级充值而减少：充值先还债，还清之后多出来的才是自有资金剩余
@@ -44,6 +47,12 @@
 //! 之前**取的毫秒，HTTP 请求取时之后还要等工作线程和写锁，排队能让「先提交」和「时间更早」对不上，同一毫秒更分不出先后。
 //! 拿毫秒比先后，后来才存在的额度会追溯偿还它存在之前的授信债务（债务凭空少一块，额度没人用、到期了授信还是空出来），
 //! 已撤销的额度会回头覆盖撤销之后才提交的花费。分录号（AUTOINCREMENT）在串行的写事务里追加，大小就是提交的先后。
+//!
+//! **每一笔花费按它自己记下的归属时刻判断，不看读的是哪一刻**（Codex 复审 2026-11-22 High 2）。读钟同样是调用方进事务之前取的：
+//! 排队等写锁的请求读到的钟可以比前面已经提交的花费更早。读钟只决定回放**之后**哪些额度此刻还能花（窗口包含读钟、没被撤销、
+//! 剩余的量）；它不能把已经提交的花费压到更早的时刻去重新找额度——压过去的花费会落进更早的、甚至已经撤销的额度的窗口里，被算成
+//! 它覆盖的，自有资金或授信就凭空回来了。同理回放要看得见读钟**之后**才开始的额度（归属时刻晚于读钟的花费要用它们），不能只加载
+//! 读钟之前已经开始的。
 //!
 //! 视图里记成净头寸：`ceiling_remaining = 额度剩余 + 自有资金剩余 − min(债务, 授信额度)`（`balance` 是 `None`，自有资金已经
 //! 并在里面；没充值的账户自有资金剩余是 0），授信额度原样放在 `credit_limit`。S0 的 `可用额度 + 授信` 因此恰好是
@@ -268,18 +277,33 @@ impl Bucket {
     }
 }
 
-/// 一笔花费：一个预留在这个账户上、同一个归属时刻上的全部分录（预留、结算、释放、过期）的净额。
+/// 一笔花费：一个预留在这个账户上、同一个归属时刻上、同一类的全部分录的净额。
+///
+/// 一个预留最多有两笔花费，**分得开，哪怕归属时刻是同一毫秒**：
+///
+/// * 预留本身（`reserve` / `settle` / `release` / `expire`，归属时刻是预留创建的时刻）：预留额，结算之后是预留之内的部分
+///   （放掉、过期了就是 0）；先后看预留自己的提交序号；
+/// * 结算那一刻才发生的花费（`late_settle`，归属时刻是结算的那一刻）：迟到的结算整笔，没迟到的结算只有超出预留的部分
+///   （overage）；先后看这次结算自己的提交序号。
+///
+/// 超出预留的部分是结算时才发生的新花费，不是预留的一部分：它要用的额度是**结算那一刻**生效、结算提交之前已经存在的额度，
+/// 和结算时算「担保人能吸收多少」读的是同一份额度（读多少、吸收多少、记多少用同一个时刻和同一个提交序号），
+/// 否则同一块额度会被吸收一次、之后又被花一次。
 #[derive(Debug, Clone, Copy)]
 struct Spend {
-    /// 归属时刻（毫秒）：预留创建的时刻；迟到的结算记在结算的时刻。
+    /// 归属时刻（毫秒）：预留创建的时刻，或者结算的时刻（见上）。
     at: i64,
     /// 这笔花费第一条分录的号：先后看它，不看毫秒。
     first_entry: i64,
     amount: i64,
 }
 
-/// 这个账户名下、`now` 之前已经开始的花费类额度（额度 0 的不要），按创建先后排好。
-fn load_buckets(conn: &Connection, account: &str, now_ms: i64) -> Result<Vec<Bucket>, LedgerError> {
+/// 这个账户名下**所有**花费类额度（额度 0 的不要），按创建先后排好，不管起点在读的时刻之前还是之后。
+///
+/// 回放的是全期的花费，每一笔按它**自己的**归属时刻去找覆盖它的额度：一笔归属时刻晚于读的那一刻的花费（读钟取得早、排队等写锁的
+/// 请求之后才提交的，或者调用方给了较早的时间）要找到读钟之后才开始的额度，找不到就会被算成自有资金或授信债务。
+/// 哪些额度**此刻**还能花，是回放之后另算的（[`separate_books`] 末尾：窗口包含 `now`、没被撤销）。
+fn load_buckets(conn: &Connection, account: &str) -> Result<Vec<Bucket>, LedgerError> {
     let mut stmt = conn.prepare(&format!(
         "SELECT a.allocation_id, a.valid_from_ms, a.valid_until_ms, a.ceiling_micros,
                 (SELECT m.after_entry FROM ledger_allocation_marks m
@@ -288,10 +312,10 @@ fn load_buckets(conn: &Connection, account: &str, now_ms: i64) -> Result<Vec<Buc
                 (SELECT m.after_entry FROM ledger_allocation_marks m
                   WHERE m.allocation_id = a.allocation_id AND m.event = 'revoked')
            FROM allocations a
-          WHERE a.child_id = ?1 AND a.purpose IN {SPENDABLE_PURPOSES} AND a.valid_from_ms <= ?2
+          WHERE a.child_id = ?1 AND a.purpose IN {SPENDABLE_PURPOSES}
           ORDER BY a.rowid"
     ))?;
-    let rows = stmt.query_map(rusqlite::params![account, now_ms], |row| {
+    let rows = stmt.query_map([account], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
@@ -334,13 +358,16 @@ fn load_buckets(conn: &Connection, account: &str, now_ms: i64) -> Result<Vec<Buc
     Ok(buckets)
 }
 
-/// 这个账户上的每一笔花费，按第一条分录的号（提交先后）排好。同一个预留在同一个归属时刻上的在途、已花合成一笔，
-/// 净额为 0 的（放掉了、过期了）不要。
+/// 这个账户上的每一笔花费，按第一条分录的号（提交先后）排好。同一个预留在同一个归属时刻上、同一类（预留本身，或者结算那一刻才
+/// 发生的花费，见 [`Spend`]）的在途、已花合成一笔，净额为 0 的（放掉了、过期了）不要。
+///
+/// 分类看分录的种类（`late_settle` = 结算那一刻才发生的花费），不看归属时刻是不是同一毫秒：预留和它的 overage 可以在同一毫秒
+/// （结算和预留取到了同一个毫秒），合成一笔就会让 overage 用上预留创建时的提交序号，够不着结算之前才发的额度。
 fn load_spends(conn: &Connection, account: &str) -> Result<Vec<Spend>, LedgerError> {
     let mut stmt = conn.prepare(
         "SELECT window_at_ms, MIN(entry_id), SUM(held_micros + spent_micros) FROM ledger_entries
           WHERE account_id = ?1 AND hold_id IS NOT NULL
-          GROUP BY hold_id, window_at_ms
+          GROUP BY hold_id, window_at_ms, kind = 'late_settle'
          HAVING SUM(held_micros + spent_micros) <> 0
           ORDER BY MIN(entry_id)",
     )?;
@@ -362,7 +389,10 @@ fn load_spends(conn: &Connection, account: &str) -> Result<Vec<Spend>, LedgerErr
 /// 没有在它之前被撤销（口径见模块文档）。所以后来才创建的额度动不了它存在之前的任何一笔花费，往账本里追加新的额度或撤销，
 /// 都不会改变之前那些花费已经得到的覆盖（只有结算、释放、过期会改一笔花费的净额）。
 /// 自有资金不参与哪一笔花费用哪一笔额度：充值不过期、不分先后，只有总数 `funds`，所以「额度之外的部分」累加之后一次扣掉。
-/// 归属时刻晚于 `now` 的花费按 `now` 算（读的是过去的某一刻时，往后的花费照样占着此刻生效的额度，只会更保守）。
+///
+/// **每一笔花费都按它自己记下的归属时刻判断，不看读的是哪一刻**（`now_ms` 只决定回放之后哪些额度此刻还能花）：读钟是调用方在进事务之前
+/// 取的，排队等写锁的请求读到的钟可以比前面已经提交的花费更早。如果把一笔已经提交的花费按读钟「压」到更早的时刻，它就可能落进
+/// 一笔更早的、甚至已经撤销的额度的窗口里，被算成这笔额度覆盖的，自有资金或授信就凭空回来了（造钱）。
 /// 回放是 `O(花费笔数 × 额度个数)`：额度个数是个位数到几十（每月一笔免费额度加预付），读花费的那一次扫描和准入已有的求和同量级。
 fn separate_books(
     conn: &Connection,
@@ -370,7 +400,7 @@ fn separate_books(
     now_ms: i64,
     funds: i64,
 ) -> Result<Books, LedgerError> {
-    let buckets = load_buckets(conn, account, now_ms)?;
+    let buckets = load_buckets(conn, account)?;
     let mut left: Vec<i64> = buckets.iter().map(|bucket| bucket.capacity).collect();
     // 先到期的先用。排序只看额度自己的到期时间（`sort_by_key` 是稳定的：同一时刻到期的保持创建先后），不看之后才发生的撤销，
     // 所以一笔花费得到的覆盖不会因为日后撤销了某笔额度而换一笔额度来覆盖。
@@ -378,14 +408,13 @@ fn separate_books(
     order.sort_by_key(|index| buckets[*index].until);
     let mut uncovered = 0_i64;
     for spend in load_spends(conn, account)? {
-        let at = spend.at.min(now_ms);
         // 万一读出负数（分录被改坏了），按 0 算：不会借此多出额度覆盖
         let mut rest = spend.amount.max(0);
         for index in &order {
             if rest == 0 {
                 break;
             }
-            if buckets[*index].covers(at, spend.first_entry) {
+            if buckets[*index].covers(spend.at, spend.first_entry) {
                 let take = rest.min(left[*index]);
                 left[*index] -= take;
                 rest -= take;

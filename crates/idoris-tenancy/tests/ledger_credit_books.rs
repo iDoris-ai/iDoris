@@ -42,7 +42,7 @@ use idoris_compute_contracts::grant::Purpose;
 use idoris_compute_contracts::ids::{AllocationId, IdempotencyKey};
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_tenancy::accounts::ledger::{
-    CreditLineSetting, FreeTierIssue, FreeTierOutcome, LedgerError,
+    CreditLineSetting, FreeTierIssue, FreeTierOutcome, LedgerError, SettleOutcome,
 };
 use idoris_tenancy::accounts::{AccountStore, GrantAllocation, Meta, Who};
 
@@ -1430,6 +1430,257 @@ fn an_allocation_that_lost_its_order_mark_fails_admission_closed() {
             "{what}: the view fails closed too"
         );
     }
+}
+
+// ------------------------------------------------------------------------------------------
+// Codex 复审（2026-11-22）：超出预留的部分、读钟乱序——没充值的账户在 main 上就有同样的两条造钱的路径
+// ------------------------------------------------------------------------------------------
+//
+// 期望数字全部从输入事件手算（推导写在注释里），不经过被测代码，也不经过上面的 `model`。区分点是「同一笔钱不能花两次」：
+// 任何时刻已花（含在途）不超过 额度 + 授信（被撤销额度没花掉的部分不算）。
+
+/// 结算一个预留。
+fn settle_at(store: &AccountStore, req: &Req, charged: i64, at: i64) -> SettleOutcome {
+    store
+        .settle_attempt(&req.attempt, &price(charged), ts(at))
+        .unwrap()
+}
+
+#[test]
+fn the_overage_of_an_unexpired_settlement_spends_the_allowance_of_its_own_moment_once() {
+    // 授信 100；额度 100。
+    //
+    //   T0 + 9    预留 100：额度的窗口 [T0 + 10, ..) 还没开始（或者额度这时还不存在），授信 100 全部占用，债务 100
+    //   T0 + 10   按 200 结算，超出预留 100
+    //
+    // 结算那一刻额度生效、一分没动：能吸收超出部分的是额度 100 + 授信可用 (100 - 100) = 100，担保人承担 100，没有平台损失。
+    // 这 100 就是额度花掉的：结算之后额度剩余 0、债务 100、能花的 0 + (100 - 100) = 0。
+    // 旧代码把整笔 200 记在预留的时刻 T0 + 9 上，额度够不着它：债务 200、额度仍剩 100，净头寸 100 - min(200, 100) = 0，
+    // 能花的是 0 + 授信额度 100，一笔 100 的请求照样放行：花了 200 + 100，只有额度 100 + 授信 100。
+    for (label, allowance_exists_before_the_reservation) in [
+        ("the window starts after the reservation", true),
+        ("the allowance is created after the reservation", false),
+    ] {
+        let db = TempDb::new(&format!(
+            "books-overage-attribution-{allowance_exists_before_the_reservation}"
+        ));
+        let store = credit_only_world(&db);
+        credit_line(&store, "emp", 100, T0);
+        if allowance_exists_before_the_reservation {
+            prepaid(&store, "emp-new", 100, T0 + 10, T0 + 10 + 30 * DAY, T0 + 5);
+        }
+        let first = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 9);
+        assert_eq!(
+            admit(&store, &first)
+                .admitted()
+                .map(|a| a.reservation.price.micros()),
+            Some(100),
+            "{label}"
+        );
+        if !allowance_exists_before_the_reservation {
+            // 窗口早就开始了，但它是预留提交之后才存在的：覆盖不到那一笔预留
+            prepaid(&store, "emp-new", 100, T0 - DAY, T0 + 30 * DAY, T0 + 9);
+        }
+
+        let outcome = settle_at(&store, &first, 200, T0 + 10);
+        assert!(!outcome.late, "{label}");
+        assert_eq!(outcome.overage, thb(100), "{label}");
+        assert_eq!(outcome.user_borne, thb(100), "{label}");
+        assert_eq!(
+            (
+                outcome.sponsor_covered.clone(),
+                outcome.platform_loss.clone()
+            ),
+            (thb(100), thb(0)),
+            "{label}: {outcome:?}"
+        );
+        assert!(!outcome.credential_frozen, "{label}");
+
+        let after = view(&store, T0 + 11);
+        assert_eq!(
+            after.ceiling_remaining,
+            Some(thb(-100)),
+            "{label}: allowance 0 - debt 100"
+        );
+        assert_eq!(headroom(&after), 0, "{label}: 200 spent of 200");
+        let next = Req::new(&store, "r-2", 0, "cred-e", M100).at(T0 + 12);
+        let rejected = admit(&store, &next);
+        assert_eq!(
+            denied(&rejected),
+            Some(ReasonCode::BudgetExhausted),
+            "{label}: {rejected:?}"
+        );
+        let laddered = admit_with_ladder(&store, "cred-e", "r-3", M30, T0 + 13);
+        assert_eq!(
+            denied(&laddered),
+            Some(ReasonCode::BudgetExhausted),
+            "{label}: {laddered:?}"
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COALESCE(SUM(held_micros + spent_micros), 0) FROM ledger_entries WHERE account_id = 'emp'"
+            ),
+            200,
+            "{label}"
+        );
+        assert_eq!(store.loss_total("platform_loss").unwrap(), 0, "{label}");
+        assert_clean(&store);
+    }
+}
+
+#[test]
+fn an_old_allowance_revoked_after_the_reservation_and_a_new_one_in_the_same_millisecond_do_not_merge_the_overage_back()
+ {
+    // 预留、撤销旧额度、发新额度、结算全在同一毫秒 X = T0 + 10，只有调用顺序（提交顺序）分得出先后。授信 100，旧额度 100，新额度 100，一共 300。
+    //
+    //   预留 150：旧额度 100（还没撤销）+ 授信 50
+    //   撤销 `old`（预留之后），发 `new`（窗口从 X 起，撤销之后）
+    //   按 250 结算，超出预留 100
+    //
+    // 结算前：旧额度只覆盖预留，新额度一分没动；能花的 = 额度 100 + (授信 100 - 债务 50) = 150，担保人吸收超出的 100，没有平台损失。
+    // 超出的 100 是撤销和发新额度之后才提交的：旧额度不再覆盖，新额度覆盖，结算之后额度 0、债务 50、能花的 0 + (100 - 50) = 50
+    // （旧代码在同一毫秒把超出部分并回预留那一笔：新额度够不着它，债务 150，新额度还剩 100，能花的是 100，一笔 100 的请求照样放行）。
+    // 下一笔 100 的请求只能降到 50；总共花了 250 + 50 = 300，正好是全部的钱。
+    let db = TempDb::new("books-overage-same-ms");
+    let store = credit_only_world(&db);
+    let x = T0 + 10;
+    credit_line(&store, "emp", 100, T0);
+    prepaid(&store, "old", 100, T0 - DAY, T0 + 30 * DAY, T0);
+
+    let first = Req::new(&store, "r-1", 0, "cred-e", 70).at(x);
+    assert_eq!(
+        admit(&store, &first)
+            .admitted()
+            .map(|a| a.reservation.price.micros()),
+        Some(150)
+    );
+    revoke_allocation_at(&db, "old", x);
+    prepaid(&store, "new", 100, x, x + 30 * DAY, x);
+
+    let outcome = settle_at(&store, &first, 250, x);
+    assert_eq!(outcome.overage, thb(100));
+    assert_eq!(outcome.user_borne, thb(150));
+    assert_eq!(
+        (
+            outcome.sponsor_covered.clone(),
+            outcome.platform_loss.clone()
+        ),
+        (thb(100), thb(0)),
+        "room before the settlement: 100 + (100 - 50) = 150: {outcome:?}"
+    );
+    assert!(!outcome.credential_frozen);
+
+    let after = view(&store, x + 1);
+    assert_eq!(
+        after.ceiling_remaining,
+        Some(thb(-50)),
+        "allowance 0 - debt 50"
+    );
+    assert_eq!(headroom(&after), 50);
+    let next = admit(
+        &store,
+        &Req::new(&store, "r-2", 0, "cred-e", M100).at(x + 2),
+    );
+    assert_eq!(
+        next.admitted().map(|a| a.reservation.price.micros()),
+        Some(50),
+        "only 50 of the 300 is left: {next:?}"
+    );
+    assert!(
+        matches!(next, AdmissionDecision::Degrade { .. }),
+        "{next:?}"
+    );
+    let none = admit_with_ladder(&store, "cred-e", "r-3", M30, x + 3);
+    assert_eq!(denied(&none), Some(ReasonCode::BudgetExhausted), "{none:?}");
+    assert_eq!(store.loss_total("platform_loss").unwrap(), 0);
+    assert_clean(&store);
+}
+
+#[test]
+fn a_request_that_read_the_clock_earlier_cannot_move_a_committed_spend_into_a_revoked_allowance() {
+    // 授信 100；旧额度 100，窗口是毫秒级的 [T0, T0 + 100)。调用顺序（提交顺序）：
+    //
+    //   A  T0 + 101 准入 100：额度窗口已经过了，用的是授信，债务 100
+    //   撤销旧额度（A 提交之后）
+    //   B  读钟读到的是 T0 + 99（早于 A，排队才拿到写锁），准入 100
+    //
+    // A 的花费归属时刻是 T0 + 101，不在旧额度的窗口里，所以是授信承担的：债务 100；旧额度已撤销，不可花：
+    // B 能花的 0 + (100 - 100) = 0，拒绝。旧代码把 A 的归属时刻按 B 的读钟压到 T0 + 99，落进旧额度的窗口、算成它覆盖的
+    // （撤销在 A 之后提交，照样覆盖）：债务 0，授信又是满的，B 放行——同一笔 100 的授信花了两次。
+    let db = TempDb::new("books-stale-read-revoked");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 100, T0);
+    prepaid(&store, "old", 100, T0, T0 + 100, T0);
+    let a = Req::new(&store, "a-1", 0, "cred-e", M100).at(T0 + 101);
+    let decision = admit(&store, &a);
+    assert!(
+        matches!(decision, AdmissionDecision::Allow { .. }),
+        "{decision:?}"
+    );
+    revoke_allocation_at(&db, "old", T0 + 102);
+
+    let b = Req::new(&store, "b-1", 0, "cred-e", M100).at(T0 + 99);
+    let rejected = admit(&store, &b);
+    assert_eq!(
+        denied(&rejected),
+        Some(ReasonCode::BudgetExhausted),
+        "A spent the credit at T0 + 101, outside the window: {rejected:?}"
+    );
+    assert!(store.hold(&b.attempt, "model").unwrap().is_none());
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COALESCE(SUM(held_micros + spent_micros), 0) FROM ledger_entries WHERE account_id = 'emp'"
+        ),
+        100,
+        "only A is on the books"
+    );
+    assert_clean(&store);
+}
+
+#[test]
+fn a_spend_that_belongs_to_an_allowance_starting_after_the_read_time_still_uses_that_allowance() {
+    // 授信 100；额度 `b2` 100，窗口 [T0 + 100, T0 + 200)。
+    //
+    //   S  T0 + 150 准入 100：b2 在窗口里，先用 b2 的 100，授信一分没动
+    //   B  读钟读到的是 T0 + 99，准入 100：b2 在 B 的时刻还没生效，能用的只有授信 100——而 S 用的是 b2，授信是满的，放行
+    //
+    // 只回放读钟那一刻已经开始的额度，S 找不到 b2，被算成授信债务，B 就被无谓地拒绝了。
+    // 放行之后：B 用授信 100，S 用 b2 100，一共 200 = 全部的钱，再来一笔拒绝。
+    let db = TempDb::new("books-future-allowance");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 100, T0);
+    prepaid(&store, "b2", 100, T0 + 100, T0 + 200, T0);
+    let s = Req::new(&store, "s-1", 0, "cred-e", M100).at(T0 + 150);
+    assert_eq!(
+        admit(&store, &s)
+            .admitted()
+            .map(|a| a.reservation.price.micros()),
+        Some(100)
+    );
+    let b = Req::new(&store, "b-1", 0, "cred-e", M100).at(T0 + 99);
+    let decision = admit(&store, &b);
+    assert_eq!(
+        decision.admitted().map(|a| a.reservation.price.micros()),
+        Some(100),
+        "S used b2, so the credit is intact: {decision:?}"
+    );
+    assert!(
+        matches!(decision, AdmissionDecision::Allow { .. }),
+        "{decision:?}"
+    );
+    let c = Req::new(&store, "c-1", 0, "cred-e", M30).at(T0 + 151);
+    let none = admit(&store, &c);
+    assert_eq!(denied(&none), Some(ReasonCode::BudgetExhausted), "{none:?}");
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COALESCE(SUM(held_micros + spent_micros), 0) FROM ledger_entries WHERE account_id = 'emp'"
+        ),
+        200
+    );
+    assert_clean(&store);
 }
 
 // ------------------------------------------------------------------------------------------

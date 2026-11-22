@@ -573,7 +573,11 @@ fn blank_outcome(unit: &Unit, result: SettleResult, charged: i64, late: bool) ->
 /// 1. **宽限里平台承担的部分** `G`（只有宽限放行的预留有）：预留之内、超出放行时下限（账户自己的可用额度加授信）
 ///    的部分 `max(min(A, R) - 下限, 0)`。这是平台批准的一次例外，**不记到付款账户链上**（不扣用户和担保人的余额，
 ///    后续充值也不会先去填它），只在平台损失账户记一条 `grace_absorbed`。迟到的结算同样先分出 `G`。
-/// 2. **记到链上的** `A - G`：沿所有祖先各记一条已花（结算 / 迟到结算）。
+/// 2. **记到链上的** `A - G`：沿所有祖先各记已花。预留还活着时拆成两块：预留之内的部分 `A - G - overage` 记在预留创建的时刻上
+///    （`settle`，冲掉在途），超出预留的部分 overage 是结算这一刻才发生的新花费，单独记一条 `late_settle`，归属时刻是结算的
+///    这一刻、提交序号是这次结算自己的（和下面算担保人能吸收多少读的是同一刻的额度；见 `project.rs` 的「花费」）。预留已经过期
+///    的迟到结算整笔 `A - G` 都是 overage，记一条 `late_settle`。`late_settle` 这个种类名沿用 0001 的 CHECK，意思是「结算那一刻
+///    才发生的花费」，不一定是迟到的结算。
 /// 3. **overage**：预留还活着时是 `max(A - R, 0)`；预留已经过期（额度早已放回去）时，扣掉 `G` 之后的整笔
 ///    `A - G` 都在预留之外。链上「剩余额度加授信」还能吸收的由担保人承担（S0 的 [`split_overage`]），超出的记入
 ///    平台损失账户，告警，并冻结这张凭证。能吸收多少是事务里现读的整条链在「钱」这个维度上的余量（见 [`credit_headroom`]）。
@@ -730,6 +734,7 @@ pub(super) fn settle_hold_in(
             },
         )?;
     } else {
+        // 预留之内的部分（`user_borne`）：冲掉在途，已花照旧记在预留创建的时刻上（沿用预留自己的提交序号）。
         let release = hold.reserved.checked_neg().ok_or(LedgerError::Overflow)?;
         post_chain(
             conn,
@@ -738,11 +743,29 @@ pub(super) fn settle_hold_in(
             &ChainPosting {
                 kind: "settle",
                 held: release,
-                spent: chain_charge,
+                spent: user_borne,
                 window_at_ms: hold.created_at,
                 at_ms: now_ms,
             },
         )?;
+        // 超出预留的部分是结算这一刻才发生的新花费，不是预留的一部分：单独记一条 `late_settle`，归属时刻是结算的这一刻，
+        // 提交序号是这次结算自己的。上面算「担保人能吸收多少」读的是结算这一刻生效、此刻已经存在的额度，所以这块花费要用的
+        // 也是这些额度；记回预留创建的时刻（旧写法），它就够不着在预留之后才开始或才发出的额度，吸收的时候算过一次的额度
+        // 会被之后的请求再花一次。
+        if overage > 0 {
+            post_chain(
+                conn,
+                &chain,
+                &hold,
+                &ChainPosting {
+                    kind: "late_settle",
+                    held: 0,
+                    spent: overage,
+                    window_at_ms: now_ms,
+                    at_ms: now_ms,
+                },
+            )?;
+        }
     }
 
     let guarantor = chain.get(1).map(|account| account.id.as_str());

@@ -43,7 +43,7 @@ use super::holds::{
 use super::period::period_of;
 use super::project::{
     Books, SPENDABLE_PURPOSES, available_of, load_config, not_revoked_clause, owes_credit,
-    project_chain, project_chain_with_books,
+    project_chain_with_books,
 };
 use super::types::{AdmitInput, AlertKind, MODEL_COMPONENT};
 use crate::accounts::rows::{load_ancestors, load_credential};
@@ -525,8 +525,30 @@ pub(super) fn apply(
             },
         )?;
     }
-    for (index, overdraft) in &write.credit_used {
-        let Some(account) = write.chain.get(*index) else {
+    insert_credit_used_alerts(
+        conn,
+        &write.chain,
+        &write.credit_used,
+        input.payment.credential().as_str(),
+        &hold_id,
+        &write.unit,
+        now_ms,
+    )
+}
+
+/// 给靠授信放行的账户各写一条 `credit_used` 告警（`credit_used` 是 [`credit_users`] 的结果：（链上的位置，透支额））。
+/// 主要预留和附加成本的预留都走这里：同一份规则、同一个事务（调用方已经开着的写事务）。
+pub(super) fn insert_credit_used_alerts(
+    conn: &Connection,
+    chain: &[Account],
+    credit_used: &[(usize, i64)],
+    credential: &str,
+    hold_id: &str,
+    unit: &Unit,
+    now_ms: i64,
+) -> Result<(), LedgerError> {
+    for (index, overdraft) in credit_used {
+        let Some(account) = chain.get(*index) else {
             continue;
         };
         insert_alert(
@@ -534,11 +556,11 @@ pub(super) fn apply(
             &NewAlert {
                 kind: AlertKind::CreditUsed,
                 account: account.id.as_str(),
-                guarantor: guarantor_of(*index),
-                credential: Some(input.payment.credential().as_str()),
-                hold: Some(&hold_id),
+                guarantor: chain.get(index + 1).map(|guarantor| guarantor.id.as_str()),
+                credential: Some(credential),
+                hold: Some(hold_id),
                 amount: *overdraft,
-                unit: &write.unit,
+                unit,
                 detail: "overdraft_within_credit",
                 at_ms: now_ms,
             },
@@ -547,28 +569,55 @@ pub(super) fn apply(
     Ok(())
 }
 
+/// [`check_extra`] 的结果。
+pub(super) struct ExtraCheck {
+    /// 付款账户链（`[付款账户, 父, ..., 根]`），通过就是要占的链。
+    pub chain: Vec<Account>,
+    /// 不通过的原因码（通过是 `None`）。
+    pub rejection: Option<ReasonCode>,
+    /// 通过时靠授信放行的账户：（链上的位置，透支额）。和主要预留同一条规则（[`credit_users`]），要通知担保人。
+    pub credit_used: Vec<(usize, i64)>,
+}
+
 /// 给附加成本（比如安全检查）用的单项准入：五项检查沿所有祖先，通过就返回要占的链，不降级、不宽限。
+///
+/// 动了授信的账户也要通知担保人：和主要预留一样，由 [`credit_users`] 判断哪些账户这一笔真的动了授信，调用方在**占预留的同一个
+/// 事务里**用 [`insert_credit_used_alerts`] 写告警（附加成本也是占付款账户额度的预留，担保人看到的授信用量不该因为它是
+/// 附加成本就少一块）。
 pub(super) fn check_extra(
     conn: &Connection,
     payer: &AccountId,
     amount: &Price,
     now_ms: i64,
     config: &super::types::LedgerConfig,
-) -> Result<(Vec<Account>, Option<ReasonCode>), LedgerError> {
+) -> Result<ExtraCheck, LedgerError> {
     let chain = load_ancestors(conn, payer)?;
     if chain.is_empty() {
-        return Ok((chain, Some(ReasonCode::PaymentContextInvalid)));
+        return Ok(ExtraCheck {
+            chain,
+            rejection: Some(ReasonCode::PaymentContextInvalid),
+            credit_used: Vec::new(),
+        });
     }
-    let views = project_chain(conn, &chain, now_ms, config)?;
+    let (views, books) = project_chain_with_books(conn, &chain, now_ms, config)?;
     let report = evaluate_admission(amount, &views)?;
     if report.passed() {
-        Ok((chain, None))
+        let credit_used = credit_users(&report, &chain, &books, amount.micros())?;
+        Ok(ExtraCheck {
+            chain,
+            rejection: None,
+            credit_used,
+        })
     } else {
         let code = report
             .blocking_codes()
             .first()
             .copied()
             .unwrap_or(ReasonCode::BudgetExhausted);
-        Ok((chain, Some(code)))
+        Ok(ExtraCheck {
+            chain,
+            rejection: Some(code),
+            credit_used: Vec::new(),
+        })
     }
 }
