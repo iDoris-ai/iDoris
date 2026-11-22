@@ -99,8 +99,12 @@ fn element(state: &AppState, health: UpstreamStatus, view: Option<&ManagedView>)
 }
 
 /// 卡的 endpoint 里的端口（http 与 https 没写端口时是协议的缺省端口）。只取端口：endpoint 里的凭据、路径不会出现在响应里。
+/// 端口 0 不是一个端口（契约的下限是 1）：`http://127.0.0.1:0` 这样的非托管卡不输出 `port`（IDORIS-CORE S6，Codex 终审 L2）。
 fn port_of(endpoint: &str) -> Option<u16> {
-    reqwest::Url::parse(endpoint).ok()?.port_or_known_default()
+    reqwest::Url::parse(endpoint)
+        .ok()?
+        .port_or_known_default()
+        .filter(|port| *port != 0)
 }
 
 /// 路由器的状态到契约的状态：穷尽的 `match`，路由器里加了新状态而契约没跟上，这里编译不过。
@@ -420,6 +424,55 @@ mod tests {
     // -----------------------------------------------------------------------------------------
     // 读
     // -----------------------------------------------------------------------------------------
+
+    /// Codex 终审 L2：端口 0 不是一个端口（契约的下限是 1）。一张非托管的卡写成 `http://127.0.0.1:0`，`port_or_known_default()` 给出 `Some(0)`，
+    /// `GET` 之前会输出 `port: 0`，违反契约；现在不输出 `port`，响应照样通过契约校验。真实的 `GET`，不是只测 `port_of`。
+    #[tokio::test]
+    async fn a_card_on_port_zero_outputs_no_port_and_the_response_still_validates() {
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_owned();
+        let mut state = state();
+        state.cards.push(card("zero-port", "http://127.0.0.1:0"));
+        state.health_state = HealthState::with_upstreams(
+            1_763_625_330_123,
+            vec![
+                health_entry(
+                    "lmstudio",
+                    "openai_compat",
+                    false,
+                    UpstreamState::Ready,
+                    None,
+                    false,
+                ),
+                health_entry(
+                    "zero-port",
+                    "openai_compat",
+                    false,
+                    UpstreamState::Ready,
+                    None,
+                    false,
+                ),
+            ],
+        );
+        let app = build_admin_app(state, token);
+        let (status, body, _) = send(
+            &app,
+            request("GET", "/admin/api/v1/upstreams", Some(&secret)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            idoris_contracts::parse::<AdminUpstreamsResponse>(&body).is_ok(),
+            "{body}"
+        );
+        assert_eq!(element_by_id(&body, "lmstudio")["port"], 1234);
+        assert!(
+            element_by_id(&body, "zero-port").get("port").is_none(),
+            "{body}"
+        );
+        assert_eq!(port_of("http://127.0.0.1:0"), None);
+        assert_eq!(port_of("https://example.com"), Some(443));
+    }
 
     #[tokio::test]
     async fn get_is_the_health_snapshot_field_for_field_in_the_same_order() {

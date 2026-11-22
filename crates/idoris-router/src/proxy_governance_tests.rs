@@ -9,7 +9,7 @@ use idoris_backend::generation;
 use idoris_contracts::common::PrivacyClass;
 use idoris_contracts::provider::Locality;
 use idoris_upstream::omlx::key::{
-    EndpointKey, block_endpoint, endpoint_generation, govern_endpoint, release_endpoint,
+    EndpointKey, block_endpoint, endpoint_generation, forget_endpoint, govern_endpoint,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -30,13 +30,13 @@ fn opts() -> ForwardOpts<'static> {
     }
 }
 
-/// 登记表是进程全局的，而端口会被操作系统很快复用给同一个进程里别的用例的假上游：每个用例结束时撤销自己的登记，不留一个
-/// 封上的（或登记着私有 key 的）端点给之后碰巧拿到同一个端口的用例。
+/// 登记表是进程全局的，而端口会被操作系统很快复用给同一个进程里别的用例的假上游：每个用例结束时把自己的登记整条删掉（代际也回到 0），
+/// 不留一个封上的（或登记着私有 key 的）端点给之后碰巧拿到同一个端口的用例。
 struct Governed(String);
 
 impl Drop for Governed {
     fn drop(&mut self) {
-        release_endpoint(&self.0);
+        forget_endpoint(&self.0);
     }
 }
 

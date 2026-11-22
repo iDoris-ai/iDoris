@@ -69,9 +69,14 @@ impl BoundSupervisor {
     }
 
     /// 引擎进程被换掉了（IDORIS-CORE S6，引擎管理器调用）：让 Supervisor 的账本跟上，见
-    /// [`idoris_backend::SupervisorHandle::engine_replaced`]。
-    pub(crate) async fn engine_replaced(&self, sample: bool) -> Result<(), BackendError> {
-        self.handle.engine_replaced(sample).await
+    /// [`idoris_backend::SupervisorHandle::engine_replaced`]。一个绝对的截止时间管入队、等安静、回答；到点还没开始的复位被 Supervisor
+    /// 丢弃，什么也不改（Codex 终审 M5）。见 [`idoris_backend::SupervisorHandle::engine_replaced_before`]。
+    pub(crate) async fn engine_replaced_before(
+        &self,
+        sample: bool,
+        deadline: std::time::Instant,
+    ) -> Result<(), BackendError> {
+        self.handle.engine_replaced_before(sample, deadline).await
     }
 
     /// 关 Supervisor 的门（引擎管理器在停止、替换引擎之前调用）：之后新的加载、卸载、聊天一律被拒绝，已经准入的做到完。见

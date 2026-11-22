@@ -147,6 +147,22 @@ impl SystemInspector {
             .ok_or(InspectError::ToolMissing)
     }
 
+    /// 监听 TCP `port` 的每个套接字（`lsof -nP -iTCP:<port> -sTCP:LISTEN -Fpn`）：进程号与它绑的地址。没有监听者是空列表；读不出来
+    /// （工具不存在、超时、出错）是 [`InspectError`]。
+    async fn listening_sockets(&self, port: u16) -> Result<Vec<ListeningSocket>, InspectError> {
+        let lsof = self.lsof_tool()?;
+        let args = ["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpn"].map(OsString::from);
+        let output = run_tool(lsof, &args, self.lsof_timeout).await?;
+        match output.code {
+            Some(0) => parse_lsof_sockets(&output.stdout),
+            // lsof 自己的「没有匹配」：退出码 1，stdout 与 stderr 都是空的（出错同样退出 1，但会在 stderr 说话）。
+            Some(1) if output.stdout.trim().is_empty() && output.stderr.trim().is_empty() => {
+                Ok(Vec::new())
+            }
+            _ => Err(InspectError::NoAnswer),
+        }
+    }
+
     async fn ps_value(&self, pid: u32, column: &str) -> Result<String, InspectError> {
         let args = vec![
             OsString::from("-o"),
@@ -193,30 +209,16 @@ impl ProcessInspector for SystemInspector {
             .map_err(|_| InspectError::NoAnswer)
     }
 
+    /// `pid` 是不是这个端口上**唯一**的监听者（IDORIS-CORE S6，Codex 终审 H1；owner 2026-11-22 拍板）：`lsof` 能看到的、监听这个
+    /// TCP 端口的每个套接字（任何地址）都必须是 `pid` 的，并且至少有一个落在目标地址上（托管的端点是 `127.0.0.1`：绑在
+    /// `127.0.0.1` 或 IPv4 通配地址上的）。别的进程也在这个端口上监听（哪怕在另一个地址上）、或者目标地址上的那个不是它，都是「不是」：
+    /// 之前只问「这个 pid 在某个地址上监听这个端口」，一个绑在 `127.0.0.1:<port>` 上的别的进程与绑在 `*:<port>` 上的引擎并存时，
+    /// 连到 `127.0.0.1` 的请求会落在更具体的那一个（别的进程）上。
+    ///
+    /// `lsof` 只看得到同一个用户的进程：别的用户的进程在这个端口上的监听它看不见，这是这个校验够不着的（规范勘误十，已知限制）。
     async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
-        let lsof = self.lsof_tool()?;
-        let args = [
-            "-nP",
-            "-a",
-            "-p",
-            &pid.to_string(),
-            &format!("-iTCP:{port}"),
-            "-sTCP:LISTEN",
-            "-t",
-        ]
-        .map(OsString::from);
-        let output = run_tool(lsof, &args, self.lsof_timeout).await?;
-        match output.code {
-            Some(0) => {
-                let wanted = pid.to_string();
-                Ok(output.stdout.lines().any(|line| line.trim() == wanted))
-            }
-            // lsof 自己的「没有匹配」：退出码 1，stdout 与 stderr 都是空的。出错同样退出 1，但会在 stderr 说话。
-            Some(1) if output.stdout.trim().is_empty() && output.stderr.trim().is_empty() => {
-                Ok(false)
-            }
-            _ => Err(InspectError::NoAnswer),
-        }
+        let sockets = self.listening_sockets(port).await?;
+        Ok(is_sole_listener(&sockets, pid))
     }
 
     async fn listeners_on(&self, port: u16) -> Result<Vec<u32>, InspectError> {
@@ -265,6 +267,45 @@ impl ProcessInspector for SystemInspector {
         Ok(super::discovery::team_identifier(&described.stderr)
             .or_else(|| super::discovery::team_identifier(&described.stdout)))
     }
+}
+
+/// 一个监听中的 TCP 套接字：属于哪个进程、绑在哪个地址上（`lsof -n` 的写法：`127.0.0.1`、`*`（通配）、`[::1]`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ListeningSocket {
+    pub(crate) pid: u32,
+    pub(crate) host: String,
+}
+
+/// `lsof -Fpn` 的输出：`p<pid>` 开头一个进程，其后每个套接字一行 `n<地址>:<端口>`（夹着 `f<fd>` 行，忽略）。`p` 行不是纯数字、
+/// `n` 行出现在任何 `p` 行之前、或者没有 `:<端口>` 的地址，都是读不出来：宁可不认也不猜。
+pub(crate) fn parse_lsof_sockets(text: &str) -> Result<Vec<ListeningSocket>, InspectError> {
+    let mut sockets = Vec::new();
+    let mut current: Option<u32> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            current = Some(rest.parse::<u32>().map_err(|_| InspectError::NoAnswer)?);
+        } else if let Some(name) = line.strip_prefix('n') {
+            let pid = current.ok_or(InspectError::NoAnswer)?;
+            let (host, _port) = name.rsplit_once(':').ok_or(InspectError::NoAnswer)?;
+            if host.is_empty() {
+                return Err(InspectError::NoAnswer);
+            }
+            sockets.push(ListeningSocket {
+                pid,
+                host: host.to_owned(),
+            });
+        }
+    }
+    Ok(sockets)
+}
+
+/// `pid` 是不是这些监听套接字的**唯一**主人，并且至少有一个套接字落在目标地址上（`127.0.0.1` 或 IPv4 通配 `*`）。
+pub(crate) fn is_sole_listener(sockets: &[ListeningSocket], pid: u32) -> bool {
+    !sockets.is_empty()
+        && sockets.iter().all(|socket| socket.pid == pid)
+        && sockets
+            .iter()
+            .any(|socket| matches!(socket.host.as_str(), "127.0.0.1" | "*"))
 }
 
 /// `lsof -Fp` 的输出：每个进程一行 `p<pid>`，其余字段行（`f…`、`n…`）忽略；`p` 行不是纯数字就是读不出来。
@@ -550,12 +591,109 @@ mod tests {
             Err(InspectError::NoAnswer)
         );
 
-        let found = script(dir.path(), "lsof-found", "echo 42");
+        let found = script(
+            dir.path(),
+            "lsof-found",
+            "printf 'p42\\nf3\\nn127.0.0.1:80\\n'",
+        );
         let inspector = with_fake_tools(&ps, &found);
         assert_eq!(inspector.listens_on(42, 80).await, Ok(true));
-        let someone_else = script(dir.path(), "lsof-other", "echo 43");
+        let someone_else = script(
+            dir.path(),
+            "lsof-other",
+            "printf 'p43\\nf3\\nn127.0.0.1:80\\n'",
+        );
         let inspector = with_fake_tools(&ps, &someone_else);
         assert_eq!(inspector.listens_on(42, 80).await, Ok(false));
+    }
+
+    /// IDORIS-CORE S6, Codex final review H1 (owner decision): a pid is "the listener" only when it is the **only** one on
+    /// the port, and one of its sockets is on the target address. The old question (does this pid listen on that port,
+    /// at any address) said yes while another process held `127.0.0.1:<port>` and the engine held `*:<port>`: a
+    /// connection to `127.0.0.1` lands on the more specific socket, the other process's.
+    #[tokio::test]
+    async fn a_pid_is_the_listener_only_when_it_is_the_only_one_and_one_socket_is_on_the_target_address()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = script(dir.path(), "ps", "exit 1");
+        let ask = |name: &str, output: &str| {
+            let lsof = script(dir.path(), name, &format!("printf '{output}'"));
+            with_fake_tools(&ps, lsof)
+        };
+        // Ours alone: on the loopback address, on the IPv4 wildcard, on both.
+        for output in [
+            "p42\\nf3\\nn127.0.0.1:80\\n",
+            "p42\\nf3\\nn*:80\\n",
+            "p42\\nf3\\nn127.0.0.1:80\\nf4\\nn*:80\\n",
+        ] {
+            assert_eq!(
+                ask("sole", output).listens_on(42, 80).await,
+                Ok(true),
+                "{output}"
+            );
+        }
+        // Someone else listens too: on the same address, on the wildcard while we are on loopback, on another family.
+        for output in [
+            "p42\\nf3\\nn127.0.0.1:80\\np43\\nf3\\nn127.0.0.1:80\\n",
+            "p42\\nf3\\nn*:80\\np43\\nf3\\nn127.0.0.1:80\\n",
+            "p42\\nf3\\nn127.0.0.1:80\\np43\\nf3\\nn*:80\\n",
+            "p42\\nf3\\nn127.0.0.1:80\\np43\\nf3\\nn[::1]:80\\n",
+        ] {
+            assert_eq!(
+                ask("shared", output).listens_on(42, 80).await,
+                Ok(false),
+                "{output}"
+            );
+        }
+        // Ours, but not on the target address (IPv6 loopback only): a connection to 127.0.0.1 does not reach it.
+        assert_eq!(
+            ask("elsewhere", "p42\\nf3\\nn[::1]:80\\n")
+                .listens_on(42, 80)
+                .await,
+            Ok(false)
+        );
+        // Not ours at all, and nobody at all.
+        assert_eq!(
+            ask("other", "p43\\nf3\\nn127.0.0.1:80\\n")
+                .listens_on(42, 80)
+                .await,
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn the_lsof_socket_listing_is_parsed_strictly() {
+        assert_eq!(
+            parse_lsof_sockets("p42\nf3\nn127.0.0.1:80\nf4\nn[::1]:80\np43\nf5\nn*:80\n"),
+            Ok(vec![
+                ListeningSocket {
+                    pid: 42,
+                    host: "127.0.0.1".into()
+                },
+                ListeningSocket {
+                    pid: 42,
+                    host: "[::1]".into()
+                },
+                ListeningSocket {
+                    pid: 43,
+                    host: "*".into()
+                },
+            ])
+        );
+        assert_eq!(parse_lsof_sockets(""), Ok(Vec::new()));
+        // A name before any process, a pid that is not a number, an address without a port: unreadable, never guessed.
+        for junk in [
+            "n127.0.0.1:80\n",
+            "pabc\nn127.0.0.1:80\n",
+            "p42\nn127.0.0.1\n",
+            "p42\nn:80\n",
+        ] {
+            assert_eq!(
+                parse_lsof_sockets(junk),
+                Err(InspectError::NoAnswer),
+                "{junk:?}"
+            );
+        }
     }
 
     #[tokio::test]

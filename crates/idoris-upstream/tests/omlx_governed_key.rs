@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use idoris_upstream::omlx::key::{
     EndpointKey, KeyRefusal, block_endpoint, endpoint_generation, endpoint_identity,
-    govern_endpoint, governed_endpoint, release_endpoint, resolve_for_endpoint, resolve_from_for,
-    resolve_governed_os, resolve_omlx_api_key_checked, resolve_omlx_api_key_for,
+    forget_endpoint, govern_endpoint, governed_endpoint, release_endpoint, resolve_for_endpoint,
+    resolve_from_for, resolve_governed_os, resolve_omlx_api_key_checked, resolve_omlx_api_key_for,
     resolve_omlx_api_key_os_for,
 };
 
@@ -65,22 +65,24 @@ fn an_endpoint_is_identified_by_scheme_host_and_port_only() {
             "http://user:pw@127.0.0.1:19731?q=1#f",
         ),
         ("http://LOCALHOST:8088", "http://localhost:8088"),
+        ("http://203.0.113.7:8088", "http://203.0.113.7:8088/v1"),
     ] {
         assert_eq!(endpoint_identity(a), endpoint_identity(b), "{a} / {b}");
         assert!(endpoint_identity(a).is_some());
     }
+    // Another port, another (non-loopback) host, another scheme on a non-loopback host: another endpoint.
     assert_eq!(
-        endpoint_identity("http://127.0.0.1:19731").as_deref(),
-        Some("http://127.0.0.1:19731")
+        endpoint_identity("http://203.0.113.7:8088").as_deref(),
+        Some("http://203.0.113.7:8088")
     );
-    // Another port, another host, another scheme: another endpoint.
     for other in [
-        "http://127.0.0.1:19732",
-        "http://127.0.0.2:19731",
-        "https://127.0.0.1:19731",
+        "http://203.0.113.7:8089",
+        "http://203.0.113.8:8088",
+        "https://203.0.113.7:8088",
+        "http://example.com:8088",
     ] {
         assert_ne!(
-            endpoint_identity("http://127.0.0.1:19731"),
+            endpoint_identity("http://203.0.113.7:8088"),
             endpoint_identity(other),
             "{other}"
         );
@@ -88,6 +90,53 @@ fn an_endpoint_is_identified_by_scheme_host_and_port_only() {
     for junk in ["", "not a url", "ftp://127.0.0.1:1", "file:///tmp/x"] {
         assert_eq!(endpoint_identity(junk), None, "{junk:?}");
     }
+}
+
+/// IDORIS-CORE S6, Codex final review H5: every loopback spelling of a port is the same endpoint. The engine manager
+/// registers `http://127.0.0.1:<port>`; a companion card that says `localhost:<port>` or `[::1]:<port>` must land on the same
+/// registration (its block, its generation), not escape it by the spelling of the host and fall into the §2.9 fallback chain.
+#[test]
+fn every_loopback_spelling_of_a_port_is_one_endpoint_and_another_port_is_another() {
+    let main = endpoint_identity("http://127.0.0.1:19731").unwrap();
+    assert_eq!(main, "loopback:19731");
+    for alias in [
+        "http://localhost:19731",
+        "http://LOCALHOST:19731/v1",
+        "https://localhost:19731",
+        "http://[::1]:19731",
+        "http://[0:0:0:0:0:0:0:1]:19731",
+        "http://127.0.0.2:19731",
+        "http://127.1.2.3:19731/",
+        "https://127.0.0.1:19731",
+        // IPv4-mapped IPv6 loopback.
+        "http://[::ffff:127.0.0.1]:19731",
+    ] {
+        assert_eq!(
+            endpoint_identity(alias).as_deref(),
+            Some(main.as_str()),
+            "{alias}"
+        );
+    }
+    for other in [
+        "http://127.0.0.1:19732",
+        "http://localhost:19732",
+        "http://[::1]:19732",
+    ] {
+        assert_ne!(
+            endpoint_identity(other).as_deref(),
+            Some(main.as_str()),
+            "{other}"
+        );
+    }
+    // The default ports are part of the identity of a port-less URL.
+    assert_eq!(
+        endpoint_identity("http://localhost").as_deref(),
+        Some("loopback:80")
+    );
+    assert_eq!(
+        endpoint_identity("https://[::1]").as_deref(),
+        Some("loopback:443")
+    );
 }
 
 #[test]
@@ -230,7 +279,7 @@ fn registering_replaces_the_previous_policy_and_a_non_url_is_refused() {
         })
     );
     assert_ne!(resolve_omlx_api_key_for(endpoint).as_deref(), Some("first"));
-    release_endpoint(endpoint);
+    forget_endpoint(endpoint);
     assert!(!govern_endpoint(
         "not a url",
         EndpointKey::Private("x".to_owned())
@@ -309,7 +358,7 @@ fn blocking_an_endpoint_is_not_releasing_it() {
         resolve_omlx_api_key_checked(endpoint, None),
         Ok(Some("new-engine".to_owned()))
     );
-    release_endpoint(endpoint);
+    forget_endpoint(endpoint);
     assert!(!block_endpoint("not a url"));
 }
 
@@ -389,7 +438,7 @@ fn a_request_admitted_for_an_older_generation_is_refused_by_the_checked_resolver
         resolve_omlx_api_key_checked(endpoint, None),
         Ok(Some("second-engine".to_owned()))
     );
-    release_endpoint(endpoint);
+    forget_endpoint(endpoint);
 }
 
 #[test]
@@ -401,4 +450,37 @@ fn the_checked_resolver_leaves_an_ungoverned_endpoint_as_it_was() {
         resolve_omlx_api_key_checked(endpoint, Some(0)),
         resolve_omlx_api_key_checked(endpoint, None)
     );
+}
+
+/// Test cleanup (S8's note, via the coordinator): the registry is process-global and the OS hands a freed port to another test of
+/// the same process. A **revocation** keeps counting (a generation is never reused: that is a production property, asserted
+/// above); **forgetting** an endpoint drops the whole entry, so the next test that gets this port sees an endpoint that was
+/// never registered.
+#[test]
+fn forgetting_an_endpoint_resets_it_completely_unlike_a_revocation() {
+    let endpoint = "http://127.0.0.1:19835";
+    assert_eq!(endpoint_generation(endpoint), 0, "never registered");
+    govern_endpoint(endpoint, EndpointKey::Private("a".to_owned()));
+    block_endpoint(endpoint);
+    assert_eq!(endpoint_generation(endpoint), 2);
+    release_endpoint(endpoint);
+    assert_eq!(
+        endpoint_generation(endpoint),
+        3,
+        "a revocation keeps counting"
+    );
+    assert!(governed_endpoint(endpoint).is_none());
+
+    forget_endpoint(endpoint);
+    assert_eq!(endpoint_generation(endpoint), 0, "forgetting starts over");
+    assert!(governed_endpoint(endpoint).is_none());
+    // The next owner of the port counts from the beginning.
+    govern_endpoint(endpoint, EndpointKey::Private("b".to_owned()));
+    assert_eq!(endpoint_generation(endpoint), 1);
+    // Forgetting a registered loopback spelling forgets the same entry; forgetting what is not a URL or was never there is harmless.
+    forget_endpoint("http://localhost:19835");
+    assert_eq!(endpoint_generation(endpoint), 0);
+    assert!(governed_endpoint(endpoint).is_none());
+    forget_endpoint(endpoint);
+    forget_endpoint("not a url");
 }

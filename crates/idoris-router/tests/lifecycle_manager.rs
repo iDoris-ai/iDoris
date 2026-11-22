@@ -39,7 +39,7 @@ use idoris_upstream::engine::{
     LaunchError, LaunchInput, LaunchPlan, ListenerPolicy, OwnedEngine, PidState, ProcessInspector,
     StopOnExit, SystemInspector, VersionError,
 };
-use idoris_upstream::omlx::key::{EndpointKey, governed_endpoint};
+use idoris_upstream::omlx::key::{EndpointGuard, EndpointKey, forget_endpoint, governed_endpoint};
 
 const GIB: u64 = 1 << 30;
 const PATIENT: Duration = Duration::from_secs(60);
@@ -258,6 +258,9 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
+        // The key registry is process-global and the OS hands a freed port to another test of this process: leave nothing of
+        // this endpoint's registration (not even its generation) behind.
+        forget_endpoint(&self.endpoint());
         fake_omlx::kill_fake_engines_under(self.work.path());
         for launch in self.fake.all_launches() {
             let pid = launch["pid"].as_u64().unwrap();
@@ -289,6 +292,7 @@ fn fast() -> Timings {
         half_open_interval: Duration::from_millis(400),
         stop_grace: Duration::from_secs(3),
         drain_timeout: Duration::from_secs(5),
+        command_timeout: Duration::from_secs(10),
         unverifiable_retries: 2,
         unverifiable_pause: Duration::from_millis(20),
     }
@@ -354,11 +358,11 @@ impl EngineBackend for TestBackend {
     fn fence_path(&self, state_dir: &Path, endpoint: &str) -> Option<PathBuf> {
         self.inner.fence_path(state_dir, endpoint)
     }
-    fn govern_private(&self, endpoint: &str, key: &EngineKey) {
-        self.inner.govern_private(endpoint, key);
+    fn govern_private(&self, endpoint: &str, key: &EngineKey, guard: Arc<dyn EndpointGuard>) {
+        self.inner.govern_private(endpoint, key, guard);
     }
-    fn govern_external(&self, endpoint: &str, settings_key_verified: bool) {
-        self.inner.govern_external(endpoint, settings_key_verified);
+    fn govern_external(&self, endpoint: &str, guard: Arc<dyn EndpointGuard>) {
+        self.inner.govern_external(endpoint, guard);
     }
     fn block(&self, endpoint: &str) {
         self.inner.block(endpoint);
@@ -2673,11 +2677,11 @@ impl EngineBackend for ScriptedProbeBackend {
     fn fence_path(&self, state_dir: &Path, endpoint: &str) -> Option<PathBuf> {
         self.inner.fence_path(state_dir, endpoint)
     }
-    fn govern_private(&self, endpoint: &str, key: &EngineKey) {
-        self.inner.govern_private(endpoint, key);
+    fn govern_private(&self, endpoint: &str, key: &EngineKey, guard: Arc<dyn EndpointGuard>) {
+        self.inner.govern_private(endpoint, key, guard);
     }
-    fn govern_external(&self, endpoint: &str, settings_key_verified: bool) {
-        self.inner.govern_external(endpoint, settings_key_verified);
+    fn govern_external(&self, endpoint: &str, guard: Arc<dyn EndpointGuard>) {
+        self.inner.govern_external(endpoint, guard);
     }
     fn block(&self, endpoint: &str) {
         self.inner.block(endpoint);
@@ -3128,5 +3132,160 @@ async fn an_engine_whose_listener_cannot_be_read_is_not_a_confirmed_listener_and
     let keyed = keyed_requests(&rig);
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(keyed_requests(&rig), keyed);
+    h.manager.shutdown(true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Codex 终审（17ac795a）H2、M3
+// ---------------------------------------------------------------------------------------------
+
+/// H2：接管外部引擎时，校验通过的监听者已经被登记成「外部」（为了带 key 探测它）；带 key 的探测一次次得不到答案（监听者「没了」），整个启动决策
+/// 一遍遍重来，直到启动超时才按终态收尾。重判耗尽直接发布终态，不经 `Attempt::Terminal`：之前这条出口留着已验证的外部登记，没有监督去重新校验
+/// 端口，端口上之后出现的东西（只要校验恰好通过）仍拿得到 `settings.json` 的 key。现在每一条没有落到「持续监督」上的出口都封上端点。
+#[tokio::test]
+async fn h2_an_external_takeover_decided_again_until_the_startup_timeout_leaves_the_endpoint_blocked()
+ {
+    let rig = Rig::new(&Behavior::default());
+    let backend = default_backend(&rig);
+    *backend.external_key.lock().unwrap() = Some("sk-external".to_owned());
+    let inspector = Scripted::claiming(rig.port);
+    inspector.external_listener(rig.port, std::process::id(), Some(TEAM));
+    // 不带 key：401（有外部引擎，要 key）；带 key：连接被拒（监听者走了）。每一轮都是这样。
+    let script = ProbeScript::new(|call| {
+        Some(if call.keyed {
+            EngineProbe::ConnectionRefused
+        } else {
+            EngineProbe::AuthRejected(401)
+        })
+    });
+    let mut timings = fast();
+    timings.startup_timeout = Duration::from_millis(700);
+    let h = Harness::start(
+        &rig,
+        ScriptedProbeBackend::new(backend, script),
+        inspector,
+        timings,
+        StopOnExit::Owned,
+    );
+    let gave_up = h.until_state(UpstreamState::Unavailable).await;
+    assert_eq!(gave_up.reason, Some(UpstreamReason::StartupTimeout));
+    assert_eq!(rig.fake.launches(), 0, "nothing was spawned");
+    assert_eq!(h.failures(), (0, None), "{:?}", h.log.lock().unwrap());
+    assert!(
+        h.logged_count("重新判断（不算失败）") >= 2,
+        "it did decide again, more than once: {:?}",
+        h.log.lock().unwrap()
+    );
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked),
+        "the verified external registration was left behind when the decision gave up"
+    );
+    h.manager.shutdown(true).await;
+}
+
+/// M3：带 key 的探测没有结论（有东西在监听、一直答不上来），而监听者**还是校验通过的那个进程**：这是它的毛病，不是「前提变了」。按一次失败算：
+/// `restarting`、`failure_count`、退避、熔断照旧（S5 的语义）。之前一律当「前提变了」重判，耗尽启动超时之后按 `unavailable` + `startup_timeout`
+/// 收尾，跳过失败计数、指数退避与熔断的半开重试。
+#[tokio::test]
+async fn m3_a_stable_listener_that_keeps_failing_the_keyed_probe_is_counted_backed_off_and_trips_the_breaker()
+ {
+    let rig = Rig::new(&Behavior::default());
+    let backend = default_backend(&rig);
+    *backend.external_key.lock().unwrap() = Some("sk-external".to_owned());
+    let inspector = Scripted::claiming(rig.port);
+    inspector.external_listener(rig.port, std::process::id(), Some(TEAM));
+    let script = ProbeScript::new(|call| {
+        Some(if call.keyed {
+            EngineProbe::Unavailable
+        } else {
+            EngineProbe::AuthRejected(401)
+        })
+    });
+    let mut timings = observable_restarts();
+    // 短的启动超时：之前的实现在这里收尾成 `unavailable`，用例立刻看到，不必等 60 秒。
+    timings.startup_timeout = Duration::from_millis(700);
+    let h = Harness::start(
+        &rig,
+        ScriptedProbeBackend::new(backend, script),
+        inspector,
+        timings,
+        StopOnExit::Owned,
+    );
+    let first = h
+        .until("a decision", |status| {
+            matches!(
+                status.state,
+                UpstreamState::Restarting | UpstreamState::Unavailable | UpstreamState::Failed
+            )
+        })
+        .await;
+    assert_eq!(
+        first.state,
+        UpstreamState::Restarting,
+        "a listener that is still the verified one and keeps failing is an engine failure: {:?}",
+        h.log.lock().unwrap()
+    );
+    assert!(h.failures().0 >= 1, "{:?}", h.log.lock().unwrap());
+    let tripped = h.until_state(UpstreamState::Failed).await;
+    assert_eq!(tripped.reason, Some(UpstreamReason::CrashLoop));
+    assert!(
+        h.failures().0 >= 3,
+        "every failure counted: {:?}",
+        h.failures()
+    );
+    assert_eq!(
+        rig.fake.launches(),
+        0,
+        "an external engine is never restarted"
+    );
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
+    h.manager.shutdown(true).await;
+}
+
+/// M3 的另一边：监听者换成了**另一个**通过校验的进程（身份变了）：不是第一个进程的毛病，重新判断，不算失败；之后接管新的那一个。
+#[tokio::test]
+async fn m3_a_listener_that_changed_identity_is_decided_again_and_is_not_an_engine_failure() {
+    let rig = Rig::new(&Behavior::default());
+    let backend = default_backend(&rig);
+    *backend.external_key.lock().unwrap() = Some("sk-external".to_owned());
+    let first = std::process::id();
+    let second = std::os::unix::process::parent_id();
+    assert_ne!(first, second);
+    let inspector = Scripted::claiming(rig.port);
+    inspector.external_listener(rig.port, first, Some(TEAM));
+    let script = {
+        let (inspector, port) = (inspector.clone(), rig.port);
+        ProbeScript::new(move |call| match (call.keyed, call.index) {
+            (false, 0) => Some(EngineProbe::AuthRejected(401)),
+            // 带 key 再问的时候，端口上换成了另一个（通过校验的）进程，它也答不上来。
+            (true, 0) => {
+                inspector.external_listener(port, second, Some(TEAM));
+                Some(EngineProbe::Unavailable)
+            }
+            // 新一轮决策：匿名的探测就答 `ready`，接管它。
+            (false, _) => Some(EngineProbe::Ready),
+            _ => None,
+        })
+    };
+    let h = Harness::start(
+        &rig,
+        ScriptedProbeBackend::new(backend, script),
+        inspector,
+        fast(),
+        StopOnExit::Owned,
+    );
+    let ready = h.until_state(UpstreamState::Ready).await;
+    assert!(
+        !ready.owned,
+        "the engine is external: it was adopted, not spawned"
+    );
+    assert_eq!(rig.fake.launches(), 0);
+    assert_eq!(h.failures(), (0, None), "{:?}", h.log.lock().unwrap());
+    assert_eq!(h.logged_count("：restarting"), 0);
+    assert!(h.logged_count("重新判断（不算失败）") >= 1);
     h.manager.shutdown(true).await;
 }

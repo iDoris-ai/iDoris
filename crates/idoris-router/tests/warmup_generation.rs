@@ -14,7 +14,7 @@ use http_body_util::BodyExt;
 use idoris_contracts::ComponentCard;
 use idoris_router::readiness::{HealthState, UpstreamState, UpstreamStatus};
 use idoris_router::{AppState, build_app};
-use idoris_upstream::omlx::key::{EndpointKey, block_endpoint, govern_endpoint, release_endpoint};
+use idoris_upstream::omlx::key::{EndpointKey, block_endpoint, forget_endpoint, govern_endpoint};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use wiremock::matchers::{method, path};
@@ -25,7 +25,7 @@ struct Governed(String);
 
 impl Drop for Governed {
     fn drop(&mut self) {
-        release_endpoint(&self.0);
+        forget_endpoint(&self.0);
     }
 }
 

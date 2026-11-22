@@ -619,6 +619,10 @@ impl EngineManager {
                 .map(|(id, _)| id.clone())
                 .collect()
         };
+        // 一个绝对的截止时间管入队与等回答两头（IDORIS-CORE S6，Codex 终审 M5）：邮箱满了、实例任务又忙着排空或复位时，
+        // 入队本身就会等，不能让它排在「预算开始计时」之前。
+        let deadline =
+            Instant::now() + self.shared.config.timings.stop_grace + Duration::from_secs(3);
         let mut waits = Vec::new();
         for id in unsettled {
             let Some(sender) = self.senders.get(&id) else {
@@ -629,13 +633,16 @@ impl EngineManager {
                 command: Command::GiveUp,
                 reply: Some(reply),
                 seq: 0,
+                deadline: None,
             };
-            if sender.send(request).await.is_ok() {
+            if tokio::time::timeout_at(deadline, sender.send(request))
+                .await
+                .is_ok_and(|sent| sent.is_ok())
+            {
                 waits.push(answer);
             }
         }
-        let budget = self.shared.config.timings.stop_grace + Duration::from_secs(3);
-        let _ = tokio::time::timeout(budget, async {
+        let _ = tokio::time::timeout_at(deadline, async {
             for answer in waits {
                 let _ = answer.await;
             }
@@ -673,15 +680,25 @@ impl EngineManager {
         // 入队时盖章（先盖章、后入队）：序号不大于某次操作完成时的 `seq_now` 的 `restart`，都是在那次操作进行期间（或之前）到达的，
         // 它们并进那次操作的结果，不再换第二次引擎（见 `Actor::restart_cover`）。
         let seq = self.shared.next_seq(id);
-        sender
-            .send(Request {
-                command,
-                reply: Some(reply),
-                seq,
-            })
+        // 一个绝对的截止时间管入队、等回答两头（`Timings::command_timeout`，IDORIS-CORE S6，Codex 终审 M5）；同一个截止时间也盖在
+        // 命令上：实例任务到点还没收下它，就当它没有发生过（回答 `Closed`、不执行），所以一个已经超时的、有副作用的命令不会在
+        // 调用方放弃之后才被执行。
+        let deadline = Instant::now() + self.shared.config.timings.command_timeout;
+        let call = async {
+            sender
+                .send(Request {
+                    command,
+                    reply: Some(reply),
+                    seq,
+                    deadline: Some(deadline.into_std()),
+                })
+                .await
+                .map_err(|_| CommandError::Closed)?;
+            answer.await.map_err(|_| CommandError::Closed)?
+        };
+        tokio::time::timeout_at(deadline, call)
             .await
-            .map_err(|_| CommandError::Closed)?;
-        answer.await.map_err(|_| CommandError::Closed)?
+            .unwrap_or(Err(CommandError::Closed))
     }
 
     /// 下命令并留一行日志（谁的、什么命令、结果；没有 token、key：只有上游 id 与命令名）。不认识的 id 不进日志：它来自调用方，
@@ -759,7 +776,13 @@ impl EngineManager {
     /// 删记录）；为假（`stop_on_exit:"never"` 的正常退出）就让引擎继续跑，所有权记录留给下一个 iDoris。
     /// 等各实例完成，至多 `stop_grace` 加一点余量；超时的实例任务被中止（`OwnedEngine` 的 `Drop` 仍会兜底）。
     pub async fn shutdown(&self, stop_engines: bool) {
+        // 一个绝对的截止时间管入队与等回答两头（IDORIS-CORE S6，Codex 终审 M5）：Admin 的命令填满了容量为 8 的邮箱、实例任务又忙着
+        // 排空或复位的时候，入队本身会等，预算必须从入队之前开始算，不能在入队之后才启动。
+        let deadline =
+            Instant::now() + self.shared.config.timings.stop_grace + Duration::from_secs(3);
         let mut waits = Vec::new();
+        // 有一个实例没能在预算里收下 `Shutdown`（邮箱满了、它又在忙）：不能等它自己结束，下面中止它的任务。
+        let mut delivered = true;
         for sender in self.senders.values() {
             let (reply, answer) = oneshot::channel();
             let request = Request {
@@ -768,22 +791,26 @@ impl EngineManager {
                 },
                 reply: Some(reply),
                 seq: 0,
+                deadline: None,
             };
-            if sender.send(request).await.is_ok() {
-                waits.push(answer);
+            match tokio::time::timeout_at(deadline, sender.send(request)).await {
+                Ok(Ok(())) => waits.push(answer),
+                // 实例任务已经结束了：没有什么可等的。
+                Ok(Err(_closed)) => {}
+                Err(_elapsed) => delivered = false,
             }
         }
-        let budget = self.shared.config.timings.stop_grace + Duration::from_secs(3);
-        let finished = tokio::time::timeout(budget, async {
+        let finished = tokio::time::timeout_at(deadline, async {
             for answer in waits {
                 let _ = answer.await;
             }
         })
         .await;
+        let finished_in_time = delivered && finished.is_ok();
         let tasks: Vec<JoinHandle<()>> =
             std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner));
         for task in tasks {
-            if finished.is_err() {
+            if !finished_in_time {
                 task.abort();
             }
             let _ = task.await;
@@ -905,6 +932,123 @@ mod tests {
         assert!(Shared::all_settled(&table(&[ready])));
         assert!(Shared::all_settled(&table(&[terminal])));
         assert!(Shared::all_settled(&table(&[ready, terminal, ready])));
+    }
+
+    /// 一个邮箱已经被命令填满、实例任务又在忙（谁也不收）的管理器：实例任务握着邮箱的接收端（通道开着、满着），既不收命令也不结束
+    /// （直到被中止）。
+    fn manager_with_a_busy_instance(
+        command_timeout: Duration,
+        stop_grace: Duration,
+    ) -> EngineManager {
+        let timings = Timings {
+            command_timeout,
+            stop_grace,
+            ..Timings::default()
+        };
+        let (sender, receiver) = mpsc::channel::<Request>(8);
+        for seq in 1..=8 {
+            sender
+                .try_send(Request {
+                    command: Command::Stop,
+                    reply: None,
+                    seq,
+                    deadline: None,
+                })
+                .unwrap();
+        }
+        let shared = Arc::new(Shared {
+            config: ManagerConfig {
+                state_dir: std::env::temp_dir(),
+                allocated_budget_bytes: None,
+                stop_on_exit: StopOnExit::Owned,
+                executables: BTreeMap::new(),
+                launched_by: "unit-test".to_owned(),
+                timings,
+                inspector: Arc::new(idoris_upstream::engine::SystemInspector::new()),
+                log: Arc::new(|_| {}),
+            },
+            health: HealthState::default(),
+            gate_open: AtomicBool::new(false),
+            statuses: Mutex::new(BTreeMap::new()),
+            kinds: BTreeMap::new(),
+            ports: BTreeMap::new(),
+            enqueued: BTreeMap::from([("omlx".to_owned(), AtomicU64::new(0))]),
+            degraded: Mutex::new(BTreeMap::new()),
+            started: Instant::now(),
+            changed: watch::channel(0_u64).0,
+            failure: watch::channel(None).0,
+            runtimes: OnceLock::new(),
+        });
+        let task = tokio::spawn(async move {
+            let _mailbox = receiver;
+            std::future::pending::<()>().await;
+        });
+        EngineManager {
+            shared,
+            senders: BTreeMap::from([("omlx".to_owned(), sender)]),
+            tasks: Mutex::new(vec![task]),
+        }
+    }
+
+    /// `shutdown` bounded by an outer timeout: a mutated (or broken) budget must fail the test, never hang the test binary.
+    async fn shutdown_bounded(manager: &EngineManager) {
+        tokio::time::timeout(Duration::from_secs(20), manager.shutdown(true))
+            .await
+            .unwrap_or_else(|_| panic!("shutdown hung on a full mailbox"));
+    }
+
+    /// IDORIS-CORE S6, Codex final review M5: the shutdown budget starts **before** the enqueue. A full mailbox in front of a busy
+    /// instance used to hold `shutdown` at `sender.send().await` for as long as the instance stayed busy, before the budget even
+    /// began; now the enqueue is inside the budget, the instance that could not take the command is aborted, and the call
+    /// returns.
+    #[tokio::test]
+    async fn shutdown_returns_within_its_budget_when_the_mailbox_of_a_busy_instance_is_full() {
+        let manager =
+            manager_with_a_busy_instance(Duration::from_secs(60), Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let finished = tokio::time::timeout(Duration::from_secs(20), manager.shutdown(true)).await;
+        assert!(finished.is_ok(), "shutdown hung on a full mailbox");
+        // The budget is `stop_grace` (100 ms) plus three seconds, counted from before the enqueue.
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The same for the settling gate's give-up: the enqueue is inside its budget.
+    #[tokio::test]
+    async fn giving_up_unsettled_instances_returns_within_its_budget_when_the_mailbox_is_full() {
+        let manager =
+            manager_with_a_busy_instance(Duration::from_secs(60), Duration::from_millis(100));
+        manager
+            .shared
+            .publish("omlx", status(UpstreamState::Starting, false));
+        let finished =
+            tokio::time::timeout(Duration::from_secs(20), manager.give_up_unsettled()).await;
+        assert!(finished.is_ok(), "give_up_unsettled hung on a full mailbox");
+        shutdown_bounded(&manager).await;
+    }
+
+    /// An operator command that cannot be enqueued (the mailbox is full, the instance is busy) is abandoned at its one absolute
+    /// deadline (`command_timeout`) with `Closed` (Admin: 503 `idoris_stopping`), instead of waiting for as long as the instance
+    /// stays busy.
+    #[tokio::test]
+    async fn a_command_that_cannot_be_enqueued_is_abandoned_at_its_deadline() {
+        let manager =
+            manager_with_a_busy_instance(Duration::from_millis(300), Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(20), manager.stop_upstream("omlx"))
+            .await
+            .unwrap_or_else(|_| panic!("the command did not wait forever"));
+        assert_eq!(result, Err(CommandError::Closed));
+        assert!(
+            started.elapsed() >= Duration::from_millis(250)
+                && started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        shutdown_bounded(&manager).await;
     }
 
     #[test]

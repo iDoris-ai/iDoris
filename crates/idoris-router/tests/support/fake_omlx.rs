@@ -38,6 +38,10 @@ pub struct Behavior {
     /// 第 `n` 次（从 0 起）及以后拉起的进程，`GET /api/status` 回 500（引擎起来了、`/v1/models` 也答，但 Supervisor 采样它的
     /// 驻留失败：模拟引擎换代之后账本复位采样不到新进程）。`None` = 从不。
     pub api_status_fails_from_launch: Option<usize>,
+    /// 一个最小的 Admin API（IDORIS-CORE S6，Codex 终审 H4）：`POST /admin/api/login`（key 对就发一个**这个进程独有**的会话 cookie）与
+    /// `GET /admin/api/activity`（要有效的 cookie，否则 401）。每个 Admin 请求记进 `admin.log`：`<pid> <方法> <路径> <none|ok|bad>`（带的
+    /// cookie 是不是这个进程签发的），测试据此断言「旧进程的会话 cookie 没有发给新进程」。`false` = 没有 `/admin/api/*`（404）。
+    pub admin_api: bool,
 }
 
 /// 引擎可以「收下请求、记进 `requests.log`，然后不回答」的几类请求（IDORIS-CORE S6，[`FakeOmlx::hold`]）。
@@ -51,6 +55,12 @@ pub enum Hold {
     Status,
     /// `GET /v1/models/status`：模型目录（聊天、预热在加载之前读的那一步）。
     List,
+    /// `GET /v1/models`：公共的模型列表对这个引擎的读取（管理器自己的探测也读这个路径：用例要把监督的节拍拉到小时级）。
+    Models,
+    /// `POST /v1/embeddings`：一个经代理（resident 的伴生卡、后台预热）转发、还在途的请求（IDORIS-CORE S6，Codex 终审 M1）。
+    Embeddings,
+    /// 流式的 `POST /v1/chat/completions`：响应头与第一块已经发出，之后的字节被扣着（一个仍在输出的流式响应体）。
+    Stream,
 }
 
 impl Hold {
@@ -60,8 +70,20 @@ impl Hold {
             Self::Load => "hold-load",
             Self::Status => "hold-status",
             Self::List => "hold-list",
+            Self::Models => "hold-models",
+            Self::Embeddings => "hold-embeddings",
+            Self::Stream => "hold-stream",
         }
     }
+}
+
+/// 一条 Admin 请求的记录（[`FakeOmlx::admin_requests`]）：`cookie` 是 `none`（没带）、`ok`（是这个进程签发的会话）、`bad`（别的进程签发的）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminRequest {
+    pub pid: u64,
+    pub method: String,
+    pub path: String,
+    pub cookie: String,
 }
 
 /// 一个生成好的假引擎。
@@ -190,6 +212,23 @@ impl FakeOmlx {
             .count()
     }
 
+    /// Admin 请求记录（[`Behavior::admin_api`]）：哪个进程收到了什么、带的 cookie 是不是它自己签发的。
+    pub fn admin_requests(&self) -> Vec<AdminRequest> {
+        std::fs::read_to_string(self.record_dir.join("admin.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split(' ');
+                Some(AdminRequest {
+                    pid: parts.next()?.parse().ok()?,
+                    method: parts.next()?.to_owned(),
+                    path: parts.next()?.to_owned(),
+                    cookie: parts.next()?.to_owned(),
+                })
+            })
+            .collect()
+    }
+
     /// 请求记录：每行 `<路径> <none|ok|bad>`（有没有带 `Authorization`，带的是不是引擎的私有 key）。
     pub fn requests(&self) -> Vec<(String, String)> {
         std::fs::read_to_string(self.record_dir.join("requests.log"))
@@ -255,6 +294,7 @@ EXIT_IMMEDIATELY = {exit_now}
 TRAP_SIGTERM = {trap}
 STATEFUL = {stateful}
 STATUS_FAILS_FROM = {status_fails_from}
+ADMIN_API = {admin_api}
 MODEL = "fake-model"
 SIZE = 1000000000
 LOADED = set()
@@ -293,6 +333,8 @@ if EXIT_IMMEDIATELY is not None:
 
 KEY = os.environ.get("OMLX_API_KEY")
 LOCK = threading.Lock()
+# The admin session this process issues: another process never accepts it.
+SESSION = "fake-session-%d-%s" % (os.getpid(), os.urandom(4).hex())
 
 if TRAP_SIGTERM is not None:
     def on_term(signum, frame):
@@ -317,7 +359,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def cookie_state(self):
+        cookie = self.headers.get("Cookie")
+        if cookie is None:
+            return "none"
+        return "ok" if ("omlx_admin_session=" + SESSION) in cookie else "bad"
+
+    def admin_log(self, method, state):
+        with LOCK:
+            with open(os.path.join(RECORDS, "admin.log"), "a") as f:
+                f.write("%d %s %s %s\n" % (os.getpid(), method, self.path, state))
+
+    def login(self, payload):
+        self.admin_log("POST", "none")
+        if KEY is not None and payload.get("api_key") != KEY:
+            return self.reply(401, {{"error": "bad key"}})
+        data = json.dumps({{"success": True}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", "omlx_admin_session=" + SESSION + "; Path=/; HttpOnly")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def admin(self, method):
+        state = self.cookie_state()
+        self.admin_log(method, state)
+        if state != "ok":
+            return self.reply(401, {{"error": "not logged in"}})
+        if self.path == "/admin/api/activity":
+            return self.reply(200, {{"active_models": {{"memory_pressure": {{"enabled": False}}}}}})
+        return self.reply(404, {{"error": "not found"}})
+
     def do_GET(self):
+        if ADMIN_API and self.path.startswith("/admin/api/"):
+            return self.admin("GET")
         header = self.headers.get("Authorization")
         if header is None:
             auth = "none"
@@ -336,6 +412,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if KEY is not None and auth != "ok":
             return self.reply(401, {{"error": {{"message": "invalid api key"}}}})
         if self.path == "/v1/models":
+            hold("hold-models")
             return self.reply(200, {{"object": "list", "data": [{{"id": "fake-model", "object": "model"}}]}})
         if self.path == "/v1/models/status":
             hold("hold-list")
@@ -353,8 +430,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw) if raw else {{}}
+        except ValueError:
+            payload = {{}}
+        if ADMIN_API and self.path == "/admin/api/login":
+            return self.login(payload)
         if not STATEFUL:
             return self.reply(404, {{"error": "not found"}})
         header = self.headers.get("Authorization")
@@ -379,6 +461,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 LOADED.discard(MODEL)
             return self.reply(200, {{}})
+        if self.path == "/v1/embeddings":
+            hold("hold-embeddings")
+            return self.reply(200, {{"object": "list", "model": "embed-model", "data": [{{"object": "embedding", "index": 0, "embedding": [0.0]}}]}})
+        if self.path == "/v1/chat/completions" and isinstance(payload, dict) and payload.get("stream") is True:
+            # A streamed answer: the headers and the first chunk go out at once, the rest is held until the test lets go.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b'data: {{"choices":[{{"delta":{{"content":"hel"}}}}]}}\n\n')
+            self.wfile.flush()
+            hold("hold-stream")
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            self.close_connection = True
+            return
         if self.path == "/v1/chat/completions":
             hold("hold-chat")
             if MODEL in LOADED:
@@ -441,5 +539,6 @@ while True:
             Some(launch) => launch.to_string(),
             None => "None".to_owned(),
         },
+        admin_api = if behavior.admin_api { "True" } else { "False" },
     )
 }

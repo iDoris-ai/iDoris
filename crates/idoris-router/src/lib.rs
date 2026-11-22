@@ -963,6 +963,10 @@ async fn embeddings(
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
     };
+    // 这个请求是为哪一代引擎准入的：**在状态门之前读**（Codex 终审 H3），所以它只可能比状态门看到的那一刻旧，不会新；之后绑定到首次发送、
+    // 每一次重试（`generation::scoped`：`outbound` 读它）。请求通过状态门后可以停在事件日志的写入、连接失败后的退避里，那时
+    // restart 若完成了，下一次发送就会拿到新引擎的 key、把旧请求的正文发给新进程；绑定之后它被拒绝，不发。
+    let admitted = models::admission_generation(&selected.card);
     if let Some(response) = managed_unavailable_response(&state, &selected) {
         return response;
     }
@@ -1029,9 +1033,9 @@ async fn embeddings(
     let dispatched_ref = &dispatched;
     let events_ref = events.as_ref();
     let selected_ref = &selected;
-    let outcome = match state
-        .proxy
-        .forward_buffered_path_finalized(
+    let outcome = match idoris_backend::generation::scoped(
+        admitted,
+        state.proxy.forward_buffered_path_finalized(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::EMBEDDINGS,
             &value,
@@ -1054,8 +1058,9 @@ async fn embeddings(
                     Ok::<(), ()>(())
                 },
             ),
-        )
-        .await
+        ),
+    )
+    .await
     {
         Ok(outcome) => outcome,
         Err(()) => return event_log_unavailable_response(),
@@ -1215,6 +1220,10 @@ async fn rerank(
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
     };
+    // 这个请求是为哪一代引擎准入的：**在状态门之前读**（Codex 终审 H3），所以它只可能比状态门看到的那一刻旧，不会新；之后绑定到首次发送、
+    // 每一次重试（`generation::scoped`：`outbound` 读它）。请求通过状态门后可以停在事件日志的写入、连接失败后的退避里，那时
+    // restart 若完成了，下一次发送就会拿到新引擎的 key、把旧请求的正文发给新进程；绑定之后它被拒绝，不发。
+    let admitted = models::admission_generation(&selected.card);
     if let Some(response) = managed_unavailable_response(&state, &selected) {
         return response;
     }
@@ -1278,9 +1287,9 @@ async fn rerank(
     let dispatched_ref = &dispatched;
     let events_ref = events.as_ref();
     let selected_ref = &selected;
-    let outcome = match state
-        .proxy
-        .forward_buffered_path_finalized(
+    let outcome = match idoris_backend::generation::scoped(
+        admitted,
+        state.proxy.forward_buffered_path_finalized(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::RERANK,
             &value,
@@ -1303,8 +1312,9 @@ async fn rerank(
                     Ok::<(), ()>(())
                 },
             ),
-        )
-        .await
+        ),
+    )
+    .await
     {
         Ok(outcome) => outcome,
         Err(()) => return event_log_unavailable_response(),
@@ -1478,6 +1488,10 @@ async fn messages(
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
     };
+    // 这个请求是为哪一代引擎准入的：**在状态门之前读**（Codex 终审 H3），所以它只可能比状态门看到的那一刻旧，不会新；之后绑定到首次发送、
+    // 每一次重试（`generation::scoped`：`outbound` 读它）。请求通过状态门后可以停在事件日志的写入、连接失败后的退避里，那时
+    // restart 若完成了，下一次发送就会拿到新引擎的 key、把旧请求的正文发给新进程；绑定之后它被拒绝，不发。
+    let admitted = models::admission_generation(&selected.card);
     if let Some(response) = managed_unavailable_response(&state, &selected) {
         return response;
     }
@@ -1526,7 +1540,11 @@ async fn messages(
     };
 
     if stream_requested {
-        return messages_stream(&state, &selected, &value, events.as_ref()).await;
+        return idoris_backend::generation::scoped(
+            admitted,
+            messages_stream(&state, &selected, &value, events.as_ref()),
+        )
+        .await;
     }
     let opts = proxy::ForwardOpts {
         request_id: headers
@@ -1544,9 +1562,9 @@ async fn messages(
     let dispatched_ref = &dispatched;
     let events_ref = events.as_ref();
     let selected_ref = &selected;
-    let outcome = match state
-        .proxy
-        .forward_buffered_path_finalized(
+    let outcome = match idoris_backend::generation::scoped(
+        admitted,
+        state.proxy.forward_buffered_path_finalized(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::MESSAGES,
             &value,
@@ -1569,8 +1587,9 @@ async fn messages(
                     Ok::<(), ()>(())
                 },
             ),
-        )
-        .await
+        ),
+    )
+    .await
     {
         Ok(outcome) => outcome,
         Err(()) => return event_log_unavailable_response(),
@@ -1962,15 +1981,25 @@ async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // 此刻没在服务的托管卡不探测（接口规范 §2.7.6，勘误六、勘误十）：它的引擎没起来、被停下了、在重启，或者那个端口上的东西没有
     // 通过属主校验、不能给它发 key；探测只会得到错误（一个 401 就会把整个列表变成 502）。别的卡照常列出。
     // 每次请求读此刻的状态，不用完整的 Router 创建时拍下的名单（IDORIS-CORE S6，G1）。
+    // 每张卡被准入时的引擎代际**先于**挑选这批卡的状态检查读（Codex 终审 M6）：逐卡请求发出前，端点被停了或者换了代就不发。
+    let admitted: models::AdmittedGenerations = state
+        .cards
+        .iter()
+        .filter_map(|card| {
+            models::admission_generation(card)
+                .map(|generation| (card.provider.id.clone(), generation))
+        })
+        .collect();
     let cards: Vec<idoris_contracts::ComponentCard> = state
         .cards
         .iter()
         .filter(|card| state.health_state.failure_of_card(card).is_none())
         .cloned()
         .collect();
-    match models::list_models_with_subscriptions(
+    match models::list_models_with_subscriptions_admitted(
         &state.http_client,
         &cards,
+        &admitted,
         &state.models_health,
         &state.subscriptions,
         state.remote_kill_switch.load(Ordering::SeqCst),
@@ -3108,6 +3137,8 @@ async fn chat_completions(
             }
             return response;
         }
+        // 这个请求是为哪一代引擎准入的：在状态门之前读（Codex 终审 H3），之后绑定到首次发送、流式首发与每一次重试（`chat_via_proxy` 一整条）。
+        let admitted = models::admission_generation(&selected.card);
         // 选中了一个没有就绪的托管引擎（门控降级放行）：不碰引擎，503 带原因；和别的本地失败一样，云端兜底（如果配置了）
         // 照常有机会接手。
         if let Some(original) = managed_unavailable_response(&state, selected) {
@@ -3200,19 +3231,22 @@ async fn chat_completions(
                 Ok(body) => body,
                 Err(error) => return model_resolution_error(error),
             };
-            return chat_via_proxy(
-                &state,
-                selected,
-                &headers,
-                &parsed,
-                &upstream_body,
-                &record_id,
-                ProxyEventContexts {
-                    budget_reserved: budget_event_context.as_ref(),
-                    dispatched: dispatched_event_context.as_ref(),
-                    completed: completed_event_context.as_ref(),
-                },
-                budget_key_id.as_deref(),
+            return idoris_backend::generation::scoped(
+                admitted,
+                chat_via_proxy(
+                    &state,
+                    selected,
+                    &headers,
+                    &parsed,
+                    &upstream_body,
+                    &record_id,
+                    ProxyEventContexts {
+                        budget_reserved: budget_event_context.as_ref(),
+                        dispatched: dispatched_event_context.as_ref(),
+                        completed: completed_event_context.as_ref(),
+                    },
+                    budget_key_id.as_deref(),
+                ),
             )
             .await;
         }
@@ -4248,6 +4282,8 @@ mod budget_reserved_wiring_tests;
 
 #[cfg(test)]
 mod dispatched_wiring_tests;
+#[cfg(test)]
+mod final_review_tests;
 
 #[cfg(test)]
 mod completed_wiring_tests;

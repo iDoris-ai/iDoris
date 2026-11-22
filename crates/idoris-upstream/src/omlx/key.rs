@@ -23,13 +23,26 @@
 //! - **代际**：每个端点的登记有一个只增的代际，口径每变一次（换了私有 key、验证状态变了、封上、撤销）加一。按请求取凭证的
 //!   调用方把请求准入时的代际带进来（[`resolve_omlx_api_key_checked`]），代际不是当前的就拒绝：属于已经被换掉的引擎的请求，
 //!   拿不到新引擎的凭证。
+//! - **发送前的授权**（IDORIS-CORE S6，Codex 终审 H1；owner 2026-11-22 拍板）：对一个托管的端点，每个要发出去的请求（带 key 的
+//!   与不带的）都经 [`authorize_omlx_request`]：在**同一个任务里、紧挨着发送之前**核对代际与口径，并让登记时一起交来的校验守卫
+//!   （[`EndpointGuard`]）**重新**确认此刻监听这个端口的还是它登记时认的那个监听者；确认不了（不一样，或者读不出来）就拒绝，什么
+//!   都不发。这把「校验通过」与「发送」之间的间隙从「管理器的一个监管节拍」缩到「一次校验到一次发送之间的毫秒」，没有消除：
+//!   本机**另一个用户**的进程恰好在这几毫秒里抢到端口，仍能收到那一个请求（同一个用户的进程本来就读得到 `settings.json` 与进程
+//!   环境，什么也没多得；`lsof` 也看不到别的用户的监听，所以这个校验对它们是盲的）。不做逐连接的对端进程核对。授权同时登记一个在途
+//!   的操作（[`FlightGuard`]），引擎管理器排空时等它们做完。
+//! - **端点的标识**（Codex 终审 H5）：loopback 的各种写法（`localhost`、`127.x.y.z`、`::1`）与协议不区分，同一个端口是同一个标识
+//!   （[`endpoint_identity`]）：管理器登记的是 `127.0.0.1:<port>`，卡里写成 `localhost:<port>` 的伴生卡也落在同一条登记上（继承它的
+//!   封上与失败），**不会**因为主机名的写法不同而逃出登记、落进 §2.9 的回退链。
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-use std::sync::{PoisonError, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
+
+use async_trait::async_trait;
 
 use super::OMLX_API_KEY_ENV;
 
@@ -165,100 +178,210 @@ impl std::fmt::Debug for EndpointKey {
     }
 }
 
-/// 一个端点在登记表里的状态：此刻的口径（`None` = 没人管）与它的**代际**。代际只增不减，口径每变一次加一，所以「这个请求
-/// 是在哪一代准入的」能和「现在是哪一代」比较。条目从不删除（撤销只是把口径清成 `None`，代际照加）：同一个端点的代际
-/// 永远不会重复。
+/// 守卫对「此刻监听这个端口的，还是登记时认的那个监听者吗」的回答（[`EndpointGuard::verify`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verification {
+    /// 是：监听者就是登记时认的那个（自有引擎：它的进程是这个端口上唯一的监听者；外部引擎：每个监听者的身份——pid 加启动时间——
+    /// 都与校验通过时的一样，并且重新过了 uid 与签名团队）。
+    Verified,
+    /// 不是了：没有监听者，监听者换了，或者端口上多了别的监听者。
+    Mismatch,
+    /// 读不出来（`lsof`、`ps` 超时或出错）：既不能说是，也不能说不是；按「不是」处理，拒绝发送。
+    Unverifiable,
+}
+
+/// 引擎管理器登记口径（私有 key、外部）时一起交来的校验守卫：每个要发往这个端点的请求，在发出之前由 [`authorize_omlx_request`]
+/// 调它，**重新**确认此刻监听这个端口的还是登记时认的那个监听者（IDORIS-CORE S6，Codex 终审 H1）。守卫只在口径是私有或外部的
+/// 时候有；封上、撤销都清掉它。
+#[async_trait]
+pub trait EndpointGuard: Send + Sync + std::fmt::Debug {
+    async fn verify(&self) -> Verification;
+}
+
+/// 一个端点在登记表里的状态：此刻的口径（`None` = 没人管）、它的**代际**、校验守卫、在途的操作数。代际只增不减，口径（或守卫）
+/// 每变一次加一，所以「这个请求是在哪一代准入的」能和「现在是哪一代」比较。条目从不删除（撤销只是把口径清成 `None`，代际照加）：
+/// 同一个端点的代际永远不会重复。
 #[derive(Clone)]
 struct Governance {
     generation: u64,
     key: Option<EndpointKey>,
+    guard: Option<Arc<dyn EndpointGuard>>,
+    /// 此刻持有 [`FlightGuard`] 的操作数（[`endpoint_flights`]）。
+    flights: Arc<AtomicUsize>,
 }
 
-/// 进程里被引擎管理器接管的端点（键是 [`endpoint_identity`]）。进程全局：三个调用点（适配器、代理、模型列表）各自
-/// 按 URL 解析 key，没有一条共同的对象能把表传下去。没有登记的端点（非托管的卡）行为与以前完全一样。
+impl Governance {
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            key: None,
+            guard: None,
+            flights: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+/// 进程里被引擎管理器接管的端点（键是 [`endpoint_identity`]）。进程全局：几个调用点（适配器、代理、模型列表、就绪探测）各自
+/// 按 URL 取凭证，没有一条共同的对象能把表传下去。没有登记的端点（非托管的卡）行为与以前完全一样。
 static GOVERNED: RwLock<BTreeMap<String, Governance>> = RwLock::new(BTreeMap::new());
 
-/// 端点的规范标识 `scheme://host[:port]`（host 小写），不含路径、凭据、查询、片段；不是 http(s) URL 时没有。
-/// `http://127.0.0.1:19731`、`http://127.0.0.1:19731/` 与带路径的写法是同一个端点。
+/// loopback 的主机写法：`localhost`、`127.0.0.0/8`、`::1`（含 IPv4 映射的写法）。
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// 端点的规范标识，不含路径、凭据、查询、片段；不是 http(s) URL 时没有。
+///
+/// - **loopback**（`localhost`、`127.x.y.z`、`::1`，http 或 https）：`loopback:<port>`。同一个端口上监听的是谁，与请求写的是哪个
+///   loopback 别名无关（IDORIS-CORE S6，Codex 终审 H5）：管理器登记的是 `127.0.0.1:<port>`，伴生卡写成 `localhost:<port>` 或
+///   `[::1]:<port>` 的，落在同一条登记上，继承它的封上与失败，不会按主机名的写法逃出去、走 §2.9 的回退链。
+/// - 别的主机：`scheme://host[:port]`（host 小写）。
 pub fn endpoint_identity(base_url: &str) -> Option<String> {
     let url = reqwest::Url::parse(base_url).ok()?;
     if !matches!(url.scheme(), "http" | "https") {
         return None;
     }
     let host = url.host_str()?.to_ascii_lowercase();
+    if is_loopback_host(&host) {
+        return Some(format!("loopback:{}", url.port_or_known_default()?));
+    }
     Some(match url.port() {
         Some(port) => format!("{}://{host}:{port}", url.scheme()),
         None => format!("{}://{host}", url.scheme()),
     })
 }
 
-/// 登记（或更新）一个端点的 key 口径。口径变了（与此刻登记的不相等）代际加一；登记同一个口径不变。`base_url` 不是
-/// http(s) URL 时什么也不做，返回 `false`。
+/// 登记（或更新）一个端点的 key 口径，没有校验守卫。口径变了（与此刻登记的不相等，或者守卫不同）代际加一；登记同一个口径不变。
+/// `base_url` 不是 http(s) URL 时什么也不做，返回 `false`。
 pub fn govern_endpoint(base_url: &str, policy: EndpointKey) -> bool {
+    govern_endpoint_guarded(base_url, policy, None)
+}
+
+/// 同 [`govern_endpoint`]，带校验守卫：之后发往这个端点的每个请求，发送前都要让守卫重新确认监听者（[`authorize_omlx_request`]）。
+/// 守卫换了（不是同一个对象）也算口径变了，代际加一。
+pub fn govern_endpoint_guarded(
+    base_url: &str,
+    policy: EndpointKey,
+    guard: Option<Arc<dyn EndpointGuard>>,
+) -> bool {
     let Some(identity) = endpoint_identity(base_url) else {
         return false;
     };
     let mut governed = GOVERNED.write().unwrap_or_else(PoisonError::into_inner);
-    let slot = governed.entry(identity).or_insert(Governance {
-        generation: 0,
-        key: None,
-    });
-    if slot.key.as_ref() != Some(&policy) {
+    let slot = governed.entry(identity).or_insert_with(Governance::new);
+    let same_guard = match (&slot.guard, &guard) {
+        (None, None) => true,
+        (Some(current), Some(next)) => Arc::ptr_eq(current, next),
+        _ => false,
+    };
+    if slot.key.as_ref() != Some(&policy) || !same_guard {
         slot.key = Some(policy);
+        slot.guard = guard;
         slot.generation += 1;
     }
     true
 }
 
-/// 封上一个端点：之后什么凭证都不发（[`EndpointKey::Blocked`]）。**引擎停了、正在被替换、监听者没了时用它，不是
-/// [`release_endpoint`]**：撤销登记会让回退链（环境变量、`settings.json`）重新适用于这个端点，把用户的 key 发给之后占着
-/// 这个端口、还没通过校验的别的东西。
+/// 封上一个端点：之后什么凭证都不发（[`EndpointKey::Blocked`]）。**引擎停了、正在被替换、监听者没了时用它，不是撤销登记**：
+/// 撤销登记会让回退链（环境变量、`settings.json`）重新适用于这个端点，把用户的 key 发给之后占着这个端口、还没通过校验的别的东西。
 pub fn block_endpoint(base_url: &str) -> bool {
     govern_endpoint(base_url, EndpointKey::Blocked)
 }
 
-/// 撤销登记：之后这个端点回到没人管的状态（按 §2.9 的顺序）。**只用在端点不再是托管的时候**（v0.6.0 里托管的端点永远不会
-/// 变成非托管，引擎管理器用 [`block_endpoint`]）；代际加一。
+/// 撤销登记：之后这个端点回到没人管的状态（按 §2.9 的顺序）；代际加一。**只在测试里用**（IDORIS-CORE S6，Codex 终审 L3）：
+/// v0.6.0 里托管的端点永远不会变成非托管，引擎管理器用 [`block_endpoint`]；生产代码里没有任何路径能把一个托管的端点交还给回退链。
+/// 测试用它在用例之间清理进程全局的登记表（`test-support` 特性，或本 crate 自己的单元测试）。
+#[cfg(any(test, feature = "test-support"))]
 pub fn release_endpoint(base_url: &str) {
     if let Some(identity) = endpoint_identity(base_url) {
         let mut governed = GOVERNED.write().unwrap_or_else(PoisonError::into_inner);
         if let Some(slot) = governed.get_mut(&identity)
-            && slot.key.take().is_some()
+            && (slot.key.take().is_some() || slot.guard.take().is_some())
         {
+            slot.guard = None;
             slot.generation += 1;
         }
     }
 }
 
+/// 测试清理：把一个端点从进程全局的登记表里**整条删掉**（口径、守卫、代际、在途计数一起），之后它与「从没登记过」一模一样（代际 0）。
+///
+/// 与 [`release_endpoint`] 不同：那个撤销口径、代际加一、条目留着（所以测试里「撤销之后代际不会重复」才测得出来）。登记表是进程全局的，
+/// 操作系统很快会把同一个端口复用给同一个进程里别的用例的假上游；用例结束时只撤销口径、留着代际不是 0 的条目，会带进下一个用例（那个用例
+/// 若断言「没登记过的端点代际是 0」就会错）。用例的清理用这个。**只在测试里用**（同 [`release_endpoint`]）：生产里条目从不删除，一个端点的
+/// 代际永远不会重复；删条目的时候还有操作持着这个端点旧的在途登记也没关系（它们各自持有自己那份计数）。
+#[cfg(any(test, feature = "test-support"))]
+pub fn forget_endpoint(base_url: &str) {
+    if let Some(identity) = endpoint_identity(base_url) {
+        GOVERNED
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&identity);
+    }
+}
+
 /// 一个端点当前的登记口径。
 pub fn governed_endpoint(base_url: &str) -> Option<EndpointKey> {
-    governance_of(base_url).0
+    snapshot_of(base_url).key
 }
 
 /// 一个端点此刻的代际：口径每变一次加一，没登记过的端点是 0。
 pub fn endpoint_generation(base_url: &str) -> u64 {
-    governance_of(base_url).1
+    snapshot_of(base_url).generation
 }
 
-/// 同一次读里的口径与代际（两者一致）。
-fn governance_of(base_url: &str) -> (Option<EndpointKey>, u64) {
+/// 此刻有几个操作持有这个端点的 [`FlightGuard`]：引擎管理器排空时等它归零（IDORIS-CORE S6，Codex 终审 M1）。
+pub fn endpoint_flights(base_url: &str) -> usize {
+    snapshot_of(base_url)
+        .flights
+        .map_or(0, |flights| flights.load(Ordering::SeqCst))
+}
+
+/// 一次读里的口径、代际、守卫与在途计数（彼此一致）。
+struct Snapshot {
+    key: Option<EndpointKey>,
+    generation: u64,
+    guard: Option<Arc<dyn EndpointGuard>>,
+    flights: Option<Arc<AtomicUsize>>,
+}
+
+fn snapshot_of(base_url: &str) -> Snapshot {
+    let empty = Snapshot {
+        key: None,
+        generation: 0,
+        guard: None,
+        flights: None,
+    };
     let Some(identity) = endpoint_identity(base_url) else {
-        return (None, 0);
+        return empty;
     };
     GOVERNED
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .get(&identity)
-        .map_or((None, 0), |slot| (slot.key.clone(), slot.generation))
+        .map_or(empty, |slot| Snapshot {
+            key: slot.key.clone(),
+            generation: slot.generation,
+            guard: slot.guard.clone(),
+            flights: Some(slot.flights.clone()),
+        })
 }
 
-/// 为什么一个请求拿不到凭证（[`resolve_omlx_api_key_checked`]）。说明里没有任何 key。
+/// 为什么一个请求拿不到凭证（[`resolve_omlx_api_key_checked`]、[`authorize_omlx_request`]）。说明里没有任何 key。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRefusal {
     /// 请求准入时绑定的引擎代际不是当前的：它属于一个已经被换掉的引擎进程，不能拿新引擎的凭证，请求体也不能发给它。
     StaleGeneration { admitted: u64, current: u64 },
     /// 端点被封上了（[`EndpointKey::Blocked`]）：没有一个通过校验的引擎在它后面，什么都不发。
     Blocked,
+    /// 发送前的重新校验说：此刻监听这个端口的已经不是登记时认的那个监听者了（Codex 终审 H1）。
+    ListenerChanged,
+    /// 发送前的重新校验读不出来（工具超时、出错）：确认不了就不发（fail closed）。
+    Unverified,
 }
 
 impl std::fmt::Display for KeyRefusal {
@@ -271,39 +394,169 @@ impl std::fmt::Display for KeyRefusal {
             Self::Blocked => f.write_str(
                 "no verified engine is behind this endpoint right now (it is blocked): the request was not sent",
             ),
+            Self::ListenerChanged => f.write_str(
+                "what listens on this endpoint is no longer the engine it was verified for: the request was not sent",
+            ),
+            Self::Unverified => f.write_str(
+                "what listens on this endpoint could not be confirmed right before sending: the request was not sent",
+            ),
         }
     }
 }
 
 impl std::error::Error for KeyRefusal {}
 
+/// 只核对代际与封上，不取 key、不重新校验监听者、不登记在途：代理在占熔断名额**之前**用它预检（被拒绝的发送留下的不是提供方的
+/// 失败）；真正的发送前核对在 [`authorize_omlx_request`]。
+pub fn check_endpoint_admission(
+    base_url: &str,
+    admitted_generation: Option<u64>,
+) -> Result<(), KeyRefusal> {
+    let snapshot = snapshot_of(base_url);
+    refuse_stale_or_blocked(&snapshot, admitted_generation)
+}
+
+fn refuse_stale_or_blocked(
+    snapshot: &Snapshot,
+    admitted_generation: Option<u64>,
+) -> Result<(), KeyRefusal> {
+    if let Some(admitted) = admitted_generation
+        && admitted != snapshot.generation
+    {
+        return Err(KeyRefusal::StaleGeneration {
+            admitted,
+            current: snapshot.generation,
+        });
+    }
+    if snapshot.key == Some(EndpointKey::Blocked) {
+        return Err(KeyRefusal::Blocked);
+    }
+    Ok(())
+}
+
 /// 按请求取 key，并核对准入时的代际（IDORIS-CORE S6）：`admitted_generation` 是这个请求所属的操作被准入时端点的代际
 /// （`None` = 不绑定，按此刻的口径）。代际不是当前的、或端点被封上时拒绝（`Err`），什么凭证都不给；否则 `Ok(key)`
 /// （`None` = 不带 key）。口径与代际在同一次读里取，所以「核对通过」与「给出的 key」一致。
+///
+/// **不重新校验监听者，也不登记在途的操作**：它是纯解析，给单元测试与不发请求的调用方用。每一个真的要发出去的请求都用
+/// [`authorize_omlx_request`]。
 pub fn resolve_omlx_api_key_checked(
     base_url: &str,
     admitted_generation: Option<u64>,
 ) -> Result<Option<String>, KeyRefusal> {
-    let (governed, generation) = governance_of(base_url);
-    if let Some(admitted) = admitted_generation
-        && admitted != generation
-    {
-        return Err(KeyRefusal::StaleGeneration {
-            admitted,
-            current: generation,
-        });
-    }
-    if governed == Some(EndpointKey::Blocked) {
-        return Err(KeyRefusal::Blocked);
-    }
+    let snapshot = snapshot_of(base_url);
+    refuse_stale_or_blocked(&snapshot, admitted_generation)?;
+    Ok(resolve_from_snapshot(base_url, snapshot.key.as_ref())
+        .and_then(|key| key.into_string().ok()))
+}
+
+fn resolve_from_snapshot(base_url: &str, governed: Option<&EndpointKey>) -> Option<OsString> {
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
-    Ok(resolve_for_endpoint(
+    resolve_for_endpoint(
         std::env::var_os(OMLX_API_KEY_ENV),
         home.as_deref().map(Path::new),
         is_loopback_base_url(base_url),
-        governed.as_ref(),
+        governed,
     )
-    .and_then(|key| key.into_string().ok()))
+}
+
+/// 一个在途的操作（IDORIS-CORE S6，Codex 终审 M1）：持有它期间，这个端点的 [`endpoint_flights`] 加一。流式响应的字节流、后台
+/// 预热、模型列表的请求、聊天……凡是发往托管端点的请求都经 [`authorize_omlx_request`]，所以排空要等的「在途」不会漏掉哪一种。
+#[derive(Debug)]
+pub struct FlightGuard {
+    flights: Arc<AtomicUsize>,
+}
+
+impl FlightGuard {
+    fn enter(flights: &Arc<AtomicUsize>) -> Self {
+        flights.fetch_add(1, Ordering::SeqCst);
+        Self {
+            flights: flights.clone(),
+        }
+    }
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        self.flights.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// [`authorize_omlx_request`] 的结果：这个请求可以发了，凭证是 `key`（没有 = 不带），`generation` 是授权那一刻端点的代际，在途
+/// 登记（`_flight`）活到这个值被丢弃为止：**调用方要把它握到响应读完（流式的握到流结束）**。
+#[derive(Debug)]
+#[must_use = "hold the authorization until the response has been read"]
+pub struct Authorization {
+    key: Option<OsString>,
+    generation: u64,
+    _flight: Option<FlightGuard>,
+}
+
+impl Authorization {
+    /// 没有登记的端点（非托管）、没有守卫：只是按 §2.9 的顺序取到的 key，没有在途登记。
+    fn unguarded(key: Option<OsString>, generation: u64, flight: Option<FlightGuard>) -> Self {
+        Self {
+            key,
+            generation,
+            _flight: flight,
+        }
+    }
+
+    /// UTF-8 的 key（非 UTF-8 的环境变量当作没有，同 [`resolve_omlx_api_key_checked`]）。
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref().and_then(OsStr::to_str)
+    }
+
+    /// 保留非 UTF-8 的 key，让调用方按「无效凭证」处理。
+    pub fn key_os(&self) -> Option<&OsStr> {
+        self.key.as_deref()
+    }
+
+    /// 授权那一刻这个端点的代际。
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// **每个要发往 oMLX 端点的请求在发出之前**调用（IDORIS-CORE S6，Codex 终审 H1；owner 2026-11-22 拍板）：在同一个任务里，紧挨着
+/// 发送之前——
+///
+/// 1. 核对准入时的代际与封上（[`KeyRefusal::StaleGeneration`]、[`KeyRefusal::Blocked`]）；
+/// 2. 登记一个在途的操作（[`FlightGuard`]），排空会等它；
+/// 3. 让登记时交来的守卫**重新**确认监听者（[`EndpointGuard::verify`]）：不是了、读不出来都拒绝（[`KeyRefusal::ListenerChanged`]、
+///    [`KeyRefusal::Unverified`]），什么都不发；
+/// 4. 再读一次登记：校验期间口径被撤销或换了（代际变了），拒绝；
+/// 5. 取 key。
+///
+/// 没有登记的端点（非托管的卡）没有守卫、没有代际，key 照 §2.9 的顺序取，行为与以前一样。
+pub async fn authorize_omlx_request(
+    base_url: &str,
+    admitted_generation: Option<u64>,
+) -> Result<Authorization, KeyRefusal> {
+    let before = snapshot_of(base_url);
+    refuse_stale_or_blocked(&before, admitted_generation)?;
+    // 先登记在途、后校验：此刻开始排空的管理器要么等到这个请求，要么在下面的重读里让它被拒绝，不会两头都漏掉。
+    let flight = before.flights.as_ref().map(FlightGuard::enter);
+    let guarded = matches!(
+        before.key,
+        Some(EndpointKey::Private(_) | EndpointKey::External { .. })
+    );
+    if guarded && let Some(guard) = &before.guard {
+        match guard.verify().await {
+            Verification::Verified => {}
+            Verification::Mismatch => return Err(KeyRefusal::ListenerChanged),
+            Verification::Unverifiable => return Err(KeyRefusal::Unverified),
+        }
+        let after = snapshot_of(base_url);
+        if after.generation != before.generation {
+            return Err(KeyRefusal::StaleGeneration {
+                admitted: before.generation,
+                current: after.generation,
+            });
+        }
+    }
+    let key = resolve_from_snapshot(base_url, before.key.as_ref());
+    Ok(Authorization::unguarded(key, before.generation, flight))
 }
 
 /// 纯解析：在 [`resolve_from_for`] 之上加「端点被引擎管理器接管」的口径（`governed`）。

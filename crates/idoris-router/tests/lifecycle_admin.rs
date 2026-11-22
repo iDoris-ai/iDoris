@@ -44,7 +44,9 @@ use idoris_upstream::engine::{
     CodesignPolicy, InspectError, ListenerPolicy, PidState, ProcessInspector, StopOnExit,
     SystemInspector,
 };
-use idoris_upstream::omlx::key::{EndpointKey, endpoint_generation, governed_endpoint};
+use idoris_upstream::omlx::key::{
+    EndpointKey, endpoint_generation, forget_endpoint, governed_endpoint,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -104,6 +106,8 @@ struct Scripted {
     start_times: Mutex<BTreeMap<u32, String>>,
     /// `listens_on(_, port)` 一律是假的：引擎进程还活着，监听这个端口的却不再是它。
     lost: Mutex<Vec<u16>>,
+    /// `listens_on` 一律读不出来（`lsof` 不答；Codex 终审 H1：读不出来也不发）。
+    unreadable: AtomicBool,
 }
 
 impl Scripted {
@@ -115,7 +119,14 @@ impl Scripted {
             teams: Mutex::new(BTreeMap::new()),
             start_times: Mutex::new(BTreeMap::new()),
             lost: Mutex::new(Vec::new()),
+            unreadable: AtomicBool::new(false),
         })
+    }
+
+    /// 从现在起（或不再）`listens_on` 读不出来。
+    fn set_unreadable(&self, unreadable: bool) {
+        self.unreadable
+            .store(unreadable, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 从现在起，`listens_on` 对这个端口回 `Ok(false)`（进程还活着，监听这个端口的不是它了）。
@@ -171,6 +182,9 @@ impl ProcessInspector for Scripted {
         self.real.process_group(pid).await
     }
     async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
+        if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(InspectError::NoAnswer);
+        }
         if self.lost.lock().unwrap().contains(&port) {
             return Ok(false);
         }
@@ -281,6 +295,7 @@ fn fast() -> Timings {
         half_open_interval: Duration::from_millis(400),
         stop_grace: Duration::from_secs(3),
         drain_timeout: Duration::from_secs(5),
+        command_timeout: Duration::from_secs(10),
         unverifiable_retries: 2,
         unverifiable_pause: Duration::from_millis(20),
     }
@@ -405,6 +420,9 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
+        // The key registry is process-global and the OS hands a freed port to another test of this process: leave nothing of
+        // this endpoint's registration (not even its generation) behind.
+        forget_endpoint(&self.endpoint());
         fake_omlx::kill_fake_engines_under(self.work.path());
         for launch in self.fake.all_launches() {
             let pid = launch["pid"].as_u64().unwrap();
@@ -1236,6 +1254,19 @@ impl Full {
         timings: Timings,
         extra_cards: Vec<ComponentCard>,
     ) -> Self {
+        let mut cards = vec![managed_card(&rig.endpoint())];
+        cards.extend(extra_cards);
+        Self::start_with_card_order(rig, inspector, timings, cards).await
+    }
+
+    /// 同 [`Self::start_with_cards`]，Router 里的全部卡（含托管的 `omlx`）由调用方按顺序给：模型列表按卡的顺序逐张请求，先排的慢卡会
+    /// 让后面的卡在列表期间被停掉（Codex 终审 M6）。
+    async fn start_with_card_order(
+        rig: Rig,
+        inspector: Arc<dyn ProcessInspector>,
+        timings: Timings,
+        cards: Vec<ComponentCard>,
+    ) -> Self {
         let executable = rig.fake.executable.clone();
         let log: Arc<Mutex<Vec<String>>> = Arc::default();
         let sink: LogSink = {
@@ -1262,8 +1293,6 @@ impl Full {
             }],
             health.clone(),
         ));
-        let mut cards = vec![managed_card(&rig.endpoint())];
-        cards.extend(extra_cards);
         let state_dir = rig.state_dir();
         let token = AdminSessionToken::mint();
         let secret = token.expose_secret().to_owned();
@@ -3212,4 +3241,1092 @@ async fn h3_an_engine_that_stays_alive_but_gives_the_port_away_never_sends_its_p
             "the engine's private key reached the new listener"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Codex 终审（17ac795a）：H1、H2、H5、H6、M1、M2、M5、M6。真的 Router、真的假引擎，时序用同步点（引擎里被扣着的请求、可编排的检查器、
+// 管理器监督节拍的暂停）到达，不靠墙钟。
+// ---------------------------------------------------------------------------------------------
+
+/// 监督节拍拉到小时级（Codex 终审 H1）：管理器自己的节拍不会在用例期间收回登记，登记表里的口径一直是「私有 key」；用例要让监听者
+/// 在「撤销登记**之前**」换掉。
+fn supervision_paused() -> Timings {
+    let mut timings = fast();
+    timings.liveness_interval = Duration::from_secs(3600);
+    timings.probe_interval = Duration::from_secs(3600);
+    timings
+}
+
+/// 一张 resident 的聊天卡，与托管的 `omlx` 同一个引擎（同一个 endpoint）：`idoris/daily` 走它，经代理转发（流式也在这里）。
+fn resident_chat_card(endpoint: &str) -> ComponentCard {
+    let mut card = template();
+    card.provider.id = "omlx-chat".to_owned();
+    card.endpoint = endpoint.to_owned();
+    card.load_policy.as_mut().unwrap().mode = LoadMode::Resident;
+    card.extensions = Some(
+        serde_json::from_value(json!({
+            "_degradation": "Removing these bindings disables aliases.",
+            "idoris_role_models": {"daily": "fake-model"}
+        }))
+        .unwrap(),
+    );
+    card
+}
+
+impl Full {
+    /// 数据面的请求，响应头一到就返回（响应体不读）：流式响应在这个时刻还开着。
+    async fn data_raw(&self, method: &str, path: &str, body: Value) -> axum::http::Response<Body> {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("X-iDoris-Privacy", "local_only")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        self.data.router().oneshot(request).await.unwrap()
+    }
+
+    /// Admin 对一条路径的原始调用（`restart`、`stop`……）：状态码与体。
+    async fn post_command(&self, action: &str) -> (StatusCode, Value) {
+        self.admin("POST", &format!("/admin/api/v1/upstreams/omlx/{action}"))
+            .await
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// H1（owner 2026-11-22 的拍板）：发送前重新确认监听者；在「撤销登记之前」切换监听者
+// ---------------------------------------------------------------------------------------------
+
+/// 引擎放掉了端口（进程还活着），一个冒名者绑上来，**而管理器自己的监督还没有走到收回登记那一步**（节拍被暂停）：登记表里还是引擎的私有
+/// key，状态还是 `ready`，数据面的状态门放行。发出去的每一个请求（聊天、公共模型列表、Admin 的模型观察）都在发送前经授权，守卫重新
+/// 确认监听者：不是引擎了，拒绝，冒名者**一个请求**也没有收到，更没有 `Authorization`。检查器读不出来（`lsof` 不答）同样不发。
+///
+/// 没有消除的窗口：重新确认与那一次发送之间的毫秒（本机另一个用户的进程恰好抢到端口）——见 `omlx_authorize.rs` 的
+/// `known_limit_…`，规范勘误十把它写成已知限制。那一段这里不断言。
+#[tokio::test]
+async fn h1_a_listener_switched_before_the_registration_is_revoked_gets_nothing_from_chat_the_model_list_or_the_admin_observation()
+ {
+    if !in_a_child_with_canary_keys(
+        "h1_a_listener_switched_before_the_registration_is_revoked_gets_nothing_from_chat_the_model_list_or_the_admin_observation",
+    ) {
+        return;
+    }
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let endpoint = rig.endpoint();
+    let inspector = Scripted::claiming(port);
+    let full = Full::start_with(rig, inspector.clone(), supervision_paused()).await;
+    full.wait_open().await;
+    assert_eq!(
+        full.chat().await.0,
+        StatusCode::OK,
+        "it serves before the switch"
+    );
+    let private_key = full.rig.key(0);
+
+    // 引擎放掉端口，冒名者绑上，检查器也不再说端口上的是引擎。管理器没有注意到（节拍被暂停）。
+    full.rig.fake.release_port();
+    inspector.lose(port);
+    let impostor = Impostor::on_port(port).await;
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Private(private_key.clone())),
+        "the switch landed before the registration was revoked"
+    );
+    assert_eq!(
+        full.health.view().upstreams[0].state,
+        UpstreamState::Ready,
+        "the state gate still lets requests through"
+    );
+
+    for scenario in [
+        "the listener is someone else",
+        "the listener cannot be read",
+    ] {
+        if scenario == "the listener cannot be read" {
+            inspector.set_unreadable(true);
+        }
+        // 聊天：Supervisor 的门开着，适配器在发送前被拒。
+        let (status, _) = full.chat().await;
+        assert_ne!(status, StatusCode::OK, "{scenario}");
+        // 公共模型列表：这张卡被跳过（不可用），不是一个匿名的、或带 key 的 GET。
+        let (status, body) = full.data("GET", "/v1/models", None).await;
+        assert_eq!(status, StatusCode::OK, "{scenario}: {body}");
+        assert_eq!(body["data"], json!([]), "{scenario}: {body}");
+        // Admin 的模型观察：如实报「不可用」。
+        let (status, body) = full.admin("GET", "/admin/api/v1/models").await;
+        assert_eq!(status, StatusCode::OK, "{scenario}: {body}");
+        let source = body["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["provider_id"] == "omlx")
+            .unwrap_or_else(|| panic!("{scenario}: no source for omlx: {body}"));
+        assert_eq!(source["state"], "error", "{scenario}: {source}");
+        assert_eq!(source["error"], "unavailable", "{scenario}: {source}");
+    }
+    assert_eq!(
+        impostor.count().await,
+        0,
+        "not one request reached the new listener"
+    );
+    impostor.assert_never_authorized().await;
+    for request in impostor.requests().await {
+        assert!(!format!("{:?}", request.headers).contains(&private_key));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// H2：外部授权在每一条没有落到「持续监督」上的出口都撤销
+// ---------------------------------------------------------------------------------------------
+
+/// 接管外部引擎之后，Supervisor 的复位失败（新进程的 `/api/status` 答不上）：这个实例不再监督它，`self.external` 被清掉；之前已验证的登记留着，
+/// 端口上之后出现的东西，只要守卫恰好通过，仍能拿到 `settings.json` 的 key。现在端点封上。退避期间（20 秒）断言，不会被下一次接管覆盖。
+#[tokio::test]
+async fn h2_a_failed_ledger_reset_after_an_external_takeover_leaves_the_endpoint_blocked() {
+    let work = tempfile::tempdir().unwrap();
+    let mut a = External::start_on(work.path(), "external-a", &stateful(), free_port());
+    let port = a.port;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let endpoint = rig.endpoint();
+    let inspector = Scripted::new();
+    inspector.external_listener(port, a.pid(), Some(TEAM));
+    let mut timings = fast();
+    // 失败之后退避很久：用例断言的那一刻，实例正在退避，不会又去接管一次。
+    timings.restart_backoff_base = Duration::from_secs(20);
+    timings.restart_backoff_cap = Duration::from_secs(30);
+    timings.crash_limit = 10;
+    let full = Full::start_with(rig, inspector.clone(), timings).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+
+    // A 关了：端口上没有监听者，`unavailable`，端点封上。
+    inspector.forget_listener(port);
+    full.until_unavailable().await;
+    a.kill();
+    // B 在同一个端口上起来了，它的 `/api/status` 一直答 500（对着它重建账本会失败）。操作员 `start`：新一轮启动决策接管 B，门控早已放行，
+    // 所以接管之后要对着 B 复位账本。
+    let behavior = Behavior {
+        api_status_fails_from_launch: Some(0),
+        ..stateful()
+    };
+    let b = External::start_on(work.path(), "external-b", &behavior, port);
+    inspector.external_listener(port, b.pid(), Some(TEAM));
+    let (status, body) = full.post_command("start").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let latched = full
+        .until("the reset to fail", |element| {
+            element["state"] == "restarting" && element["reason"] == "startup_latched"
+        })
+        .await;
+    assert!(latched["failure_count"].as_u64().unwrap() >= 1, "{latched}");
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Blocked),
+        "the verified external registration was left behind after the takeover failed"
+    );
+    // 管理器不再监督 B；数据面 503，B 收不到聊天。
+    assert_eq!(full.chat().await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(b.fake.requests_of("POST:/v1/chat/completions"), 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// H5：伴生卡按明确的托管实例关联，不按主机名的写法
+// ---------------------------------------------------------------------------------------------
+
+/// 主卡 `127.0.0.1:<端口>`，伴生卡写成 `localhost:<端口>`（IPv4 的冒名者）或 `[::1]:<端口>`（IPv6 的冒名者）：`stop` 做完、端点封上之后，
+/// 别名上的转发、预热、模型列表、Admin 的模型观察、后台探测都被挡在状态门外（伴生卡继承主卡的停止），冒名者收不到一个请求，更没有
+/// `Authorization`：之前登记与继承都按 URL 的 host 字符串匹配，别名落进了没人管的端点、走 §2.9 的回退链，金丝雀 key 发了出去。
+#[tokio::test]
+async fn h5_a_companion_card_spelled_with_a_loopback_alias_is_gated_and_never_handed_a_credential_after_a_stop()
+ {
+    if !in_a_child_with_canary_keys(
+        "h5_a_companion_card_spelled_with_a_loopback_alias_is_gated_and_never_handed_a_credential_after_a_stop",
+    ) {
+        return;
+    }
+    // (别名的写法, 冒名者绑的地址)
+    for (alias, impostor_address) in [("localhost", "127.0.0.1"), ("[::1]", "::1")] {
+        let rig = Rig::new(&stateful());
+        let port = rig.port;
+        let alias_endpoint = format!("http://{alias}:{port}");
+        let companion = companion_card(&alias_endpoint);
+        let full = Arc::new(
+            Full::start_with_cards(
+                rig,
+                Scripted::claiming(port),
+                fast(),
+                vec![companion.clone()],
+            )
+            .await,
+        );
+        full.wait_open().await;
+        assert_eq!(
+            full.chat().await.0,
+            StatusCode::OK,
+            "{alias}: it serves while the engine is up"
+        );
+
+        let (status, body) = full.post_command("stop").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{alias}: {body}");
+        full.until_gone().await;
+        assert_eq!(
+            governed_endpoint(&full.rig.endpoint()),
+            Some(EndpointKey::Blocked),
+            "{alias}"
+        );
+        assert_eq!(
+            governed_endpoint(&alias_endpoint),
+            Some(EndpointKey::Blocked),
+            "{alias}: the alias lands on the same registration"
+        );
+        // 冒名者绑上这个端口（IPv6 的别名对应 IPv6 的地址；没有 IPv6 loopback 的机器跳过这一个）。
+        let Ok(listener) = std::net::TcpListener::bind((impostor_address, port)) else {
+            eprintln!("skipping {alias}: cannot bind {impostor_address}:{port} here");
+            continue;
+        };
+        let impostor = Impostor::on(listener).await;
+
+        // 转发：伴生卡继承主卡的停止，状态门 503，一个请求也不碰那个端口。
+        let (status, body) = full
+            .data(
+                "POST",
+                "/v1/embeddings",
+                Some(json!({"model": "idoris/embed", "input": "hello"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{alias}: {body}");
+        assert_eq!(
+            body["error"]["type"], "local_only_unavailable",
+            "{alias}: {body}"
+        );
+        // 预热。
+        let (status, body) = full
+            .data(
+                "POST",
+                "/v1/models/warmup",
+                Some(json!({"model": "idoris/embed"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{alias}: {body}");
+        // 公共模型列表：两张卡都不探测。
+        let (status, body) = full.data("GET", "/v1/models", None).await;
+        assert_eq!(status, StatusCode::OK, "{alias}: {body}");
+        assert_eq!(body["data"], json!([]), "{alias}: {body}");
+        // Admin 的模型观察：伴生卡如实报「不可用」。
+        let (status, body) = full.admin("GET", "/admin/api/v1/models").await;
+        assert_eq!(status, StatusCode::OK, "{alias}: {body}");
+        let source = body["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["provider_id"] == "omlx-embed")
+            .unwrap_or_else(|| panic!("{alias}: no source for the companion: {body}"));
+        assert_eq!(source["state"], "error", "{alias}: {source}");
+        // 后台探测。
+        let context = ProberContext {
+            health: full.health.clone(),
+            plans: plan_upstreams(std::slice::from_ref(&companion)).unwrap(),
+            runtimes: RuntimeRegistry::default(),
+            client: reqwest::Client::new(),
+            remote_kill_switch: Arc::new(AtomicBool::new(false)),
+            timings: ProberTimings::default(),
+        };
+        assert!(
+            matches!(
+                context.observe(&context.plans[0]).await,
+                Observation::Unavailable(_)
+            ),
+            "{alias}"
+        );
+        assert_eq!(
+            impostor.count().await,
+            0,
+            "{alias}: nothing reached the impostor"
+        );
+        impostor.assert_never_authorized().await;
+        drop(impostor);
+        full.manager.shutdown(true).await;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// H6：外部引擎换进程：明确的不可服务状态，排空之后重新确认身份
+// ---------------------------------------------------------------------------------------------
+
+/// A 换成 B：管理器关门、发布 `restarting`（不是数据面当成「只是慢」的 `unavailable`），伴生卡也被状态门挡住；B 在排空期间离开了：排空
+/// 之后重新核对监听者，不是预期的那一个，不登记、不复位、不放行；之前排空前的结论直接恢复凭证、对着已经走了的 B 复位采样。
+#[tokio::test]
+async fn h6_an_external_changeover_is_unservable_at_once_and_is_re_verified_after_the_drain() {
+    let work = tempfile::tempdir().unwrap();
+    let a = External::start_on(work.path(), "external-a", &stateful(), free_port());
+    let port = a.port;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let endpoint = rig.endpoint();
+    let inspector = Scripted::new();
+    inspector.external_listener(port, a.pid(), Some(TEAM));
+    let full = Arc::new(
+        Full::start_with_cards(
+            rig,
+            inspector.clone(),
+            fast(),
+            vec![companion_card(&endpoint)],
+        )
+        .await,
+    );
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+
+    // 一个聊天停在 A 里：排空要等它。
+    a.fake.hold(Hold::Chat);
+    let chats = a.fake.requests_of("POST:/v1/chat/completions");
+    let in_flight = {
+        let full = full.clone();
+        tokio::spawn(async move { full.chat().await })
+    };
+    wait_for("the chat to reach A", || {
+        a.fake.requests_of("POST:/v1/chat/completions") == chats + 1
+    })
+    .await;
+
+    // 检查器说监听这个端口的换成了另一个（通过校验的）进程 B（pid、启动时间都不同）。
+    let b_pid = std::process::id();
+    inspector.external_listener(port, b_pid, Some(TEAM));
+    wait_for("the changeover to be published as unservable", || {
+        full.health.view().upstreams[0].state == UpstreamState::Restarting
+    })
+    .await;
+    let element = full.element("omlx").await;
+    assert_eq!(
+        element["failure_count"], 0,
+        "a changeover of the external process is not an engine failure: {element}"
+    );
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Blocked),
+        "nothing is sent while the ledger is rebuilt"
+    );
+    // 伴生卡此刻被状态门挡住（继承了主卡的 `restarting`）：它不能在账本复位完成之前通过健康门。
+    let (status, body) = full
+        .data(
+            "POST",
+            "/v1/embeddings",
+            Some(json!({"model": "idoris/embed", "input": "hello"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["type"], "local_only_unavailable", "{body}");
+
+    // B 在排空期间离开了；放开 A 里的聊天，排空结束。
+    inspector.forget_listener(port);
+    a.fake.release(Hold::Chat);
+    assert_eq!(in_flight.await.unwrap().0, StatusCode::OK);
+    full.until_unavailable().await;
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Blocked),
+        "the process verified before the drain was gone: no credential was restored for it"
+    );
+    assert_eq!(full.chat().await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(full.health.view().upstreams[0].state, UpstreamState::Ready);
+}
+
+/// H6 的另一条：排空期间监听者没有离开，而是又换成了**第三个**（同样通过校验的）进程：排空之前验过的 B 已经不是此刻的监听者，不能凭那一次的结论放行
+/// （登记它的凭证与新的守卫、复位、开门）。重新核对的那一刻日志里有「又换了一个进程」；下一个周期按第三个进程重新来，之后才回 `ready`。
+/// 之前排空之后直接恢复凭证、用排空前的结论复位。
+#[tokio::test]
+async fn h6_a_third_process_after_the_drain_is_not_let_through_on_the_strength_of_the_one_verified_before()
+ {
+    let work = tempfile::tempdir().unwrap();
+    let a = External::start_on(work.path(), "external-a", &stateful(), free_port());
+    let port = a.port;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let endpoint = rig.endpoint();
+    let inspector = Scripted::new();
+    inspector.external_listener(port, a.pid(), Some(TEAM));
+    let full = Arc::new(Full::start(rig, inspector.clone()).await);
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+
+    // 一个聊天停在 A 里：排空要等它。
+    a.fake.hold(Hold::Chat);
+    let chats = a.fake.requests_of("POST:/v1/chat/completions");
+    let in_flight = {
+        let full = full.clone();
+        tokio::spawn(async move { full.chat().await })
+    };
+    wait_for("the chat to reach A", || {
+        a.fake.requests_of("POST:/v1/chat/completions") == chats + 1
+    })
+    .await;
+
+    // A 换成了 B（通过校验）；排空开始，状态是 `restarting`。
+    let b_pid = std::process::id();
+    let c_pid = std::os::unix::process::parent_id();
+    assert_ne!(b_pid, c_pid);
+    inspector.external_listener(port, b_pid, Some(TEAM));
+    wait_for("the changeover to be published as unservable", || {
+        full.health.view().upstreams[0].state == UpstreamState::Restarting
+    })
+    .await;
+    // 排空还在等 A 里的聊天时，B 又被第三个进程 C 取代。
+    inspector.external_listener(port, c_pid, Some(TEAM));
+    a.fake.release(Hold::Chat);
+    assert_eq!(in_flight.await.unwrap().0, StatusCode::OK);
+
+    wait_for(
+        "the re-verification after the drain to refuse the process verified before it",
+        || full.logged("外部引擎在排空期间又换了一个进程") >= 1,
+    )
+    .await;
+    // 下一个周期按第三个进程重新来：最终放行它（引擎还是同一个假引擎在应答），而且是以 C 的身份。
+    full.until("the third process to be let through", |element| {
+        element["state"] == "ready"
+    })
+    .await;
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::External {
+            settings_key_verified: true
+        })
+    );
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+}
+
+/// H4（Router 层）：Supervisor 经适配器的 Admin API 读引擎的活动（`status()`）；放行时的第一次采样登录并缓存了那个进程签发的会话 cookie。引擎被
+/// `restart` 换成新进程之后，复位采样又读一次：旧进程签发的 cookie 属于上一代引擎，**不能发给新进程**；适配器丢弃它、对着新进程重新登录。
+/// 之前缓存命中时只看有没有 cookie、不看它是哪一代签发的，新进程先收到旧会话的 cookie（假引擎把别的进程签发的 cookie 记成 `bad`）。
+#[tokio::test]
+async fn h4_the_admin_session_of_the_old_engine_is_never_sent_to_the_replacement() {
+    let rig = Rig::new(&Behavior {
+        admin_api: true,
+        ..stateful()
+    });
+    let port = rig.port;
+    let full = Full::start(rig, Scripted::claiming(port)).await;
+    full.wait_open().await;
+    // 放行时的采样经 Admin API 读了第一个引擎的活动：登录一次，之后带着它自己签发的 cookie 读。
+    let first = full.rig.pid(0);
+    wait_for("the first engine's admin session to be used", || {
+        full.rig
+            .fake
+            .admin_requests()
+            .iter()
+            .any(|r| r.pid == first && r.path == "/admin/api/activity" && r.cookie == "ok")
+    })
+    .await;
+
+    let (status, body) = full.post_command("restart").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for("the replacement to be ready", || {
+        full.rig.fake.launches() == 2
+            && full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    let second = full.rig.pid(1);
+    let seen: Vec<_> = full
+        .rig
+        .fake
+        .admin_requests()
+        .into_iter()
+        .filter(|r| r.pid == second)
+        .collect();
+    assert!(
+        !seen.is_empty(),
+        "the replacement's reset sample read the engine's activity through the admin API"
+    );
+    assert!(
+        seen.iter().all(|r| r.cookie != "bad"),
+        "the old engine's admin session was sent to the replacement: {seen:?}"
+    );
+    assert_eq!(
+        seen[0].path, "/admin/api/login",
+        "the replacement is logged in to first: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|r| r.path == "/admin/api/activity" && r.cookie == "ok"),
+        "{seen:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// M1：排空要看见列表、resident 转发、后台预热、仍在输出的流式响应体
+// ---------------------------------------------------------------------------------------------
+
+/// `held` 的那一类请求已经在引擎里、还没做完（调用方起好并等它到达）；这时 `restart` 到来：状态马上是 `restarting`，旧引擎在这些请求做完之前
+/// **不被停止**（SIGTERM 的标记不出现、没有第二个引擎）。返回旧引擎的 pid。
+async fn restart_and_expect_the_drain_to_wait(full: &Full, held: Hold) -> u64 {
+    let old = full.rig.pid(0);
+    let (status, body) = full.post_command("restart").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["state"], "restarting", "{body}");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(pid_alive(old), "{held:?}");
+    assert!(
+        !full.rig.fake.got_sigterm(old),
+        "{held:?}: the engine was stopped before the request in flight was done"
+    );
+    assert_eq!(full.rig.fake.launches(), 1, "{held:?}");
+    old
+}
+
+/// 放开之后：旧引擎才被停、新引擎换上；排空是等出来的，不是到点切断的。
+async fn release_and_expect_the_replacement(full: &Full, held: Hold, old: u64) {
+    full.rig.fake.release(held);
+    wait_for("the old engine to get SIGTERM", || {
+        full.rig.fake.got_sigterm(old)
+    })
+    .await;
+    wait_for("the replacement to be ready", || {
+        full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    assert_eq!(full.rig.fake.launches(), 2, "{held:?}");
+    assert_eq!(
+        full.logged("排空的上限到了"),
+        0,
+        "{held:?}: the drain was waited for, not cut off at its limit"
+    );
+}
+
+/// 一个已准入的目录读取（`list`，预热在加载之前读它）只持有 Supervisor 的调用许可：不在任何模型的 `inflight` 里。排空看不见它，就去停进程。
+#[tokio::test]
+async fn m1_a_catalog_read_in_flight_keeps_the_drain_open() {
+    let rig = Rig::new(&stateful_with_term_marker());
+    let port = rig.port;
+    let full = Arc::new(Full::start(rig, Scripted::claiming(port)).await);
+    full.wait_open().await;
+    full.rig.fake.hold(Hold::List);
+    let before = full.rig.fake.requests_of("/v1/models/status");
+    let warmup = {
+        let full = full.clone();
+        tokio::spawn(async move {
+            full.data(
+                "POST",
+                "/v1/models/warmup",
+                Some(json!({"model": "idoris/fast"})),
+            )
+            .await
+        })
+    };
+    wait_for("the catalog read to reach the engine", || {
+        full.rig.fake.requests_of("/v1/models/status") > before
+    })
+    .await;
+    let old = restart_and_expect_the_drain_to_wait(&full, Hold::List).await;
+    full.rig.fake.release(Hold::List);
+    // 目录读取放开之后，预热接着去加载，被关着的门拒绝：不是 200。
+    let (status, _) = warmup.await.unwrap();
+    assert_ne!(status, StatusCode::OK);
+    release_and_expect_the_replacement(&full, Hold::List, old).await;
+}
+
+/// 公共模型列表对托管引擎的读取（`GET /v1/models`，`models.rs` 里自己的授权，不经 Supervisor）：它是端点上登记的一个在途操作，排空要等它做完。
+/// 监督的节拍拉到小时级，管理器自己不再探测 `/v1/models`，所以引擎里这个路径上被扣着的请求只可能来自这次列表。
+#[tokio::test]
+async fn m1_a_model_list_request_in_flight_keeps_the_drain_open() {
+    let rig = Rig::new(&stateful_with_term_marker());
+    let port = rig.port;
+    let full =
+        Arc::new(Full::start_with(rig, Scripted::claiming(port), supervision_paused()).await);
+    full.wait_open().await;
+    full.rig.fake.hold(Hold::Models);
+    let before = full.rig.fake.requests_of("/v1/models");
+    let listing = {
+        let full = full.clone();
+        tokio::spawn(async move { full.data("GET", "/v1/models", None).await })
+    };
+    wait_for("the model list request to reach the engine", || {
+        full.rig.fake.requests_of("/v1/models") > before
+    })
+    .await;
+    let old = restart_and_expect_the_drain_to_wait(&full, Hold::Models).await;
+    full.rig.fake.release(Hold::Models);
+    assert_eq!(listing.await.unwrap().0, StatusCode::OK);
+    release_and_expect_the_replacement(&full, Hold::Models, old).await;
+}
+
+/// resident 的伴生卡经代理转发的请求（不经 Supervisor）：没有 Supervisor 可问，排空要等的是这个端点上登记的在途操作。
+#[tokio::test]
+async fn m1_a_forwarded_request_in_flight_keeps_the_drain_open() {
+    let rig = Rig::new(&stateful_with_term_marker());
+    let port = rig.port;
+    let endpoint = rig.endpoint();
+    let full = Arc::new(
+        Full::start_with_cards(
+            rig,
+            Scripted::claiming(port),
+            fast(),
+            vec![companion_card(&endpoint)],
+        )
+        .await,
+    );
+    full.wait_open().await;
+    full.rig.fake.hold(Hold::Embeddings);
+    let forwarded = {
+        let full = full.clone();
+        tokio::spawn(async move {
+            full.data(
+                "POST",
+                "/v1/embeddings",
+                Some(json!({"model": "idoris/embed", "input": "hello"})),
+            )
+            .await
+        })
+    };
+    wait_for("the forwarded request to reach the engine", || {
+        full.rig.fake.requests_of("POST:/v1/embeddings") == 1
+    })
+    .await;
+    let old = restart_and_expect_the_drain_to_wait(&full, Hold::Embeddings).await;
+    full.rig.fake.release(Hold::Embeddings);
+    assert_eq!(forwarded.await.unwrap().0, StatusCode::OK);
+    release_and_expect_the_replacement(&full, Hold::Embeddings, old).await;
+}
+
+/// 后台预热（resident 的最小请求在自己的任务里跑，调用方放弃之后照常跑完）：它活到引擎被停止、替换之后也不该被排空漏掉。
+#[tokio::test]
+async fn m1_a_background_warmup_in_flight_keeps_the_drain_open() {
+    let rig = Rig::new(&stateful_with_term_marker());
+    let port = rig.port;
+    let endpoint = rig.endpoint();
+    let full = Arc::new(
+        Full::start_with_cards(
+            rig,
+            Scripted::claiming(port),
+            fast(),
+            vec![companion_card(&endpoint)],
+        )
+        .await,
+    );
+    full.wait_open().await;
+    full.rig.fake.hold(Hold::Embeddings);
+    let warmup = {
+        let full = full.clone();
+        tokio::spawn(async move {
+            full.data(
+                "POST",
+                "/v1/models/warmup",
+                Some(json!({"model": "idoris/embed", "timeout_ms": 1000})),
+            )
+            .await
+        })
+    };
+    wait_for("the warmup request to reach the engine", || {
+        full.rig.fake.requests_of("POST:/v1/embeddings") == 1
+    })
+    .await;
+    let old = restart_and_expect_the_drain_to_wait(&full, Hold::Embeddings).await;
+    full.rig.fake.release(Hold::Embeddings);
+    let _ = warmup.await.unwrap();
+    release_and_expect_the_replacement(&full, Hold::Embeddings, old).await;
+}
+
+/// 已经收到响应头与第一块、引擎还在往外输出的流式响应体：它是端点上的一个在途操作，直到响应体结束或被丢弃。之前没有谁数它，排空以为没有在途的，
+/// 停进程把流打断了。
+#[tokio::test]
+async fn m1_a_streaming_body_that_is_still_coming_keeps_the_drain_open() {
+    let rig = Rig::new(&stateful_with_term_marker());
+    let port = rig.port;
+    let endpoint = rig.endpoint();
+    let full = Arc::new(
+        Full::start_with_cards(
+            rig,
+            Scripted::claiming(port),
+            fast(),
+            vec![resident_chat_card(&endpoint)],
+        )
+        .await,
+    );
+    full.wait_open().await;
+    full.rig.fake.hold(Hold::Stream);
+    let chats = full.rig.fake.requests_of("POST:/v1/chat/completions");
+    let response = full
+        .data_raw(
+            "POST",
+            "/v1/chat/completions",
+            json!({"model": "idoris/daily", "stream": true,
+                   "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+    // 响应头已经到了（引擎发出了第一块），响应体还没读完：流是开着的。
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for("the streaming request to reach the engine", || {
+        full.rig.fake.requests_of("POST:/v1/chat/completions") == chats + 1
+    })
+    .await;
+    let old = restart_and_expect_the_drain_to_wait(&full, Hold::Stream).await;
+    // 放开：引擎把流写完；读完响应体，流结束，在途登记归零，排空才结束。
+    full.rig.fake.release(Hold::Stream);
+    let text = body_text(response).await;
+    assert!(text.contains("[DONE]"), "the stream ran to its end: {text}");
+    release_and_expect_the_replacement(&full, Hold::Stream, old).await;
+}
+
+async fn body_text(response: axum::http::Response<Body>) -> String {
+    String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes()).into_owned()
+}
+
+// ---------------------------------------------------------------------------------------------
+// M2：重启之后新引擎起不来，旧引擎的容量占用也要放掉
+// ---------------------------------------------------------------------------------------------
+
+/// `stop` 确认旧进程消失之后清算它的账本（`forget_engine`），`restart` 之前丢弃退役结果、等新引擎就绪才复位：旧进程确已停止、替代的可执行文件却
+/// 找不到（实例进入 `absent`）时，旧模型的容量占用一直留在账本与共享的容量账本里，挡着别的上游。现在旧进程一确认消失就清算，门保持关着。
+#[tokio::test]
+async fn m2_when_the_replacement_cannot_start_the_old_engines_models_stop_counting() {
+    let rig = Rig::new(&stateful_with_term_marker());
+    let port = rig.port;
+    let full = Full::start(rig, Scripted::claiming(port)).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    let before = full.runtime().await;
+    assert_eq!(before["loaded"], json!(["fake-model"]), "{before}");
+    assert!(before["used_gb"].as_f64().unwrap() > 0.0, "{before}");
+
+    // 可执行文件没了：替代的引擎起不来。
+    std::fs::remove_file(&full.rig.fake.executable).unwrap();
+    let old = full.rig.pid(0);
+    let (status, body) = full.post_command("restart").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    full.until("the replacement to be impossible", |element| {
+        element["state"] == "absent"
+    })
+    .await;
+    wait_for("the old engine to be gone", || !pid_alive(old)).await;
+    let after = full.runtime().await;
+    assert_eq!(
+        after["loaded"],
+        json!([]),
+        "the old model still counts: {after}"
+    );
+    assert_eq!(after["used_gb"].as_f64().unwrap(), 0.0, "{after}");
+}
+
+/// 同上，`start` 的那一条路：一个活着、监听着、却答不上来的自有引擎（`unavailable`）被 `start`：走完整的退役路径（`attempt()` 开头），旧进程一确认
+/// 消失就清算它的账本，不等新引擎就绪；替代的可执行文件找不到（`absent`）时，旧模型也不再占着容量。
+#[tokio::test]
+async fn m2_start_on_an_alive_but_unresponsive_engine_settles_its_models_when_the_replacement_cannot_start()
+ {
+    let rig = Rig::new(&stateful_with_term_marker());
+    let port = rig.port;
+    let full = Full::start(rig, Scripted::claiming(port)).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    let before = full.runtime().await;
+    assert_eq!(before["loaded"], json!(["fake-model"]), "{before}");
+    assert!(before["used_gb"].as_f64().unwrap() > 0.0, "{before}");
+
+    // 活着、监听着、但「不答」：探测拿到 503，状态 `unavailable`，进程与句柄都还在。
+    full.rig.fake.force_status(503);
+    full.until("the engine to stop answering", |element| {
+        element["state"] == "unavailable"
+    })
+    .await;
+    let old = full.rig.pid(0);
+    assert!(pid_alive(old));
+
+    // 可执行文件没了：替代的引擎起不来。
+    std::fs::remove_file(&full.rig.fake.executable).unwrap();
+    let (status, body) = full.post_command("start").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    full.until("the replacement to be impossible", |element| {
+        element["state"] == "absent"
+    })
+    .await;
+    wait_for("the old engine to be gone", || !pid_alive(old)).await;
+    let after = full.runtime().await;
+    assert_eq!(
+        after["loaded"],
+        json!([]),
+        "the old model still counts: {after}"
+    );
+    assert_eq!(after["used_gb"].as_f64().unwrap(), 0.0, "{after}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// M5：命令的绝对截止时间，超时的命令不会事后执行
+// ---------------------------------------------------------------------------------------------
+
+/// 实例任务正忙：一个聊天停在引擎里，`restart` 的排空在等它。老引擎还握在手里（元素的 `owned` 仍是 true），所以一个 `stop` 过得了 Admin 的预检、
+/// 排进邮箱，而实例任务不去收它。它在 `command_timeout`（这里 400 毫秒）的绝对截止时间放弃，Admin 回 503 `idoris_stopping`；放开之后 `restart`
+/// 做完，引擎仍是 `ready`，日志里没有「已受理」的 stop。**这一条只证明 Admin 一层的映射**：这个窗口里被放弃的 `stop` 之后被实例任务收到时，
+/// 新引擎还没登记（`engine` 是空），它本来就只会得到 `NotOwned`；「事后不会执行」要在下一个用例的窗口里才测得出来。
+#[tokio::test]
+async fn m5_a_stop_the_busy_instance_cannot_take_in_time_is_abandoned_and_never_runs_later() {
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let mut timings = fast();
+    timings.command_timeout = Duration::from_millis(400);
+    let full = Arc::new(Full::start_with(rig, Scripted::claiming(port), timings).await);
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+
+    // 一个聊天已经到了引擎、还没答；`restart` 受理之后排空在等它，实例任务正忙。
+    full.rig.fake.hold(Hold::Chat);
+    let chats = full.rig.fake.requests_of("POST:/v1/chat/completions");
+    let in_flight = {
+        let full = full.clone();
+        tokio::spawn(async move { full.chat().await })
+    };
+    wait_for("the chat to reach the engine", || {
+        full.rig.fake.requests_of("POST:/v1/chat/completions") == chats + 1
+    })
+    .await;
+    let (status, body) = full.post_command("restart").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["owned"], true, "the old engine is still held: {body}");
+
+    // 这时的 `stop` 过了预检、排在队里，实例任务不去收它：到截止时间放弃。
+    let started = Instant::now();
+    let (status, body) = full.post_command("stop").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["type"], "idoris_stopping", "{body}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(350)
+            && started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // 放开：在途的聊天做完，`restart` 做完，引擎回到 `ready`；被放弃的 `stop` 没有被执行。
+    full.rig.fake.release(Hold::Chat);
+    assert_eq!(in_flight.await.unwrap().0, StatusCode::OK);
+    wait_for("the replacement to be ready", || {
+        full.rig.fake.launches() == 2
+            && full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(full.health.view().upstreams[0].state, UpstreamState::Ready);
+    assert_eq!(full.rig.fake.launches(), 2);
+    assert_eq!(
+        full.logged("收到命令 stop，已受理"),
+        0,
+        "the abandoned stop must not run later"
+    );
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+}
+
+/// M5 的「事后不执行」：新引擎已经起来、已经登记（`engine` 不空），实例任务正忙在账本复位的采样里（`GET /api/status` 被引擎扣着，发布的状态还是
+/// `restarting`、`owned` 还是 false，所以 Admin 的预检挡着 `stop`，这一步直接走管理器的接口：Admin 调的就是它）。一个 `stop` 排进邮箱，实例任务不去
+/// 收它，到 `command_timeout` 放弃（`Closed`）。放开之后复位做完、发布 `ready`，实例任务这才收到那个已经过期的 `stop`：不执行（回答 `Closed`），
+/// 刚换上的引擎还在、仍是 `ready`。之前命令不带截止时间，它在这时被执行，把刚换上的引擎停掉。
+#[tokio::test]
+async fn m5_a_command_abandoned_while_the_instance_was_busy_in_the_reset_is_never_executed_afterwards()
+ {
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let mut timings = fast();
+    timings.command_timeout = Duration::from_millis(400);
+    let full = Arc::new(Full::start_with(rig, Scripted::claiming(port), timings).await);
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+
+    // 新引擎起来之后，复位的那次采样（`GET /api/status`）停在引擎里：实例任务在等它，不去收命令。
+    let samples = full.rig.fake.requests_of("/api/status");
+    full.rig.fake.hold(Hold::Status);
+    let (status, body) = full.post_command("restart").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for("the reset sample to reach the replacement", || {
+        full.rig.fake.launches() == 2 && full.rig.fake.requests_of("/api/status") > samples
+    })
+    .await;
+
+    let started = Instant::now();
+    let result = full.manager.stop_upstream("omlx").await;
+    assert_eq!(result, Err(idoris_router::lifecycle::CommandError::Closed));
+    assert!(
+        started.elapsed() >= Duration::from_millis(350)
+            && started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // 放开：复位做完，引擎回到 `ready`；那个被放弃的 `stop` 没有被执行。
+    full.rig.fake.release(Hold::Status);
+    wait_for("the replacement to be ready", || {
+        full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        full.health.view().upstreams[0].state,
+        UpstreamState::Ready,
+        "the abandoned stop was executed after its caller had given up"
+    );
+    assert_eq!(full.rig.fake.launches(), 2);
+    assert!(pid_alive(full.rig.pid(1)), "the replacement was stopped");
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------------------------
+// M6：模型列表与 Admin 的模型观察带着准入时的代际，被封上或换代的端点跳过
+// ---------------------------------------------------------------------------------------------
+
+/// 一个对 `GET /v1/models` 不答、直到被放行的上游（慢卡）：到达与放行都是同步点。
+struct SlowUpstream {
+    port: u16,
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl SlowUpstream {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (arrive, go) = (reached.clone(), release.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let (arrive, go) = (arrive.clone(), go.clone());
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buffer = [0_u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    arrive.notify_one();
+                    go.notified().await;
+                    let body =
+                        br#"{"object":"list","data":[{"id":"slow-model","object":"model"}]}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+        Self {
+            port,
+            reached,
+            release,
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+/// 列表（公共的或 Admin 的）正卡在前一张慢卡上；托管的引擎这时被停掉、端口被别的东西占了；放行之后列表走到托管的那张卡：它的端点被封上了，
+/// 逐卡请求发出前被拒绝，**一个请求也没有发给占着那个端口的东西**。之前先筛整批卡、再逐卡请求，`Blocked` 被当成「没有 key」，照样发一个匿名的
+/// GET，未验证的监听者的回答还会被采纳为这张卡的模型列表。
+async fn listing_while_the_managed_card_is_stopped(uri: &str, admin: bool) {
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let slow = SlowUpstream::start().await;
+    let cards = vec![
+        upstream_card(&slow.endpoint()),
+        managed_card(&rig.endpoint()),
+    ];
+    let full =
+        Arc::new(Full::start_with_card_order(rig, Scripted::claiming(port), fast(), cards).await);
+    full.wait_open().await;
+    let listing = {
+        let full = full.clone();
+        let uri = uri.to_owned();
+        tokio::spawn(async move {
+            if admin {
+                full.admin("GET", &uri).await
+            } else {
+                full.data("GET", &uri, None).await
+            }
+        })
+    };
+    // 列表已经在第一张卡（慢卡）的请求里：状态检查与准入时的代际早已读过，托管的那张卡还没轮到。
+    slow.reached.notified().await;
+    let (status, body) = full.post_command("stop").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    full.until_gone().await;
+    let impostor = Impostor::on_port(port).await;
+    slow.release.notify_one();
+    let (status, body) = listing.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        impostor.count().await,
+        0,
+        "the stopped engine's endpoint was asked for its models: {:?}",
+        impostor.requests().await
+    );
+    impostor.assert_never_authorized().await;
+    if !admin {
+        // 慢卡的模型列出来了，托管的那张卡不可用，没有冒名者的东西。
+        let listed: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, vec!["slow-model"], "{body}");
+    }
+}
+
+/// 同上，换代而不是停止：公共列表卡在前一张慢卡上时，托管的引擎被 `restart` 到做完（新进程、新的私有 key、更新的代际）。放行之后列表走到托管的
+/// 那张卡：它是为旧引擎准入的（代际先于挑选这批卡的状态检查读），代际对不上，逐卡请求发出前被拒绝，**新引擎没有收到这一次列表的任何请求**
+/// （更没有带着它的新 key）。之前 `fetch_models_body` 不带准入代际，换了代的端点会改用新一代的凭证。监督的节拍拉到小时级，所以新引擎收到的
+/// `GET /v1/models` 只可能来自这次列表。
+#[tokio::test]
+async fn m6_the_public_model_list_never_asks_the_replacement_of_a_card_replaced_while_a_slower_card_was_being_listed()
+ {
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let slow = SlowUpstream::start().await;
+    let cards = vec![
+        upstream_card(&slow.endpoint()),
+        managed_card(&rig.endpoint()),
+    ];
+    let full = Arc::new(
+        Full::start_with_card_order(rig, Scripted::claiming(port), supervision_paused(), cards)
+            .await,
+    );
+    full.wait_open().await;
+    let listing = {
+        let full = full.clone();
+        tokio::spawn(async move { full.data("GET", "/v1/models", None).await })
+    };
+    // 列表已经在第一张卡（慢卡）的请求里：准入时的代际早已读过，托管的那张卡还没轮到。
+    slow.reached.notified().await;
+    let (status, body) = full.post_command("restart").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for("the replacement to be ready", || {
+        full.rig.fake.launches() == 2
+            && full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    let asked = full.rig.fake.requests_of("/v1/models");
+    slow.release.notify_one();
+    let (status, body) = listing.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        full.rig.fake.requests_of("/v1/models"),
+        asked,
+        "the listing admitted for the old engine asked the new one (with the new engine's key)"
+    );
+    let listed: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, vec!["slow-model"], "{body}");
+}
+
+#[tokio::test]
+async fn m6_the_public_model_list_never_asks_a_card_stopped_while_a_slower_card_was_being_listed() {
+    listing_while_the_managed_card_is_stopped("/v1/models", false).await;
+}
+
+#[tokio::test]
+async fn m6_the_admin_model_observation_never_asks_a_card_stopped_while_a_slower_card_was_being_observed()
+ {
+    listing_while_the_managed_card_is_stopped("/admin/api/v1/models", true).await;
 }

@@ -10,6 +10,13 @@ description = "Upstream inference clients: local RuntimeAdapter implementations 
 [lints]
 workspace = true
 
+[features]
+# 测试支撑（IDORIS-CORE S6，Codex 终审 L3）：把 `omlx::key::release_endpoint`（撤销一个端点的登记，让它回到 §2.9 的回退链）与
+# `forget_endpoint`（把条目整条删掉，代际也回到 0：测试清理用，端口会被复用）放出来给
+# 别的 crate 的测试清理进程全局的登记表用。生产代码里没有任何路径能把一个托管的端点交还给回退链，所以这个函数不在默认的公开接口里；
+# 本 crate 自己的集成测试与 `idoris-router` 的测试经各自的 dev-dependencies 打开它。
+test-support = []
+
 [dependencies]
 idoris-backend = { workspace = true }
 idoris-contracts = { workspace = true }
@@ -55,6 +62,8 @@ nix = { workspace = true }
 rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
+# 本 crate 的集成测试要用 `test-support` 特性（`release_endpoint`、`forget_endpoint`）：dev-dependency 里指回自己，只在测试构建里打开它。
+idoris-upstream = { path = ".", features = ["test-support"] }
 # `io-util` (for `AsyncWriteExt`) is test-only: the raw-TCP regression test
 # for the body-read timeout (see `omlx::http`'s tests) writes a partial
 # HTTP response by hand instead of going through `reqwest`/`wiremock`,

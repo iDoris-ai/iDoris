@@ -1,5 +1,11 @@
 //! Lazy, serialized admin sessions. Only the main key can log in; keys,
 //! cookies, response bodies and reqwest errors never enter diagnostics.
+//!
+//! **A cookie belongs to the engine generation that issued it** (IDORIS-CORE S6, Codex final review H4): the
+//! session is cached together with the endpoint generation it was obtained under, and **every** admin send
+//! (a cached cookie's reuse included) is authorized right before it goes out ([`OmlxAdapter::credential`]):
+//! work admitted for an engine that has since been replaced is refused before anything is written, and a
+//! cookie issued by one engine is dropped and re-obtained rather than sent to the next one.
 
 use idoris_backend::BackendError;
 use reqwest::header::{COOKIE, HeaderValue, SET_COOKIE};
@@ -7,6 +13,13 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::{OmlxAdapter, upstream_error};
+
+/// A logged-in admin session: the cookie and the engine generation it was issued under (`None` = the adapter has no
+/// notion of generations: a fixed key).
+pub(super) struct AdminSession {
+    cookie: HeaderValue,
+    pub(super) generation: Option<u64>,
+}
 
 #[derive(Debug)]
 pub(super) enum AdminRequestError {
@@ -23,15 +36,18 @@ impl AdminRequestError {
 }
 
 impl OmlxAdapter {
-    async fn admin_login(&self) -> Result<HeaderValue, AdminRequestError> {
-        let key = self
-            .api_key()
-            .map_err(AdminRequestError::Definite)?
-            .ok_or_else(|| {
-                AdminRequestError::Definite(upstream_error(
-                    "oMLX admin login requires the main API key",
-                ))
-            })?;
+    /// Log in. This is a send of its own: it is authorized (generation, blocked endpoint, the listener re-verified)
+    /// right before the main key goes out, and the session it returns remembers the generation it was issued under.
+    async fn admin_login(&self) -> Result<AdminSession, AdminRequestError> {
+        let credential = self
+            .credential()
+            .await
+            .map_err(AdminRequestError::Definite)?;
+        let key = credential.key().ok_or_else(|| {
+            AdminRequestError::Definite(upstream_error(
+                "oMLX admin login requires the main API key",
+            ))
+        })?;
         let response = self
             .client
             .post(format!("{}/admin/api/login", self.base_url))
@@ -68,7 +84,10 @@ impl OmlxAdapter {
                 "oMLX admin login was not successful",
             )));
         }
-        Ok(cookie)
+        Ok(AdminSession {
+            cookie,
+            generation: credential.generation,
+        })
     }
 
     /// Hold the mutex through refresh and dispatch so concurrent callers
@@ -93,17 +112,48 @@ impl OmlxAdapter {
     ) -> Result<Value, AdminRequestError> {
         let mut session = self.admin_session.lock().await;
         for attempt in 0..2 {
+            // Authorize this send — a reuse of a cached cookie is a send like any other: the generation it was admitted
+            // under, a blocked endpoint, the listener (re-verified now) are all checked before the cookie goes out.
+            let mut credential = self
+                .credential()
+                .await
+                .map_err(AdminRequestError::Definite)?;
+            // A cookie belongs to the engine generation that issued it: it is never sent to the next engine.
+            if session
+                .as_ref()
+                .is_some_and(|cached| cached.generation != credential.generation)
+            {
+                *session = None;
+            }
             if session.is_none() {
                 *session = Some(self.admin_login().await?);
+                // The login took a round trip and the request that follows is a send of its own: authorize it again,
+                // and refuse if the engine was replaced meanwhile (the session just issued is the old engine's).
+                credential = self
+                    .credential()
+                    .await
+                    .map_err(AdminRequestError::Definite)?;
+                if session
+                    .as_ref()
+                    .is_some_and(|issued| issued.generation != credential.generation)
+                {
+                    *session = None;
+                    return Err(AdminRequestError::Definite(upstream_error(
+                        "the oMLX engine was replaced while its admin session was being established: the request was not sent",
+                    )));
+                }
             }
-            let cookie = session.as_ref().ok_or_else(|| {
-                AdminRequestError::Unknown(upstream_error("oMLX admin session unavailable"))
-            })?;
+            let cookie = session
+                .as_ref()
+                .map(|session| session.cookie.clone())
+                .ok_or_else(|| {
+                    AdminRequestError::Unknown(upstream_error("oMLX admin session unavailable"))
+                })?;
             let mut request = self
                 .client
                 .request(method.clone(), format!("{}{path}", self.base_url))
                 .timeout(self.call_timeout)
-                .header(COOKIE, cookie.clone());
+                .header(COOKIE, cookie);
             if let Some(body) = body {
                 request = request.json(body);
             }

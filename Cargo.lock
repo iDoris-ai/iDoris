@@ -1264,6 +1264,7 @@ dependencies = [
  "genai",
  "idoris-backend",
  "idoris-contracts",
+ "idoris-upstream",
  "nix",
  "percent-encoding",
  "reqwest",

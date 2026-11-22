@@ -128,7 +128,7 @@ mod tests {
     /// for the endpoint, an adapter for any other card sends none.
     #[tokio::test]
     async fn only_a_card_the_proxy_would_give_a_key_gets_an_adapter_that_carries_one() {
-        use crate::omlx::key::{EndpointKey, govern_endpoint, release_endpoint};
+        use crate::omlx::key::{EndpointKey, forget_endpoint, govern_endpoint};
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -169,7 +169,7 @@ mod tests {
             );
             adapter.list().await.unwrap();
         }
-        release_endpoint(&endpoint);
+        forget_endpoint(&endpoint);
 
         let sent = authorizations(&server).await;
         assert_eq!(sent.len(), 3);

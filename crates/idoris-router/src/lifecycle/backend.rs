@@ -17,7 +17,7 @@ use idoris_upstream::omlx::engine::{
     BASE_PATH_ENV, OMLX_TEAM_ID, OmlxRecipe, base_path_in, prepare_base_dir,
 };
 use idoris_upstream::omlx::key::{
-    EndpointKey, block_endpoint, govern_endpoint, resolve_omlx_api_key_for,
+    EndpointGuard, EndpointKey, block_endpoint, govern_endpoint_guarded, resolve_omlx_api_key_for,
 };
 
 use crate::readiness::UpstreamReason;
@@ -51,11 +51,13 @@ pub trait EngineBackend: Send + Sync + std::fmt::Debug {
     /// 这个 endpoint 上的加载围栏文件（`None` = 这种引擎没有围栏）。必须与它的适配器用的是同一个路径。
     fn fence_path(&self, state_dir: &Path, endpoint: &str) -> Option<PathBuf>;
 
-    /// 登记：这个 endpoint 上的引擎是 iDoris 自己拉起的，发往它的请求只用这个私有 key。
-    fn govern_private(&self, endpoint: &str, key: &EngineKey);
+    /// 登记：这个 endpoint 上的引擎是 iDoris 自己拉起的，发往它的请求只用这个私有 key。`guard` 一起登记：之后发往这个 endpoint 的
+    /// 每个请求，在发出之前都要让它**重新**确认监听这个端口的还是这个引擎（IDORIS-CORE S6，Codex 终审 H1）。
+    fn govern_private(&self, endpoint: &str, key: &EngineKey, guard: Arc<dyn EndpointGuard>);
 
-    /// 登记：这个 endpoint 上是外部引擎。`settings_key_verified` 为 true 时，才可以把读来的 `settings.json` key 发给它。
-    fn govern_external(&self, endpoint: &str, settings_key_verified: bool);
+    /// 登记：这个 endpoint 上是通过了属主校验的外部引擎，可以把读来的 `settings.json` key 发给它。`guard` 同上：每个请求发出之前重新
+    /// 确认监听者还是校验通过时的那个（pid 加启动时间都一样）。没有通过校验的不登记成外部，是 [`Self::block`]。
+    fn govern_external(&self, endpoint: &str, guard: Arc<dyn EndpointGuard>);
 
     /// **封上**这个 endpoint：什么凭证都不发（私有 key、环境变量的 key、`settings.json` 的 key 都不发），直到下一个监听者通过校验、
     /// 被登记成私有或外部的口径（IDORIS-CORE S6，Codex 预审 3）。托管的 endpoint 在管理器启动时就先封上；引擎停了、正在被替换、
@@ -192,16 +194,21 @@ impl EngineBackend for OmlxBackend {
         idoris_upstream::omlx::load_fence_path_in(state_dir, endpoint).ok()
     }
 
-    fn govern_private(&self, endpoint: &str, key: &EngineKey) {
-        govern_endpoint(endpoint, EndpointKey::Private(key.expose().to_owned()));
+    fn govern_private(&self, endpoint: &str, key: &EngineKey, guard: Arc<dyn EndpointGuard>) {
+        govern_endpoint_guarded(
+            endpoint,
+            EndpointKey::Private(key.expose().to_owned()),
+            Some(guard),
+        );
     }
 
-    fn govern_external(&self, endpoint: &str, settings_key_verified: bool) {
-        govern_endpoint(
+    fn govern_external(&self, endpoint: &str, guard: Arc<dyn EndpointGuard>) {
+        govern_endpoint_guarded(
             endpoint,
             EndpointKey::External {
-                settings_key_verified,
+                settings_key_verified: true,
             },
+            Some(guard),
         );
     }
 
@@ -329,8 +336,14 @@ mod tests {
         fn fence_path(&self, _state_dir: &Path, _endpoint: &str) -> Option<PathBuf> {
             None
         }
-        fn govern_private(&self, _endpoint: &str, _key: &EngineKey) {}
-        fn govern_external(&self, _endpoint: &str, _settings_key_verified: bool) {}
+        fn govern_private(
+            &self,
+            _endpoint: &str,
+            _key: &EngineKey,
+            _guard: Arc<dyn EndpointGuard>,
+        ) {
+        }
+        fn govern_external(&self, _endpoint: &str, _guard: Arc<dyn EndpointGuard>) {}
         fn block(&self, _endpoint: &str) {}
         fn current_key(&self, _endpoint: &str) -> Option<String> {
             None

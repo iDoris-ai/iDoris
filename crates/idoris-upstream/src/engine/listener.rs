@@ -12,6 +12,8 @@
 //! 2. 每个 pid 的 uid 都等于 iDoris 的有效 uid（别的用户的进程不是我们的引擎）；
 //! 3. 每个 pid 正在运行的代码的签名团队都等于要求的那个（oMLX：`PSK5Q5T46L`；签名无效、没有签名、ad-hoc 都不算）；
 //! 4. 校验通过之前不发 key；校验结果按 **pid + 启动时间** 缓存，进程换了（pid 变了，或同一个 pid 的启动时间变了）就重查；
+//!    端口上出现过监听的空档（这个 pid 不在监听者里了）也废弃它的记录：启动时间只到秒（`ps -o lstart`），同一秒内被回收的同一个
+//!    pid 再绑上这个端口，（pid、启动时间）一模一样，不能靠缓存放过它（IDORIS-CORE S6，Codex 终审 L1）；
 //! 5. 读不出来（工具不存在、超时）**不是**通过，也不是被拒：[`ListenerVerdict::Unverifiable`]，调用方按「没有 key」处理。
 //!
 //! 「校验与发送之间的连接复用被关闭」不在这里：它是调用方发请求的方式（每个带 key 的请求都用新开的连接，
@@ -159,6 +161,17 @@ impl ListenerVerifier {
             Ok(pids) => pids,
             Err(error) => return ListenerVerdict::Unverifiable(error),
         };
+        // 监听上的空档废弃通过记录（IDORIS-CORE S6，Codex 终审 L1）：`ps` 给的启动时间只到秒，同一秒内被回收、又绑上这个端口的
+        // 同一个 pid，读出来的（pid、启动时间）与之前通过校验的那个一模一样，缓存会跳过 uid 与签名团队的复核。端口上没有这个
+        // pid 的那一刻，它的通过记录就不再作数：它之后再出现，要重新过 uid 与签名团队。
+        {
+            let mut verified = self.verified.lock().unwrap_or_else(PoisonError::into_inner);
+            if pids.is_empty() {
+                verified.clear();
+            } else {
+                verified.retain(|pid, _| pids.contains(pid));
+            }
+        }
         if pids.is_empty() {
             return ListenerVerdict::NoListener;
         }
@@ -537,6 +550,69 @@ mod tests {
         scripted.procs.lock().unwrap().insert(43, Proc::ok());
         assert!(verifier.check(19731).await.is_verified());
         assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Codex final review L1: `ps` gives the start time to the second. A pid recycled within the same second and bound
+    /// to the port again reads exactly like the process that passed before; the pass must not survive a gap in the
+    /// port's listeners.
+    #[tokio::test]
+    async fn a_pass_does_not_survive_a_gap_in_the_ports_listeners() {
+        let (verifier, scripted) = rig(Scripted::default()
+            .listening(19731, &[42])
+            .process(42, Proc::ok()));
+        assert!(verifier.check(19731).await.is_verified());
+        assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 1);
+        // A listener that is still there keeps its pass.
+        assert!(verifier.check(19731).await.is_verified());
+        assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 1);
+        // The port is empty for a moment (the process left)...
+        scripted.listeners.lock().unwrap().insert(19731, Ok(vec![]));
+        assert_eq!(verifier.check(19731).await, ListenerVerdict::NoListener);
+        // ... and a process with the very same pid and the very same start time (the second did not change) is there
+        // again. It is checked from scratch, and this one is unsigned.
+        scripted
+            .listeners
+            .lock()
+            .unwrap()
+            .insert(19731, Ok(vec![42]));
+        {
+            let mut procs = scripted.procs.lock().unwrap();
+            let proc = procs.get_mut(&42).unwrap();
+            proc.team = Ok(None);
+            proc.reads = 0;
+        }
+        assert_eq!(
+            verifier.check(19731).await,
+            ListenerVerdict::Rejected(ListenerRejection::NoTeam { pid: 42 })
+        );
+        assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A pid that is no longer among the port's listeners loses its pass even while others still listen.
+    #[tokio::test]
+    async fn a_pid_that_left_the_port_loses_its_pass_while_the_others_keep_theirs() {
+        let (verifier, scripted) = verifier_two_good();
+        assert!(verifier.check(19731).await.is_verified());
+        assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 2);
+        scripted
+            .listeners
+            .lock()
+            .unwrap()
+            .insert(19731, Ok(vec![42]));
+        assert!(verifier.check(19731).await.is_verified());
+        // 42 kept its pass: no new signature read; 41's was dropped.
+        assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 2);
+        scripted
+            .listeners
+            .lock()
+            .unwrap()
+            .insert(19731, Ok(vec![41, 42]));
+        assert!(verifier.check(19731).await.is_verified());
+        assert_eq!(
+            scripted.team_calls.load(Ordering::SeqCst),
+            3,
+            "41 was checked again"
+        );
     }
 
     #[tokio::test]

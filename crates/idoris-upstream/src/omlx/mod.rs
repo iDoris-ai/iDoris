@@ -207,8 +207,22 @@ pub struct OmlxAdapter {
     load_timeout: Option<Duration>,
     chat_timeout: Duration,
     client: reqwest::Client,
-    admin_session: tokio::sync::Mutex<Option<reqwest::header::HeaderValue>>,
+    admin_session: tokio::sync::Mutex<Option<admin::AdminSession>>,
     load_fence_path: Option<std::path::PathBuf>,
+}
+
+/// 一个请求的凭证（[`OmlxAdapter::credential`]）：key（没有 = 不带），以及授权那一刻端点的代际。持有它直到响应读完：per-request 模式下它
+/// 同时是端点上的一个在途操作（引擎管理器排空时等它，IDORIS-CORE S6，Codex 终审 M1）。
+struct Credential {
+    key: Option<String>,
+    generation: Option<u64>,
+    _authorization: Option<key::Authorization>,
+}
+
+impl Credential {
+    fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
 }
 
 impl OmlxAdapter {
@@ -278,44 +292,58 @@ impl OmlxAdapter {
         self.api_key.as_deref()
     }
 
-    /// The credential for the request about to be made — the **one place** this adapter resolves one.
+    /// The authorization for the request about to be made — the **one place** this adapter obtains a credential, and it is
+    /// awaited **right before every send** (IDORIS-CORE S6; Codex final review H1, owner decision 2026-11-22).
     ///
-    /// In per-request mode the request's engine generation (bound by the Supervisor at admission, see
-    /// [`idoris_backend::generation`]) is checked against the endpoint's current one in the same read that
-    /// yields the key: work admitted for an engine that has since been replaced is **refused**, and so is
-    /// anything aimed at a blocked endpoint — nothing is sent, so neither the new engine's credentials nor
-    /// the request body (a prompt) can reach a process the work was not admitted for. An adapter with a
-    /// fixed key is unchanged.
-    fn api_key(&self) -> Result<Option<String>, BackendError> {
+    /// In per-request mode ([`key::authorize_omlx_request`]): the request's engine generation (bound by the Supervisor
+    /// at admission, see [`idoris_backend::generation`]) is checked against the endpoint's current one; work admitted
+    /// for an engine that has since been replaced is **refused**, and so is anything aimed at a blocked endpoint; and
+    /// the engine manager's guard **re-verifies the listener** on this very task, immediately before the send. Nothing
+    /// is sent on a refusal, so neither the new engine's credentials nor the request body (a prompt) can reach a
+    /// process the work was not admitted for. The authorization is also an in-flight operation the engine manager's
+    /// drain waits for, so hold the returned value until the response has been read. An adapter with a fixed key is
+    /// unchanged.
+    async fn credential(&self) -> Result<Credential, BackendError> {
         if !self.per_request_key {
-            return Ok(self.api_key.clone());
+            return Ok(Credential {
+                key: self.api_key.clone(),
+                generation: None,
+                _authorization: None,
+            });
         }
-        key::resolve_omlx_api_key_checked(&self.base_url, idoris_backend::pinned_generation())
-            .map_err(|refusal| upstream_error(refusal.to_string()))
+        let authorization =
+            key::authorize_omlx_request(&self.base_url, idoris_backend::pinned_generation())
+                .await
+                .map_err(|refusal| upstream_error(refusal.to_string()))?;
+        Ok(Credential {
+            key: authorization.key().map(str::to_owned),
+            generation: Some(authorization.generation()),
+            _authorization: Some(authorization),
+        })
     }
 
     // Thin wrappers binding `http`'s free functions to this instance's
     // client/base_url/api_key/call_timeout — every call site below reads
     // as just "GET/POST/PUT `path`" instead of repeating all four fields.
     async fn get(&self, path: &str) -> Result<serde_json::Value, BackendError> {
-        let key = self.api_key()?;
+        let credential = self.credential().await?;
         http::get_json(
             &self.client,
             &self.base_url,
             path,
-            key.as_deref(),
+            credential.key(),
             self.call_timeout,
         )
         .await
     }
 
     async fn post(&self, path: &str) -> Result<(), BackendError> {
-        let key = self.api_key()?;
+        let credential = self.credential().await?;
         http::post_empty(
             &self.client,
             &self.base_url,
             path,
-            key.as_deref(),
+            credential.key(),
             self.call_timeout,
         )
         .await
@@ -327,12 +355,12 @@ impl OmlxAdapter {
         body: &serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, BackendError> {
-        let key = self.api_key()?;
+        let credential = self.credential().await?;
         http::post_and_parse(
             &self.client,
             &self.base_url,
             path,
-            key.as_deref(),
+            credential.key(),
             timeout,
             body,
         )
@@ -373,16 +401,18 @@ impl OmlxAdapter {
     /// [`BackendError::LoadUnconfirmed`]. Once loaded state is confirmed,
     /// deterministic policy failures use `LoadPostconditionFailed`.
     pub async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
-        let key = self.api_key()?;
-        http::post_load(
-            &self.client,
-            &self.base_url,
-            &self.encoded_path("/v1/models/", id, "/load"),
-            key.as_deref(),
-            self.load_timeout.unwrap_or(self.call_timeout),
-            id,
-        )
-        .await?;
+        {
+            let credential = self.credential().await?;
+            http::post_load(
+                &self.client,
+                &self.base_url,
+                &self.encoded_path("/v1/models/", id, "/load"),
+                credential.key(),
+                self.load_timeout.unwrap_or(self.call_timeout),
+                id,
+            )
+            .await?;
+        }
         let confirmed = if policy.map(|p| p.mode) == Some(LoadMode::Resident) {
             self.pin(id).await
         } else {
@@ -820,7 +850,7 @@ mod tests {
             authorization_of(&server, 1).await.as_deref(),
             Some("Bearer owned")
         );
-        key::release_endpoint(&endpoint);
+        key::forget_endpoint(&endpoint);
     }
 
     // Per-failure-mode coverage (4xx/5xx/timeout/malformed body) already

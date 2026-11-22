@@ -9,7 +9,7 @@ use idoris_backend::{BackendError, ChatMessage, ChatRequest, RuntimeAdapter};
 use idoris_contracts::LoadPolicy;
 use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode};
 use idoris_upstream::omlx::key::{
-    EndpointKey, block_endpoint, endpoint_generation, govern_endpoint, release_endpoint,
+    EndpointKey, block_endpoint, endpoint_generation, forget_endpoint, govern_endpoint,
 };
 use idoris_upstream::{OmlxAdapter, OmlxAdapterConfig};
 use tokio_util::sync::CancellationToken;
@@ -117,7 +117,7 @@ async fn work_admitted_for_a_replaced_engine_sends_nothing_to_the_new_one() {
             "Bearer second-engine"
         );
     }
-    release_endpoint(&endpoint);
+    forget_endpoint(&endpoint);
 }
 
 #[tokio::test]
@@ -146,7 +146,7 @@ async fn a_blocked_endpoint_is_sent_nothing_at_all() {
     govern_endpoint(&endpoint, EndpointKey::Private("next-engine".into()));
     adapter.list().await.unwrap();
     assert_eq!(received(&server).await, 1);
-    release_endpoint(&endpoint);
+    forget_endpoint(&endpoint);
 }
 
 #[tokio::test]
@@ -165,5 +165,5 @@ async fn an_adapter_with_a_fixed_key_has_no_generation_and_ignores_the_registry(
     // Not per-request: the construction-time key is what it always was, bound generation or not.
     scoped(Some(0), fixed.list()).await.unwrap();
     assert_eq!(received(&server).await, 1);
-    release_endpoint(&endpoint);
+    forget_endpoint(&endpoint);
 }

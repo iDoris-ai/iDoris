@@ -13,9 +13,11 @@ use idoris_backend::BackendError;
 use idoris_backend::load_fence::LoadFence;
 use idoris_upstream::engine::{
     DiscoveryError, EngineError, EngineInstance, EngineKey, EngineLaunch, EngineLaunchSpec,
-    EngineProbe, EngineRecipe, LaunchError, ListenerIdentity, ListenerVerdict, ListenerVerifier,
-    OwnedEngine, Recovery, fresh_connection_client,
+    EngineProbe, EngineRecipe, ExternalListenerGuard, LaunchError, ListenerIdentity,
+    ListenerVerdict, ListenerVerifier, OwnedEngine, OwnedListenerGuard, Recovery,
+    fresh_connection_client,
 };
+use idoris_upstream::omlx::key::{EndpointGuard, endpoint_flights};
 use tokio::sync::{mpsc, oneshot};
 
 use super::backoff::{CrashWindow, restart_delay};
@@ -43,6 +45,16 @@ pub(super) struct Request {
     pub reply: Option<oneshot::Sender<Result<(), CommandError>>>,
     /// 入队时盖的章（[`Shared::next_seq`]，从 1 起；`GiveUp`、`Shutdown` 是 0）：见 [`Actor::restart_cover`]。
     pub seq: u64,
+    /// 命令的绝对截止时间（`Timings::command_timeout`，只有 `start`、`stop`、`restart` 有；IDORIS-CORE S6，Codex 终审 M5）：到点还没被
+    /// 收下就当它没有发生过（回答 `Closed`、不执行）。调用方在同一个截止时间放弃，所以一个超时的、有副作用的命令不会在它放弃之后才被执行。
+    pub deadline: Option<Instant>,
+}
+
+impl Request {
+    fn expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
 }
 
 /// 操作员发起、还没做完的一次操作。从受理一直到引擎就绪（或不会再往前走）。
@@ -115,11 +127,42 @@ enum WaitFailure {
 struct Owned {
     engine: OwnedEngine,
     key: Option<EngineKey>,
+    /// 登记私有 key 时一起交给登记表的校验守卫：发往这个端点的每个请求，发出之前都让它重新确认监听这个端口的还是这个引擎的进程
+    /// （Codex 终审 H1）。**整个引擎的一生用同一个对象**：重新登记同一个口径时守卫是同一个，登记表的代际不动。
+    guard: Arc<dyn EndpointGuard>,
+}
+
+impl Owned {
+    fn new(
+        engine: OwnedEngine,
+        key: Option<EngineKey>,
+        inspector: Arc<dyn idoris_upstream::engine::ProcessInspector>,
+    ) -> Self {
+        let guard: Arc<dyn EndpointGuard> = Arc::new(OwnedListenerGuard::new(
+            inspector,
+            engine.pid(),
+            engine.port(),
+        ));
+        Self { engine, key, guard }
+    }
 }
 
 /// 接管的外部引擎：监听者通过了属主校验。
 struct External {
     verifier: ListenerVerifier,
+    /// 校验通过的监听者（pid 加启动时间）与据此建的守卫：发往这个端点的每个请求，发出之前都让它重新确认监听者还是它们。
+    guard: Arc<dyn EndpointGuard>,
+}
+
+impl External {
+    fn new(verifier: ListenerVerifier, port: u16, listeners: &[ListenerIdentity]) -> Self {
+        let guard: Arc<dyn EndpointGuard> = Arc::new(ExternalListenerGuard::new(
+            verifier.clone(),
+            port,
+            listeners.to_vec(),
+        ));
+        Self { verifier, guard }
+    }
 }
 
 /// 一个引擎**进程**的身份：Supervisor 的账本是对着它建的（放行时采样一次；之后每次换代复位时再采样）。身份变了就是换了一个
@@ -355,9 +398,17 @@ impl Actor {
                             command: Command::Shutdown { stop_engine: false },
                             reply: None,
                             seq: 0,
+                            deadline: None,
                         });
                         return true;
                     };
+                    // 调用方已经在这个截止时间放弃了：当作没有发生过（Codex 终审 M5）。
+                    if request.expired() {
+                        if let Some(reply) = request.reply {
+                            let _ = reply.send(Err(CommandError::Closed));
+                        }
+                        continue;
+                    }
                     match self.immediate_answer(&request) {
                         Some(result) => {
                             if let Some(reply) = request.reply {
@@ -496,18 +547,36 @@ impl Actor {
         }
     }
 
-    /// 门已经关了：等已经准入的加载、聊天做完，至多 [`super::backoff::Timings::drain_timeout`]。引擎此刻还活着，它们拿着
-    /// 它们准入时的凭证照常跑完。`true` = 排空了（没有 Supervisor、读不出来也算：没有什么可等的）；`false` = 到点还有在途的。
+    /// 门已经关了：等已经准入的操作做完，至多 [`super::backoff::Timings::drain_timeout`]。引擎此刻还活着，它们拿着它们准入时的凭证照常
+    /// 跑完。等两样（Codex 终审 M1）：Supervisor 的在途（加载、卸载、聊天、**列表**），和这个端点上登记的在途操作（`endpoint_flights`：
+    /// resident 的转发、后台预热、模型列表的读取、仍在输出的流式响应体……凡是经 `authorize_omlx_request` 发出去的请求，没有
+    /// Supervisor 的托管卡也一样）。`true` = 排空了（Supervisor 读不出来也算：没有什么可等的）；`false` = 到点还有在途的。
+    ///
+    /// **一个绝对的截止时间管每一次读**（Codex 终审 M5）：Supervisor 忙着的时候一次 `is_quiescent` 的 RPC 本身就可能等，不能到它返回之后才
+    /// 发现已经过了截止时间。
     async fn drain(&self) -> bool {
-        let Some(bound) = self.supervisor() else {
-            return true;
-        };
         let deadline = Instant::now() + self.timings().drain_timeout;
         let pause = self.timings().ready_initial_interval;
         loop {
-            match bound.is_quiescent().await {
-                Ok(true) | Err(_) => return true,
-                Ok(false) => {}
+            let supervisor_quiet = match self.supervisor() {
+                None => true,
+                Some(bound) => {
+                    match tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        bound.is_quiescent(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(quiet)) => quiet,
+                        // Supervisor 没了（读不出来）：没有什么可等的。
+                        Ok(Err(_)) => true,
+                        // 读它的这一次 RPC 本身就超过了截止时间。
+                        Err(_elapsed) => return false,
+                    }
+                }
+            };
+            if supervisor_quiet && endpoint_flights(&self.plan.endpoint) == 0 {
+                return true;
             }
             let now = Instant::now();
             if now >= deadline {
@@ -544,10 +613,18 @@ impl Actor {
 
     /// 在 `current`（被打断的步骤）这个上下文里处理一个命令，返回下一步。命令不改变任何东西时返回 `current`。
     async fn on_command(&mut self, request: Request, current: Step) -> Step {
+        // 在邮箱里排队排到过期的命令不执行（它的调用方已经放弃了）：回答 `Closed`，什么也不改（Codex 终审 M5）。
+        if request.expired() {
+            if let Some(reply) = request.reply {
+                let _ = reply.send(Err(CommandError::Closed));
+            }
+            return current;
+        }
         let Request {
             command,
             reply,
             seq,
+            deadline: _,
         } = request;
         // 入队时落在一次 `start`、`restart` 操作之内（或之前）：见 [`Actor::restart_cover`]。
         let covered = seq != 0 && seq <= self.restart_cover;
@@ -646,7 +723,11 @@ impl Actor {
                     self.publish_uncounted(UpstreamState::Restarting, None);
                     answer(Ok(()));
                     // 没能确认旧进程消失时也往下走：`attempt()` 开头的孤儿接管按既有的规矩处理（记录还在，围栏没清）。
-                    let _ = self.retire_engine().await;
+                    // 旧进程确认消失了：它的模型占着的共享容量现在就放掉（Codex 终审 M2）。新引擎要是起不来（找不到可执行文件、
+                    // 起不来），账本若还留着旧进程的占用，别的上游申请同一份容量就一直被它挡着；门保持关着，新进程就绪之后再单独采样。
+                    if self.retire_engine().await {
+                        self.forget_engine().await;
+                    }
                     self.window.clear();
                     Step::Attempt
                 } else {
@@ -683,7 +764,14 @@ impl Actor {
         } else {
             self.publish(UpstreamState::Starting, None);
         }
-        match self.attempt().await {
+        let outcome = self.attempt().await;
+        // 默认拒绝（Codex 终审 H2）：启动决策不论怎么走出来（终局的失败、重判耗尽、放弃、被命令打断、一次运行期失败），只要没有落到
+        // 「引擎就绪、有持续的监督」上，端点就封上。接管外部引擎时，校验通过的监听者已经被登记成「外部」（为了带 key 探测它），带 key 的
+        // 探测没有结论、被打断、要退避重来……这些出口之后都没有监督去重新校验端口，那条登记不能留着。
+        if !matches!(outcome, Attempt::Ready) && self.engine.is_none() && self.external.is_none() {
+            self.plan.backend.block(&self.plan.endpoint);
+        }
+        match outcome {
             Attempt::Ready => {
                 self.redecide_since = None;
                 match self.sync_supervisor().await {
@@ -693,9 +781,13 @@ impl Actor {
                         Step::Supervise
                     }
                     // Supervisor 的账本没能跟上：这个引擎不能放行，停掉它（`sync_supervisor` 已经停了），按一次失败算，退避之后重来。
-                    Synced::Retry => self.fail(Some(UpstreamReason::StartupLatched)).await,
+                    Synced::Retry => {
+                        self.revoke_external_authorization();
+                        self.fail(Some(UpstreamReason::StartupLatched)).await
+                    }
                     // Supervisor 没有了：不会自己好，要重启 iDoris。
                     Synced::Permanent => {
+                        self.revoke_external_authorization();
                         self.publish_terminal(
                             UpstreamState::Failed,
                             Some(UpstreamReason::StartupLatched),
@@ -707,10 +799,7 @@ impl Actor {
             }
             Attempt::Terminal { state, reason } => {
                 self.redecide_since = None;
-                // 默认拒绝：终局的失败之后端点保持封上（Codex 审计 H1）。接管外部引擎时，校验通过的监听者已经被登记成「外部」
-                // （为了带 key 探测它），之后它要 key 而没有、key 被拒、围栏还在……这个上游从此不服务，也没有监督去重新校验端口：
-                // 不能让那个口径一直留着，端口上之后出现的任何东西都按它拿到 `settings.json` 的 key。
-                self.plan.backend.block(&self.plan.endpoint);
+                // 终局的失败之后端点保持封上（Codex 审计 H1）：上面那条对每一条非 `Ready` 的出口统一做了。
                 self.publish_terminal(state, reason);
                 self.finish_op();
                 Step::Idle(Idle::Terminal)
@@ -737,6 +826,7 @@ impl Actor {
         let started = *self.redecide_since.get_or_insert_with(Instant::now);
         if started.elapsed() >= self.timings().startup_timeout {
             self.redecide_since = None;
+            // 重判耗尽直接发布终态，不经 `Attempt::Terminal`；端点已经在 `attempt_cycle` 里随这一轮的出口封上了（Codex 终审 H2）。
             self.publish_terminal(
                 UpstreamState::Unavailable,
                 Some(UpstreamReason::StartupTimeout),
@@ -804,8 +894,9 @@ impl Actor {
         // 不丢弃一个还活着的引擎句柄：丢弃就是 SIGKILL，绕过 `stop_engine`（优雅停止、封上端点），也没有人知道引擎换了。
         // 对一个还活着却不答的自有引擎 `start`（`unavailable`，G3）走到这里时它还在：走完整的退役路径（关门、排空、停进程、封上
         // 端点），再重新走启动决策。
-        if self.engine.is_some() {
-            let _ = self.retire_engine().await;
+        if self.engine.is_some() && self.retire_engine().await {
+            // 同 `restart`：旧进程确认消失，它占着的共享容量现在就放掉（Codex 终审 M2）。
+            self.forget_engine().await;
         }
         self.external = None;
         self.adopted_listeners = None;
@@ -834,7 +925,11 @@ impl Actor {
                         break None;
                     }
                     let key = engine.api_key().cloned();
-                    break Some(Owned { engine, key });
+                    break Some(Owned::new(
+                        engine,
+                        key,
+                        self.shared.config.inspector.clone(),
+                    ));
                 }
                 Ok(Recovery::Starting(engine)) => {
                     // 上一个 iDoris 在引擎启动途中被杀：它没有就绪过，什么都没加载，停掉重拉。
@@ -944,8 +1039,8 @@ impl Actor {
             };
         };
         let verifier = ListenerVerifier::new(self.shared.config.inspector.clone(), policy);
-        match verifier.check(self.plan.port).await {
-            ListenerVerdict::Verified { listeners } => self.adopted_listeners = Some(listeners),
+        let listeners = match verifier.check(self.plan.port).await {
+            ListenerVerdict::Verified { listeners } => listeners,
             ListenerVerdict::NoListener => {
                 // 探测与校验之间监听者没了：回到决策的开头重来（不是引擎失败：没有哪个我们拉起的进程出了问题）。
                 return Attempt::Redecide;
@@ -969,9 +1064,12 @@ impl Actor {
                     reason: Some(UpstreamReason::PortInUse),
                 };
             }
-        }
-        // 通过：`settings.json` 的 key 现在可以发给它了（环境变量的 key 一直可以）。
-        backend.govern_external(&self.plan.endpoint, true);
+        };
+        self.adopted_listeners = Some(listeners.clone());
+        let external = External::new(verifier.clone(), self.plan.port, &listeners);
+        // 通过：`settings.json` 的 key 现在可以发给它了（环境变量的 key 一直可以）。每个发往它的请求发出之前，守卫都重新确认监听者
+        // 还是刚才校验通过的这些（Codex 终审 H1）。
+        backend.govern_external(&self.plan.endpoint, external.guard.clone());
         let adopted = match first {
             EngineProbe::Ready => true,
             _ => {
@@ -997,13 +1095,20 @@ impl Actor {
                                 reason: Some(UpstreamReason::PortInUse),
                             };
                         }
-                        EngineProbe::ConnectionRefused | EngineProbe::Unavailable => false,
+                        // 连接被拒：端口上已经没有监听者了（确定地消失了）。
+                        EngineProbe::ConnectionRefused => false,
+                        // 有东西在监听、带 key 却答不上来：是不是还是刚才校验通过的那个，下面再确认一次。
+                        EngineProbe::Unavailable => {
+                            return self
+                                .after_inconclusive_keyed_probe(&verifier, &listeners)
+                                .await;
+                        }
                     },
                 }
             }
         };
         if !adopted {
-            // 带 key 的探测没有结论（监听者没了，或者还答不上来）：回到决策的开头重来，不是引擎失败。
+            // 带 key 的探测被拒绝连接：监听者确定地没了，回到决策的开头重来，不是引擎失败。
             return Attempt::Redecide;
         }
         // 外部引擎的围栏不是我们的：没有证据证明它的加载已经停止，原样留着，要人工处理。但 Supervisor 在围栏存在时会把启动
@@ -1015,8 +1120,29 @@ impl Actor {
                 reason: Some(UpstreamReason::FencePending),
             };
         }
-        self.external = Some(External { verifier });
+        self.external = Some(external);
         Attempt::Ready
+    }
+
+    /// 接管外部引擎时，带 key 的探测没有结论（有东西在监听，却答不上来）。**只有确认监听者消失、或者换了一个身份时才回到决策开头重来
+    /// （不是引擎失败）**；一个稳定的、还是刚才校验通过的监听者一直这样，就是它的毛病：按一次失败算，退避、熔断照旧（S5 的语义；Codex
+    /// 终审 M3）。读不出来（`Unverifiable`）既不能说它走了也不能说它换了，不免计。
+    async fn after_inconclusive_keyed_probe(
+        &mut self,
+        verifier: &ListenerVerifier,
+        verified: &[ListenerIdentity],
+    ) -> Attempt {
+        match verifier.check(self.plan.port).await {
+            ListenerVerdict::Verified { listeners } if listeners == verified => {
+                self.log("外部引擎的监听者没有变，但带 key 的探测一直答不上来：按失败算");
+                Attempt::Failure { reason: None }
+            }
+            ListenerVerdict::Unverifiable(_) => Attempt::Failure { reason: None },
+            // 没有监听者了，或者监听者换了、不合格：不是这个引擎的毛病。
+            ListenerVerdict::NoListener
+            | ListenerVerdict::Rejected(_)
+            | ListenerVerdict::Verified { .. } => Attempt::Redecide,
+        }
     }
 
     /// 端点上有服务在监听，但探测还答不上来：每个探测间隔再试，直到有结论或启动超时。
@@ -1169,7 +1295,7 @@ impl Actor {
             }
             None => return Attempt::Failure { reason: None },
         };
-        let mut owned = Owned { engine, key };
+        let mut owned = Owned::new(engine, key, self.shared.config.inspector.clone());
         match self.wait_owned_ready(&mut owned).await {
             Ok(()) => self.finish_owned(owned).await,
             Err(failure) => self.abandon(owned, failure).await,
@@ -1240,7 +1366,9 @@ impl Actor {
             }
         }
         if let Some(key) = &owned.key {
-            self.plan.backend.govern_private(&self.plan.endpoint, key);
+            self.plan
+                .backend
+                .govern_private(&self.plan.endpoint, key, owned.guard.clone());
         }
         self.owned_key_revoked = false;
         self.engine = Some(owned);
@@ -1351,7 +1479,8 @@ impl Actor {
                 if let Some(owned) = self.engine.take() {
                     self.stop_engine(owned).await;
                 }
-                self.external = None;
+                // 接管的外部引擎：这个实例不再监督它，已验证的登记不能留着（Codex 终审 H2）。
+                self.revoke_external_authorization();
                 classify_reset_failure(&error)
             }
         }
@@ -1458,7 +1587,9 @@ impl Actor {
             if let Some(owned) = self.engine.as_ref()
                 && let Some(key) = owned.key.as_ref()
             {
-                self.plan.backend.govern_private(&self.plan.endpoint, key);
+                self.plan
+                    .backend
+                    .govern_private(&self.plan.endpoint, key, owned.guard.clone());
             }
             self.owned_key_revoked = false;
         }
@@ -1517,6 +1648,14 @@ impl Actor {
         }
     }
 
+    /// 不再监督接管的外部引擎（放弃、复位失败、重来）：忘掉它、封上端点，登记表里那条「已验证的外部」不能留着
+    /// （Codex 终审 H2）：留着，端口上之后出现的东西，凭那条登记（再加上守卫恰好通过）仍能拿到 `settings.json` 的 key。
+    fn revoke_external_authorization(&mut self) {
+        if self.external.take().is_some() {
+            self.plan.backend.block(&self.plan.endpoint);
+        }
+    }
+
     /// 收回自有引擎的私有 key：端点封上，之后什么凭证都不发（回退链不适用），旧一代还在飞的操作也拿不到任何东西。
     fn revoke_owned_key(&mut self) {
         if !self.owned_key_revoked {
@@ -1559,13 +1698,14 @@ impl Actor {
             return;
         };
         let verifier = external.verifier.clone();
+        let guard = external.guard.clone();
         let backend = self.plan.backend.clone();
         match verifier.check(self.plan.port).await {
             ListenerVerdict::Verified { listeners } => {
                 let identity = EngineIdentity::External { listeners };
                 if self.identity.as_ref() == Some(&identity) {
-                    // 还是校验过的那个进程：`settings.json` 的 key 现在可以发给它了。
-                    backend.govern_external(&self.plan.endpoint, true);
+                    // 还是校验过的那个进程：`settings.json` 的 key 现在可以发给它了（同一个守卫：登记表的代际不动）。
+                    backend.govern_external(&self.plan.endpoint, guard);
                     if self.external_gap {
                         // 刚才的「没有监听者」是一次误读，或者它自己回来了：同一个进程，账本没有过期，开回来。
                         if let Some(bound) = self.supervisor()
@@ -1629,25 +1769,68 @@ impl Actor {
         self.external_gap = true;
     }
 
-    /// 通过校验的监听者换了一个进程：Supervisor 的账本是对着旧进程建的。次序：封上端点（旧一代拿不到凭证）、关门、排空
-    /// （有界；旧进程已经没了，在途的很快失败）、新监听者已经通过校验所以给它凭证、复位账本、开门；这期间状态不是 `ready`。
-    /// 返回这个周期能不能接着探测、发布状态：复位没成功就不能（端点保持封上、门保持关着，下一个周期再来）。
+    /// 通过校验的监听者换了一个进程：Supervisor 的账本是对着旧进程建的。次序：封上端点（旧一代拿不到凭证）、关门、发布**明确不可服务**的
+    /// `restarting`（不记失败）、排空（有界；旧进程已经没了，在途的很快失败）、**重新确认监听者**、登记新监听者的凭证与守卫、复位账本、
+    /// 开门；这期间状态不是 `ready`。返回这个周期能不能接着探测、发布状态：复位没成功、或者排空期间监听者又变了就不能（端点保持封上、
+    /// 门保持关着，下一个周期再来）。
+    ///
+    /// Codex 终审 H6：之前这里发布的是没有原因码的 `unavailable`，而数据面的状态门把它当成「只是慢、照常服务」，伴生卡能在账本复位完成
+    /// 之前通过健康门；并且新监听者是在排空**之前**验的，排空花了一段时间，之后直接恢复凭证、用排空前的结论复位采样。现在换代期间是
+    /// `restarting`（`upstream_serves` 为假，同操作员的 `restart`），排空之后重新取一次监听者、重新核对身份，仍是预期的那个进程才登记、
+    /// 采样、开放服务；它在排空期间离开了、或又换成了第三个，不放行。
     async fn external_replaced(&mut self, identity: EngineIdentity) -> bool {
+        let EngineIdentity::External {
+            listeners: expected,
+        } = &identity
+        else {
+            return false;
+        };
+        let expected = expected.clone();
         let backend = self.plan.backend.clone();
         self.log("外部引擎换了一个进程：Supervisor 的账本对着新进程重建");
         backend.block(&self.plan.endpoint);
         self.external_gap = true;
-        self.publish(UpstreamState::Unavailable, None);
-        let Some(bound) = self.supervisor() else {
+        let bound = self.supervisor();
+        if let Some(bound) = &bound {
+            let _ = bound.close_admission().await;
+        }
+        self.publish_uncounted(UpstreamState::Restarting, None);
+        let _ = self.drain().await;
+        // 排空花了一段时间：上面验过的进程可能已经离开，或者换成了第三个。重新取一次监听者、重新核对。
+        let Some(verifier) = self
+            .external
+            .as_ref()
+            .map(|external| external.verifier.clone())
+        else {
+            return false;
+        };
+        match verifier.check(self.plan.port).await {
+            ListenerVerdict::Verified { listeners } if listeners == expected => {}
+            ListenerVerdict::Verified { .. } => {
+                self.log("外部引擎在排空期间又换了一个进程：不放行，下一个周期重新来");
+                return false;
+            }
+            ListenerVerdict::NoListener => {
+                self.external_unavailable().await;
+                self.publish(UpstreamState::Unavailable, None);
+                return false;
+            }
+            ListenerVerdict::Rejected(_) | ListenerVerdict::Unverifiable(_) => {
+                self.external_unavailable().await;
+                self.publish(UpstreamState::Failed, Some(UpstreamReason::PortInUse));
+                return false;
+            }
+        }
+        // 还是校验过的那个进程：登记它的凭证与新的守卫（登记表的代际前进），再复位账本。
+        let external = External::new(verifier, self.plan.port, &expected);
+        backend.govern_external(&self.plan.endpoint, external.guard.clone());
+        self.external = Some(external);
+        let Some(bound) = bound else {
             // 没有 Supervisor（门控还没放行、resident 的托管卡）：没有账本要复位。
-            backend.govern_external(&self.plan.endpoint, true);
             self.identity = Some(identity);
             self.external_gap = false;
             return true;
         };
-        let _ = bound.close_admission().await;
-        let _ = self.drain().await;
-        backend.govern_external(&self.plan.endpoint, true);
         match self.reset_supervisor(&bound, true).await {
             Ok(()) => match self.reopen_admission(&bound).await {
                 Synced::Done => {
@@ -1697,9 +1880,11 @@ async fn reset_when_quiet(
     pause: Duration,
 ) -> Result<(), BackendError> {
     loop {
-        match bound.engine_replaced(sample).await {
+        // 一个绝对的截止时间管入队、等安静、回答（Codex 终审 M5）：到点还没开始的复位被 Supervisor 丢弃，不会在调用方放弃之后才执行。
+        match bound.engine_replaced_before(sample, deadline).await {
             Err(BackendError::Busy { .. }) if Instant::now() < deadline => {
-                tokio::time::sleep(pause).await;
+                tokio::time::sleep(pause.min(deadline.saturating_duration_since(Instant::now())))
+                    .await;
             }
             other => return other,
         }
