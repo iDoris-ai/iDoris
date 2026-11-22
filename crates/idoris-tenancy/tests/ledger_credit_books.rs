@@ -1683,6 +1683,78 @@ fn a_spend_that_belongs_to_an_allowance_starting_after_the_read_time_still_uses_
 }
 
 #[test]
+fn spends_are_replayed_in_commit_order_even_when_their_attribution_moments_are_out_of_order() {
+    // 回放的先后是提交先后（分录号），不是归属时刻：排队让后提交的请求归属时刻更早（读钟取在排队之前，设计稿 S3-20）。
+    //
+    // 授信 100；两笔额度都在两笔花费之前创建：W 50，窗口 [T0, T0 + 300)；V 50，窗口 [T0 + 150, T0 + 350)。
+    //   S1  先提交，归属时刻 T0 + 200，预留 50：W 和 V 的窗口都包含它，先到期的先用（W 300 < V 350）：W 出 50，V 一分没动
+    //   S2  后提交，归属时刻 T0 + 100，预留 50：窗口包含它的只有 W（V 从 T0 + 150 起），W 已经被 S1 用光：额度够不着，授信债务 50
+    // （按归属时刻的先后回放：S2 先用 W，S1 改用 V，债务 0——两笔花费争同一份额度，先后换一下，落到授信上的那笔就换了。）
+    // T0 + 250（两笔额度都还有效）：W 0、V 50，额度剩余 50，债务 50：净头寸 50 - min(50, 100) = 0，两种先后读出来一样，分不出来。
+    // T0 + 400（两笔额度都到期了）：额度剩余 0，债务 50 还在：净头寸 -50，能花 -50 + 100 = 50。按归属时刻回放，债务 0，能花 100。
+    // 所以：再来一笔 70 只能降到 50（降级放行，用掉剩下的 50），之后再来任何一笔都拒绝。按归属时刻回放，这笔 70 会被整笔放行。
+    let db = TempDb::new("books-commit-order-replay");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 100, T0);
+    prepaid(&store, "emp-w", 50, T0, T0 + 300, T0);
+    prepaid(&store, "emp-v", 50, T0 + 150, T0 + 350, T0);
+    let s1 = Req::new(&store, "s-1", 0, "cred-e", 20).at(T0 + 200);
+    assert_eq!(
+        admit(&store, &s1)
+            .admitted()
+            .map(|a| a.reservation.price.micros()),
+        Some(50)
+    );
+    let s2 = Req::new(&store, "s-2", 0, "cred-e", 20).at(T0 + 100);
+    let decision = admit(&store, &s2);
+    assert_eq!(
+        decision.admitted().map(|a| a.reservation.price.micros()),
+        Some(50),
+        "{decision:?}"
+    );
+
+    let books = check_books(&store, &db, "emp", T0 + 250);
+    assert_eq!(
+        (books.allowance_left, books.covered, books.credit_debt),
+        (50, 50, 50),
+        "S1 used W, S2 could only use W: {books:?}"
+    );
+    assert_eq!(view(&store, T0 + 250).ceiling_remaining, Some(thb(0)));
+
+    let after = view(&store, T0 + 400);
+    assert_eq!(
+        after.ceiling_remaining,
+        Some(thb(-50)),
+        "both allowances ended, S2's 50 is still credit debt"
+    );
+    assert_eq!(headroom(&after), 50);
+    let books = check_books(&store, &db, "emp", T0 + 400);
+    assert_eq!(
+        (books.allowance_left, books.covered, books.credit_debt),
+        (0, 50, 50)
+    );
+    let too_big = Req::new(&store, "s-3", 0, "cred-e", 30).at(T0 + 400);
+    let degraded = admit(&store, &too_big);
+    assert!(
+        matches!(degraded, AdmissionDecision::Degrade { .. }),
+        "70 does not fit in 50, only the degraded request does: {degraded:?}"
+    );
+    assert_eq!(
+        degraded.admitted().map(|a| a.reservation.price.micros()),
+        Some(50),
+        "{degraded:?}"
+    );
+    let none_left = Req::new(&store, "s-4", 0, "cred-e", 20).at(T0 + 401);
+    let rejected = admit(&store, &none_left);
+    assert_eq!(
+        denied(&rejected),
+        Some(ReasonCode::BudgetExhausted),
+        "the last 50 went to s-3: {rejected:?}"
+    );
+    assert_clean(&store);
+}
+
+#[test]
 fn an_unexpired_overage_booked_whole_in_the_old_shape_is_split_when_the_books_are_read() {
     // 旧写法（v0.5.0 / main）把没迟到的结算里超出预留的部分和预留之内的部分一起记在预留创建的时刻（一条 `settle`，已花是整笔）。
     // 已经写下的行不改，读的时候按新口径解释：旧格式 `settle` 里 `charged - reserved` 的正差是一笔单独的逻辑花费，用这条 `settle`
