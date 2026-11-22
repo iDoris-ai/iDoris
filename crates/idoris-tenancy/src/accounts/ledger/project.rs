@@ -1046,6 +1046,10 @@ pub(super) fn credit_headroom(views: &[AncestorView]) -> Result<Option<i64>, Led
 mod tests {
     //! 按归属时刻找候选额度的索引（[`WindowIndex`]）：每个时刻的候选额度必须恰好是「窗口包含它」的那些，次序是回放要的（先到期的，
     //! 同时到期的先创建的）。期望数字手算；另外和暴力扫描对一遍随机的窗口和时刻。
+    //!
+    //! 窗口求和（[`entry_sums`]、[`pool_consumed_micros`]）按归属规则（[`LEGACY_OVERAGE_SQL`]）切：随机的历史（新格式 / 中间形态 / 旧格式的预留，
+    //! 放掉的、迟到结算的、还在途的）对一份独立写的暴力期望——一笔笔算出每个预留的花费落在哪个时刻——必须逐窗口一模一样。
+    //! 这也是「只在预留和结算落在窗口两边时才读预留表」的恒等式的检验：期望里没有这个捷径。
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
@@ -1304,5 +1308,228 @@ mod tests {
         assert_eq!(index.at(0), &[0]);
         assert_eq!(index.at(14_995), &[1_499]);
         assert!(index.at(15_000).is_empty());
+    }
+    /// 只有求和用到的两张表（内存里的 SQLite，没有触发器和 CHECK）。
+    fn open_sums_schema() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ledger_holds (
+                 hold_id TEXT NOT NULL PRIMARY KEY, state TEXT NOT NULL, late INTEGER NOT NULL DEFAULT 0,
+                 reserved_micros INTEGER NOT NULL, charged_micros INTEGER);
+             CREATE TABLE ledger_entries (
+                 entry_id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, hold_id TEXT, kind TEXT NOT NULL,
+                 held_micros INTEGER NOT NULL DEFAULT 0, spent_micros INTEGER NOT NULL DEFAULT 0,
+                 funds_micros INTEGER NOT NULL DEFAULT 0, window_at_ms INTEGER NOT NULL, at_ms INTEGER NOT NULL);
+             CREATE INDEX by_hold ON ledger_entries (hold_id);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// 一个预留在一个账户上的分录：（种类，在途，已花，归属时刻，at_ms）。
+    type EntryRow = (String, i64, i64, i64, i64);
+
+    /// 每个预留的花费落在哪个时刻：（归属时刻，金额）。**独立于被测 SQL 的暴力期望**：预留本身在预留创建的时刻，没迟到、已结算的预留里
+    /// 还留在 `settle` 里的超出部分（`charged - reserved` 的正差，减去已经另记在 `late_settle` 里的，夹到预留剩下的净额以内）在结算时刻，
+    /// `late_settle` 在它自己的归属时刻。
+    fn expected_pieces(conn: &Connection, account: &str) -> Vec<(i64, i64)> {
+        let mut pieces = Vec::new();
+        let holds: Vec<(String, String, bool, i64, Option<i64>)> = conn
+            .prepare(
+                "SELECT hold_id, state, late <> 0, reserved_micros, charged_micros FROM ledger_holds",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for (hold, state, late, reserved, charged) in holds {
+            let entries: Vec<EntryRow> = conn
+                .prepare(
+                    "SELECT kind, held_micros, spent_micros, window_at_ms, at_ms FROM ledger_entries
+                      WHERE hold_id = ?1 AND account_id = ?2 ORDER BY entry_id",
+                )
+                .unwrap()
+                .query_map([&hold, account], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let net_of = |late_kind: bool| -> i64 {
+                entries
+                    .iter()
+                    .filter(|(kind, ..)| (kind == "late_settle") == late_kind)
+                    .map(|(_, held, spent, ..)| held + spent)
+                    .sum()
+            };
+            let reservation_net = net_of(false);
+            let late_net = net_of(true);
+            let reservation_at = entries
+                .iter()
+                .find(|(kind, ..)| kind != "late_settle")
+                .map(|(_, _, _, window_at, _)| *window_at);
+            let settle_at = entries
+                .iter()
+                .find(|(kind, ..)| kind == "settle")
+                .map(|(_, _, _, _, at)| *at);
+            let inside = match (state.as_str(), late, settle_at) {
+                ("settled", false, Some(_)) => {
+                    let over = (charged.unwrap() - reserved).max(0);
+                    (over - late_net).clamp(0, reservation_net.max(0))
+                }
+                _ => 0,
+            };
+            if let Some(at) = reservation_at {
+                pieces.push((at, reservation_net - inside));
+            }
+            if inside > 0 {
+                pieces.push((settle_at.unwrap(), inside));
+            }
+            for (kind, _, spent, window_at, _) in &entries {
+                if kind == "late_settle" {
+                    pieces.push((*window_at, *spent));
+                }
+            }
+        }
+        pieces
+    }
+
+    #[test]
+    fn window_sums_follow_the_attribution_rule_on_random_histories() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move |n: u64| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+        };
+        let mut straddlers = 0_u32;
+        for round in 0..300 {
+            let conn = open_sums_schema();
+            let count = 1 + next(12);
+            for index in 0..count {
+                let hold = format!("h{index}");
+                let reserved = i64::try_from(next(150)).unwrap();
+                let charged = i64::try_from(next(400)).unwrap();
+                let reserved_at = i64::try_from(next(600)).unwrap();
+                let settled_at = i64::try_from(next(600)).unwrap();
+                let entry = |kind: &str, held: i64, spent: i64, window_at: i64, at: i64| {
+                    conn.execute(
+                        "INSERT INTO ledger_entries (account_id, hold_id, kind, held_micros, spent_micros, window_at_ms, at_ms)
+                         VALUES ('acct', ?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![hold, kind, held, spent, window_at, at],
+                    )
+                    .unwrap();
+                };
+                let hold_row = |state: &str, late: i64, charged: Option<i64>| {
+                    conn.execute(
+                        "INSERT INTO ledger_holds (hold_id, state, late, reserved_micros, charged_micros) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![hold, state, late, reserved, charged],
+                    )
+                    .unwrap();
+                };
+                match next(4) {
+                    // 还在途
+                    0 => {
+                        entry("reserve", reserved, 0, reserved_at, reserved_at);
+                        hold_row("open", 0, None);
+                    }
+                    // 放掉了
+                    1 => {
+                        entry("reserve", reserved, 0, reserved_at, reserved_at);
+                        entry("release", -reserved, 0, reserved_at, settled_at);
+                        hold_row("released", 0, Some(0));
+                    }
+                    // 过期之后迟到结算：整笔是结算时刻的花费
+                    2 => {
+                        entry("reserve", reserved, 0, reserved_at, reserved_at);
+                        entry("expire", -reserved, 0, reserved_at, reserved_at);
+                        entry("late_settle", 0, charged, settled_at, settled_at);
+                        hold_row("settled", 1, Some(charged));
+                    }
+                    // 没迟到的结算：新格式 / 中间形态 / 旧格式
+                    _ => {
+                        let within = charged.min(reserved);
+                        let over = (charged - reserved).max(0);
+                        // 搬到 `late_settle` 里的部分：新格式全部，旧格式 0，中间形态随机
+                        let moved = match next(3) {
+                            0 => over,
+                            1 => 0,
+                            _ => i64::try_from(next(u64::try_from(over).unwrap() + 1)).unwrap(),
+                        };
+                        entry("reserve", reserved, 0, reserved_at, reserved_at);
+                        entry(
+                            "settle",
+                            -reserved,
+                            within + over - moved,
+                            reserved_at,
+                            settled_at,
+                        );
+                        if moved > 0 || (over == 0 && next(2) == 0) {
+                            entry("late_settle", 0, moved, settled_at, settled_at);
+                        }
+                        hold_row("settled", 0, Some(charged));
+                        if (reserved_at < 300) != (settled_at < 300) {
+                            straddlers += 1;
+                        }
+                    }
+                }
+            }
+            let pieces = expected_pieces(&conn, "acct");
+            for _ in 0..6 {
+                let from = i64::try_from(next(700)).unwrap() - 50;
+                // 读的时刻取 `from + 59_999`：分钟窗口 `t > now - 60 000` 就是 `t > from - 1`，小时窗口 `t > now - 3 600 000`
+                // 就是 `t > from - 3 540 001`；额度窗口 `t >= from`，没有上界
+                let now = from + 59_999;
+                let sums = entry_sums(&conn, "acct", from, now).unwrap();
+                let expected = |keep: &dyn Fn(i64) -> bool| -> i64 {
+                    pieces
+                        .iter()
+                        .filter(|(at, _)| keep(*at))
+                        .map(|(_, amount)| amount)
+                        .sum()
+                };
+                assert_eq!(
+                    sums.window,
+                    expected(&|at| at >= from),
+                    "round {round}: allowance window from {from}"
+                );
+                assert_eq!(
+                    sums.minute,
+                    expected(&|at| at > now - MINUTE_MS),
+                    "round {round}: minute window"
+                );
+                assert_eq!(
+                    sums.hour,
+                    expected(&|at| at > now - HOUR_MS),
+                    "round {round}: hour window"
+                );
+                let (start, end) = (from, from + 200);
+                assert_eq!(
+                    pool_consumed_micros(&conn, "acct", start, end).unwrap(),
+                    expected(&|at| start <= at && at < end),
+                    "round {round}: pool period [{start}, {end})"
+                );
+            }
+        }
+        assert!(
+            straddlers >= 100,
+            "the random histories must cross the window boundaries often enough: {straddlers}"
+        );
     }
 }
