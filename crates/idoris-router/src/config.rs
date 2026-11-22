@@ -37,6 +37,11 @@ pub fn resolve_env(name: &str, default_relative: &str) -> Result<PathBuf, String
     resolve_path(None, default_relative, &executable)
 }
 
+/// `trim` 只用来判断是不是整个都是空白；非空的值原样做成路径（首尾的空白是路径的一部分，#L1）。
+fn non_blank_path(value: String) -> Option<PathBuf> {
+    (!value.trim().is_empty()).then(|| PathBuf::from(value))
+}
+
 /// Read an optional Unicode path without inventing a bundled default.
 pub fn optional_env_path(name: &str) -> Result<Option<PathBuf>, String> {
     std::env::var_os(name)
@@ -44,10 +49,7 @@ pub fn optional_env_path(name: &str) -> Result<Option<PathBuf>, String> {
             value
                 .into_string()
                 .map_err(|_| format!("环境变量 {name} 不是有效的 Unicode 路径"))
-                .map(|value| {
-                    let value = value.trim();
-                    (!value.is_empty()).then(|| PathBuf::from(value))
-                })
+                .map(non_blank_path)
         })
         .transpose()
         .map(Option::flatten)
@@ -69,6 +71,26 @@ mod tests {
             resolve_path(Some("/opt/idoris/policy.yaml"), "config/policy.yaml", exe).unwrap(),
             PathBuf::from("/opt/idoris/policy.yaml")
         );
+    }
+
+    /// #5：`optional_env_path` 与其他路径一样：`trim` 只用来判断是否整个空白，非空的值原样做成路径。
+    /// 目录里有 `cfg` 与 `cfg `（末尾带空格）两个内容不同的文件：带空格的值必须读到带空格的那个。
+    #[test]
+    fn an_optional_path_keeps_its_surrounding_spaces_and_blank_means_unset() {
+        let dir = std::env::temp_dir().join(format!("idoris-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cfg"), "without space").unwrap();
+        std::fs::write(dir.join("cfg "), "with space").unwrap();
+        let raw = format!("{}/cfg ", dir.display());
+        let path = non_blank_path(raw.clone()).unwrap();
+        assert_eq!(path, PathBuf::from(&raw));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "with space");
+        let trimmed = non_blank_path(format!("{}/cfg", dir.display())).unwrap();
+        assert_eq!(std::fs::read_to_string(trimmed).unwrap(), "without space");
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(non_blank_path(blank.to_string()), None, "{blank:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// #L1：`trim` 只用来判断是不是整个都是空白；非空的路径原样保留，首尾的空格是路径的一部分。

@@ -1268,6 +1268,17 @@ fn reject_link_into_replaced_files(
     let (Ok(target), Ok(root)) = (std::fs::canonicalize(path), std::fs::canonicalize(dir)) else {
         return Ok(());
     };
+    // 只保证这个目录里的卡读得一致：指向目录之外的符号链接，外面那个目录的锁我们拿不到（与 serve 读卡同一条规则）。
+    if !target.starts_with(&root) {
+        return Err(SetupError::new(
+            "validation_failed",
+            format!(
+                "out-dir 里的 {} 是指向目录之外（{}）的符号链接：只保证这个目录里的卡读得一致，请把卡放进目录里，或去掉这个链接",
+                name.to_string_lossy(),
+                target.display()
+            ),
+        ));
+    }
     let hits_replaced = target.parent() == Some(root.as_path())
         && target
             .file_name()
@@ -1369,13 +1380,15 @@ pub fn write_validated_hooked(
             std::fs::write(stage.join(name), content).map_err(io)?;
         }
         // 说明里的暂存目录路径换成 `out_dir`：暂存目录里的文件名与 `out_dir` 里的一一对应，保留下来的卡出问题时点得到名。
-        let cards = crate::components::load_components(&stage, false).map_err(|e| {
-            SetupError::new(
-                "validation_failed",
-                e.to_string()
-                    .replace(&stage.display().to_string(), &out_dir.display().to_string()),
-            )
-        })?;
+        let cards =
+            crate::components::load_components(&stage, crate::components::allow_mock_from_env())
+                .map_err(|e| {
+                    SetupError::new(
+                        "validation_failed",
+                        e.to_string()
+                            .replace(&stage.display().to_string(), &out_dir.display().to_string()),
+                    )
+                })?;
         // 最终的集合（保留的加新的）里至多一张默认卡。
         check_at_most_one_default(&cards)?;
         // serve 启动时还会做的纯配置校验（托管卡的计划、引擎种类）：在发布之前先过一遍，免得 setup 成功而 serve 起不来。
@@ -1598,8 +1611,9 @@ pub fn write_added_hooked(
             Snapshot::new()
         };
         std::fs::write(stage.join(file), content).map_err(io)?;
-        let cards = crate::components::load_components(&stage, false)
-            .map_err(|e| added_load_failure(e, &stage, out_dir, &card.provider.id))?;
+        let cards =
+            crate::components::load_components(&stage, crate::components::allow_mock_from_env())
+                .map_err(|e| added_load_failure(e, &stage, out_dir, &card.provider.id))?;
         check_at_most_one_default(&cards)?;
         check_serve_preflight(&cards)?;
         fire(hook, CommitPhase::Validated, out_dir);

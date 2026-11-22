@@ -234,6 +234,45 @@ async fn serve_starts_with_a_consistent_upstream_card() {
     assert_eq!(upstream["engine_kind"], "lmstudio");
 }
 
+/// Codex #2：`form: bundled_binary` 的普通卡：serve 在构造运行时时确定地拒绝（与 setup 的预检同一句话）。
+#[test]
+fn serve_refuses_a_card_form_the_runtime_cannot_construct() {
+    let comp = TempDir::new().unwrap();
+    std::fs::write(
+        comp.path().join("odd.yaml"),
+        card("odd", "http://127.0.0.1:1", "openai_compat@unknown", "")
+            .replace("form: http_service", "form: bundled_binary"),
+    )
+    .unwrap();
+    let (status, text) = serve_expecting_failure(comp.path());
+    assert!(
+        matches!(status, Some(code) if code != 0),
+        "{status:?}\n{text}"
+    );
+    assert!(text.contains("no runtime constructor"), "{text}");
+}
+
+/// Codex #8：`IDORIS_COMPONENTS_LOCK_WAIT_MS` 不是毫秒数：启动错误，说明里点名变量与取值，不悄悄退回默认。
+#[test]
+fn serve_rejects_a_non_numeric_lock_wait_setting() {
+    let comp = TempDir::new().unwrap();
+    std::fs::write(
+        comp.path().join("plain.yaml"),
+        card("plain", "http://127.0.0.1:1", "somethingelse@9", ""),
+    )
+    .unwrap();
+    let (status, text) =
+        serve_expecting_failure_with(comp.path(), &[("IDORIS_COMPONENTS_LOCK_WAIT_MS", "soon")]);
+    assert!(
+        matches!(status, Some(code) if code != 0),
+        "{status:?}\n{text}"
+    );
+    assert!(
+        text.contains("IDORIS_COMPONENTS_LOCK_WAIT_MS") && text.contains("soon"),
+        "{text}"
+    );
+}
+
 /// #M2：`idoris setup` 持有组件目录的独占锁（落盘中）时 serve 启动：serve 等到上限，启动失败（退出码非 0），说明点出是
 /// setup 在改写这个目录；不会读到改了一半的卡。锁一放开，同样的 serve 正常起来。
 #[tokio::test(flavor = "multi_thread")]

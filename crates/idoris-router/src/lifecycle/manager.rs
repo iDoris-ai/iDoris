@@ -107,10 +107,17 @@ impl std::error::Error for PlanError {}
 
 /// 从启动时读到的上游计划里取出托管的那些，生产的引擎种类到 [`EngineBackend`] 的对应（v0.6.0 只有 oMLX）。
 pub fn plan_managed(upstreams: &[UpstreamPlan]) -> Result<Vec<ManagedPlan>, PlanError> {
-    plan_managed_with(upstreams, |kind| match kind {
-        "omlx" => Some(Arc::new(OmlxBackend::from_env()) as Arc<dyn EngineBackend>),
+    plan_managed_with(upstreams, production_backend)
+}
+
+/// 生产的引擎种类到 backend 的对应：种类的认定只在 [`managed_backend_kind`] 一处，这里按它给出的种类构造 backend。
+fn production_backend(engine_kind: &str) -> Option<Arc<dyn EngineBackend>> {
+    match managed_backend_kind(engine_kind) {
+        Some(kind) if kind == EngineKind::OMLX => {
+            Some(Arc::new(OmlxBackend::from_env()) as Arc<dyn EngineBackend>)
+        }
         _ => None,
-    })
+    }
 }
 
 /// 本版本能托管的引擎种类到 backend 种类的对应（v0.6.0 只有 oMLX）。纯函数：不构造 backend、不碰环境。
@@ -158,23 +165,32 @@ pub fn validate_managed_plan(
     Ok(seen.into_iter().map(|(id, port, _)| (id, port)).collect())
 }
 
-/// 同上，引擎种类到 backend 的对应由调用方给（测试里换假的 backend）。
+/// 同上，引擎种类到 backend 的对应由调用方给（测试里换假的 backend）。每张托管卡只解析一次 backend：先解析，再对解析出的
+/// 种类做 [`validate_managed_plan`]，保留下来的就是校验过的那一个。
 pub fn plan_managed_with(
     upstreams: &[UpstreamPlan],
     backend_for: impl Fn(&str) -> Option<Arc<dyn EngineBackend>>,
 ) -> Result<Vec<ManagedPlan>, PlanError> {
-    let checked = validate_managed_plan(upstreams, |kind| backend_for(kind).map(|b| b.kind()))?;
-    let mut plans: Vec<ManagedPlan> = Vec::with_capacity(checked.len());
-    for (upstream, (id, port)) in upstreams
+    let resolved: Vec<(&UpstreamPlan, Option<Arc<dyn EngineBackend>>)> = upstreams
         .iter()
         .filter(|plan| plan.identity.managed)
-        .zip(checked)
-    {
-        let backend =
-            backend_for(&upstream.identity.engine_kind).ok_or_else(|| PlanError::NoBackend {
-                id: id.clone(),
-                engine_kind: upstream.identity.engine_kind.clone(),
-            })?;
+        .map(|plan| (plan, backend_for(&plan.identity.engine_kind)))
+        .collect();
+    let kinds: BTreeMap<&str, EngineKind> = resolved
+        .iter()
+        .filter_map(|(plan, backend)| {
+            backend
+                .as_ref()
+                .map(|backend| (plan.identity.engine_kind.as_str(), backend.kind()))
+        })
+        .collect();
+    let checked = validate_managed_plan(upstreams, |kind| kinds.get(kind).cloned())?;
+    let mut plans: Vec<ManagedPlan> = Vec::with_capacity(checked.len());
+    for ((upstream, backend), (id, port)) in resolved.into_iter().zip(checked) {
+        let backend = backend.ok_or_else(|| PlanError::NoBackend {
+            id: id.clone(),
+            engine_kind: upstream.identity.engine_kind.clone(),
+        })?;
         plans.push(ManagedPlan {
             id,
             endpoint: format!("http://127.0.0.1:{port}"),
@@ -611,6 +627,19 @@ mod tests {
             owned: false,
             terminal,
         }
+    }
+
+    /// 引擎种类到 backend 的对应只在 `managed_backend_kind` 一处认定：生产的构造器与纯校验的种类认定同进同退。
+    #[test]
+    fn the_production_backend_follows_the_single_kind_mapping() {
+        for kind in ["omlx", "lmstudio", "", "OMLX", "omlx "] {
+            assert_eq!(
+                production_backend(kind).map(|backend| backend.kind()),
+                managed_backend_kind(kind),
+                "{kind:?}"
+            );
+        }
+        assert!(production_backend("omlx").is_some());
     }
 
     fn table(list: &[Status]) -> BTreeMap<String, Status> {

@@ -1054,30 +1054,18 @@ async fn a_kept_link_is_refused_when_the_out_dir_itself_is_given_through_a_symli
     no_setup_leftovers(env.work.path());
 }
 
-/// 对照：不该被拒绝的链接。指向 out-dir 之外的合法目标、指向子目录里同名的文件、指向另一个不被替换的文件；
+/// 对照：不该被拒绝的链接：指向子目录里同名的文件（还在这个目录之内）；
 /// 另有加载器的口径：`.yml` 是卡（被拒），`.YML` 不是卡（加载器不读它，快照也不看它，所以不拒绝）。
+/// 指向目录之外的链接现在是被拒的（只保证当前目录，见下一条测试）。
 #[tokio::test]
 async fn links_that_do_not_reach_a_replaced_file_pass_and_yml_follows_the_loader() {
-    let valid_external: Vec<(&str, MakeLink)> = vec![
-        ("absolute external target", |env, _| {
-            let ext = env.work.path().join("external");
-            fs::create_dir_all(&ext).unwrap();
-            fs::write(ext.join("card.txt"), upstream_card("ext", 1601, "")).unwrap();
-            symlink(ext.join("card.txt"), env.out().join("alias.yaml")).unwrap();
-        }),
-        ("relative external target", |env, _| {
-            let ext = env.work.path().join("external");
-            fs::create_dir_all(&ext).unwrap();
-            fs::write(ext.join("card.txt"), upstream_card("ext", 1601, "")).unwrap();
-            symlink("../external/card.txt", env.out().join("alias.yaml")).unwrap();
-        }),
-        ("same file name in a sub directory", |env, t| {
+    let valid_external: Vec<(&str, MakeLink)> =
+        vec![("same file name in a sub directory", |env, t| {
             let sub = env.out().join("sub");
             fs::create_dir_all(&sub).unwrap();
             fs::write(sub.join(t), upstream_card("sub", 1602, "")).unwrap();
             symlink(format!("sub/{t}"), env.out().join("alias.yaml")).unwrap();
-        }),
-    ];
+        })];
     for (label, make) in valid_external {
         let env = Env::new();
         seeded_with_kept_card(&env).await;
@@ -1119,4 +1107,51 @@ async fn links_that_do_not_reach_a_replaced_file_pass_and_yml_follows_the_loader
     );
     env.run("http://127.0.0.1:8001", true, None).await.unwrap();
     assert!(!env.out().join("omlx-embed.yaml").exists());
+}
+
+/// 决定（Codex 审计）：只保证当前目录。指向目录之外的卡符号链接（绝对、相对、经另一个目录）在 setup 一侧是
+/// `validation_failed`，说明点名链接与它指向的位置，目录不变；对照：目录之内的链接不受影响（上一条测试）。
+#[tokio::test]
+async fn a_card_symlink_that_points_outside_the_directory_is_refused_by_setup() {
+    let forms: Vec<(&str, MakeLink)> = vec![
+        ("absolute external target", |env, _| {
+            let ext = env.work.path().join("external");
+            fs::create_dir_all(&ext).unwrap();
+            fs::write(ext.join("card.txt"), upstream_card("ext", 1601, "")).unwrap();
+            symlink(ext.join("card.txt"), env.out().join("alias.yaml")).unwrap();
+        }),
+        ("relative external target", |env, _| {
+            let ext = env.work.path().join("external");
+            fs::create_dir_all(&ext).unwrap();
+            fs::write(ext.join("card.txt"), upstream_card("ext", 1601, "")).unwrap();
+            symlink("../external/card.txt", env.out().join("alias.yaml")).unwrap();
+        }),
+    ];
+    for (label, make) in forms {
+        let env = Env::new();
+        seeded_with_kept_card(&env).await;
+        make(&env, "unused");
+        let before = env.snapshot();
+        let error = env
+            .run("http://127.0.0.1:8001", true, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code, "validation_failed",
+            "{label}: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("目录之外"),
+            "{label}: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("alias.yaml"),
+            "{label}: {}",
+            error.message
+        );
+        assert_eq!(env.snapshot(), before, "{label}");
+        no_setup_leftovers(env.work.path());
+    }
 }

@@ -16,6 +16,10 @@ use crate::readiness::plan_upstreams;
 
 /// 对（已通过加载器的）卡集合做 serve 启动时的纯配置校验；失败时返回 serve 会打印的那句话。
 pub fn validate_card_set(cards: &[ComponentCard]) -> Result<(), String> {
+    // 运行时对卡 `form` 的确定拒绝（serve 在构造运行时注册表时报，托管时在完整 Router 创建时报）。
+    for card in cards {
+        crate::runtime::check_runtime_form(card)?;
+    }
     let plans = plan_upstreams(cards).map_err(|error| error.to_string())?;
     validate_managed_plan(&plans, managed_backend_kind).map_err(|error| error.to_string())?;
     Ok(())
