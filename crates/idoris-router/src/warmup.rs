@@ -181,15 +181,15 @@ fn with_headers(mut response: Response, selected: &Selected) -> Response {
     response
 }
 
-/// 预热只服务**本机**的卡：它发出的请求（resident 的最小请求，或生命周期卡的加载）不会离开这台机器。判据是两个已有的判断合在一起，
-/// 没有另写一套：
+/// 预热服务的是**本机**的卡：它要发的请求（resident 的最小请求，或生命周期卡的加载）发往这台机器上的地址。判据是两个已有的判断
+/// 合在一起，没有另写一套：
 ///
-/// - [`models::is_trusted_local`]：路由给 `local_only` 请求用的可信本地三条件（实际 loopback、卡只承载 `local_only`、出站只有 none
-///   或 loopback），`/v1/models` 与 `/health` 探活的熔断口径用的也是它；订阅中转与 `spawn_cli` 卡在里面一律算远程。
+/// - [`models::is_trusted_local`]：路由给 `local_only` 请求用的可信本地三条件（实际 loopback、卡的隐私等级是 `local_only`、出站是 none
+///   或 loopback），`/v1/models` 与 `/health` 探活的熔断口径用的也是它；订阅中转与 `spawn_cli` 卡在里面算远程。
 /// - [`is_loopback_url`]：代理自己判断「这个请求算不算非本机出口」的那个函数（出口计数、凭据类别、去标识都用它），按**真要发往的 URL
 ///   的主机**判，不信卡自己声明的 locality：声明 loopback 而端点指向别处的卡（注册校验没拦住，或根本没走注册）在这里过不去。
 ///
-/// 只看「单价为零」不够：免费的远程卡同样会被选中（`X-iDoris-Privacy: any` 下聊天本来就可以选它），预热却会向它的真实地址发一个请求。
+/// 单价为零不能说明在本机：免费的远程卡同样会被选中（`X-iDoris-Privacy: any` 下聊天本来就可以选它），预热却会向它的真实地址发一个请求。
 fn is_local_endpoint(card: &ComponentCard) -> bool {
     models::is_trusted_local(card) && is_loopback_url(&card.endpoint)
 }
@@ -807,9 +807,9 @@ async fn handle(
     parsed.task.privacy = Some(inspection.effective);
 
     let policy = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
-    // 候选只有本机的卡：订阅中转卡、远程与局域网的卡、端点指向别处的卡都不参与，隐私头是 `any` 也一样（它只对聊天开放远程卡）。
-    // 在选卡之前排除，而不是选完再拒绝：排在前面的远程卡不会把同一角色下的本机卡挡住，没有本机候选时得到的是选卡管线自己的 503
-    // （缺省的 `local_only` 是 `local_only_unavailable`，`any` 是 `no_eligible_candidate`），什么也不发。
+    // 候选限于本机的卡：订阅中转卡、远程与局域网的卡、端点指向别处的卡都不参与，隐私头是 `any` 也一样（`any` 放开的是聊天的远程候选，
+    // 预热不跟）。在选卡之前排除，而不是选完再拒绝：排在前面的远程卡不再把同一角色下的本机卡挡住；没有本机候选时得到的是选卡管线自己
+    // 的 503（缺省的 `local_only` 是 `local_only_unavailable`，`any` 是 `no_eligible_candidate`），什么也不发。
     let cards: Vec<_> = policy.cards.into_iter().filter(is_local_endpoint).collect();
     let blocked = state.proxy.blocked_cards(&cards);
     let selected = match dispatch::select_with_gate_fallback(
@@ -1213,8 +1213,8 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
     }
 
     /// 选卡阶段已经把不在本机的卡排除了，所以从 HTTP 入口看不到复核起作用；这里把选卡绕过去，直接交给 `warm_resident`：请求照样发不
-    /// 出去，合并表里也不留名额与表项。两种卡各只有判据的一半拦得住：声明在远程的（端点碰巧在本机，所以只有「声明」拦得住它），
-    /// 和声明在本机而端点指向别处的（只有「地址」拦得住它）。
+    /// 出去，合并表里也不留名额与表项。两种卡各由判据的一半拦下：声明在远程的（端点碰巧在本机，由「声明」那一半拦下），
+    /// 和声明在本机而端点指向别处的（由「地址」那一半拦下）。
     #[tokio::test]
     async fn the_recheck_refuses_a_card_that_is_not_on_this_machine_before_anything_is_sent() {
         let upstream = wiremock::MockServer::start().await;
@@ -1264,7 +1264,7 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
         );
     }
 
-    /// 对照：同一条路径上，一张声明与端点都在本机的卡不会被复核拦住（复核不是「一律拒绝」）。
+    /// 对照：同一条路径上，一张声明与端点都在本机的卡过得了复核（复核没有把本机的卡也拒掉）。
     #[tokio::test]
     async fn the_recheck_lets_a_card_that_is_on_this_machine_through() {
         let upstream = wiremock::MockServer::start().await;
