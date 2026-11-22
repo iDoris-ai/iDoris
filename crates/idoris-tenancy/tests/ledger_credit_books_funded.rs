@@ -796,6 +796,47 @@ fn an_expired_reservation_gives_the_allowance_and_the_funds_back_and_its_late_se
 }
 
 #[test]
+fn a_late_settlement_is_judged_when_it_settles_so_an_allowance_that_ended_since_does_not_cover_it()
+{
+    // 迟到的结算是结算那一刻才发生的新花费：额度的窗口在这之前就结束了，就覆盖不了它。充值 100、授信 100，额度 100 的窗口在 T0 + 10 分钟结束。
+    //
+    //   T0 + 1 秒        预留 100（额度覆盖）
+    //   T0 + 31 分钟     预留过了 TTL（30 分钟）被过期，占着的额度放回去；额度的窗口早就结束了，放回去也没有用
+    //   T0 + 31 分钟 + 1 秒  迟到的结算按 100：额度够不着，花的是自有资金 100，授信一分没动
+    //
+    // 结算之后：额度 0、自有资金 0、债务 0，能花的 0 + 0 + 100 = 100。记在预留创建的时刻（T0 + 1 秒）的话，已经到期的额度会覆盖它：
+    // 自有资金 100 还在，能花的是 200。
+    let db = TempDb::new("funded-late-after-window");
+    let store = credit_world(&db);
+    top_up(&store, 100, "emp", T0);
+    credit_line(&store, 100, T0);
+    prepaid(&store, "emp-allow", 100, T0 - DAY, T0 + 10 * MINUTE, T0);
+    let first = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 1_000);
+    assert_eq!(price_of(&admit(&store, &first)), Some(100));
+    let expired = T0 + 31 * MINUTE;
+    assert_eq!(store.sweep_expired_holds(ts(expired)).unwrap(), 1);
+
+    let outcome = settle_at(&store, &first, 100, expired + 1_000);
+    assert!(outcome.late, "{outcome:?}");
+    assert_eq!(
+        (
+            outcome.sponsor_covered.clone(),
+            outcome.platform_loss.clone()
+        ),
+        (thb(100), thb(0)),
+        "the chain still has room (funds 100 + credit 100): {outcome:?}"
+    );
+    let after = view(&store, expired + 2_000);
+    assert_eq!(
+        after.ceiling_remaining,
+        Some(thb(0)),
+        "allowance gone, funds spent, no debt"
+    );
+    assert_eq!(headroom(&after), 100);
+    assert_clean(&store);
+}
+
+#[test]
 fn extra_costs_are_checked_against_the_same_three_books() {
     // 附加成本（比如安全检查）的预留只放行或拒绝，走的是同一份视图：充值 100、授信 100、额度 100，一共 300。
     let db = TempDb::new("funded-extra-cost");
