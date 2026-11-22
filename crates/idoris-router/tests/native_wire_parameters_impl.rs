@@ -348,7 +348,22 @@ async fn memory_admission_blocks_parameters_in_a_clean_home() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    // 不是随便一个 503：必须是内存准入给出的拒绝（没有可行的驱逐方案），不是启动门控、鉴权之类。
+    assert_eq!(body["error"]["type"], "local_only_unavailable", "{body}");
+    assert_eq!(
+        body["error"]["reason_code"], "eviction_impossible",
+        "{body}"
+    );
     let requests = upstream.received_requests().await.unwrap();
+    // 准入确实读过模型的内存估算（`GET /v1/models/status`），不是在读到之前就因为别的原因 503。
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.method == "GET" && r.url.path() == "/v1/models/status"),
+        "estimate was never fetched"
+    );
     // 被内存准入拦下：不加载模型、不发推理请求；没有 key，也就没有登录请求，不许有任何 POST。
     assert!(
         requests.iter().all(|request| request.method != "POST"),

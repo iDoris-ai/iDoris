@@ -1200,6 +1200,7 @@ version = "0.5.0"
 dependencies = [
  "idoris-contracts",
  "idoris-policy",
+ "nix",
  "serde",
  "serde_json",
  "serde_yaml",

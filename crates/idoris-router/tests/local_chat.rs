@@ -172,6 +172,9 @@ async fn only_role_chat_is_supported_and_everything_else_is_400_unsupported_role
         "/v1/recommendation?role=chat+",
         "/v1/recommendation?role=ch%zzat",
         "/v1/recommendation?role=chat%00",
+        // 编码后重复的 `role`（键被编码）仍是重复；`%25` 只解码一次，得到字面的 `ch%61t`，不是 `chat`。
+        "/v1/recommendation?role=chat&r%6Fle=chat",
+        "/v1/recommendation?role=ch%2561t",
         "/v1/recommendation?r%6Fle%00=chat",
     ] {
         // 数据源在不在都一样：角色先于数据源判断。

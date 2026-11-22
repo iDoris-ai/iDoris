@@ -17,15 +17,18 @@ use idoris_recommender::chat_recommendation::{
     RecommendInput, probed_gpu_available_bytes, recommend_chat,
 };
 use idoris_recommender::local_models::{
-    LocalModelsResponse, default_models_dir, scan_local_models,
+    LocalModel, LocalModelsResponse, default_models_dir, scan_local_models,
 };
+use idoris_recommender::single_flight::SingleFlight;
 use serde_json::Value;
 
 use crate::{AppState, error_envelope_with_reason};
 
-/// 一次推荐 / 列表所需的全部输入。创建后不可变；每次调用重新扫描模型目录。
+/// 一次推荐 / 列表所需的全部输入。创建后不可变；每次调用重新扫描模型目录，但并发的调用共用同一次进行中的扫描
+/// （单飞，不缓存：扫描结束后到达的请求会重新扫描）。
 #[derive(Debug, Clone)]
 pub struct LocalChatSource {
+    flight: Arc<SingleFlight<Arc<Vec<LocalModel>>>>,
     catalog: Catalog,
     bindings: Vec<OmlxBinding>,
     models_dir: PathBuf,
@@ -42,6 +45,7 @@ impl LocalChatSource {
         allocated_budget_bytes: Option<u64>,
     ) -> Self {
         Self {
+            flight: Arc::default(),
             catalog,
             bindings,
             models_dir,
@@ -73,14 +77,21 @@ impl LocalChatSource {
         ))
     }
 
+    /// 已安装的模型：与并发的请求共用同一次扫描。
+    fn installed(&self) -> Result<Arc<Vec<LocalModel>>, String> {
+        self.flight
+            .run(|| Arc::new(scan_local_models(&self.models_dir, &self.bindings)))
+            .ok_or_else(|| "本地模型目录扫描失败".to_owned())
+    }
+
     /// `GET /v1/recommendation?role=chat` 的响应体。
     pub fn recommendation_json(&self) -> Result<Value, String> {
-        let installed = scan_local_models(&self.models_dir, &self.bindings);
+        let installed = self.installed()?;
         let recommendation = recommend_chat(&RecommendInput {
             ram_bytes: self.ram_bytes,
             allocated_budget_bytes: self.allocated_budget_bytes,
             gpu_available_bytes: probed_gpu_available_bytes(self.ram_bytes),
-            installed: &installed,
+            installed: installed.as_slice(),
             catalog: &self.catalog,
             bindings: &self.bindings,
         })
@@ -90,7 +101,7 @@ impl LocalChatSource {
 
     /// `GET /v1/models/local` 的响应体。
     pub fn local_models_json(&self) -> Result<Value, String> {
-        let models = scan_local_models(&self.models_dir, &self.bindings);
+        let models = self.installed()?.as_ref().clone();
         serde_json::to_value(LocalModelsResponse { models }).map_err(|error| error.to_string())
     }
 }

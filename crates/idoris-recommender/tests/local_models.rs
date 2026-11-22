@@ -609,3 +609,147 @@ fn infer_kind_table() {
         assert_eq!(infer_kind(&config), expected, "{config}");
     }
 }
+
+/// 把 `prefix` + 填充 + `suffix` 凑成恰好 `total` 字节的合法 JSON（填充放在一个字符串字段里）。
+fn json_of_exact_len(prefix: &str, suffix: &str, total: usize) -> String {
+    let overhead = prefix.len() + suffix.len() + r#","pad":"""#.len();
+    assert!(total > overhead);
+    format!(
+        r#"{prefix},"pad":"{}"{suffix}"#,
+        "x".repeat(total - overhead)
+    )
+}
+
+const READ_LIMIT: usize = 4 * 1024 * 1024;
+
+/// #609（Codex）：`config.json` 与索引按句柄读，上限是 4 MiB：恰好 4 MiB 可以，多 1 字节拒绝。
+#[test]
+fn config_json_size_boundary_is_exactly_four_mib() {
+    let tmp = TempDir::new();
+    let prefix = r#"{"architectures":["Qwen3ForCausalLM"]"#;
+    for (name, total) in [
+        ("at-limit", READ_LIMIT),
+        ("one-over", READ_LIMIT + 1),
+        ("one-under", READ_LIMIT - 1),
+    ] {
+        let config = json_of_exact_len(prefix, "}", total);
+        assert_eq!(config.len(), total);
+        model_dir(tmp.path(), name, &config, &[("w.safetensors", 5)]);
+    }
+    assert_eq!(
+        ids(&scan_local_models(tmp.path(), &[])),
+        ["at-limit", "one-under"]
+    );
+}
+
+#[test]
+fn index_json_size_boundary_is_exactly_four_mib_and_is_never_read_unbounded() {
+    let tmp = TempDir::new();
+    let prefix = r#"{"weight_map":{"a":"w.safetensors"}"#;
+    for (name, total) in [
+        ("at-limit", READ_LIMIT),
+        ("one-over", READ_LIMIT + 1),
+        ("far-over", READ_LIMIT * 3),
+    ] {
+        let dir = model_dir(tmp.path(), name, &causal_config(), &[("w.safetensors", 5)]);
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            json_of_exact_len(prefix, "}", total),
+        )
+        .unwrap();
+    }
+    assert_eq!(ids(&scan_local_models(tmp.path(), &[])), ["at-limit"]);
+}
+
+fn with_index(root: &Path, name: &str, files: &[(&str, usize)], index: serde_json::Value) {
+    let dir = model_dir(root, name, &causal_config(), files);
+    fs::write(dir.join("model.safetensors.index.json"), index.to_string()).unwrap();
+}
+
+/// #609（Codex）：索引必须有非空 `weight_map`；分片（去重后）必须是遍历时认定的「顶层、可见、非空权重」。
+#[test]
+fn a_shard_index_must_be_non_empty_and_every_shard_must_be_a_visible_non_empty_weight() {
+    let tmp = TempDir::new();
+    let good = &[("model-1.safetensors", 5), ("model-2.safetensors", 6)];
+    // 合格：两个分片齐全，重复引用同一个分片不影响。
+    with_index(
+        tmp.path(),
+        "ok",
+        good,
+        json!({"weight_map": {"a": "model-1.safetensors", "b": "model-2.safetensors",
+                              "c": "model-1.safetensors"}}),
+    );
+    // 空 weight_map。
+    with_index(tmp.path(), "empty-map", good, json!({"weight_map": {}}));
+    // 分片是空文件（索引之外还有别的非空权重，目录本身有权重）。
+    with_index(
+        tmp.path(),
+        "empty-shard",
+        &[("model-1.safetensors", 5), ("model-2.safetensors", 0)],
+        json!({"weight_map": {"a": "model-1.safetensors", "b": "model-2.safetensors"}}),
+    );
+    // 分片是隐藏文件。
+    with_index(
+        tmp.path(),
+        "hidden-shard",
+        &[("model-1.safetensors", 5), (".hidden.safetensors", 6)],
+        json!({"weight_map": {"a": "model-1.safetensors", "b": ".hidden.safetensors"}}),
+    );
+    // 分片不是权重文件（普通的非空文件）。
+    with_index(
+        tmp.path(),
+        "not-a-weight",
+        &[("model-1.safetensors", 5), ("notes.txt", 6)],
+        json!({"weight_map": {"a": "model-1.safetensors", "b": "notes.txt"}}),
+    );
+    // 分片是目录。
+    let dir = model_dir(
+        tmp.path(),
+        "dir-shard",
+        &causal_config(),
+        &[("model-1.safetensors", 5)],
+    );
+    fs::create_dir_all(dir.join("model-2.safetensors")).unwrap();
+    fs::write(
+        dir.join("model.safetensors.index.json"),
+        json!({"weight_map": {"a": "model-1.safetensors", "b": "model-2.safetensors"}}).to_string(),
+    )
+    .unwrap();
+    // 分片在子目录里（名字里带路径）。
+    let dir = model_dir(
+        tmp.path(),
+        "nested-shard",
+        &causal_config(),
+        &[("model-1.safetensors", 5)],
+    );
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    fs::write(dir.join("sub").join("model-2.safetensors"), b"x").unwrap();
+    fs::write(
+        dir.join("model.safetensors.index.json"),
+        json!({"weight_map": {"a": "model-1.safetensors", "b": "sub/model-2.safetensors"}})
+            .to_string(),
+    )
+    .unwrap();
+    // 值不是字符串、空字符串。
+    with_index(
+        tmp.path(),
+        "non-string",
+        good,
+        json!({"weight_map": {"a": 1}}),
+    );
+    with_index(
+        tmp.path(),
+        "empty-name",
+        good,
+        json!({"weight_map": {"a": ""}}),
+    );
+    // 索引本身是目录。
+    let dir = model_dir(
+        tmp.path(),
+        "index-is-dir",
+        &causal_config(),
+        &[("model-1.safetensors", 5)],
+    );
+    fs::create_dir_all(dir.join("model.safetensors.index.json")).unwrap();
+    assert_eq!(ids(&scan_local_models(tmp.path(), &[])), ["ok"]);
+}
