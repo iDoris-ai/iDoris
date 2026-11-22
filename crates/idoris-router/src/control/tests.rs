@@ -706,6 +706,57 @@ async fn the_admin_token_the_local_data_key_and_the_control_credential_are_three
     );
 }
 
+/// 源码里（注释除外）读取请求来源的行：对端地址、转发头、回环判断……返回 `文件名:行号: 命中的词: 原行`。
+///
+/// `extractor` 给了的话，这份源码里**只有**那个提取器（`impl<S: Send + Sync> FromRequestParts<S> for <extractor>` 到它结尾的
+/// `}`）允许读来源；`use` 行不算（导入本身读不了什么），`#[cfg(test)]` 之后的单元测试不算运行期代码。
+fn origin_reads(name: &str, source: &str, extractor: Option<&str>) -> Vec<String> {
+    const NEEDLES: [&str; 8] = [
+        "connectinfo",
+        "x-forwarded",
+        "x-real-ip",
+        "remote_addr",
+        "peer_addr",
+        "is_loopback",
+        "forwarded",
+        "origin",
+    ];
+    let allowed_impl = extractor
+        .map(|extractor| format!("impl<S: Send + Sync> FromRequestParts<S> for {extractor}"));
+    let mut inside_extractor = false;
+    let mut found = Vec::new();
+    for (number, line) in source.lines().enumerate() {
+        let code = line.trim_start();
+        if extractor.is_some() {
+            if code.starts_with("#[cfg(test)]") {
+                break;
+            }
+            if allowed_impl
+                .as_deref()
+                .is_some_and(|head| code.starts_with(head))
+            {
+                inside_extractor = true;
+            }
+            if inside_extractor {
+                // 顶格的 `}` 结束这个 impl
+                inside_extractor = line != "}";
+                continue;
+            }
+            if code.starts_with("use ") {
+                continue;
+            }
+        }
+        if code.starts_with("//") {
+            continue;
+        }
+        let lowered = code.to_ascii_lowercase();
+        if let Some(needle) = NEEDLES.iter().find(|needle| lowered.contains(**needle)) {
+            found.push(format!("{name}:{}: {needle}: {line}", number + 1));
+        }
+    }
+    found
+}
+
 #[test]
 fn the_control_plane_sources_never_look_at_where_a_request_came_from() {
     // 组织局域网也不默认互信：授权只由凭证决定。把「看来源」这件事在源码层面钉死：处理函数里没有任何
@@ -716,30 +767,72 @@ fn the_control_plane_sources_never_look_at_where_a_request_came_from() {
         ("wire.rs", include_str!("wire.rs")),
         ("bootstrap.rs", include_str!("bootstrap.rs")),
     ] {
-        for (number, line) in source.lines().enumerate() {
-            let code = line.trim_start();
-            if code.starts_with("//") {
-                continue;
-            }
-            let lowered = code.to_ascii_lowercase();
-            for needle in [
-                "connectinfo",
-                "x-forwarded",
-                "x-real-ip",
-                "remote_addr",
-                "peer_addr",
-                "is_loopback",
-                "forwarded",
-                "origin",
-            ] {
-                assert!(
-                    !lowered.contains(needle),
-                    "{name}:{}: control-plane code must not consult the request origin ({needle}): {line}",
-                    number + 1
-                );
-            }
-        }
+        let found = origin_reads(name, source, None);
+        assert!(
+            found.is_empty(),
+            "control-plane code must not consult the request origin: {found:#?}"
+        );
     }
+    // 配对兑换的失败限速器按来源分桶（#603 N3），读来源的代码在 `pairing_codes.rs` 里。PR-Daemon 在 #607 评审里指出：那个文件
+    // 不在上面的扫描里。这里把它也扫一遍，只有 `RedeemSource` 提取器允许读来源；限速器自己（`acquire` 等）拿到的只是
+    // 提取器算好的地址，不能再按「回环」「转发头」之类另做文章。
+    let found = origin_reads(
+        "pairing_codes.rs",
+        include_str!("pairing_codes.rs"),
+        Some("RedeemSource"),
+    );
+    assert!(
+        found.is_empty(),
+        "only the RedeemSource extractor may consult the request origin: {found:#?}"
+    );
+}
+
+/// 上面那条扫描自己不能是摆设：提取器之外的读取、被误当成注释或 `use` 行遮住的读取都要被抓到，提取器之内的、注释里的、
+/// 单元测试里的不报。
+#[test]
+fn the_origin_scan_flags_a_read_outside_the_one_allowed_extractor() {
+    let sample = "\
+use axum::extract::connect_info::ConnectInfo;
+// X-Forwarded-For 只在注释里出现
+impl FailureLimiter {
+    fn acquire(&self, source: IpAddr) -> Option<Ticket> {
+        if source.is_loopback() { return Some(Ticket(0)); }
+        None
+    }
+}
+impl<S: Send + Sync> FromRequestParts<S> for RedeemSource {
+    async fn from_request_parts(parts: &mut Parts) -> Result<Self, Self::Rejection> {
+        let peer = parts.extensions.get::<ConnectInfo<ConnectionInfo>>();
+        Ok(Self(peer))
+    }
+}
+fn later(headers: &HeaderMap) { let _ = headers.get(\"x-forwarded-for\"); }
+#[cfg(test)]
+mod tests {
+    fn t(source: IpAddr) { source.is_loopback(); }
+}
+";
+    let found = origin_reads("sample.rs", sample, Some("RedeemSource"));
+    assert_eq!(found.len(), 2, "{found:#?}");
+    assert!(
+        found[0].starts_with("sample.rs:5: is_loopback:"),
+        "{found:#?}"
+    );
+    assert!(
+        found[1].starts_with("sample.rs:15: x-forwarded:"),
+        "{found:#?}"
+    );
+    // 没有提取器的白名单时，同一份源码里 `use` 行、提取器里的读取也都算
+    let strict = origin_reads("sample.rs", sample, None);
+    assert!(strict.len() > found.len(), "{strict:#?}");
+    // 提取器换了名字，它里面的读取就不再被放过
+    let renamed = origin_reads("sample.rs", sample, Some("SomethingElse"));
+    assert!(
+        renamed
+            .iter()
+            .any(|line| line.contains(":11: connectinfo:")),
+        "{renamed:#?}"
+    );
 }
 
 // ================================================================================================
