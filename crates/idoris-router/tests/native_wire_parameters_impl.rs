@@ -299,8 +299,45 @@ async fn null_without_tool_calls_is_an_upstream_error() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
+const CHILD_ENV: &str = "IDORIS_TEST_MEMORY_ADMISSION_CHILD";
+
+/// 内存准入的测试要在没有任何 oMLX key 的环境里跑：环境变量或 `~/.omlx/settings.json` 里有 key 时，适配器会先
+/// POST `/admin/api/login`，请求序列就随开发者机器变了（#609）。这里在子进程里重跑同一个用例：`HOME` 指向临时
+/// 空目录、环境变量里没有 `IDORIS_OMLX_API_KEY`，所以子进程里的断言可以更严——除了准入拦截，一个 POST 都不许有。
+#[test]
+fn parameters_cannot_bypass_supervisor_memory_admission() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "memory_admission_blocks_parameters_in_a_clean_home",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_ENV, "1")
+        .env("HOME", home.path())
+        .env_remove("IDORIS_OMLX_API_KEY")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "child failed:\n{stdout}\n{stderr}");
+    // 子进程确实跑了那一个用例（不是 0 个用例也算成功）。
+    assert!(
+        stdout.contains("1 passed"),
+        "child did not run it:\n{stdout}"
+    );
+}
+
 #[tokio::test]
-async fn parameters_cannot_bypass_supervisor_memory_admission() {
+async fn memory_admission_blocks_parameters_in_a_clean_home() {
+    // 只在子进程里跑；直接跑（没有 CHILD_ENV）等于没有假 HOME，什么也不断言。
+    if std::env::var_os(CHILD_ENV).is_none() {
+        return;
+    }
     let upstream = MockServer::start().await;
     let app = native_app_with_memory(&upstream, 64 * 1024 * 1024 * 1024).await;
     let response = app
@@ -312,13 +349,9 @@ async fn parameters_cannot_bypass_supervisor_memory_admission() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let requests = upstream.received_requests().await.unwrap();
-    // 被内存准入拦下：不加载模型、不发推理请求。进程里带着 oMLX key（环境变量或
-    // ~/.omlx/settings.json）时，适配器会先 POST /admin/api/login 取会话读内存状态——
-    // 这不是加载也不是推理，不算绕过；其余任何 POST 都算。
+    // 被内存准入拦下：不加载模型、不发推理请求；没有 key，也就没有登录请求，不许有任何 POST。
     assert!(
-        requests
-            .iter()
-            .all(|request| request.method != "POST" || request.url.path() == "/admin/api/login"),
+        requests.iter().all(|request| request.method != "POST"),
         "{:?}",
         requests
             .iter()

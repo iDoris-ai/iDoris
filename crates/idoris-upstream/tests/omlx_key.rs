@@ -181,6 +181,52 @@ fn a_symlinked_settings_file_is_ignored() {
     assert_eq!(settings_api_key(home.path()).as_deref(), Some("via-link"));
 }
 
+/// #609：检查与打开之间没有窗口——类型由已打开的句柄说了算。FIFO 里即使有一份合法的 JSON（写端先开着、
+/// 读端 `O_NONBLOCK` 打开能成功并读到内容），也必须因为不是常规文件而被拒绝。
+#[cfg(unix)]
+#[test]
+fn a_fifo_with_valid_content_is_rejected_by_the_opened_handles_type() {
+    use std::io::Write;
+    let home = Home::new();
+    let path = home.path().join(".omlx/settings.json");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // 读写方式打开 FIFO 不会阻塞，也让之后的读端打开成功；内容是合法的带 key 的 JSON。
+    let mut writer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    writer
+        .write_all(br#"{"auth":{"api_key":"from-fifo"}}"#)
+        .unwrap();
+    assert_eq!(settings_api_key(home.path()), None);
+    assert_eq!(resolve_from(None, Some(home.path())), None);
+}
+
+/// 「不跟随符号链接」只对最后一段成立（规范与注释已收窄）：`~/.omlx` 本身是符号链接（常见：模型与配置放在别的盘）
+/// 时，里面的常规文件照常读取。这条钉住的是已知口径，不是承诺的安全属性。
+#[cfg(unix)]
+#[test]
+fn only_the_final_path_component_is_not_followed() {
+    let home = Home::new();
+    let real = home.path().join("elsewhere");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(
+        real.join("settings.json"),
+        r#"{"auth":{"api_key":"k-dir"}}"#,
+    )
+    .unwrap();
+    fs::remove_dir_all(home.path().join(".omlx")).unwrap();
+    std::os::unix::fs::symlink(&real, home.path().join(".omlx")).unwrap();
+    assert_eq!(settings_api_key(home.path()).as_deref(), Some("k-dir"));
+}
+
 #[test]
 fn settings_key_is_only_for_loopback_but_env_key_is_unchanged() {
     let home = Home::new();

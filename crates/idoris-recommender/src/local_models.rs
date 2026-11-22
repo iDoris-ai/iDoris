@@ -6,10 +6,12 @@
 //!
 //! 实现口径（规范没写到的地方，全部取保守一侧）：
 //! - 符号链接一律不跟随：模型目录本身是符号链接时整项跳过；目录内的符号链接文件既不计入体积、也不算权重。
-//! - 「完整」= 目录里有可读的常规文件 `config.json`、至少一个权重文件（`.safetensors` / `.gguf` / `.npz`），
-//!   `model.safetensors.index.json` 列出的分片全部存在，且没有下载残留（`.incomplete` / `.partial` /
-//!   `.part` / `.tmp` / `.downloading`）。不完整的目录不出现在列表里，也不算「已安装」。
-//! - `config.json` 读得到但不是合法 JSON：目录仍算完整，`kind` 取目录里写的值，没有就是 `unknown`。
+//! - 「完整」= 目录里有可读的常规文件 `config.json` 且它是合法的 JSON 对象（截断或损坏的 config 说明下载没收完，
+//!   首次加载必失败，不算已安装）、至少一个**非空**的权重文件（`.safetensors` / `.gguf` / `.npz`；零字节的
+//!   占位文件不算），`model.safetensors.index.json` 列出的分片全部是非空的常规文件，且没有下载残留
+//!   （`.incomplete` / `.partial` / `.part` / `.tmp` / `.downloading`）。不完整的目录不出现在列表里，也不算「已安装」。
+//! - 符号链接目录（含 HF snapshot 风格的链接）本版**不支持**，一律按未安装：理由与取舍见接口规范 §2.9 与勘误十一。
+//! - 遍历上限数的是目录项（文件与子目录都算），超过即当作不完整。
 //! - 以 `.` 开头的目录（`.cache`、`.tmp` 之类的暂存）和非 UTF-8 名字跳过。
 
 use std::collections::BTreeMap;
@@ -24,9 +26,20 @@ use crate::catalog::{ModelKind, OmlxBinding};
 
 /// `config.json` 的读取上限；超过的当作读不了。
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
-/// 单个模型目录最多遍历的文件数与深度，防止畸形目录拖住请求。
-const MAX_FILES_PER_MODEL: usize = 100_000;
+/// 单个模型目录最多遍历的目录项数（文件与子目录都算）与深度，防止畸形目录拖住请求。
+const MAX_ENTRIES_PER_MODEL: usize = 100_000;
 const MAX_DEPTH: usize = 8;
+
+#[derive(Clone, Copy)]
+struct Limits {
+    max_entries: usize,
+    max_depth: usize,
+}
+
+const LIMITS: Limits = Limits {
+    max_entries: MAX_ENTRIES_PER_MODEL,
+    max_depth: MAX_DEPTH,
+};
 
 /// 一个已安装的本地模型。字段名与 §2.9 的响应逐字一致。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +93,7 @@ pub fn scan_local_models(dir: &Path, bindings: &[OmlxBinding]) -> Vec<LocalModel
         let binding = by_id.get(name.as_str());
         let kind = binding
             .and_then(|binding| binding.kind)
-            .or_else(|| inspected.config.as_ref().map(infer_kind))
+            .or_else(|| Some(infer_kind(&inspected.config)))
             .unwrap_or(ModelKind::Unknown);
         models.push(LocalModel {
             omlx_id: name,
@@ -94,13 +107,16 @@ pub fn scan_local_models(dir: &Path, bindings: &[OmlxBinding]) -> Vec<LocalModel
 }
 
 struct InspectedDir {
-    /// `None` 表示 `config.json` 读得到但不是合法 JSON。
-    config: Option<Value>,
+    config: Value,
     size_bytes: u64,
 }
 
 /// 目录完整时返回其体积与解析后的 `config.json`；不完整返回 `None`。
 fn inspect_model_dir(dir: &Path) -> Option<InspectedDir> {
+    inspect_model_dir_with(dir, LIMITS)
+}
+
+fn inspect_model_dir_with(dir: &Path, limits: Limits) -> Option<InspectedDir> {
     let config_path = dir.join("config.json");
     let meta = fs::symlink_metadata(&config_path).ok()?;
     if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
@@ -112,10 +128,13 @@ fn inspect_model_dir(dir: &Path) -> Option<InspectedDir> {
         .take(MAX_CONFIG_BYTES)
         .read_to_end(&mut raw)
         .ok()?;
-    let config = serde_json::from_slice::<Value>(&raw).ok();
+    // 解析失败（截断、损坏）或不是对象：下载没收完，首次加载必失败，不算完整。
+    let config = serde_json::from_slice::<Value>(&raw)
+        .ok()
+        .filter(Value::is_object)?;
 
     let mut walk = Walk::default();
-    walk_dir(dir, 0, &mut walk);
+    walk_dir(dir, 0, limits, &mut walk);
     if walk.truncated || walk.partial || walk.weights == 0 {
         return None;
     }
@@ -131,14 +150,14 @@ fn inspect_model_dir(dir: &Path) -> Option<InspectedDir> {
 #[derive(Default)]
 struct Walk {
     size_bytes: u64,
-    files: usize,
+    entries: usize,
     weights: usize,
     partial: bool,
     truncated: bool,
 }
 
-fn walk_dir(dir: &Path, depth: usize, walk: &mut Walk) {
-    if depth > MAX_DEPTH {
+fn walk_dir(dir: &Path, depth: usize, limits: Limits, walk: &mut Walk) {
+    if depth > limits.max_depth {
         walk.truncated = true;
         return;
     }
@@ -148,18 +167,19 @@ fn walk_dir(dir: &Path, depth: usize, walk: &mut Walk) {
         return;
     };
     for entry in entries.flatten() {
+        // 文件、子目录、符号链接一视同仁地计数：只数文件会让一堆空子目录拖住请求。
+        walk.entries += 1;
+        if walk.entries > limits.max_entries || walk.truncated {
+            walk.truncated = true;
+            return;
+        }
         let Ok(meta) = fs::symlink_metadata(entry.path()) else {
             continue;
         };
         let name = entry.file_name().to_string_lossy().to_lowercase();
         if meta.is_dir() {
-            walk_dir(&entry.path(), depth + 1, walk);
+            walk_dir(&entry.path(), depth + 1, limits, walk);
         } else if meta.is_file() {
-            walk.files += 1;
-            if walk.files > MAX_FILES_PER_MODEL {
-                walk.truncated = true;
-                return;
-            }
             if [".incomplete", ".partial", ".part", ".tmp", ".downloading"]
                 .iter()
                 .any(|suffix| name.ends_with(suffix))
@@ -169,9 +189,10 @@ fn walk_dir(dir: &Path, depth: usize, walk: &mut Walk) {
             // 隐藏目录里的文件（暂存）不计体积；残留标记上面已经检查过。
             if !name.starts_with('.') && !is_in_hidden_component(dir, depth) {
                 walk.size_bytes = walk.size_bytes.saturating_add(meta.len());
-                if [".safetensors", ".gguf", ".npz"]
-                    .iter()
-                    .any(|suffix| name.ends_with(suffix))
+                if meta.len() > 0
+                    && [".safetensors", ".gguf", ".npz"]
+                        .iter()
+                        .any(|suffix| name.ends_with(suffix))
                 {
                     walk.weights += 1;
                 }
@@ -188,7 +209,7 @@ fn is_in_hidden_component(dir: &Path, depth: usize) -> bool {
         .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
 }
 
-/// `model.safetensors.index.json` 存在时，它列出的分片必须全部是目录里的常规文件。
+/// `model.safetensors.index.json` 存在时，它列出的分片必须全部是目录里的非空常规文件。
 fn shards_present(dir: &Path) -> bool {
     let index = dir.join("model.safetensors.index.json");
     let Ok(meta) = fs::symlink_metadata(&index) else {
@@ -211,7 +232,8 @@ fn shards_present(dir: &Path) -> bool {
             !name.is_empty()
                 && !name.contains(['/', '\\'])
                 && name != ".."
-                && fs::symlink_metadata(dir.join(name)).is_ok_and(|meta| meta.is_file())
+                && fs::symlink_metadata(dir.join(name))
+                    .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
         })
     })
 }
@@ -274,4 +296,59 @@ pub fn infer_kind(config: &Value) -> ModelKind {
         return ModelKind::Chat;
     }
     ModelKind::Unknown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 遍历上限数目录项而不只数文件：一堆空子目录也会触顶（用小上限验证，不必真造 10 万个目录）。
+    /// 返回（临时根，模型目录）：tempfile 的目录名以 `.` 开头，会被隐藏目录规则排除，所以模型目录放在一层子目录里。
+    fn model_dir_with_empty_subdirs(count: usize) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = DirHandle(root.path().join("m"));
+        fs::create_dir(&dir.0).unwrap();
+        fs::write(
+            dir.0.join("config.json"),
+            r#"{"architectures":["XForCausalLM"]}"#,
+        )
+        .unwrap();
+        fs::write(dir.0.join("model.safetensors"), b"w").unwrap();
+        for index in 0..count {
+            fs::create_dir(dir.0.join(format!("d{index}"))).unwrap();
+        }
+        (root, dir.0)
+    }
+
+    struct DirHandle(PathBuf);
+
+    #[test]
+    fn the_entry_limit_counts_subdirectories_not_just_files() {
+        let limits = Limits {
+            max_entries: 10,
+            max_depth: 8,
+        };
+        // config + 权重 + 7 个空目录 = 9 项，未触顶。
+        let (_keep, under) = model_dir_with_empty_subdirs(7);
+        assert!(inspect_model_dir_with(&under, limits).is_some());
+        // 再多几个空目录（文件数仍是 2）就触顶，当作不完整。
+        let (_keep, over) = model_dir_with_empty_subdirs(12);
+        assert!(inspect_model_dir_with(&over, limits).is_none());
+    }
+
+    #[test]
+    fn the_depth_limit_still_applies() {
+        let (_keep, dir) = model_dir_with_empty_subdirs(0);
+        let mut deep = dir.clone();
+        for _ in 0..4 {
+            deep.push("n");
+        }
+        fs::create_dir_all(&deep).unwrap();
+        let tight = Limits {
+            max_entries: 100,
+            max_depth: 2,
+        };
+        assert!(inspect_model_dir_with(&dir, tight).is_none());
+        assert!(inspect_model_dir_with(&dir, LIMITS).is_some());
+    }
 }

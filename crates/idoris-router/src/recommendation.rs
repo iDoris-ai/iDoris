@@ -105,14 +105,22 @@ fn unavailable(what: &str) -> Response {
 }
 
 /// 查询串里恰好有一个 `role`，且值恰好是 `chat`。缺省、重复、其他值都不算。
+///
+/// 键与值按 `application/x-www-form-urlencoded` 解码后再比较（`role=ch%61t` 与 `role=chat` 等价，`r%6Fle=chat`
+/// 也是 `role`），与调用方用任何标准 URL 库拼出来的查询串一致；解码后重复的 `role` 仍然拒绝。
 fn role_is_chat(query: Option<&str>) -> bool {
-    let mut roles = query
-        .unwrap_or_default()
-        .split('&')
-        .filter_map(|pair| pair.split_once('=').or(Some((pair, ""))))
-        .filter(|(key, _)| *key == "role")
+    let Some(query) = query.filter(|query| !query.is_empty()) else {
+        return false;
+    };
+    let Ok(mut url) = reqwest::Url::parse("http://localhost/") else {
+        return false;
+    };
+    url.set_query(Some(query));
+    let mut roles = url
+        .query_pairs()
+        .filter(|(key, _)| key == "role")
         .map(|(_, value)| value);
-    matches!((roles.next(), roles.next()), (Some("chat"), None))
+    matches!((roles.next(), roles.next()), (Some(value), None) if value == "chat")
 }
 
 async fn run_blocking(

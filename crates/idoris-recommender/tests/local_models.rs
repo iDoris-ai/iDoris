@@ -166,15 +166,22 @@ fn catalog_kind_wins_over_config_and_config_wins_over_unknown() {
     assert_eq!(entry.catalog_id.as_deref(), Some("c2"));
 }
 
+/// #609：损坏或截断的 `config.json` 说明下载没收完，首次加载必失败，不能报已安装（推荐会因此跳过下载）。
 #[test]
-fn invalid_json_config_is_unknown_but_the_model_is_still_listed() {
+fn a_corrupt_config_json_means_not_installed() {
     let tmp = TempDir::new();
-    model_dir(
-        tmp.path(),
-        "broken-config",
-        "{ not json",
-        &[("w.safetensors", 5)],
-    );
+    let cases: [(&str, &str); 6] = [
+        ("truncated", r#"{"architectures":["Qwen3ForCausal"#),
+        ("not-json", "{ not json"),
+        ("empty-config", ""),
+        ("array-root", r#"["architectures"]"#),
+        ("string-root", r#""hello""#),
+        ("null-root", "null"),
+    ];
+    for (name, config) in cases {
+        // 权重是非空的：拦下这个目录的只有损坏的 config。
+        model_dir(tmp.path(), name, config, &[("w.safetensors", 5)]);
+    }
     model_dir(
         tmp.path(),
         "good",
@@ -182,15 +189,138 @@ fn invalid_json_config_is_unknown_but_the_model_is_still_listed() {
         &[("w.safetensors", 5)],
     );
     let models = scan_local_models(tmp.path(), &[]);
-    assert_eq!(ids(&models), ["broken-config", "good"]);
-    assert_eq!(models[0].kind, ModelKind::Unknown);
-    assert_eq!(models[1].kind, ModelKind::Chat);
-    // 目录里写了 kind 时，config.json 坏了也不影响。
-    let models = scan_local_models(
-        tmp.path(),
-        &[binding("broken-config", "c", Some(ModelKind::Vision))],
+    assert_eq!(ids(&models), ["good"]);
+    // 目录里写了 kind 也救不了：不完整就是不完整。
+    let bound: Vec<_> = cases
+        .iter()
+        .map(|(name, _)| binding(name, "c", Some(ModelKind::Vision)))
+        .collect();
+    assert_eq!(
+        ids(&scan_local_models(tmp.path(), &bound)),
+        ["good"],
+        "a catalog binding must not resurrect a corrupt directory"
     );
-    assert_eq!(models[0].kind, ModelKind::Vision);
+    // `{}` 是合法的 JSON 对象：照旧列出，`kind` 是 unknown。
+    model_dir(tmp.path(), "empty-object", "{}", &[("w.safetensors", 5)]);
+    let models = scan_local_models(tmp.path(), &[]);
+    assert_eq!(ids(&models), ["empty-object", "good"]);
+    assert_eq!(models[0].kind, ModelKind::Unknown);
+}
+
+/// #609 的原始复现：截断的 config + 一个零字节填充的权重文件。
+#[test]
+fn truncated_config_with_a_zero_byte_weight_is_not_installed() {
+    let tmp = TempDir::new();
+    model_dir(
+        tmp.path(),
+        "half-downloaded",
+        r#"{"architectures":["Qwen3ForCausalLM"],"model_ty"#,
+        &[("model.safetensors", 0)],
+    );
+    assert!(scan_local_models(tmp.path(), &[]).is_empty());
+}
+
+#[test]
+fn zero_byte_weights_and_zero_byte_shards_do_not_count() {
+    let tmp = TempDir::new();
+    // 只有零字节权重：不算权重。
+    model_dir(
+        tmp.path(),
+        "only-empty-weight",
+        &causal_config(),
+        &[("model.safetensors", 0)],
+    );
+    // 一个非空、一个零字节：非空的算数，目录完整。
+    model_dir(
+        tmp.path(),
+        "one-real-weight",
+        &causal_config(),
+        &[("a.safetensors", 7), ("b.safetensors", 0)],
+    );
+    // 索引列出的分片里有零字节的：不完整。
+    let dir = model_dir(
+        tmp.path(),
+        "empty-shard",
+        &causal_config(),
+        &[
+            ("model-00001.safetensors", 5),
+            ("model-00002.safetensors", 0),
+        ],
+    );
+    fs::write(
+        dir.join("model.safetensors.index.json"),
+        json!({"weight_map": {"a": "model-00001.safetensors", "b": "model-00002.safetensors"}})
+            .to_string(),
+    )
+    .unwrap();
+    let models = scan_local_models(tmp.path(), &[]);
+    assert_eq!(ids(&models), ["one-real-weight"]);
+}
+
+/// #609：隐藏目录（暂存）里的权重不计体积、不算权重；文件名以 `.` 开头同理。
+#[test]
+fn hidden_components_inside_a_model_dir_are_excluded_from_size_and_weights() {
+    let tmp = TempDir::new();
+    let config_len = causal_config().len() as u64;
+    let dir = model_dir(
+        tmp.path(),
+        "with-staging",
+        &causal_config(),
+        &[("w.safetensors", 5), (".dotfile.safetensors", 1000)],
+    );
+    fs::create_dir_all(dir.join(".cache").join("deep")).unwrap();
+    fs::write(dir.join(".cache").join("big.safetensors"), vec![0u8; 2000]).unwrap();
+    fs::write(
+        dir.join(".cache").join("deep").join("bigger.gguf"),
+        vec![0u8; 3000],
+    )
+    .unwrap();
+    // 只有隐藏处有权重：不完整。
+    let only_hidden = model_dir(tmp.path(), "only-hidden-weights", &causal_config(), &[]);
+    fs::create_dir_all(only_hidden.join(".staging")).unwrap();
+    fs::write(only_hidden.join(".staging").join("w.safetensors"), b"x").unwrap();
+    let models = scan_local_models(tmp.path(), &[]);
+    assert_eq!(ids(&models), ["with-staging"]);
+    assert_eq!(models[0].size_bytes, 5 + config_len);
+}
+
+/// 隐藏目录里的下载残留标记仍然让目录不完整（残留检查在隐藏排除之前）。
+#[test]
+fn a_partial_marker_inside_a_hidden_directory_still_blocks_installed() {
+    let tmp = TempDir::new();
+    let dir = model_dir(tmp.path(), "m", &causal_config(), &[("w.safetensors", 5)]);
+    fs::create_dir_all(dir.join(".cache")).unwrap();
+    fs::write(dir.join(".cache").join("x.safetensors.incomplete"), b"x").unwrap();
+    assert!(scan_local_models(tmp.path(), &[]).is_empty());
+}
+
+/// #609：符号链接模型目录（含 HF snapshot 风格）本版不支持，按未安装；规范 §2.9 勘误十一写明了取舍。
+#[cfg(unix)]
+#[test]
+fn hf_snapshot_style_symlinked_model_dirs_are_documented_as_unsupported() {
+    use std::os::unix::fs::symlink;
+    let tmp = TempDir::new();
+    let cache = TempDir::new();
+    let snapshot = cache.path().join("snapshots").join("abc123");
+    fs::create_dir_all(&snapshot).unwrap();
+    let blobs = cache.path().join("blobs");
+    fs::create_dir_all(&blobs).unwrap();
+    fs::write(blobs.join("w"), b"weights").unwrap();
+    fs::write(blobs.join("c"), causal_config()).unwrap();
+    symlink(blobs.join("w"), snapshot.join("model.safetensors")).unwrap();
+    symlink(blobs.join("c"), snapshot.join("config.json")).unwrap();
+    // 目录级链接指向 snapshot；snapshot 里的文件本身也是链接。
+    symlink(&snapshot, tmp.path().join("Linked-Model")).unwrap();
+    // 在 models 根内的别名也一样不支持。
+    model_dir(
+        tmp.path(),
+        "Real-Model",
+        &causal_config(),
+        &[("w.safetensors", 5)],
+    );
+    symlink(tmp.path().join("Real-Model"), tmp.path().join("Alias")).unwrap();
+    let models = scan_local_models(tmp.path(), &[]);
+    assert_eq!(ids(&models), ["Real-Model"]);
 }
 
 #[test]

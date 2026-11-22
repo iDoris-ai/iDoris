@@ -18,7 +18,7 @@ use crate::dispatch::BoundSupervisor;
 
 /// Decimal 1GB kept unreserved inside an allocated budget unless a chat
 /// request confirms the breach (`X-iDoris-Headroom-Breach: confirmed`).
-const HEADROOM_BYTES: u64 = 1_000_000_000;
+const HEADROOM_BYTES: u64 = idoris_recommender::chat_recommendation::HEADROOM_BYTES;
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeRegistry {
