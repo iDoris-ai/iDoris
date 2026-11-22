@@ -538,7 +538,7 @@ impl Registry {
         }
     }
 
-    /// 预检：此刻这样一个预热会不会因为哪一道上限被 429。什么也不登记。放在预算检查之前（它要拿账本的锁），免得一堆注定被拒的
+    /// 预检：此刻这样一个预热是不是要因为哪一道上限被 429。什么也不登记。放在预算检查之前（它要拿账本的锁），免得一堆注定被拒的
     /// 预热每个都去拿；真正的判断仍在登记时再做一次，两次之间别人先到的话以登记为准。
     fn refusal(&self, key: &RequestKey, caller: Option<&str>) -> Option<Limit> {
         let caller = caller.map(str::to_string);
@@ -626,7 +626,7 @@ impl Drop for Lead {
     }
 }
 
-/// 超了一道在途上限：429，带 `Retry-After`。三道上限共用一个错误类型与原因码，只有说明文字不同。
+/// 超了一道在途上限：429，带 `Retry-After`。三道上限共用一个错误类型与原因码，说明文字各不相同。
 fn limited_response(selected: &Selected, limit: Limit) -> Response {
     let message = match limit {
         Limit::Key => format!(
@@ -672,7 +672,7 @@ struct ResidentRequest {
 }
 
 /// 测试注入点（[`ResidentRequest::run`]）：让一个 resident 预热的领头任务停在发请求之前，等测试放行；放行之后可以让它 panic，
-/// 而不是发请求。用来让「并入者一定在领头的结束之前到」、以及领头任务 panic 的路径都不靠时间碰运气。
+/// 而不是发请求。用来让并入者在领头的结束之前到、以及领头任务 panic 的路径都不靠时间碰运气。
 #[cfg(test)]
 pub(crate) struct RunHook {
     /// 领头任务在这里等：测试往里放许可才继续（`add_permits`）。
@@ -1613,7 +1613,7 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
             leads(&registry, "m", Some("key")),
             leads(&registry, "n", Some("key")),
         ];
-        // 这把 key 到了自己的上限：第三个模型会被拒，在途的两个模型仍然可以并入；问一问不会并入任何东西。
+        // 这把 key 到了自己的上限：第三个模型会被拒，在途的两个模型仍然可以并入；问一问并入不了任何东西。
         assert_eq!(
             registry.refusal(&request("o"), Some("key")),
             Some(Limit::Key)

@@ -44,7 +44,7 @@ use crate::error::BackendError;
 use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo};
 
 /// How far past its declared [`RuntimeAdapter::load_timeout`] a load may run, at most: the confirmation of
-/// an accepted load (for oMLX the pin and the state verification) is always given at least this long, or
+/// an accepted load (for oMLX the pin and the state verification) is given at least this long, or
 /// the adapter's own per-call timeout when that is shorter, even if the engine accepted the load only at
 /// the very end of the budget (local review of #634, L-5). Without a floor, a load accepted with 100 ms of
 /// budget left could not be confirmed in time and would be reported as unknown — fence retained — although
@@ -67,7 +67,7 @@ pub trait RuntimeAdapter: Send + Sync {
     /// An implementation that returns `Some` promises that its **whole** `load` call — including any
     /// verification it does after the engine accepted the load (PR-Daemon's #634 review, W-3) — returns
     /// within this deadline plus at most [`LOAD_CONFIRMATION_FLOOR`] (the time the confirmation is
-    /// guaranteed even when the engine accepted the load at the very end of the budget), so its own
+    /// given even when the engine accepted the load at the very end of the budget), so its own
     /// timeout error (an unknown outcome, [`BackendError::LoadUnconfirmed`]), not the Supervisor's, is the
     /// one reported. The Supervisor adds the floor and a fixed margin on top, never going below its generic
     /// `adapter_call_timeout`, as a backstop against an implementation that hangs anyway; that backstop can

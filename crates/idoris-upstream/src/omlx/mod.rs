@@ -72,7 +72,7 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default deadline of one whole load (IDORIS-CORE S8, interface spec §2.11.2): the `POST /v1/models/{id}/load`
 /// **and** the pin and state verification that follow it, which must all finish inside it (PR-Daemon's #634
-/// review, W-3; the confirmation is always given at least [`LOAD_CONFIRMATION_FLOOR`], so a load accepted
+/// review, W-3; the confirmation is given at least [`LOAD_CONFIRMATION_FLOOR`], so a load accepted
 /// at the very end of the budget can still be confirmed). Loading a model is not a management call: Qwen3-8B takes about 4 s cold
 /// (`spike/u0/U0-LOG.md`) and the 27B the 48 GiB+ tier recommends is expected to take much longer, but under
 /// [`DEFAULT_CALL_TIMEOUT`] such a load would be reported as an unknown outcome and leave the durable
