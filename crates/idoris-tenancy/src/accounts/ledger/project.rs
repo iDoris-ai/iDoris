@@ -9,7 +9,7 @@
 //! | `credit_limit` | 此刻有效的**授信额度**（`allocations` 里 purpose = `credit_line`、窗口内、没被撤销的）之和，没有 = 0 |
 //! | `rate_windows` | 配了分钟 / 小时上限才有：`Σ (held + spent)` 里归属时刻落在最近 60 秒 / 3600 秒（滑动窗口，不是日历桶：任意一个窗口长度的区间里都不会超过上限）的部分（超出预留的部分按结算时刻算） |
 //! | `in_flight` | 配了在途上限才有：当前在途 = `Σ held`；过期的预留已经有 `expire` 分录冲掉 |
-//! | `subsidy_pool_remaining` | 只有补贴池账户：当前账期的总上限（`ledger_pool_caps` 最新一条，没有 = 0）减去该账期池账户上的 `Σ (held + spent)`（超出预留的部分按结算时刻算；报表 `pool_report` 是同一个数） |
+//! | `subsidy_pool_remaining` | 只有补贴池账户：当前账期的总上限（`ledger_pool_caps` 最新一条，没有 = 0）减去该账期池账户上的 `Σ (held + spent)`（超出预留的部分按结算时刻算；报表 `pool_report` 是同一个数）。**只读这个账期的分录**，不管池账户有多少历史：预留的时刻在账期里的，和 `settle` 的结算时刻在账期里的（迁移 0005 的索引），见 [`pool_period_entries`] |
 //!
 //! **按归属时刻切的窗口，超出预留的部分用同一条规则**（Codex 三复审 High 1）。一条花费有两个时刻：预留之内的部分归属预留创建的时刻
 //! （`window_at_ms`），超出预留的部分（overage）归属结算的时刻——担保人能吸收多少读的是结算那一刻生效的额度，这块花费就该占结算那一刻的
@@ -252,20 +252,39 @@ fn straddler_count(windows: &[&WindowSpec]) -> String {
     format!("COALESCE(SUM(CASE WHEN e.kind = 'settle' AND ({straddles}) THEN 1 ELSE 0 END), 0)")
 }
 
-/// 一个账户（`?1`）的全部分录，加一列 `moved`：这条 `settle` 里**还留着、要按结算时刻算**的超出预留的部分（[`LEGACY_OVERAGE_SQL`]，
-/// 取不到按 0）。按归属时刻求和的地方都从这里取数，见 [`attributed_sum`]。
+/// 要求和的分录是哪些（`FROM ... WHERE ...`，`e` 是 `ledger_entries` 的别名，`?1` 是账户）。额度窗口、速率窗口要的是账户的**全部**分录
+/// （在途、自有资金、全期已花都要从全部历史里求），所以不加别的条件。
+const ACCOUNT_ENTRIES: &str = "FROM ledger_entries e WHERE e.account_id = ?1";
+
+/// 补贴池一个账期（[`POOL_PERIOD`]：`?2` 起、`?3` 止）里**可能有归属**的分录，只读这个账期的，不管池账户有多少历史（池账户上有所有成员的
+/// 每一笔花费）：预留的时刻（`window_at_ms`）在账期里的，和 `settle` 的结算时刻（`at_ms`）在账期里的——旧格式里还留在 `settle` 里的超出部分
+/// 归属结算时刻，预留可能在上个账期（只按预留的时刻截就会漏掉它）。两个方向各走一个索引（`ledger_entries_by_account_window`、
+/// 迁移 0005 的 `ledger_entries_settled_by_account_at`），SQLite 的多索引 `OR` 按 rowid（`entry_id`）去重，同一条分录两个方向都在只算一次。
+/// 其余的分录对这个账期的消耗没有贡献：预留的时刻不在账期里、又不是结算时刻在账期里的 `settle`，两项都是 0（[`attributed_sum`]）。
+/// 执行计划由单测 `the_pool_period_reads_use_the_indexes_and_never_scan_the_pool_history` 钉住。
+fn pool_period_entries(period: &WindowSpec) -> String {
+    let by_reservation = period.condition.replace("{t}", "e.window_at_ms");
+    let by_settlement = period.condition.replace("{t}", "e.at_ms");
+    format!(
+        "FROM ledger_entries e WHERE e.account_id = ?1
+            AND (({by_reservation}) OR (e.kind = 'settle' AND ({by_settlement})))"
+    )
+}
+
+/// `source`（[`ACCOUNT_ENTRIES`] 或 [`pool_period_entries`]）里的分录，加一列 `moved`：这条 `settle` 里**还留着、要按结算时刻算**的超出预留的部分
+/// （[`LEGACY_OVERAGE_SQL`]，取不到按 0）。按归属时刻求和的地方都从这里取数，见 [`attributed_sum`]。
 ///
 /// **只在这条 `settle` 的两块落在任何一个窗口的两边时才去查预留表**（[`straddles_sql`]）：十万笔的历史里，需要读的只有预留和结算跨过
 /// 窗口边界的那几笔，不是十万笔。对没有被跨过的窗口，`moved` 非 0 也不改变那个窗口的和（两块都在里面：`(held + spent - moved) + moved`；
 /// 都在外面：`0 + 0`），所以所有窗口共用这一列，查预留表的子查询在语句里只出现一次。
-fn attributed_entries_sql(windows: &[&WindowSpec]) -> String {
+fn attributed_entries_sql(windows: &[&WindowSpec], source: &str) -> String {
     let straddles = straddles_sql(windows);
     format!(
         "SELECT e.kind AS kind, e.held_micros AS held_micros, e.spent_micros AS spent_micros, e.funds_micros AS funds_micros,
                 e.window_at_ms AS window_at_ms, e.at_ms AS at_ms,
                 CASE WHEN e.kind = 'settle' AND ({straddles})
                      THEN COALESCE({LEGACY_OVERAGE_SQL}, 0) ELSE 0 END AS moved
-           FROM ledger_entries e WHERE e.account_id = ?1"
+           {source}"
     )
 }
 
@@ -284,32 +303,41 @@ fn attributed_sum(window: &WindowSpec) -> String {
 /// （[`LEGACY_OVERAGE_SQL`]）。准入的视图（[`project_chain_with_books`]）和报表（`subsidy.rs` 的 `pool_report_in`）共用。
 ///
 /// 和 [`entry_sums`] 一样分两步：先用一条短语句求不拆的和，同时数一数跨过账期边界的 `settle`；一条也没有（绝大多数情况）就是它；
-/// 有才用带查预留表子查询的那条长语句。
+/// 有才用带查预留表子查询的那条长语句。**两条语句都只读这个账期的分录**（[`pool_period_entries`]）：耗时只和这个账期的分录数有关，
+/// 不随池账户的历史变长（Codex 四复审 Low：原来两条语句都把池账户的全部历史读一遍）。
 pub(super) fn pool_consumed_micros(
     conn: &Connection,
     pool: &str,
     start_ms: i64,
     end_ms: i64,
 ) -> Result<i64, LedgerError> {
-    let windows = [&POOL_PERIOD];
     let params: &[&dyn rusqlite::ToSql] = &[&pool, &start_ms, &end_ms];
-    let raw = raw_sum(&POOL_PERIOD);
-    let count = straddler_count(&windows);
-    let (consumed, straddlers): (i64, i64) = conn.query_row(
-        &format!("SELECT {raw}, {count} FROM ledger_entries e WHERE e.account_id = ?1"),
-        params,
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    let (short, long) = pool_period_statements();
+    let (consumed, straddlers): (i64, i64) =
+        conn.query_row(&short, params, |row| Ok((row.get(0)?, row.get(1)?)))?;
     if straddlers == 0 {
         return Ok(consumed);
     }
-    let attributed = attributed_sum(&POOL_PERIOD);
-    let entries = attributed_entries_sql(&windows);
-    Ok(conn.query_row(
-        &format!("SELECT {attributed} FROM ({entries})"),
-        params,
-        |row| row.get(0),
-    )?)
+    Ok(conn.query_row(&long, params, |row| row.get(0))?)
+}
+
+/// 补贴池一个账期的消耗的两条语句（`?1` 池、`?2` 起、`?3` 止）：短语句（不拆的和，加上跨过账期边界的 `settle` 有几条）和长语句（按归属规则的和，
+/// 带查预留表的子查询）。**两条都只读这个账期的分录**（[`pool_period_entries`]）。放在一个函数里，是为了单测
+/// `the_pool_period_reads_use_the_indexes_and_never_scan_the_pool_history` 钉住的执行计划就是生产代码在跑的这两条语句。
+fn pool_period_statements() -> (String, String) {
+    let windows = [&POOL_PERIOD];
+    let source = pool_period_entries(&POOL_PERIOD);
+    let short = format!(
+        "SELECT {}, {} {source}",
+        raw_sum(&POOL_PERIOD),
+        straddler_count(&windows)
+    );
+    let long = format!(
+        "SELECT {} FROM ({})",
+        attributed_sum(&POOL_PERIOD),
+        attributed_entries_sql(&windows, &source)
+    );
+    (short, long)
 }
 
 /// 一个账户的分录总量：在途、已花、自有资金，和额度 / 分钟 / 小时窗口里的消耗（按归属规则，见 [`LEGACY_OVERAGE_SQL`]）。
@@ -342,7 +370,7 @@ fn entry_sums(
                     COALESCE(SUM(e.funds_micros), 0),
                     COALESCE(SUM(CASE WHEN e.kind = 'fund' THEN 1 ELSE 0 END), 0),
                     {raw_window}, {raw_minute}, {raw_hour}, {count}
-               FROM ledger_entries e WHERE e.account_id = ?1"
+               {ACCOUNT_ENTRIES}"
         ),
         params,
         |row| {
@@ -366,7 +394,7 @@ fn entry_sums(
     let window = attributed_sum(&ALLOWANCE_WINDOW);
     let minute = attributed_sum(&MINUTE_WINDOW);
     let hour = attributed_sum(&HOUR_WINDOW);
-    let entries = attributed_entries_sql(&windows);
+    let entries = attributed_entries_sql(&windows, ACCOUNT_ENTRIES);
     (sums.window, sums.minute, sums.hour) = conn.query_row(
         &format!("SELECT {window}, {minute}, {hour} FROM ({entries})"),
         params,
@@ -1686,6 +1714,54 @@ mod tests {
         assert_eq!(
             pool_consumed_micros(&conn, "acct", 1_200, 10_000).unwrap(),
             60
+        );
+    }
+
+    /// 一条语句的执行计划（`EXPLAIN QUERY PLAN` 的每一行，连起来）。参数不影响计划，随便绑。
+    fn plan_of(conn: &Connection, sql: &str, parameters: usize) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let params: Vec<i64> = (0..parameters).map(|_| 1).collect();
+        let lines: Vec<String> = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        lines.join("\n")
+    }
+
+    /// 补贴池一个账期的消耗只读这个账期的分录（Codex 四复审 Low）：真库（跑全部迁移，包括 0005 的索引）里，两条语句（短语句、长语句）的执行计划
+    /// 是两个方向各一次索引范围查找——预留的时刻在账期里的走 `ledger_entries_by_account_window`，`settle` 的结算时刻在账期里的走 0005 的
+    /// `ledger_entries_settled_by_account_at`——没有任何一行是整张表（或整个账户）的扫描。对照：账户的全部分录（额度窗口、速率窗口求和读的）
+    /// 只能按账户查，计划里没有时间的范围，这个断言分得出两者。
+    #[test]
+    fn the_pool_period_reads_use_the_indexes_and_never_scan_the_pool_history() {
+        let dir = crate::test_support::TempDir::new("pool-period-plan");
+        let path = dir.db("ledger.sqlite3");
+        drop(crate::accounts::AccountStore::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        let (short, long) = pool_period_statements();
+        for (what, sql) in [("short", short), ("long", long)] {
+            let plan = plan_of(&conn, &sql, 3);
+            assert!(
+                plan.contains("SEARCH e USING INDEX ledger_entries_by_account_window (account_id=? AND window_at_ms>? AND window_at_ms<?)"),
+                "{what} statement, entries by reservation time:\n{plan}"
+            );
+            assert!(
+                plan.contains("SEARCH e USING INDEX ledger_entries_settled_by_account_at (account_id=? AND at_ms>? AND at_ms<?)"),
+                "{what} statement, settlements by settlement time:\n{plan}"
+            );
+            assert!(
+                !plan.lines().any(|line| line.starts_with("SCAN")),
+                "{what} statement scans a table:\n{plan}"
+            );
+        }
+        // 对照：账户的全部分录只能按账户查，没有时间的范围
+        let everything = plan_of(&conn, &format!("SELECT COUNT(*) {ACCOUNT_ENTRIES}"), 1);
+        assert!(
+            everything.contains("(account_id=?)") && !everything.contains("window_at_ms>?"),
+            "the control (all entries of an account) has no time range:\n{everything}"
         );
     }
 }

@@ -9,6 +9,9 @@
 //! * `projecting_100k_spends_against_120_allowances`：10 万笔 × 120 笔额度，`#[ignore]`，手动跑并把耗时打出来：
 //!   `cargo test -p idoris-tenancy --release --test ledger_projection_perf -- --ignored --nocapture`。
 //!
+//! * 补贴池账期（Codex 四复审 Low）：`a_pool_period_reads_only_the_period_and_matches_the_hand_computed_consumption`（每次都跑，核对数）和
+//!   `reading_a_pool_period_does_not_grow_with_a_million_historical_entries`（`#[ignore]`，手动跑：一百万条历史分录、这个账期 100 条）。
+//!
 //! 数据用 SQL 批量写（和账本自己写的分录同一个形状：每个预留在付款账户链上每个账户一条 `reserve`、一条 `settle`），
 //! 数字都能手算：额度 `b-i` 的窗口是第 i 个 30 天，容量 1 000 万；第 j 笔花费 100，`j` 是 10 的倍数的在第一个窗口之前
 //! （没有额度覆盖，授信债务），其余按 `j × 步长` 均匀落在 120 个窗口里（每个窗口 800 多笔，远没用满容量，全部被额度覆盖）。
@@ -212,5 +215,214 @@ fn projecting_100k_spends_against_120_allowances() {
     assert!(
         best < Duration::from_secs(10),
         "one projection of a 100k-spend history took {best:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// 补贴池账期的消耗：只读这个账期的分录（Codex 四复审 Low）
+// ------------------------------------------------------------------------------------------
+
+/// 2026-12-01T00:00:00Z：补贴池的账期边界（账本时区默认 UTC）。
+const DEC1: i64 = 1_796_083_200_000;
+const MINUTE_MS: i64 = 60_000;
+const POOL_CAP: i64 = 100_000;
+
+/// 补贴池 `pool` 上的合成历史：`history` 笔花费（每笔 `reserve` + `settle` 各一条分录，共 `2 × history` 条）一分钟一笔，往 12 月 1 日之前排
+/// （第 `i` 笔（从 0 数）的预留时刻是 `DEC1 - 60 秒 × (i + 1)`，结算在半秒后），再加这个账期（12 月）的 `this_month` 笔（`DEC1 + 60 秒 × (j + 1)`），
+/// 外加一笔**跨账期的旧格式**结算：预留 100 在 `DEC1 - 1`（11 月），按 160 结算在 `DEC1`（12 月），超出的 60 还整条记在 `settle` 里
+/// （v0.5.0 / main 的写法，归属结算时刻）：11 月拿预留之内的 100，12 月拿超出的 60。每笔 100。
+///
+/// 手算：12 月的消耗 = `this_month × 100 + 60`；11 月的消耗 = `min(history, 43 200) × 100 + 100`（11 月 30 天 = 43 200 分钟，
+/// 第 43 200 笔正好落在 11 月 1 日 0 点，账期左闭）。批量写，先拆掉 `ledger_entries` 上的触发器（合成的历史不需要它们，一百万行跑触发器太慢，
+/// 这个库只给这个测试用）。
+fn build_pool(db: &TempDb, history: i64, this_month: i64) -> AccountStore {
+    let store = world(db);
+    store
+        .set_pool_cap(&aid("pool"), month(2026, 12), &thb(POOL_CAP), t0())
+        .unwrap();
+    store
+        .set_pool_cap(&aid("pool"), month(2026, 11), &thb(1_000_000_000), t0())
+        .unwrap();
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.busy_timeout(Duration::from_secs(30)).unwrap();
+    let triggers: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'ledger_entries'")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    for name in triggers {
+        conn.execute_batch(&format!("DROP TRIGGER {name}")).unwrap();
+    }
+    conn.execute_batch("BEGIN").unwrap();
+    for (prefix, count, at_sql) in [
+        ("h", history, format!("{DEC1} - {MINUTE_MS} * (i + 1)")),
+        ("m", this_month, format!("{DEC1} + {MINUTE_MS} * (i + 1)")),
+    ] {
+        for (kind, held, spent, delay) in [
+            ("reserve", AMOUNT, 0, 0_i64),
+            ("settle", -AMOUNT, AMOUNT, 500),
+        ] {
+            conn.execute(
+                &format!(
+                    "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < {count})
+                     INSERT INTO ledger_entries
+                        (account_id, hold_id, kind, unit, held_micros, spent_micros, funds_micros, liability_micros,
+                         window_at_ms, at_ms, idempotency_key)
+                     SELECT 'pool', '{prefix}' || i || '#0', '{kind}', 'THB', {held}, {spent}, 0, 0,
+                            {at_sql}, {at_sql} + {delay}, '{prefix}' || i || '#0|{kind}|pool'
+                       FROM n"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+    }
+    // 跨账期的旧格式结算：预留 100（`DEC1 - 1`），按 160 结算（`DEC1`），超出的 60 整条记在 `settle` 里
+    conn.execute(
+        &format!(
+            "INSERT INTO ledger_holds
+                (hold_id, attempt_id, component, request_id, attempt_index, payer_account, credential_id, unit,
+                 reserved_micros, period, created_at_ms, expires_at_ms, grace_floor_micros, state)
+             VALUES ('strad#0', 'strad#0', 'model', 'strad', 0, 'kid-a', 'cred-a', 'THB',
+                     {AMOUNT}, '2026-11', {DEC1} - 1, {DEC1} - 1 + 1800000, NULL, 'open')"
+        ),
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        &format!(
+            "UPDATE ledger_holds SET state = 'settled', closed_at_ms = {DEC1}, charged_micros = {} WHERE hold_id = 'strad#0'",
+            AMOUNT + 60
+        ),
+        [],
+    )
+    .unwrap();
+    for (kind, held, spent, at) in [
+        ("reserve", AMOUNT, 0, DEC1 - 1),
+        ("settle", -AMOUNT, AMOUNT + 60, DEC1),
+    ] {
+        conn.execute(
+            &format!(
+                "INSERT INTO ledger_entries
+                    (account_id, hold_id, kind, unit, held_micros, spent_micros, funds_micros, liability_micros,
+                     window_at_ms, at_ms, idempotency_key)
+                 VALUES ('pool', 'strad#0', '{kind}', 'THB', {held}, {spent}, 0, 0, {DEC1} - 1, {at}, 'strad#0|{kind}|pool')"
+            ),
+            [],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    store
+}
+
+/// 核对池两个账期的消耗、闸门（视图里的剩余）和手算一致，返回读 12 月消耗（`pool_report`）最快的一次。
+fn check_pool_period(
+    store: &AccountStore,
+    history: i64,
+    this_month: i64,
+    rounds: usize,
+) -> Duration {
+    let december = this_month * AMOUNT + 60;
+    let november = history.min(43_200) * AMOUNT + AMOUNT;
+    let mut best = Duration::MAX;
+    for _ in 0..rounds {
+        let started = Instant::now();
+        let report = store.pool_report(&aid("pool"), month(2026, 12)).unwrap();
+        best = best.min(started.elapsed());
+        assert_eq!(
+            report.consumed,
+            thb(december),
+            "December: this month's spends plus the 60 of overage settled on December 1st"
+        );
+        assert_eq!(report.cap, thb(POOL_CAP));
+    }
+    let report = store.pool_report(&aid("pool"), month(2026, 11)).unwrap();
+    assert_eq!(
+        report.consumed,
+        thb(november),
+        "November: its spends plus the 100 inside the reservation of the one settled on December 1st"
+    );
+    let view = store
+        .account_view(&aid("pool"), ts(DEC1 + 12 * HOUR))
+        .unwrap();
+    assert_eq!(
+        view.subsidy_pool_remaining,
+        Some(thb(POOL_CAP - december)),
+        "the gate and the report say the same number"
+    );
+    best
+}
+
+#[test]
+fn a_pool_period_reads_only_the_period_and_matches_the_hand_computed_consumption() {
+    // 3 000 笔历史（比 11 月的 43 200 笔少，全在 11 月）+ 12 月 50 笔 + 一笔跨账期的旧格式结算
+    let db = TempDb::new("perf-pool-small");
+    let store = build_pool(&db, 3_000, 50);
+    let best = check_pool_period(&store, 3_000, 50, 3);
+    eprintln!("pool period, 6k historical entries + 100 this month: {best:?}");
+    // 历史再长，11 月最多 43 200 笔（86 400 条分录）：同一个断言换一份更长的历史（11 月之外还有十个月）
+    let db = TempDb::new("perf-pool-long-history");
+    let store = build_pool(&db, 60_000, 50);
+    check_pool_period(&store, 60_000, 50, 1);
+}
+
+#[test]
+#[ignore = "perf: 1M historical pool entries, run by hand with --ignored --nocapture (see the module docs)"]
+fn reading_a_pool_period_does_not_grow_with_a_million_historical_entries() {
+    // 历史分录 1 万 / 10 万 / 100 万条（5 千 / 5 万 / 50 万笔），这个账期 100 条（50 笔）：读 12 月的消耗应该不随历史变长。
+    // 对照：原来的短语句（把池账户的全部历史读一遍）的耗时，在同一个库上量。
+    let mut reads = Vec::new();
+    for history in [5_000_i64, 50_000, 500_000] {
+        let db = TempDb::new(&format!("perf-pool-{history}"));
+        let started = Instant::now();
+        let store = build_pool(&db, history, 50);
+        let build_time = started.elapsed();
+        let best = check_pool_period(&store, history, 50, 5);
+        // 对照：原来的写法（全部历史）
+        let conn = rusqlite::Connection::open(db.path()).unwrap();
+        let mut before = Duration::MAX;
+        for _ in 0..3 {
+            let started = Instant::now();
+            let raw: (i64, i64) = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(CASE WHEN e.window_at_ms >= ?2 AND e.window_at_ms < ?3 THEN e.held_micros + e.spent_micros ELSE 0 END), 0),
+                            COALESCE(SUM(CASE WHEN e.kind = 'settle'
+                                               AND ((e.window_at_ms >= ?2 AND e.window_at_ms < ?3) <> (e.at_ms >= ?2 AND e.at_ms < ?3))
+                                              THEN 1 ELSE 0 END), 0)
+                       FROM ledger_entries e WHERE e.account_id = ?1",
+                    rusqlite::params!["pool", DEC1, DEC1 + 31 * DAY],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            before = before.min(started.elapsed());
+            assert_eq!(
+                raw.1, 1,
+                "the one settlement that crosses the period boundary"
+            );
+        }
+        // 池账户整个投影（视图）：`entry_sums` 照旧读这个账户的全部历史（和链上每个账户一样），不在这条修复里
+        let view_started = Instant::now();
+        store
+            .account_view(&aid("pool"), ts(DEC1 + 12 * HOUR))
+            .unwrap();
+        let view_time = view_started.elapsed();
+        eprintln!(
+            "PERF pool {} historical entries (+ 100 this month): build {build_time:?}, \
+             read December's consumption (best of 5) {best:?}, the old short statement over the whole history {before:?}, \
+             one whole pool projection {view_time:?}",
+            2 * history
+        );
+        reads.push(best);
+    }
+    // 宽松的断言：100 万条历史下读一个账期不会比 1 万条历史下慢十倍以上（原来是线性的：慢约 100 倍）
+    let (small, large) = (reads[0], reads[2]);
+    assert!(
+        large < small * 10 + Duration::from_millis(5),
+        "reading a pool period grew with the history: {small:?} -> {large:?}"
     );
 }
