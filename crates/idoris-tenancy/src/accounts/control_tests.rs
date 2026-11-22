@@ -4694,12 +4694,17 @@ fn a_manager_with_a_narrow_scope_replays_and_conflicts_inside_it_and_is_blind_ou
 /// 调用者对 `op` 只管 teacher 子树，对别的每个操作都管着整个 eduai：对 `op` 来说，eduai 下 teacher 之外的、别的组织的、不存在的目标
 /// 都管不到，而「别的操作的范围」不能让它们变得可见。
 pub(super) fn narrow_for(env: &Env, op: ControlOp) -> Minted {
+    narrow_for_root(env, op, "teacher")
+}
+
+/// 和 [`narrow_for`] 一样，只是对 `op` 管的子树根可以自己指定（要在根下面再深几层的目标时用）。
+pub(super) fn narrow_for_root(env: &Env, op: ControlOp, root: &str) -> Minted {
     let mut scopes: Vec<AdminScope> = all_ops("eduai", 1_000_000_000)
         .into_iter()
         .filter(|scope| scope.op != op)
         .collect();
     let cap = (op == ControlOp::GrantAllocation).then_some(1_000_000_000);
-    scopes.push(sc(op, "teacher", cap));
+    scopes.push(sc(op, root, cap));
     env.issue_as_operator(Issue::service("eduai", scopes))
 }
 
@@ -4874,8 +4879,27 @@ fn revoking_a_hidden_or_missing_allocation_runs_the_same_statements() {
     let env = Env::new();
     env.tree();
     env.allocation_chain();
-    let narrow = narrow_for(&env, ControlOp::GrantAllocation);
+    // eduai 下面再嵌一个组织 dept：eduai -> dept -> team -> s-x。调用者撤销额度只管 dept 子树，别的操作管着整个 eduai
+    env.account("dept", AccountKind::Org, Some("eduai"));
+    env.account("team", AccountKind::Sponsor, Some("dept"));
+    env.account("s-x", AccountKind::Member, Some("team"));
+    for (id, parent, child, micros) in [
+        ("a-dept", "eduai", "dept", 500_000_000),
+        ("a-team", "dept", "team", 20_000_000),
+        ("a-leaf", "team", "s-x", 1_000_000),
+    ] {
+        let rid = env.rid();
+        env.store
+            .control_grant_allocation(
+                &Env::operator(),
+                &env.meta(T0, &rid),
+                &grant(id, parent, child, micros),
+            )
+            .unwrap();
+    }
+    let narrow = narrow_for_root(&env, ControlOp::GrantAllocation, "dept");
     let who = narrow.who();
+    // 授权方在 dept 子树之外的（eduai、pool、platform）管不到
     assert_hidden_costs_what_missing_costs(
         &env,
         "revoke_allocation",
@@ -4890,24 +4914,18 @@ fn revoking_a_hidden_or_missing_allocation_runs_the_same_statements() {
                 )
             })
         },
-        &["a-teacher", "a-edu", "a-b"],
+        &["a-dept", "a-edu", "a-b"],
         "a-ghost",
     );
-    // 管得到的（授权方在 teacher 子树里）照常撤销：范围看授权方账户，权限上有额度上限也不影响「管得到」
-    assert_eq!(
-        Action::GrantAllocation {
-            id: "a-vis",
-            parent: "teacher",
-            child: "s1",
-            micros: 1_000_000
-        }
-        .run(&env, &who, T0 + 2),
-        Ok(WriteResult::Created)
-    );
-    assert_eq!(
-        Action::RevokeAllocation { id: "a-vis" }.run(&env, &who, T0 + 3),
-        Ok(WriteResult::Updated)
-    );
+    // 管得到的照常撤销：授权方在子树根自己（dept），或者在根下面一层 / 两层（要沿 parent_id 往上走才碰到根）；
+    // 权限上有额度上限也不影响「管得到」
+    for id in ["a-team", "a-leaf"] {
+        assert_eq!(
+            Action::RevokeAllocation { id }.run(&env, &who, T0 + 2),
+            Ok(WriteResult::Updated),
+            "{id}"
+        );
+    }
 }
 
 #[test]
@@ -5208,4 +5226,35 @@ fn the_scoped_readers_see_exactly_the_targets_inside_the_given_roots() {
         .ensure_principal(&pid("p-orphan"), ts(T0))
         .unwrap();
     assert!(!principal("p-orphan", &["platform"]));
+    // 足迹一半在 teacher 子树里、一半在外面：要全部落在范围里才算
+    env.account("s5", AccountKind::Member, Some("teacher"));
+    env.account("s6", AccountKind::Member, Some("eduai"));
+    env.account("s7", AccountKind::Member, Some("teacher"));
+    let attach = |membership: &str, principal: &str, account: &str| {
+        env.store
+            .create_membership(
+                &member_membership(membership, principal, "eduai", account),
+                ts(T0),
+            )
+            .unwrap();
+    };
+    env.store
+        .ensure_principal(&pid("p-partial"), ts(T0))
+        .unwrap();
+    attach("m-p1", "p-partial", "s5");
+    attach("m-p2", "p-partial", "s6");
+    assert!(!principal("p-partial", &["teacher"]));
+    assert!(principal("p-partial", &["teacher", "eduai"]));
+    // 登记它的组织也要在范围里：登记组织 eduai 在 teacher 子树之外，成员关系在里面
+    assert_eq!(
+        Action::CreatePrincipal {
+            principal: "p-reg",
+            org: "eduai"
+        }
+        .run(&env, &Env::operator(), T0),
+        Ok(WriteResult::Created)
+    );
+    attach("m-r1", "p-reg", "s7");
+    assert!(!principal("p-reg", &["teacher"]));
+    assert!(principal("p-reg", &["eduai"]));
 }
