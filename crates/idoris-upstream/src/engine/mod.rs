@@ -48,8 +48,8 @@
 //!
 //! 外部引擎（用户自己的 oMLX.app 之类）没有对应的类型，也就没有任何一条路径能给它发信号。
 //!
-//! 全部只在 unix 上编译。不加依赖：取别的进程的身份用 `ps` / `lsof` 子进程（workspace 禁 unsafe，
-//! 设计稿风险 R5），见 `inspect.rs`。
+//! 全部只在 unix 上编译。取别的进程的身份用 `ps` / `lsof` 子进程（workspace 禁 unsafe，设计稿风险 R5），见 `inspect.rs`；唯一的例外
+//! 是每个请求的监听者确认（要便宜：不起子进程），它用 `idoris-sockprobe`（libproc、`/proc`），见 `guard.rs`。
 
 mod discovery;
 mod fsutil;

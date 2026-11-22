@@ -27,8 +27,6 @@ const TSI_S_LISTEN: i32 = 1;
 /// `INI_IPV4` (`insi_vflag`): the socket serves IPv4. A native IPv4 socket and a dual-stack IPv6 socket have it; an IPv6-only socket
 /// (`INI_IPV6` alone) does not, and a client that connects to `127.0.0.1` never reaches it.
 const INI_IPV4: u8 = 0x1;
-/// `SZOMB`: a zombie (dead, not yet reaped): it holds nothing.
-const SZOMB: u32 = 5;
 
 // ----- `struct socket_fdinfo` and what it contains (sys/proc_info.h) -----------------------------------------------------------------
 
@@ -216,7 +214,7 @@ fn failure_of(errno: Option<i32>) -> Failure {
     }
 }
 
-/// The start time of `pid`, or why it cannot be had. A zombie is gone.
+/// The start time of `pid`, or why it cannot be had. A zombie (dead, not yet reaped) is reported by libproc as `ESRCH`, so it is gone too.
 fn process_start(pid: i32) -> Result<(u64, u64), Failure> {
     // SAFETY: `proc_bsdinfo` is plain old data; the all-zero value is valid.
     let mut info: proc_bsdinfo = unsafe { zeroed() };
@@ -232,9 +230,6 @@ fn process_start(pid: i32) -> Result<(u64, u64), Failure> {
         )
     };
     if written == size {
-        if info.pbi_status == SZOMB {
-            return Err(Failure::Gone);
-        }
         Ok((info.pbi_start_tvsec, info.pbi_start_tvusec))
     } else if written <= 0 {
         Err(failure_of_errno())

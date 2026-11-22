@@ -102,6 +102,13 @@ impl Watch {
                 Ok(text) => text,
                 // No IPv6 on this host.
                 Err(error) if v6 && error.kind() == io::ErrorKind::NotFound => continue,
+                // No IPv4 table at all (an unusual /proc): this host cannot be asked, which is not "the process is gone".
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "no /proc/net/tcp",
+                    ));
+                }
                 Err(error) => return Err(error),
             };
             listening.extend(
@@ -511,6 +518,20 @@ mod tests {
         assert_eq!(watch.check(None), (Probe::Unavailable, None));
         fs::set_permissions(&fds, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(watch.check(hint), (Probe::Holds, hint));
+    }
+
+    /// A /proc without a TCP table cannot be asked: "cannot tell" (the caller asks the slow question), not "the process is gone".
+    #[test]
+    fn a_host_without_a_tcp_table_cannot_be_asked() {
+        let fake = FakeProc::new(88);
+        fake.stat(4);
+        fake.fd(3, Some("socket:[41]"));
+        let (watch, hint) = establish_at(fake.root(), 88, 8088).unwrap();
+        assert_eq!(hint, None);
+        assert_eq!(watch.check(None), (Probe::Unavailable, None));
+        // And a process that is gone is still gone.
+        fs::remove_dir_all(fake.root().join("88")).unwrap();
+        assert_eq!(watch.check(None), (Probe::NotHolding, None));
     }
 
     /// `/proc/net/tcp6` is read too: an IPv6 dual-stack wildcard is a target (and `::1` is not); a host without IPv6 has no `tcp6` file.

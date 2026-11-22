@@ -47,7 +47,7 @@
 | UDS 客户端、登记、心跳 | 没有 | 新增 `register` 模块（客户端状态机、退避、心跳、发现文件自愈、孤儿计时） |
 | 父进程监视 | 没有，stdin 读完就不再读；且 launcher 写完即关，EOF 无意义 | 不能用 stdin EOF，只能用登记会话的有无做孤儿判定 |
 | 信号与退出 | SIGTERM、SIGINT 同一优雅路径（`R/bin/idoris.rs:63-76`）；总时长约 15 秒 = 排空 10 秒（`:60`）+ 销毁 runtime 5 秒（`:85`）；退出码 0 / 1 / 3 | 新增退出码需要进规范（孤儿超时、引擎失败自退，见 2.6） |
-| 可用依赖 | `ring`（随机数、HMAC）已在 router 依赖里（`crates/idoris-router/Cargo.toml`：`ring = "0.17"`）；`uuid` v4；tokio `net` 已启用，`tokio::net::UnixStream` 可用（根 `Cargo.toml` 的 tokio features） | 无新 crate 需求。注意 workspace `unsafe_code = "forbid"`（`Cargo.toml:106-107`）：不能裸调 libc 的 `getsockopt`/`proc_pidinfo`，要用 `nix`/`rustix` 的安全封装，或不做 |
+| 可用依赖 | `ring`（随机数、HMAC）已在 router 依赖里（`crates/idoris-router/Cargo.toml`：`ring = "0.17"`）；`uuid` v4；tokio `net` 已启用，`tokio::net::UnixStream` 可用（根 `Cargo.toml` 的 tokio features） | 无新 crate 需求。注意 workspace `unsafe_code = "forbid"`（`Cargo.toml:106-107`）：不能裸调 libc 的 `getsockopt`/`proc_pidinfo`，要用 `nix`/`rustix` 的安全封装，或不做（S6 例外：每个请求的监听者确认用的 libproc 在 `crates/idoris-sockprobe`，见 R5 的 S6 补记） |
 | 被 Agent24 校验的签名身份 | 发布 CLI 以 `--identifier ai.idoris.cli` 签名（`scripts/macos_signed_release.py:313`），hardened runtime，Team `HYAP444FN9`（规范 §2.7 下载行） | 标识符必须保持稳定，改动要同步 Agent24 的允许清单 |
 
 ### 1.3 ID-3 oMLX 生命周期
@@ -426,7 +426,7 @@ iDoris 被 SIGKILL 时 `Drop` 不会运行，引擎成为孤儿，继续占着�
 {"schema":1,"pid":51234,"port":19731,"started_at":"Fri Nov 20 15:14:05 2026","executable":"/Applications/oMLX.app/Contents/MacOS/omlx-cli","api_key":"<引擎私有 key>","launched_by_instance":"3f0c6a52-…"}
 ```
 
-`started_at` 是 `ps -o lstart= -p <pid>` 的原文，用 `ps` 子进程取，规避 workspace 的 `unsafe_code = "forbid"`（也可以加 `libproc` 依赖，Agent24 已在用；二选一，见风险 R5）。这与 Agent24 `omlx-kept.ts` 的做法一致：pid、启动时间、命令、监听端口四项全部吻合才算同一个进程，读不出来不算不吻合（不发信号，记录保留）。
+`started_at` 是 `ps -o lstart= -p <pid>` 的原文，用 `ps` 子进程取，规避 workspace 的 `unsafe_code = "forbid"`（也可以加 `libproc` 依赖，Agent24 已在用；二选一，见风险 R5；S6 之后每个请求的监听者确认是例外，见 R5 的 S6 补记）。这与 Agent24 `omlx-kept.ts` 的做法一致：pid、启动时间、命令、监听端口四项全部吻合才算同一个进程，读不出来不算不吻合（不发信号，记录保留）。
 
 新 iDoris 启动时对记录的处理：
 - 四项吻合：接管（沿用记录里的 key，不重启引擎，已加载的模型继续在内存里；Supervisor 的「继承驻留」逻辑本来就处理引擎启动时已有模型，`B/supervisor.rs:1829-1851`）。
@@ -454,7 +454,7 @@ iDoris 被 SIGKILL 时 `Drop` 不会运行，引擎成为孤儿，继续占着�
 
 **S6 实现回填（2026-11-21，接口规范勘误十；Codex 预审与审计后修订）。** Admin 发起的 `restart`、`stop` 之后的 `start`（放行时就绪的上游），以及外部引擎换了进程，没有走 3b 的「重建加 swap」，而是让 Supervisor **原地复位**（`engine_replaced`），并且把次序做对：关门（Supervisor 不再准入新的加载、卸载、聊天、目录读取）、发布不可服务的状态、排空（等已经准入的做完，至多 `drain_timeout`；到点切断旧一代的凭证）、停进程（确认消失）、封上端点、清围栏、拉起新进程、复位账本（只在静止时，对着新进程重新采样）、开门、发布 `ready`。每个准入的操作绑定准入时的引擎代际（任务局部量），适配器取 key 的唯一入口核对它：旧一代的任务拿不到新一代的凭证，请求体也不会发给新进程；端点只有「封上」（什么凭证都不发，回退链不适用）、私有、外部三种口径，没有「撤销」。所以不需要围栏代际、不需要重建 actor、不需要 Shutdown/Join；旧一代的完成消息在静止条件下不可能落在重建的账本上。S10 剩下的范围因此是：自有引擎在门控放行之后自己崩溃（仍是退出码 5），以及放行时没就绪的上游（完整的 Router 里没有它的 Supervisor，`restart_required`）。
 
-**Codex 终审（17ac795a；接口规范勘误十（8））之后又收紧的几处**：（1）凭证只发给**此刻**确认过的监听者：登记表给每个托管端点带一个校验守卫（`engine/guard.rs`），每个发往它的请求在发送它的那个任务里、紧挨着发送之前经 `authorize_omlx_request`，守卫重新确认监听者与代际，确认不了就拒绝。owner（2026-11-22）拍板：缩小窗口、写明限制，不做逐连接的对端进程核对；剩下的窗口是重新确认与发送之间的毫秒，本机**另一个用户**的进程恰好在那里抢到端口，仍能收到那一个请求（同一个用户的进程本来就读得到 key 文件；`lsof` 看不到别的用户的监听）。（2）端点标识规范化（loopback 的各种写法同一个端口是同一个标识），所以别名写法的伴生卡不会落进没人管的端点。（3）普通 resident 代理的每个入口在状态门之前读端点代际，绑定到首次发送、流式首发与每次重试。（4）排空还等端点上登记的在途操作（转发、预热、模型列表、仍在输出的流）与已准入的目录读取。（5）命令带绝对的截止时间（`command_timeout`），超时放弃、事后不执行；`shutdown` 与放弃的预算从入队之前算起。（6）外部引擎换进程期间发布明确不可服务的 `restarting`，排空之后重新核对身份才开放服务。
+**Codex 终审（17ac795a；接口规范勘误十（8））之后又收紧的几处**：（1）凭证只发给**此刻**确认过的监听者：登记表给每个托管端点带一个校验守卫（`engine/guard.rs`），每个发往它的请求在发送它的那个任务里、紧挨着发送之前经 `authorize_omlx_request`，守卫重新确认监听者与代际，确认不了就拒绝。owner（2026-11-22）拍板：缩小窗口、写明限制，不做逐连接的对端进程核对；主会话随后要求每个请求的确认 p99 < 5 毫秒、请求路径上不起子进程，所以确认分两半：**每个请求**只问登记时认的那个进程（pid 加启动时间）此刻还握着这个端口上的一个 LISTEN 套接字（原生：macOS libproc、Linux `/proc`，两三次系统调用，`crates/idoris-sockprobe`），贵的那些——「这个端口上只有它一个监听者」（`lsof`）、外部引擎的 uid 与签名团队——留给管理器的监督节拍与每次状态变化（启动、认回、重启、外部换代）。窗口：引擎放掉端口或被别的进程接管，下一个请求就拒绝；一个并存的监听者（引擎的套接字还在、另一个进程也在监听），自上一个节拍起；确认与发送之间的毫秒，本机**另一个用户**的进程恰好在那里抢到端口，仍能收到那一个请求（同一个用户的进程本来就读得到 key 文件；libproc 与 `lsof` 看不到别的用户的套接字）；原生监视建不出来的平台走退路（贵的问题，肯定的答案至多重用 250 毫秒）。（2）端点标识规范化（loopback 的各种写法同一个端口是同一个标识），所以别名写法的伴生卡不会落进没人管的端点。（3）普通 resident 代理的每个入口在状态门之前读端点代际，绑定到首次发送、流式首发与每次重试。（4）排空还等端点上登记的在途操作（转发、预热、模型列表、仍在输出的流）与已准入的目录读取。（5）命令带绝对的截止时间（`command_timeout`），超时放弃、事后不执行；`shutdown` 与放弃的预算从入队之前算起。（6）外部引擎换进程期间发布明确不可服务的 `restarting`，排空之后重新核对身份才开放服务。
 
 #### 2.7.8 停止、重启与控制面；与 #611、§2.9 下载的关系
 
@@ -602,7 +602,7 @@ Content-Type: application/json
 | R2 | 冷加载超过 10 秒或 30 秒，留下 `load.pending` 围栏（2.8.3） | 首次启动预热大模型后 iDoris「不可用」，且需人工恢复 | 分离 `load_timeout`；owned 引擎超时后可走「杀引擎、确认已死、清围栏、重启」（2.7.5） |
 | R3 | 用户自己的 oMLX.app 与 iDoris 拉起的实例并存，双份内存 | 内存吃紧、加载失败 | adopt 优先；私有端口不占 8000；`--memory-guard-gb` 对齐额度（2.7.2、2.7.4、2.7.9） |
 | R4 | 私有引擎 key 的优先级未实测（2.7.10） | 对不知情客户端的过滤不生效，或请求 401 | 先实测；失败退回现有 key 顺序（D10） |
-| R5 | workspace `unsafe_code = "forbid"`（`Cargo.toml:106-107`），取进程启动时间、`getsockopt` 都不能裸调 libc | 所有权记录的 pid 复用防护 | 用 `ps -o lstart=` 子进程（Agent24 的 `omlx-kept.ts` 也这么做）；或加 `libproc`（Agent24 已用，MIT，需过 `cargo deny`，未核对）；`nix` 的 `LocalPeerCred`（client 侧 uid 校验，次要）是否可用，未核对，不可用就略过 |
+| R5 | workspace `unsafe_code = "forbid"`（`Cargo.toml:106-107`），取进程启动时间、`getsockopt` 都不能裸调 libc | 所有权记录的 pid 复用防护 | 用 `ps -o lstart=` 子进程（Agent24 的 `omlx-kept.ts` 也这么做）；或加 `libproc`（Agent24 已用，MIT，需过 `cargo deny`，未核对）；`nix` 的 `LocalPeerCred`（client 侧 uid 校验，次要）是否可用，未核对，不可用就略过。**S6 补记（2026-11-23）**：每个请求的监听者确认（Codex 终审 H1 之后）不能每次起 `lsof`（约 100 毫秒、一个子进程），所以**只有这一处**用原生调用：单独的内部 crate `idoris-sockprobe`（macOS 的 libproc、Linux 的 `/proc`），workspace 里**唯一**带 `unsafe` 的地方（它自己 `deny`，只有 `macos.rs` 一个文件有窄的 `allow`；别的 crate 仍是 `forbid`，不新增第三方包），其余一律仍是上面的 `ps` / `lsof` |
 | R6 | 热点文件冲突：`R/bin/idoris.rs`（1235 行）、`R/lib.rs`（6500 行）、`R/cli.rs` 几乎每片都碰 | 并行分支反复冲突 | 按依赖串行 S1、S2、S5；其余片限定在 `idoris-upstream`、`setup_omlx.rs`、`proxy.rs` |
 | R7 | embedding 冷加载撞 10 秒 header 超时；resident 路径内存不入账本（2.8.1） | 首次向量召回偶发 504；内存超配由 oMLX 上限兜底 | 预热；`EMBEDDINGS` 路径放宽到 30 秒；E2 以后做 |
 | R8 | Agent24 的 30 秒就绪窗口与引擎冷启动（2.4 两级就绪） | iDoris 被误判失败并重启，形成重启风暴 | 两级就绪；`starting` 阶段 `/health` 与 Admin 照常答 |

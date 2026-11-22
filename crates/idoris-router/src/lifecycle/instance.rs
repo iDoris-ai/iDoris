@@ -1627,7 +1627,8 @@ impl Actor {
     }
 
     /// 自有引擎此刻还拥有它的端口吗：监听这个端口的就是它的进程（进程本身还在，由调用方先问过 `is_running`；认回的孤儿那一问还
-    /// 核对了身份）。**每一次**发带私有 key 的请求之前都要重新问，不缓存。检查器读不出来（`lsof` 没答上来）按
+    /// 核对了身份）。**每个监督节拍、等就绪时每一次带私有 key 的探测之前**都要重新问，不缓存（数据面的每个请求只问守卫里原生的那一半：
+    /// 登记时认的进程还握着套接字，见 `engine::guard`；这一问是贵的那一半，`lsof`）。检查器读不出来（`lsof` 没答上来）按
     /// `unverifiable_retries` 重读，仍读不出来就当作没有确认：宁可不发。
     async fn owned_listener_confirmed(&self) -> bool {
         let Some(owned) = self.engine.as_ref() else {

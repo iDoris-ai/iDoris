@@ -323,8 +323,8 @@ async fn an_endpoint_nobody_governs_is_unchanged() {
 /// between "the listener was verified" and "the request is sent" from a supervision tick to the milliseconds between one
 /// verification and one send on the same task; it does not close it, and there is no per-connection peer check. A process of
 /// **another user** that grabs the port in exactly that interval still receives that one request. (A same-user process gains
-/// nothing: it can read the key files and the process environment anyway. `lsof` cannot see another user's sockets, so the
-/// check is blind to them as well.)
+/// nothing: it can read the key files and the process environment anyway. libproc and `lsof` cannot see another user's sockets,
+/// so the check is blind to them as well.)
 ///
 /// This test runs the scenario and **documents** it: it asserts nothing about what the impostor saw, on purpose. If the window is
 /// ever closed (a peer check on the connection), this is where the assertion goes.
