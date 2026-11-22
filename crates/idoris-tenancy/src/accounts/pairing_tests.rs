@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use idoris_compute_contracts::account::{AccountStatus, MembershipStatus};
+use idoris_compute_contracts::account::{AccountKind, AccountStatus, MembershipStatus};
 use idoris_compute_contracts::control::ControlReason;
 use idoris_compute_contracts::credential::{
     AdminScope, ControlOp, CredentialBinding, CredentialStatus,
@@ -17,7 +17,7 @@ use super::control_tests::{
     DAY_MS, Env, Issue, Minted, T0, aid, all_ops, cid, failure_reason, mid, pid, sc, ts,
 };
 use super::{
-    CreatePairingCode, GateVerdict, MAX_ACTIVE_DEVICES_PER_MEMBERSHIP, MAX_PAIRING_TTL_MS,
+    CreatePairingCode, Failure, GateVerdict, MAX_ACTIVE_DEVICES_PER_MEMBERSHIP, MAX_PAIRING_TTL_MS,
     MIN_PAIRING_TTL_MS, Meta, PairingStatus, RedeemPairingCode, RevokePairingCode, Who,
 };
 use crate::virtual_key::MintedVirtualKey;
@@ -1263,6 +1263,111 @@ fn pairing_codes_follow_the_same_authorization_as_credential_issuance() {
     assert!(
         redeem(&env, &code, &"x".repeat(64), T0 + 1).is_ok(),
         "64 characters is the limit"
+    );
+}
+
+/// issue #603 N7 同类（PR-Daemon 在 #608 评审里指出）：创建配对码先按成员关系 id、撤销配对码先按配对码 id 去查，才轮到授权。
+/// 旧代码：没有 `issue_credential` 权限（或绑定账户被冻结）的调用者，不存在的 id 得到 `out_of_scope`，已有的（自己组织的、
+/// 别的组织的）得到 `op_not_granted` / `account_inactive`，靠它探测别的组织有哪些成员关系 / 配对码 id。
+/// 现在先做与目标无关的授权判定（`require_op_capability`），三种 id 得到同一个失败。
+#[test]
+fn pairing_code_writes_do_not_tell_a_caller_that_cannot_issue_whether_the_id_exists() {
+    let (env, service) = setup();
+    let other = env.issue_as_operator(Issue::service("school-b", all_ops("school-b", 1)));
+    // 有权限的人各创建一个码：eduai 的（m-kid1）、school-b 的（m-kb1）
+    let own = new_code("own");
+    create_code(&env, &service.who(), &own, "m-kid1", T0);
+    let foreign = new_code("foreign");
+    create_code(&env, &other.who(), &foreign, "m-kb1", T0);
+    // 只有 read 的调用者；有 issue_credential 但自己绑定的组织（school-c）已被冻结的调用者
+    let reader = env.issue_as_operator(Issue::service(
+        "eduai",
+        vec![sc(ControlOp::Read, "eduai", None)],
+    ));
+    env.account("school-c", AccountKind::Org, Some("platform"));
+    let frozen = env.issue_as_operator(Issue::service(
+        "school-c",
+        vec![sc(ControlOp::IssueCredential, "school-c", None)],
+    ));
+    env.store
+        .set_account_status(&aid("school-c"), AccountStatus::Frozen)
+        .unwrap();
+
+    let create = |who: &Who<'_>, membership: &str| -> Failure {
+        let rid = env.rid();
+        env.store
+            .control_create_pairing_code(
+                who,
+                &env.meta(T0 + 1, &rid),
+                &create_request(&new_code("probe"), membership, TTL),
+            )
+            .expect_err("a caller that cannot issue must be refused")
+    };
+    let revoke = |who: &Who<'_>, pairing: &str| -> Failure {
+        let rid = env.rid();
+        env.store
+            .control_revoke_pairing_code(
+                who,
+                &env.meta(T0 + 1, &rid),
+                &RevokePairingCode {
+                    pairing_id: pairing.to_string(),
+                },
+            )
+            .expect_err("a caller that cannot issue must be refused")
+    };
+    for (label, caller, expected) in [
+        ("only read", &reader, ControlReason::OpNotGranted),
+        ("frozen anchor", &frozen, ControlReason::AccountInactive),
+    ] {
+        for membership in ["m-kid1", "m-kb1", "m-ghost"] {
+            assert_eq!(
+                create(&caller.who(), membership),
+                Failure::new(expected),
+                "{label}: create for {membership}"
+            );
+        }
+        for pairing in [
+            own.pairing_id.as_str(),
+            foreign.pairing_id.as_str(),
+            "pc_nope",
+        ] {
+            assert_eq!(
+                revoke(&caller.who(), pairing),
+                Failure::new(expected),
+                "{label}: revoke {pairing}"
+            );
+        }
+    }
+    // 对照：有权限的调用者，别的组织的和不存在的 id 仍是同一个 out_of_scope
+    let out_of_scope = Failure::new(ControlReason::OutOfScope);
+    for membership in ["m-kb1", "m-ghost"] {
+        assert_eq!(
+            create(&service.who(), membership),
+            out_of_scope,
+            "{membership}"
+        );
+    }
+    for pairing in [foreign.pairing_id.as_str(), "pc_nope"] {
+        assert_eq!(revoke(&service.who(), pairing), out_of_scope, "{pairing}");
+    }
+    // 本机运维不受授权约束：不存在的码仍是 out_of_scope；运维创建配对码仍是 op_not_granted
+    assert_eq!(revoke(&Env::operator(), "pc_nope"), out_of_scope);
+    assert_eq!(
+        create(&Env::operator(), "m-ghost"),
+        Failure::new(ControlReason::OpNotGranted)
+    );
+    // 自己组织的码照常撤销
+    let rid = env.rid();
+    assert!(
+        env.store
+            .control_revoke_pairing_code(
+                &service.who(),
+                &env.meta(T0 + 2, &rid),
+                &RevokePairingCode {
+                    pairing_id: own.pairing_id.clone(),
+                },
+            )
+            .is_ok()
     );
 }
 

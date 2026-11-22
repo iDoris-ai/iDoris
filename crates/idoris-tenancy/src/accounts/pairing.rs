@@ -46,7 +46,7 @@ use subtle::ConstantTimeEq;
 use super::control::{
     Actor, AuditSpec, Caller, Ctx, Failure, Identity, Meta, NewKey, TargetKind, Who, Written,
     authorize_op, check_ceilings, insert_issuance, insert_virtual_key, load_key_by_id,
-    revoke_virtual_key, slice_directory,
+    require_op_capability, revoke_virtual_key, slice_directory,
 };
 use super::error::AccountStoreError;
 use super::rows::{load_ancestors, load_credential, load_membership, load_principal};
@@ -344,6 +344,8 @@ impl AccountStore {
             let (Some(issuer), Some(ceilings)) = (caller.credential(), caller.ceilings()) else {
                 return Err(Failure::new(ControlReason::OpNotGranted));
             };
+            // 先做与目标无关的授权判定，再按成员关系 id 去查（见 `require_op_capability`，issue #603 N7 同类）
+            require_op_capability(conn, caller, meta.now, ControlOp::IssueCredential)?;
             let Some(found) = load_membership(conn, &request.membership)? else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
@@ -430,6 +432,8 @@ impl AccountStore {
         let spec = AuditSpec::new("revoke_pairing_code", TargetKind::PairingCode)
             .target(&request.pairing_id);
         self.control_write(who, meta, spec, |conn, caller, spec| {
+            // 先做与目标无关的授权判定，再按配对码 id 去查（见 `require_op_capability`，issue #603 N7 同类）
+            require_op_capability(conn, caller, meta.now, ControlOp::IssueCredential)?;
             let Some(record) = load_pairing_by_id(conn, &request.pairing_id)? else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };

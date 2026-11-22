@@ -778,7 +778,7 @@ pub(super) fn authorize_op(
 
 /// 与操作**目标**无关的那几步授权判定：凭证此刻可用、绑定账户没被冻结、调用者有没有 `op` 这个操作（任何范围里）。
 ///
-/// 按 id 查的写操作（撤销成员关系 / 额度、改凭证状态）在碰目标之前先做：没有这个操作权限的调用者，无论目标存在与否
+/// 按 id 查的写操作（撤销成员关系 / 额度、改凭证状态、签发成员凭证、创建 / 撤销配对码）在碰目标之前先做：没有这个操作权限的调用者，无论目标存在与否
 /// 都得到同一个答案（契约 `authorize` 的检查顺序：有没有这个操作的权限先于目标存不存在）。否则已有的目标得到
 /// `op_not_granted`，不存在的目标在授权判定之前就得到 `out_of_scope`，靠它能探测别的组织有哪些 id。
 /// 范围问题（`op` 的子树不含自己的绑定账户）不在这里判，交给后面按目标判。本机运维不受授权约束。
@@ -1295,7 +1295,7 @@ impl AccountStore {
     /// 建成员关系。授权看成员关系的付款账户（管理员关系看组织）。
     ///
     /// 顺序：授权（付款账户）-> 请求自己声明的结构（`org` 必须是付款账户的祖先，见 [`check_membership_structure`]）-> 成员关系 id 的重放 /
-    /// 冲突 -> 主体。主体状态（没登记、已撤销）只告诉**有资格知道的人**：本机运维，或者这个主体的归属方（登记组织，或老主体已经在用它的
+    /// 冲突（调用者管不到的成员关系对调用者按「不存在」走，最后才以 `out_of_scope` 拒绝）-> 主体。主体状态（没登记、已撤销）只告诉**有资格知道的人**：本机运维，或者这个主体的归属方（登记组织，或老主体已经在用它的
     /// 组织）自己的管理员。其他人——包括调用者对目标账户有 `manage_membership`、但对归属方没有 `revoke_principal` 的外部组织，
     /// 和伪造 `org` 字段的外部组织——对活跃、已撤销、不存在拿到同一个失败（结构错是固定的 `invalid_membership`，可见性授权失败是
     /// 无细节的 `out_of_scope`）。没有归属方的活跃老主体仍可以由第一个组织挂上去。
@@ -1347,20 +1347,26 @@ impl AccountStore {
             )? {
                 return Err(Failure::new(ControlReason::OutOfScope));
             }
-            if let Some(existing) = load_membership(conn, &membership.id)? {
-                // 已有的成员关系可能属于别的付款账户：调用者对它所属的账户没有 `manage_membership` 时，不告诉他它存在
-                // （同样的 `out_of_scope`），只有管得到它的人才看得到 replayed / already_exists。
-                if membership_target(&existing) != &target {
-                    authorize_op(
+            // 已有的成员关系属于调用者管不到的付款账户（对它所属的账户没有 `manage_membership`）时，这个 id 对调用者按「不存在」走：
+            // 先过主体状态，最后才以同样的 `out_of_scope` 拒绝；replayed / already_exists 留给管得到它的人。顺序反了的话，调用者拿
+            // 自己名下已撤销的主体建成员关系，别的组织已有的 id 得到 `out_of_scope`、不存在的 id 得到 `principal_revoked`，
+            // 不用写入就能探测别的组织有哪些成员关系 id（issue #603 N7 残余）。创建成功与否本身仍可探测（成员关系 id 是客户端
+            // 自选的全局命名空间），这个残余消除不了，见设计稿 S2-10。
+            let existing = load_membership(conn, &membership.id)?;
+            let hidden = match &existing {
+                Some(other) if membership_target(other) != &target => {
+                    !authority_is_visible(authorize_op(
                         conn,
                         caller,
                         meta.now,
                         ControlOp::ManageMembership,
-                        membership_target(&existing),
+                        membership_target(other),
                         None,
-                    )
-                    .map_err(|_| Failure::new(ControlReason::OutOfScope))?;
+                    ))?
                 }
+                _ => false,
+            };
+            if let Some(existing) = existing.filter(|_| !hidden) {
                 return if existing == *membership {
                     Ok(Written {
                         result: WriteResult::Replayed,
@@ -1390,6 +1396,9 @@ impl AccountStore {
                     ));
                 }
                 Some(_) => {}
+            }
+            if hidden {
+                return Err(Failure::new(ControlReason::OutOfScope));
             }
             create_membership_in(conn, membership, meta.now)
                 .map_err(|error| Failure::from_store(error, Ctx::Membership))?;
@@ -1607,6 +1616,9 @@ impl AccountStore {
         let spec =
             AuditSpec::new("issue_credential", TargetKind::Credential).target(&request.key_id);
         self.control_write(who, meta, spec, |conn, caller, spec| {
+            // 先做与目标无关的授权判定，再按成员关系 id 去取付款账户（见 `require_op_capability`）：没有这个操作权限、或绑定账户
+            // 被冻结的调用者，对已有的和不存在的成员关系得到同一个答案，没法靠错误码探测别的组织有哪些成员关系 id（issue #603 N7 同类）
+            require_op_capability(conn, caller, meta.now, ControlOp::IssueCredential)?;
             // 目标账户 = 新凭证的绑定账户。绑定的成员关系不存在，和「不在范围内」是同一个答案。
             let anchor = binding_anchor(conn, &request.binding)?
                 .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;

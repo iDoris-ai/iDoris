@@ -3976,3 +3976,94 @@ async fn a_caller_without_the_operation_gets_the_same_http_answer_for_an_existin
         );
     }
 }
+
+#[tokio::test]
+async fn member_credentials_and_pairing_codes_give_a_caller_without_the_operation_the_same_http_answer_for_any_id()
+ {
+    // issue #603 N7 同类（PR-Daemon 在 #608 评审里指出）：签发成员凭证、创建配对码按成员关系 id 去查，撤销配对码按配对码 id 去查，
+    // 旧代码都是先查、后授权。没有 `issue_credential` 权限的调用者（reader 只有 read），对「自己组织的」「别的组织的」
+    // 「不存在的」id 必须得到逐字节相同的回答（状态码、头、正文，只有每次请求都不一样的关联 id 除外）。
+    let world = World::new();
+    world.people().await;
+    let (reader, other) = (world.reader.secret.clone(), world.other.secret.clone());
+    // school-b 自己的主体、成员关系（成员账户 b1）和一个配对码
+    world
+        .ok(
+            "/control/v1/principals",
+            &other,
+            json!({"principal_id": "kb1", "org": "school-b"}),
+        )
+        .await;
+    world
+        .ok(
+            "/control/v1/memberships",
+            &other,
+            json!({"membership_id": "m-kb1", "principal_id": "kb1", "org": "school-b",
+                   "role": "member", "account": "b1"}),
+        )
+        .await;
+    let (_, own_code) = pairing_code(&world, "m-kid1").await;
+    let foreign_code = world
+        .ok(
+            "/control/v1/pairing/codes",
+            &other,
+            json!({"membership": "m-kb1", "allowed_privacy": ["local_only"], "allowed_roles": ["fast"]}),
+        )
+        .await["pairing"]["pairing_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    type Call = (String, Option<Value>);
+    let probes: Vec<(&str, Vec<Call>)> = vec![
+        (
+            "issue member credential",
+            ["m-kid1", "m-kb1", "m-ghost"]
+                .iter()
+                .map(|id| {
+                    (
+                        "/control/v1/credentials".to_string(),
+                        Some(json!({"binding": {"kind": "member", "membership": id},
+                                    "allowed_privacy": ["local_only"], "allowed_roles": ["fast"]})),
+                    )
+                })
+                .collect(),
+        ),
+        (
+            "create pairing code",
+            ["m-kid1", "m-kb1", "m-ghost"]
+                .iter()
+                .map(|id| {
+                    (
+                        "/control/v1/pairing/codes".to_string(),
+                        Some(json!({"membership": id, "allowed_privacy": ["local_only"],
+                                    "allowed_roles": ["fast"]})),
+                    )
+                })
+                .collect(),
+        ),
+        (
+            "revoke pairing code",
+            [
+                own_code.as_str(),
+                foreign_code.as_str(),
+                "pc_0123456789abcdef",
+            ]
+            .iter()
+            .map(|id| (format!("/control/v1/pairing/codes/{id}/revoke"), None))
+            .collect(),
+        ),
+    ];
+    for (label, calls) in probes {
+        let mut answers = Vec::new();
+        for (path, body) in calls {
+            let reply = world.call("POST", &path, Some(&reader), body).await;
+            assert!(!reply.status.is_success(), "{label} {path}: {}", reply.raw);
+            answers.push(answer_without_the_correlation_id(&reply));
+        }
+        assert!(
+            answers.iter().all(|answer| *answer == answers[0]),
+            "{label}: an existing and a missing id must be indistinguishable: {answers:?}"
+        );
+    }
+}

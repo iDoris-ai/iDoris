@@ -140,7 +140,7 @@ impl Env {
 
     // ---------- 夹具：树、成员、凭证 ----------
 
-    fn account(&self, id: &str, kind: AccountKind, parent: Option<&str>) {
+    pub(super) fn account(&self, id: &str, kind: AccountKind, parent: Option<&str>) {
         let account = Account {
             id: aid(id),
             kind,
@@ -4055,5 +4055,216 @@ fn id_keyed_writes_do_not_tell_a_caller_without_the_operation_whether_the_id_exi
     assert_eq!(
         Action::RevokeMembership { id: "m-kid1" }.run(&env, &edu.who(), T0 + 3),
         Ok(WriteResult::Updated)
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// issue #603 N7 同类（PR-Daemon 在 #608 评审里指出）：还有三处先按 id 查、后授权——签发成员凭证（`Member` 绑定）、
+// 创建配对码、撤销配对码。配对码的两条在 `pairing_tests.rs`。
+// ------------------------------------------------------------------------------------------------
+
+/// 一个只有 `read` 的调用者，和一个有 `issue_credential`、但自己绑定的组织（school-c）已被冻结的调用者。
+fn callers_that_cannot_issue(env: &Env) -> [(&'static str, Minted, ControlReason); 2] {
+    let reader = env.issue_as_operator(Issue::service(
+        "eduai",
+        vec![sc(ControlOp::Read, "eduai", None)],
+    ));
+    env.account("school-c", AccountKind::Org, Some("platform"));
+    let frozen = env.issue_as_operator(Issue::service(
+        "school-c",
+        vec![sc(ControlOp::IssueCredential, "school-c", None)],
+    ));
+    assert_eq!(
+        Action::SetAccountStatus {
+            account: "school-c",
+            status: AccountStatus::Frozen
+        }
+        .run(env, &Env::operator(), T0 + 1),
+        Ok(WriteResult::Updated)
+    );
+    [
+        ("only read", reader, ControlReason::OpNotGranted),
+        ("frozen anchor", frozen, ControlReason::AccountInactive),
+    ]
+}
+
+/// 签发成员凭证要先按成员关系 id 取付款账户，才轮到授权。旧代码：没有 `issue_credential` 权限（或绑定账户被冻结）的调用者，
+/// 不存在的成员关系得到 `out_of_scope`，已有的（自己组织的、别的组织的）得到 `op_not_granted` / `account_inactive`，
+/// 靠它探测别的组织有哪些成员关系 id。现在先做与目标无关的授权判定（`require_op_capability`），三种 id 得到同一个失败。
+#[test]
+fn issuing_a_member_credential_does_not_tell_a_caller_that_cannot_issue_whether_the_membership_exists()
+ {
+    let env = Env::new();
+    env.tree();
+    let issue = |who: &Who<'_>, membership: &str| -> Failure {
+        let key = MintedVirtualKey::mint();
+        let rid = env.rid();
+        env.store
+            .control_issue_credential(
+                who,
+                &env.meta(T0 + 2, &rid),
+                &Issue::member(membership).request(&key),
+            )
+            .expect_err("a caller that cannot issue must be refused")
+    };
+    for (label, caller, expected) in callers_that_cannot_issue(&env) {
+        // m-kid1：eduai 的成员关系；m-kb1：school-b 的；m-ghost：不存在
+        for id in ["m-kid1", "m-kb1", "m-ghost"] {
+            assert_eq!(
+                issue(&caller.who(), id),
+                Failure::new(expected),
+                "{label}: {id}"
+            );
+        }
+    }
+    // 对照：有权限的调用者，别的组织的和不存在的成员关系仍是同一个 out_of_scope，自己组织的照常签发
+    let edu = env.issue_as_operator(Issue::service("eduai", all_ops("eduai", 1)));
+    for id in ["m-kb1", "m-ghost"] {
+        assert_eq!(
+            issue(&edu.who(), id),
+            Failure::new(ControlReason::OutOfScope),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        Action::IssueCredential {
+            membership: "m-kid1"
+        }
+        .run(&env, &edu.who(), T0 + 3),
+        Ok(WriteResult::Created)
+    );
+    // 本机运维不受授权约束：成员关系不存在仍是 out_of_scope
+    assert_eq!(
+        Action::IssueCredential {
+            membership: "m-ghost"
+        }
+        .run(&env, &Env::operator(), T0 + 4),
+        Err(ControlReason::OutOfScope)
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// issue #603 N7（PR-Daemon 在 #608 评审里指出的残余）：建成员关系时，调用者用自己名下已撤销的主体
+// ------------------------------------------------------------------------------------------------
+
+/// 旧代码：调用者用自己登记、已经撤销的主体建成员关系。别的组织已有的成员关系 id 在「主体状态」之前就被 `out_of_scope` 拒绝，
+/// 不存在的 id 走到主体状态得到 `principal_revoked`——不用写入就能探测别的组织有哪些成员关系 id。
+/// 现在调用者管不到的成员关系对调用者按「不存在」走，先过主体状态，最后才以 `out_of_scope` 拒绝；两种 id 得到同一个失败。
+///
+/// **残余（无法消除，只钉住）**：主体是活跃的时候，不存在的 id 会创建成功、别的组织已有的 id 得到 `out_of_scope`，
+/// 「创建成功与否」本身仍然可探测——成员关系 id 是客户端自选的全局命名空间。
+#[test]
+fn creating_a_membership_with_the_callers_own_revoked_principal_does_not_probe_membership_ids() {
+    let env = Env::new();
+    let (_edu, other) = principal_world(&env);
+    // school-b 登记并撤销自己的主体 bee；再登记一个活跃的 cat
+    for principal in ["bee", "cat"] {
+        assert_eq!(
+            Action::CreatePrincipal {
+                principal,
+                org: "school-b"
+            }
+            .run(&env, &other.who(), T0 + 2),
+            Ok(WriteResult::Created)
+        );
+    }
+    assert_eq!(
+        Action::RevokePrincipal {
+            principal: "bee",
+            org: "school-b"
+        }
+        .run(&env, &other.who(), T0 + 3),
+        Ok(WriteResult::Updated)
+    );
+    env.account("acct-b", AccountKind::Member, Some("school-b"));
+    // m-kid1 是 eduai 的成员关系（已有，school-b 管不到）；m-probe-missing 不存在
+    let existing = attach_failure(
+        &env,
+        &other.who(),
+        T0 + 4,
+        member_membership("m-kid1", "bee", "school-b", "acct-b"),
+    );
+    let missing = attach_failure(
+        &env,
+        &other.who(),
+        T0 + 4,
+        member_membership("m-probe-missing", "bee", "school-b", "acct-b"),
+    );
+    assert_eq!(existing, missing, "{existing:?} vs {missing:?}");
+    assert_eq!(existing.to_string(), missing.to_string());
+    assert_eq!(
+        existing,
+        Failure::with_detail(
+            ControlReason::PrincipalRevoked,
+            "principal bee has been revoked"
+        )
+    );
+    // 残余：活跃的主体，别的组织已有的 id 是 out_of_scope，不存在的 id 创建成功
+    assert_eq!(
+        attach_failure(
+            &env,
+            &other.who(),
+            T0 + 5,
+            member_membership("m-kid1", "cat", "school-b", "acct-b"),
+        ),
+        Failure::new(ControlReason::OutOfScope)
+    );
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-cat",
+            principal: "cat",
+            org: "school-b",
+            account: "acct-b"
+        }
+        .run(&env, &other.who(), T0 + 6),
+        Ok(WriteResult::Created)
+    );
+}
+
+/// 上面那条的对照，防止「管不到的 id 按不存在走」被推广到调用者管得到的成员关系：自己已有的成员关系，主体事后被撤销，
+/// 同样的创建请求照旧是幂等的 `replayed`（成员关系行本身没变），定义不同照旧是 `already_exists`，不是 `principal_revoked`。
+#[test]
+fn replaying_the_creation_of_an_own_membership_stays_idempotent_after_its_principal_is_revoked() {
+    let env = Env::new();
+    let (_edu, other) = principal_world(&env);
+    env.account("acct-b", AccountKind::Member, Some("school-b"));
+    env.account("acct-b2", AccountKind::Member, Some("school-b"));
+    for action in [
+        Action::CreatePrincipal {
+            principal: "bee",
+            org: "school-b",
+        },
+        Action::CreateMembership {
+            id: "m-bee",
+            principal: "bee",
+            org: "school-b",
+            account: "acct-b",
+        },
+        Action::RevokePrincipal {
+            principal: "bee",
+            org: "school-b",
+        },
+    ] {
+        assert!(action.run(&env, &other.who(), T0 + 2).is_ok(), "{action:?}");
+    }
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-bee",
+            principal: "bee",
+            org: "school-b",
+            account: "acct-b"
+        }
+        .run(&env, &other.who(), T0 + 3),
+        Ok(WriteResult::Replayed)
+    );
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-bee",
+            principal: "bee",
+            org: "school-b",
+            account: "acct-b2"
+        }
+        .run(&env, &other.who(), T0 + 4),
+        Err(ControlReason::AlreadyExists)
     );
 }
