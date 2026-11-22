@@ -53,6 +53,17 @@ impl Env {
         force: bool,
         hook: Option<CommitHook>,
     ) -> Result<Value, SetupError> {
+        self.run_in(&self.out(), endpoint, force, hook).await
+    }
+
+    /// 同 `run`，out-dir 由调用方给（例如指向 `out()` 的符号链接）。
+    async fn run_in(
+        &self,
+        out_dir: &Path,
+        endpoint: &str,
+        force: bool,
+        hook: Option<CommitHook>,
+    ) -> Result<Value, SetupError> {
         let mut setup = OmlxSetup::new(Some(self.home.path().to_path_buf()));
         if let Some(hook) = hook {
             setup = setup.with_commit_hook(hook);
@@ -62,7 +73,7 @@ impl Env {
                 url: endpoint.to_string(),
                 probe: false,
             },
-            out_dir: self.out(),
+            out_dir: out_dir.to_path_buf(),
             bindings: Vec::new(),
             load_mode: LoadMode::OnDemand,
             api_key_stdin: false,
@@ -702,4 +713,410 @@ fn two_kept_default_cards_plus_a_non_default_new_card_is_refused_and_nothing_is_
     // 对照：只有一张默认卡，新卡不是默认，放行。
     fs::remove_file(out.join("d2.yaml")).unwrap();
     write_validated_hooked(&out, true, &[("fresh.yaml", fresh.as_str())], &[], None).unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// 七、#633 评审的后续（N1 到 N4）
+// ---------------------------------------------------------------------------------------------
+
+/// N1：被保留的符号链接指向这次要删除的旧伴生卡（`alias.yaml -> omlx-embed.yaml`）：暂存目录里放的是解引用后的内容，
+/// 校验会过，落盘后链接悬空。整体 `validation_failed`，点名链接与目标，目录不变。对照：链接指向不受影响的文件，照常。
+#[tokio::test]
+async fn a_kept_symlink_into_a_file_that_the_run_deletes_is_refused() {
+    let env = Env::new();
+    seeded_with_kept_card(&env).await;
+    fs::write(
+        env.out().join("omlx-embed.yaml"),
+        upstream_card("omlx-embed", 1111, ""),
+    )
+    .unwrap();
+    symlink("omlx-embed.yaml", env.out().join("alias.yaml")).unwrap();
+    let before = env.snapshot();
+    let error = env
+        .run("http://127.0.0.1:8001", true, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "validation_failed", "{}", error.message);
+    assert!(
+        error.message.contains("alias.yaml") && error.message.contains("omlx-embed.yaml"),
+        "{}",
+        error.message
+    );
+    assert_eq!(env.snapshot(), before);
+    assert_eq!(
+        fs::read_link(env.out().join("alias.yaml")).unwrap(),
+        Path::new("omlx-embed.yaml")
+    );
+    env.assert_no_stage_left();
+
+    // 对照：同样的链接指向一个不被替换的文件（不叫 .yaml），旧伴生卡被清掉，链接不悬空。
+    fs::remove_file(env.out().join("alias.yaml")).unwrap();
+    fs::write(
+        env.out().join("kept-copy.txt"),
+        upstream_card("copy", 1112, ""),
+    )
+    .unwrap();
+    symlink("kept-copy.txt", env.out().join("alias.yaml")).unwrap();
+    env.run("http://127.0.0.1:8001", true, None).await.unwrap();
+    assert!(!env.out().join("omlx-embed.yaml").exists());
+    assert!(
+        fs::metadata(env.out().join("alias.yaml")).is_ok(),
+        "链接没有悬空"
+    );
+}
+
+/// N2：受管名字上是用户的目录（或符号链接）：`--force` 不挪、不删，`out_dir_not_empty`，目录里的内容原样。
+#[tokio::test]
+async fn force_never_moves_or_deletes_a_user_directory_at_a_managed_name() {
+    for managed in ["omlx.yaml", "subscription.yaml"] {
+        let env = Env::new();
+        seeded_with_kept_card(&env).await;
+        fs::remove_file(env.out().join(managed)).unwrap();
+        fs::create_dir(env.out().join(managed)).unwrap();
+        fs::write(
+            env.out().join(managed).join("precious.txt"),
+            "do not delete",
+        )
+        .unwrap();
+        let error = env
+            .run("http://127.0.0.1:8001", true, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code, "out_dir_not_empty",
+            "{managed}: {}",
+            error.message
+        );
+        assert!(error.message.contains(managed), "{}", error.message);
+        assert_eq!(
+            fs::read(env.out().join(managed).join("precious.txt")).unwrap(),
+            b"do not delete",
+            "{managed}"
+        );
+        env.assert_no_stage_left();
+    }
+    // 受管名字上是符号链接：同样不替换（链接与它的目标都原样）。
+    let env = Env::new();
+    seeded_with_kept_card(&env).await;
+    fs::write(env.out().join("real.txt"), "target").unwrap();
+    fs::remove_file(env.out().join("omlx.yaml")).unwrap();
+    symlink("real.txt", env.out().join("omlx.yaml")).unwrap();
+    let error = env
+        .run("http://127.0.0.1:8001", true, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "out_dir_not_empty", "{}", error.message);
+    assert_eq!(
+        fs::read_link(env.out().join("omlx.yaml")).unwrap(),
+        Path::new("real.txt")
+    );
+    assert_eq!(fs::read(env.out().join("real.txt")).unwrap(), b"target");
+}
+
+fn filesystem_is_case_insensitive(dir: &Path) -> bool {
+    let probe = dir.join("CaseProbe.tmp");
+    fs::write(&probe, b"x").unwrap();
+    let insensitive = dir.join("caseprobe.tmp").exists();
+    fs::remove_file(&probe).unwrap();
+    insensitive
+}
+
+/// N3：用户的 `OMLX.yaml` 与要生成的 `omlx.yaml` 只差大小写。大小写不敏感的文件系统（macOS 默认的 APFS）上它们是同一个路径，
+/// 不能悄悄换掉用户的文件；所以按不分大小写比较，撞了就 `validation_failed`，点名两个文件名，目录不变。大小写敏感的文件系统
+/// （Linux CI）上它们是两个文件，同样拒绝，让同一个目录在不同机器上行为一致；只有「它们其实是同一个文件」这条断言
+/// 要先在运行时探测文件系统，不是大小写不敏感的就跳过那一条。
+#[tokio::test]
+async fn a_user_file_differing_only_in_case_from_a_managed_name_is_refused() {
+    let env = Env::new();
+    seeded_with_kept_card(&env).await;
+    fs::remove_file(env.out().join("omlx.yaml")).unwrap();
+    let user_card = upstream_card("user", 1113, "").into_bytes();
+    fs::write(env.out().join("OMLX.yaml"), &user_card).unwrap();
+    let before = env.snapshot();
+    let error = env
+        .run("http://127.0.0.1:8001", true, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "validation_failed", "{}", error.message);
+    assert!(
+        error.message.contains("OMLX.yaml") && error.message.contains("omlx.yaml"),
+        "{}",
+        error.message
+    );
+    assert_eq!(env.snapshot(), before);
+    if filesystem_is_case_insensitive(env.work.path()) {
+        // 同一个路径：用 `omlx.yaml` 读到的就是用户的字节，说明没有被生成的卡盖掉。
+        assert_eq!(fs::read(env.out().join("omlx.yaml")).unwrap(), user_card);
+    }
+    env.assert_no_stage_left();
+}
+
+/// N4：目录非空，没有任何组件卡，也没有这次要替换的文件：`--force` 也不放行，说明点出多半是 `--out-dir` 写错了；
+/// 目录原样。对照：有别的卡的目录，`--force` 照常。
+#[tokio::test]
+async fn force_refuses_a_non_empty_directory_with_no_cards_and_says_it_may_be_the_wrong_one() {
+    let env = Env::new();
+    fs::create_dir_all(env.out()).unwrap();
+    fs::write(env.out().join("notes.txt"), "my notes").unwrap();
+    fs::write(env.out().join("photo.jpg"), "jpg").unwrap();
+    let before = env.snapshot();
+    let error = env
+        .run("http://127.0.0.1:8001", true, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "out_dir_not_empty", "{}", error.message);
+    assert!(error.message.contains("写错"), "{}", error.message);
+    assert_eq!(env.snapshot(), before);
+    env.assert_no_stage_left();
+
+    // 对照：同一个目录里有一张别的卡，`--force` 照常（这是 #626 的用法）。
+    fs::write(
+        env.out().join("lmstudio.yaml"),
+        upstream_card("lmstudio", 1234, ""),
+    )
+    .unwrap();
+    env.run("http://127.0.0.1:8001", true, None).await.unwrap();
+    assert_eq!(env.snapshot()["notes.txt"], b"my notes");
+}
+
+// ---------------------------------------------------------------------------------------------
+// 八、#633 后续评审：大小写撞名在 setup upstream 一侧、符号链接各种形状、文件系统自己的折叠
+// ---------------------------------------------------------------------------------------------
+
+fn no_setup_leftovers(work: &Path) {
+    let left: Vec<_> = fs::read_dir(work)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with(".idoris-"))
+        .collect();
+    assert!(left.is_empty(), "暂存目录没有清理：{left:?}");
+}
+
+/// `setup upstream` 一侧（`write_added`）：已有的文件与要写的文件只差大小写，两个方向、带不带 `--force`，一律
+/// `validation_failed`，目录一个字节不变。快照只排除名字完全相同的条目，所以只差大小写的那张卡不会被悄悄漏掉：
+/// 大小写敏感的文件系统上它是被保留的卡、要参与校验，大小写不敏感的文件系统上它与新文件是同一个文件。
+#[test]
+fn write_added_refuses_a_name_that_differs_only_in_case_in_both_directions() {
+    for (existing, new) in [("LM.yaml", "lm.yaml"), ("lm.yaml", "LM.yaml")] {
+        for force in [false, true] {
+            let work = TempDir::new().unwrap();
+            let out = work.path().join("comp");
+            fs::create_dir_all(&out).unwrap();
+            fs::write(out.join(existing), upstream_card("lm", 1, "")).unwrap();
+            let before = snapshot(&out);
+            let text = upstream_card("lm2", 2, "");
+            let card: ComponentCard = serde_yaml::from_str(&text).unwrap();
+            let error = write_added(&out, force, new, &text, &card).unwrap_err();
+            assert_eq!(
+                error.code, "validation_failed",
+                "{existing}/{new} force={force}: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains(existing),
+                "{existing}/{new}: {}",
+                error.message
+            );
+            assert_eq!(snapshot(&out), before, "{existing}/{new} force={force}");
+            no_setup_leftovers(work.path());
+        }
+    }
+}
+
+/// 文件系统自己的折叠（Codex 追问的 APFS Unicode 情形）：APFS 把 `ſubscription.yaml`（U+017F，长 s）与
+/// `subscription.yaml` 当成同一个文件，ASCII 比较抓不到，所以撞名检查还比较两个路径背后的文件身份（设备与 inode）。
+/// 先在运行时探测这个文件系统是否真的这样折叠，不是（例如 Linux 的 ext4、tmpfs）就跳过。受管名字都是 ASCII，
+/// 没有 NFC 与 NFD 两种写法的问题；这里验证的是折叠本身。
+#[tokio::test]
+async fn a_name_the_filesystem_folds_onto_a_managed_name_is_refused() {
+    let probe = TempDir::new().unwrap();
+    let variant = "\u{17f}ubscription.yaml";
+    fs::write(probe.path().join(variant), "x").unwrap();
+    if !probe.path().join("subscription.yaml").exists() {
+        eprintln!("skipped: this filesystem does not fold U+017F onto s");
+        return;
+    }
+    let env = Env::new();
+    seeded_with_kept_card(&env).await;
+    fs::remove_file(env.out().join("subscription.yaml")).unwrap();
+    let user_card = upstream_card("user", 1114, "").into_bytes();
+    fs::write(env.out().join(variant), &user_card).unwrap();
+    let before = env.snapshot();
+    let error = env
+        .run("http://127.0.0.1:8001", true, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "validation_failed", "{}", error.message);
+    assert_eq!(env.snapshot(), before);
+    env.assert_no_stage_left();
+}
+
+type MakeLink = fn(&Env, &str);
+
+/// 在 `env.out()` 里造一个叫 `alias.yaml` 的符号链接，最终指向 `target`（`env.out()` 下的一个文件名）。
+fn link_forms() -> Vec<(&'static str, MakeLink)> {
+    vec![
+        ("direct relative", |env, t| {
+            symlink(t, env.out().join("alias.yaml")).unwrap();
+        }),
+        ("two hops in the same directory", |env, t| {
+            symlink(t, env.out().join("hop.txt")).unwrap();
+            symlink("hop.txt", env.out().join("alias.yaml")).unwrap();
+        }),
+        ("two hops through another directory", |env, t| {
+            let ext = env.work.path().join("ext");
+            fs::create_dir_all(&ext).unwrap();
+            symlink(format!("../comp/{t}"), ext.join("hop.txt")).unwrap();
+            symlink("../ext/hop.txt", env.out().join("alias.yaml")).unwrap();
+        }),
+        ("absolute target", |env, t| {
+            symlink(env.out().join(t), env.out().join("alias.yaml")).unwrap();
+        }),
+        ("target containing ..", |env, t| {
+            symlink(format!("../comp/{t}"), env.out().join("alias.yaml")).unwrap();
+        }),
+        (
+            "absolute target through a symlinked path of the out-dir",
+            |env, t| {
+                let via = env.work.path().join("comp-via");
+                symlink(env.out(), &via).unwrap();
+                symlink(via.join(t), env.out().join("alias.yaml")).unwrap();
+            },
+        ),
+    ]
+}
+
+/// N1 参数化：被保留的链接（各种写法）最终指向这次要删除（旧伴生卡）或要替换（`omlx.yaml`）的文件：整体
+/// `validation_failed`，点名链接；原文件与链接都原样，暂存目录清理干净。
+#[tokio::test]
+async fn kept_links_of_every_shape_into_a_deleted_or_replaced_file_are_refused() {
+    for target in ["omlx-embed.yaml", "omlx.yaml"] {
+        for (label, make) in link_forms() {
+            let env = Env::new();
+            seeded_with_kept_card(&env).await;
+            fs::write(
+                env.out().join("omlx-embed.yaml"),
+                upstream_card("omlx-embed", 1111, ""),
+            )
+            .unwrap();
+            make(&env, target);
+            let before = env.snapshot();
+            let link_before = fs::read_link(env.out().join("alias.yaml")).unwrap();
+            let error = env
+                .run("http://127.0.0.1:8001", true, None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code, "validation_failed",
+                "{label} -> {target}: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains("alias.yaml"),
+                "{label} -> {target}: {}",
+                error.message
+            );
+            assert_eq!(env.snapshot(), before, "{label} -> {target}");
+            assert_eq!(
+                fs::read_link(env.out().join("alias.yaml")).unwrap(),
+                link_before,
+                "{label} -> {target}"
+            );
+            no_setup_leftovers(env.work.path());
+        }
+    }
+}
+
+/// 同上，out-dir 本身是通过符号链接给出的（`--out-dir <指向目录的链接>`）。
+#[tokio::test]
+async fn a_kept_link_is_refused_when_the_out_dir_itself_is_given_through_a_symlink() {
+    let env = Env::new();
+    seeded_with_kept_card(&env).await;
+    fs::write(
+        env.out().join("omlx-embed.yaml"),
+        upstream_card("omlx-embed", 1111, ""),
+    )
+    .unwrap();
+    symlink("omlx-embed.yaml", env.out().join("alias.yaml")).unwrap();
+    let via = env.work.path().join("comp-via");
+    symlink(env.out(), &via).unwrap();
+    let before = env.snapshot();
+    let error = env
+        .run_in(&via, "http://127.0.0.1:8001", true, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "validation_failed", "{}", error.message);
+    assert_eq!(env.snapshot(), before);
+    assert_eq!(
+        fs::read_link(env.out().join("alias.yaml")).unwrap(),
+        Path::new("omlx-embed.yaml")
+    );
+    no_setup_leftovers(env.work.path());
+}
+
+/// 对照：不该被拒绝的链接。指向 out-dir 之外的合法目标、指向子目录里同名的文件、指向另一个不被替换的文件；
+/// 另有加载器的口径：`.yml` 是卡（被拒），`.YML` 不是卡（加载器不读它，快照也不看它，所以不拒绝）。
+#[tokio::test]
+async fn links_that_do_not_reach_a_replaced_file_pass_and_yml_follows_the_loader() {
+    let valid_external: Vec<(&str, MakeLink)> = vec![
+        ("absolute external target", |env, _| {
+            let ext = env.work.path().join("external");
+            fs::create_dir_all(&ext).unwrap();
+            fs::write(ext.join("card.txt"), upstream_card("ext", 1601, "")).unwrap();
+            symlink(ext.join("card.txt"), env.out().join("alias.yaml")).unwrap();
+        }),
+        ("relative external target", |env, _| {
+            let ext = env.work.path().join("external");
+            fs::create_dir_all(&ext).unwrap();
+            fs::write(ext.join("card.txt"), upstream_card("ext", 1601, "")).unwrap();
+            symlink("../external/card.txt", env.out().join("alias.yaml")).unwrap();
+        }),
+        ("same file name in a sub directory", |env, t| {
+            let sub = env.out().join("sub");
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join(t), upstream_card("sub", 1602, "")).unwrap();
+            symlink(format!("sub/{t}"), env.out().join("alias.yaml")).unwrap();
+        }),
+    ];
+    for (label, make) in valid_external {
+        let env = Env::new();
+        seeded_with_kept_card(&env).await;
+        make(&env, "omlx-embed.yaml");
+        let link = fs::read_link(env.out().join("alias.yaml")).unwrap();
+        env.run("http://127.0.0.1:8001", true, None)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {}", e.message));
+        assert_eq!(
+            fs::read_link(env.out().join("alias.yaml")).unwrap(),
+            link,
+            "{label}"
+        );
+        no_setup_leftovers(env.work.path());
+    }
+
+    // `.yml` 是加载器读的扩展名：同样被拒。
+    let env = Env::new();
+    seeded_with_kept_card(&env).await;
+    fs::write(
+        env.out().join("omlx-embed.yaml"),
+        upstream_card("omlx-embed", 1111, ""),
+    )
+    .unwrap();
+    symlink("omlx-embed.yaml", env.out().join("alias.yml")).unwrap();
+    let error = env
+        .run("http://127.0.0.1:8001", true, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "validation_failed", "{}", error.message);
+    // `.YML` 不是加载器读的扩展名（区分大小写），不是卡：不拒绝；跑完旧伴生卡被清掉。
+    fs::remove_file(env.out().join("alias.yml")).unwrap();
+    symlink("omlx-embed.yaml", env.out().join("alias.YML")).unwrap();
+    assert!(
+        load_components(&env.out(), false)
+            .unwrap()
+            .iter()
+            .all(|c| c.provider.id != "alias")
+    );
+    env.run("http://127.0.0.1:8001", true, None).await.unwrap();
+    assert!(!env.out().join("omlx-embed.yaml").exists());
 }
