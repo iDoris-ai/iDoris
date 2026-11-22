@@ -1281,6 +1281,156 @@ fn an_allocation_that_lost_its_order_mark_fails_admission_closed() {
     }
 }
 
+/// 往 `account` 上这个预留里插一条金额 0 的分录（库被改坏了的样子，插入不用拆触发器）：账户、预留、币种抄预留那一条，
+/// 种类和归属时刻自己给。
+fn insert_zero_entry(db: &TempDb, account: &str, hold_id: &str, kind: &str, window_at: i64) {
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let inserted = conn
+        .execute(
+            "INSERT INTO ledger_entries
+                 (account_id, hold_id, kind, unit, held_micros, spent_micros, funds_micros, liability_micros,
+                  window_at_ms, at_ms, idempotency_key)
+             SELECT account_id, hold_id, ?3, unit, 0, 0, 0, 0, ?4, at_ms, 'tampered-' || ?3 || '-' || ?4
+               FROM ledger_entries WHERE hold_id = ?2 AND account_id = ?1 AND kind = 'reserve'",
+            rusqlite::params![account, hold_id, kind, window_at],
+        )
+        .unwrap();
+    assert_eq!(
+        inserted, 1,
+        "the reservation has one reserve entry on {account}"
+    );
+}
+
+#[test]
+fn a_hold_whose_entries_disagree_on_their_attribution_moment_fails_the_books_closed() {
+    // 一个预留在一个账户上的预留 / 结算 / 释放 / 过期分录都记在预留创建的时刻（T0 + 9），结算那一刻才发生的花费（`late_settle`）整个预留
+    // 只有一个归属时刻（结算的时刻 T0 + 10）。同一类里出现第二个时刻就是库被改坏了（插一条金额 0 的分录就够）：失败即关闭，不能随便挑一个
+    // 来读（挑错了，一笔花费落进不该覆盖它的额度窗口，授信被白白空出来）。
+    //
+    // 账户：授信 100、额度 100 的窗口从 T0 + 10 起；T0 + 9 预留 100，T0 + 10 按 200 结算（超出 100，由额度覆盖）。改坏之前：预留之内的 100 在
+    // T0 + 9（额度够不着，授信债务 100），超出的 100 在 T0 + 10（额度覆盖，剩 0）：净头寸 0 - 100 = -100。
+    for (what, kind, window_at) in [
+        ("the reservation", "release", T0 + 8),
+        ("the settlement-time spend", "late_settle", T0 + 11),
+    ] {
+        let db = TempDb::new(&format!("books-two-moments-{kind}"));
+        let store = credit_only_world(&db);
+        credit_line(&store, "emp", 100, T0);
+        prepaid(&store, "emp-new", 100, T0 + 10, T0 + 10 + 30 * DAY, T0 + 5);
+        let first = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 9);
+        assert_eq!(
+            admit(&store, &first)
+                .admitted()
+                .map(|a| a.reservation.price.micros()),
+            Some(100),
+            "{what}"
+        );
+        settle_at(&store, &first, 200, T0 + 10);
+        assert_eq!(
+            view(&store, T0 + 11).ceiling_remaining,
+            Some(thb(-100)),
+            "{what}: the books are sound before the tampering"
+        );
+        let hold = store
+            .hold(&first.attempt, "model")
+            .unwrap()
+            .unwrap()
+            .hold_id;
+        drop(store);
+        insert_zero_entry(&db, "emp", &hold, kind, window_at);
+
+        let store = AccountStore::open(db.path()).unwrap();
+        let next = Req::new(&store, "r-2", 0, "cred-e", M30).at(T0 + 12);
+        let error = store
+            .admit_attempt(&next.input())
+            .expect_err("admission must fail closed");
+        assert!(
+            matches!(error, LedgerError::Corrupt(_)),
+            "{what}: {error:?}"
+        );
+        assert!(
+            store.hold(&next.attempt, "model").unwrap().is_none(),
+            "{what}: nothing was reserved"
+        );
+        assert!(
+            store.account_view(&aid("emp"), ts(T0 + 12)).is_err(),
+            "{what}: the view fails closed too"
+        );
+    }
+}
+
+#[test]
+fn a_settle_entry_on_a_hold_that_is_neither_being_settled_nor_settled_on_time_fails_the_books_closed()
+ {
+    // `settle` 只写在没迟到的结算里：预留要么正在这个事务里结算（状态还是 open），要么已经结算且没迟到。挂在放掉了的预留、迟到结算了的预留
+    // 上的 `settle` 是库被改坏了：失败即关闭。读不出「超出了多少」不能当成「没有超出」（当成没有，旧格式里超出的部分就按预留创建的时刻读）。
+    //
+    // 账户：授信 100、额度 100 的窗口 [T0, T0 + 30 天)（没有任何额度时不回放花费，也就读不到这条 `settle`）；T0 + 1 000 预留 100，
+    //   放掉：债务 0，额度一分没动，净头寸 100 - 0 = 100；
+    //   过了 TTL 才按 100 结算（迟到）：整笔 100 是结算那一刻的花费，额度覆盖，净头寸 0 + 0 - 0 = 0。
+    for what in ["released", "settled late"] {
+        let db = TempDb::new(&format!("books-settle-on-{}", what.replace(' ', "-")));
+        let store = credit_only_world(&db);
+        credit_line(&store, "emp", 100, T0);
+        prepaid(&store, "emp-new", 100, T0, T0 + 30 * DAY, T0);
+        let first = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 1_000);
+        assert_eq!(
+            admit(&store, &first)
+                .admitted()
+                .map(|a| a.reservation.price.micros()),
+            Some(100),
+            "{what}"
+        );
+        let (healthy_at, healthy_net) = if what == "released" {
+            store
+                .release_attempt(&first.attempt, ts(T0 + 2_000))
+                .unwrap();
+            (T0 + 3_000, 100)
+        } else {
+            let ttl = store.ledger_config().unwrap().reservation_ttl_ms;
+            let settle_at = T0 + 1_000 + ttl + 5_000;
+            assert_eq!(store.sweep_expired_holds(ts(settle_at - 1_000)).unwrap(), 1);
+            let outcome = store
+                .settle_attempt(&first.attempt, &price(100), ts(settle_at))
+                .unwrap();
+            assert!(outcome.late, "{outcome:?}");
+            (settle_at + 500, 0)
+        };
+        assert_eq!(
+            view(&store, healthy_at).ceiling_remaining,
+            Some(thb(healthy_net)),
+            "{what}: the books are sound before the tampering"
+        );
+        let hold = store
+            .hold(&first.attempt, "model")
+            .unwrap()
+            .unwrap()
+            .hold_id;
+        drop(store);
+        insert_zero_entry(&db, "emp", &hold, "settle", T0 + 1_000);
+
+        let store = AccountStore::open(db.path()).unwrap();
+        let next = Req::new(&store, "r-2", 0, "cred-e", M30).at(healthy_at + 1_000);
+        let error = store
+            .admit_attempt(&next.input())
+            .expect_err("admission must fail closed");
+        assert!(
+            matches!(error, LedgerError::Corrupt(_)),
+            "{what}: {error:?}"
+        );
+        assert!(
+            store.hold(&next.attempt, "model").unwrap().is_none(),
+            "{what}: nothing was reserved"
+        );
+        assert!(
+            store
+                .account_view(&aid("emp"), ts(healthy_at + 1_000))
+                .is_err(),
+            "{what}: the view fails closed too"
+        );
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // Codex 复审（2026-11-22）：超出预留的部分、读钟乱序——没充值的账户在 main 上就有同样的两条造钱的路径
 // ------------------------------------------------------------------------------------------

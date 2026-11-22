@@ -461,7 +461,9 @@ struct HoldRows {
 /// （结算时刻），提交序号是这条 `settle` 自己的分录号，和新格式的 `late_settle` 一回事（同一个事务里，序号和别的花费、额度的创建 /
 /// 撤销序号比出来的先后一样）。没有这一步，旧库里超出预留的部分会一直被当成预留之内的、记在预留创建的时刻，够不着结算时才生效的
 /// 额度：担保人吸收过一次的额度又被下一个请求花一次。不迁移，不改写历史：只是读的时候多看一眼预留表里的 `charged - reserved`
-/// （只有 `settle` 那一行才查）。
+/// （只有 `settle` 那一行才查）。结算自己在同一个事务里读整条链的余量时，这个预留还是 `open`，它那条 `settle` 是刚写的新格式
+/// （只有用户承担的那一块），没有要分出来的，算 0；`settle` 挂在别的状态的预留上（放掉了、过期了、迟到的结算）是库被改坏了，
+/// 失败即关闭，不能把「取不到」当成「没有超出」。同一个预留的两条预留类分录（或两条 `late_settle`）归属时刻对不上，同样是库被改坏了。
 ///
 /// 一遍顺序扫描（走 `(account_id, window_at_ms)` 索引，不排序），在内存里按预留聚合：比让 SQLite 先按 (预留, 归属时刻, 种类)
 /// 分组、再按第一条分录的号排序（两次排序）快。
@@ -469,8 +471,11 @@ fn load_spends(conn: &Connection, account: &str) -> Result<Vec<Spend>, LedgerErr
     let mut stmt = conn.prepare(
         "SELECT e.entry_id, e.hold_id, e.kind, e.window_at_ms, e.at_ms, e.held_micros + e.spent_micros,
                 CASE WHEN e.kind = 'settle' THEN
-                     (SELECT h.charged_micros - h.reserved_micros FROM ledger_holds h
-                       WHERE h.hold_id = e.hold_id AND h.state = 'settled' AND h.late = 0)
+                     (SELECT CASE h.state
+                                  WHEN 'open' THEN 0
+                                  WHEN 'settled' THEN CASE WHEN h.late = 0 THEN h.charged_micros - h.reserved_micros END
+                             END
+                        FROM ledger_holds h WHERE h.hold_id = e.hold_id)
                 END
            FROM ledger_entries e
           WHERE e.account_id = ?1 AND e.hold_id IS NOT NULL
@@ -533,8 +538,17 @@ fn load_spends(conn: &Connection, account: &str) -> Result<Vec<Spend>, LedgerErr
             rows_of_hold.seen = true;
             rows_of_hold.amount = add(rows_of_hold.amount, amount)?;
             if kind == "settle" {
+                // `settle` 只写在没迟到的结算里，预留要么正在这个事务里结算（状态还是 `open`：这条 `settle` 是刚写的新格式，只有用户承担的
+                // 那一块，没有旧格式的超出部分，SQL 给 0），要么已经结算且没迟到。别的状态（放掉了、过期了、迟到的结算）下不会有 `settle`：
+                // 是库被改坏了，取不到数不能当成「没有超出」，失败即关闭。
                 let over: Option<i64> = row.get(6)?;
-                rows_of_hold.settle = Some((entry, at_ms, over.unwrap_or(0)));
+                let over = over.ok_or_else(|| {
+                    corrupt(
+                        "have a settle entry, but the hold is neither being settled nor settled on time",
+                        hold,
+                    )
+                })?;
+                rows_of_hold.settle = Some((entry, at_ms, over));
             }
         }
     }
