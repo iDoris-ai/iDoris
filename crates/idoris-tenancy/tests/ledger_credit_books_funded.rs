@@ -1475,6 +1475,15 @@ fn an_extra_cost_reserved_inside_an_attempt_raises_the_credit_used_alert_too() {
             "overdraft_within_credit".to_string()
         )]
     );
+    // 金额 0 的附加成本（挂在尝试上的那个入口）也不再记告警
+    let decision = store
+        .reserve_component(&main.attempt, "safety_zero", &price(0), ts(T0 + 3_000))
+        .unwrap();
+    assert!(
+        matches!(decision, ComponentDecision::Reserved { .. }),
+        "{decision:?}"
+    );
+    assert_eq!(credit_used_alerts(&store).len(), 1);
     assert_clean(&store);
 }
 
@@ -1499,6 +1508,19 @@ fn an_extra_cost_raises_the_credit_used_alert_on_the_other_account_shapes_too() 
             .collect::<Vec<_>>(),
         [60, 100]
     );
+    // 金额 0 的附加成本不占任何钱，不是「动了授信」：账户欠着授信的钱（S0 对它也是 `PassUsingCredit`），但不再记一条重复的告警
+    assert!(matches!(
+        reserve_extra(&store, "c-3", 0, T0 + 3_000),
+        ComponentDecision::Reserved { .. }
+    ));
+    assert_eq!(
+        credit_used_alerts(&store)
+            .iter()
+            .map(|alert| alert.0)
+            .collect::<Vec<_>>(),
+        [60, 100],
+        "a zero-amount extra cost draws no credit"
+    );
     assert_clean(&store);
 
     // 充了值、没有额度（S0 的 `余额 + 授信`，视图仍是余额）：充值 100、授信 100，附加成本 100 全在自有资金里 -> 没有告警；
@@ -1522,6 +1544,19 @@ fn an_extra_cost_raises_the_credit_used_alert_on_the_other_account_shapes_too() 
             .map(|alert| alert.0)
             .collect::<Vec<_>>(),
         [50]
+    );
+    // 金额 0 的附加成本：余额 -50 时 S0 对它也是 `PassUsingCredit`（透支 50），但它不占任何钱，不再记一条重复的金额 50 的告警
+    assert!(matches!(
+        reserve_extra(&store, "c-3", 0, T0 + 3_000),
+        ComponentDecision::Reserved { .. }
+    ));
+    assert_eq!(
+        credit_used_alerts(&store)
+            .iter()
+            .map(|alert| alert.0)
+            .collect::<Vec<_>>(),
+        [50],
+        "a zero-amount extra cost draws no credit: the alert sequence is still [50]"
     );
     assert_clean(&store);
 }
@@ -2037,19 +2072,24 @@ fn check_against_sim(store: &AccountStore, db: &TempDb, sim: &Sim, now: i64) -> 
     books
 }
 
-/// 结算 `req`（预留 `reserved`，实际 `charged`），同步到 `Sim`，并核对这次结算的分摊：调用方保证超出预留的部分不超过此刻整条链
-/// 能吸收的，所以全由担保人承担，没有平台损失，不冻结凭证。
+/// 结算 `req`（预留 `reserved`，实际 `charged`），同步到 `Sim`，并按**手算规则**核对这次结算的分摊（`Sim::settle`）：先记预留之内的部分、再读
+/// 整条链的余量，担保人能吸收 `min(超出, max(余量, 0))`，吸收不了的是平台损失，凭证因此被冻结（然后解冻，历史接着走）。超出预留的部分
+/// **不再**被夹到余量以内：余量不够时要有平台损失和冻结。`legacy`：结算之后把这个预留的分录改回 v0.5.0 的写法（超出的部分并回 `settle`、
+/// 没有 `late_settle`），账不能变——读旧格式的分录要和新格式是同一回事。
 #[allow(clippy::too_many_arguments)]
 fn settle_both(
     store: &AccountStore,
+    db: &TempDb,
     sim: &mut Sim,
     req: &Req,
     spend: usize,
     reserved: i64,
     charged: i64,
     at: i64,
+    legacy: bool,
     reached: &mut Reached,
 ) {
+    let hold = store.hold(&req.attempt, "model").unwrap().unwrap().hold_id;
     let extra = (charged - reserved).max(0);
     if extra > 0 {
         reached.overage_settled += 1;
@@ -2058,13 +2098,35 @@ fn settle_both(
         }
     }
     let outcome = settle_at(store, req, charged, at);
+    let expected = sim.settle(spend, charged, at);
     assert_eq!(outcome.result, SettleResult::Settled);
     assert!(!outcome.late, "{outcome:?}");
-    assert_eq!(outcome.overage, thb(extra), "{outcome:?}");
-    assert_eq!(outcome.sponsor_covered, thb(extra), "{outcome:?}");
-    assert_eq!(outcome.platform_loss, thb(0), "{outcome:?}");
-    assert!(!outcome.credential_frozen, "{outcome:?}");
-    sim.settle(spend, charged, at);
+    assert_eq!(outcome.overage, thb(expected.overage), "{outcome:?}");
+    assert_eq!(
+        outcome.sponsor_covered,
+        thb(expected.sponsor),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.platform_loss, thb(expected.loss), "{outcome:?}");
+    assert_eq!(
+        outcome.credential_frozen,
+        expected.loss > 0,
+        "a platform loss freezes the credential, and only a platform loss does: {outcome:?}"
+    );
+    reached.loss_total += expected.loss;
+    assert_eq!(
+        store.loss_total("platform_loss").unwrap(),
+        reached.loss_total,
+        "the platform's losses are exactly the overage the chain could not absorb"
+    );
+    if expected.loss > 0 {
+        reached.loss_settled += 1;
+        unfreeze_credential(db, "cred-e");
+    }
+    if legacy && extra > 0 {
+        rewrite_overage_as_v0_5_0(db, &hold);
+        reached.legacy_rewritten += 1;
+    }
 }
 
 /// 随机历史走过了哪些有意思的状态。
@@ -2092,6 +2154,12 @@ struct Reached {
     overage_settled: u32,
     /// 超出预留的结算，结算那一刻还有额度可花：超出的部分用了结算那一刻的额度。
     overage_with_allowance: u32,
+    /// 超出预留的部分超过了整条链能吸收的：有平台损失，凭证被冻结（然后解冻，历史接着走）。
+    loss_settled: u32,
+    /// 平台损失的总额。
+    loss_total: i64,
+    /// 结算之后把分录改回 v0.5.0 的写法（超出的部分并回 `settle`）的次数。
+    legacy_rewritten: u32,
     /// 写进表里的毫秒取的是排队之前的旧时间的步骤数（只有抖动的随机历史才有）。
     stale_stamped: u32,
     /// 读钟比已经提交的某笔花费的归属时刻更早的请求数：回放不能把那笔花费压到读钟上。
@@ -2114,6 +2182,9 @@ impl Reached {
         self.half_settled += other.half_settled;
         self.overage_settled += other.overage_settled;
         self.overage_with_allowance += other.overage_with_allowance;
+        self.loss_settled += other.loss_settled;
+        self.loss_total += other.loss_total;
+        self.legacy_rewritten += other.legacy_rewritten;
         self.stale_stamped += other.stale_stamped;
         self.read_behind_a_spend += other.read_behind_a_spend;
     }
@@ -2203,28 +2274,33 @@ fn run_random_history(seed: u64, steps: usize, initial_funds: i64, jitter: bool)
                         1 => {
                             settle_both(
                                 &store,
+                                &db,
                                 &mut sim,
                                 &req,
                                 spend,
                                 reserved,
                                 reserved / 2,
                                 now,
+                                false,
                                 &mut reached,
                             );
                             reached.half_settled += 1;
                         }
                         _ => {
-                            let extra = [1_i64, 20, 60, 150]
-                                [usize::try_from(rng.below(4)).unwrap()]
-                            .min(sim.room(now));
+                            // 超出预留的部分不再夹到余量以内：余量不够就是平台损失，凭证被冻结
+                            let extra =
+                                [1_i64, 20, 60, 150, 400][usize::try_from(rng.below(5)).unwrap()];
+                            let legacy = rng.below(3) == 0;
                             settle_both(
                                 &store,
+                                &db,
                                 &mut sim,
                                 &req,
                                 spend,
                                 reserved,
                                 reserved + extra,
                                 now,
+                                legacy,
                                 &mut reached,
                             );
                         }
@@ -2305,19 +2381,21 @@ fn run_random_history(seed: u64, steps: usize, initial_funds: i64, jitter: bool)
                     } else {
                         let at = now + 500;
                         let extra = if rng.below(4) == 0 {
-                            [1_i64, 20, 60, 150][usize::try_from(rng.below(4)).unwrap()]
-                                .min(sim.room(at))
+                            [1_i64, 20, 60, 150, 400][usize::try_from(rng.below(5)).unwrap()]
                         } else {
                             0
                         };
+                        let legacy = rng.below(3) == 0;
                         settle_both(
                             &store,
+                            &db,
                             &mut sim,
                             &req,
                             spend,
                             charged,
                             charged + extra,
                             at,
+                            legacy,
                             &mut reached,
                         );
                     }
@@ -2329,8 +2407,8 @@ fn run_random_history(seed: u64, steps: usize, initial_funds: i64, jitter: bool)
         // 每一步之后：视图、模型、事件三方对得上，授信占用不超过授信额度
         let books = check_against_sim(&store, &db, &sim, now + 700);
         assert!(
-            books.credit_debt <= CREDIT,
-            "seed {seed} step {step}: credit use beyond the line: {books:?}"
+            books.credit_debt <= CREDIT + reached.loss_total,
+            "seed {seed} step {step}: credit use beyond the line by more than the platform lost: {books:?}"
         );
         if books.allowance_left > 0 && books.credit_debt > 0 {
             reached.allowance_and_debt += 1;
@@ -2371,6 +2449,8 @@ fn random_histories_with_top_ups_agree_with_the_independent_models_decisions_and
     assert!(total.half_settled >= 3, "{total:?}");
     assert!(total.overage_settled >= 15, "{total:?}");
     assert!(total.overage_with_allowance >= 5, "{total:?}");
+    assert!(total.loss_settled >= 8, "{total:?}");
+    assert!(total.legacy_rewritten >= 6, "{total:?}");
 }
 
 #[test]
@@ -2395,4 +2475,6 @@ fn random_histories_with_out_of_order_clocks_still_agree_with_the_independent_mo
     assert!(total.alerted >= 30, "{total:?}");
     assert!(total.overage_settled >= 20, "{total:?}");
     assert!(total.overage_with_allowance >= 5, "{total:?}");
+    assert!(total.loss_settled >= 8, "{total:?}");
+    assert!(total.legacy_rewritten >= 10, "{total:?}");
 }

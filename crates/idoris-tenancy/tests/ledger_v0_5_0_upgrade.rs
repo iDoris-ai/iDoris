@@ -316,15 +316,18 @@ fn credit_used_alerts_written_by_the_old_code_stay_and_covered_spends_add_none()
 }
 
 #[test]
-fn an_unexpired_overage_that_v0_5_0_booked_whole_at_the_reservation_is_read_as_it_was_booked() {
-    // v0.5.0 把没迟到的结算里超出预留的部分和预留一起记在预留创建的时刻（一条 `settle`，已花是整笔）。现在的代码把超出的部分另记在
-    // 结算那一刻（一条 `late_settle`，Codex 复审 2026-11-22 High 1），但已经写下的行一行都不改：读出来就是它们记下的样子，对账干净。
+fn an_unexpired_overage_that_v0_5_0_booked_whole_at_the_reservation_is_split_when_it_is_read() {
+    // v0.5.0 把没迟到的结算里超出预留的部分和预留之内的部分一起记在预留创建的时刻（一条 `settle`，已花是整笔）。现在的代码把超出的部分
+    // 另记在结算那一刻（一条 `late_settle`，Codex 复审 2026-11-22 High 1）。**已经写下的行一行都不改**，但读它们的时候按同一个口径解释：
+    // 旧格式 `settle` 里 `charged - reserved` 的正差是一笔单独的逻辑花费，用这条 `settle` 自己的 `at_ms`（结算时刻）和 `entry_id`
+    // （结算的提交序号），预留之内的部分仍在预留创建的时刻。不迁移，不改写历史。
     // 夹具里没有 overage 的结算（所有结算都等于预留），所以这里用现在的代码写一笔，再按 v0.5.0 的写法改回去（拆掉只追加的触发器：
     // 把 `settle` 的已花改成整笔 300，删掉 `late_settle`）。
     //
     // 充值 100、授信 100，额度 100 的窗口从 T0 + 10 起（T0 + 5 创建）；T0 + 9 预留 200，T0 + 10 按 300 结算（超出 100）。
-    // 旧写法：整笔 300 在 T0 + 9，额度够不着：自有资金 100 + 授信债务 200，额度剩余 100，净头寸 100 - min(200, 100) = 0。
-    // （债务超过授信额度，正是旧写法对额度被吸收一次又被花一次的记法；只有新结算才按新写法记，已经写下的历史不重写。）
+    // 读的时候：预留之内的 300 - 100 = 200 在 T0 + 9，额度够不着：自有资金 100 + 授信债务 100；超出的 100 在 T0 + 10（这条 `settle`
+    // 的 `at_ms`），额度的窗口包含它、额度是在它之前创建的：额度覆盖，剩余 0。净头寸 0 + 0 - 100 = -100，能花的 -100 + 授信 100 = 0。
+    // （只按整笔 300 记在 T0 + 9 来读：债务 200、额度还剩 100，净头寸 0，能花 100，下一笔 100 照样放行——额度被吸收一次又被花一次。）
     let db = TempDb::new("v050-legacy-overage");
     let store = world(&db);
     store
@@ -381,16 +384,7 @@ fn an_unexpired_overage_that_v0_5_0_booked_whole_at_the_reservation_is_read_as_i
     drop(store);
 
     // 改回 v0.5.0 写下的样子
-    {
-        let conn = raw(db.path());
-        conn.execute_batch(
-            "DROP TRIGGER ledger_entries_append_only_update;
-             DROP TRIGGER ledger_entries_append_only_delete;
-             UPDATE ledger_entries SET spent_micros = 300 WHERE hold_id = 'r-1#0' AND kind = 'settle';
-             DELETE FROM ledger_entries WHERE hold_id = 'r-1#0' AND kind = 'late_settle';",
-        )
-        .unwrap();
-    }
+    rewrite_overage_as_v0_5_0(&db, "r-1#0");
 
     let store = AccountStore::open(db.path()).unwrap();
     let kinds: Vec<(String, i64, i64, i64)> = store
@@ -419,9 +413,47 @@ fn an_unexpired_overage_that_v0_5_0_booked_whole_at_the_reservation_is_read_as_i
     assert_eq!(v.balance, None);
     assert_eq!(
         v.ceiling_remaining.map(|m| m.micros),
-        Some(0),
-        "read as booked: 300 at T0 + 9 is out of the allowance's reach"
+        Some(-100),
+        "the 100 beyond the reservation is a spend of its own at T0 + 10: allowance 0 + funds 0 - debt 100"
     );
     assert_eq!(v.credit_limit, thb(100));
+    // 端到端：能花的是 0，任何一笔正的预留都过不了（旧读法：能花 100，一笔 100 的预留照样放行）
+    let next = Req::new(&store, "r-2", 0, "cred-e", 45).at(T0 + 12);
+    let decision = store.admit_attempt(&next.input()).unwrap();
+    assert!(
+        matches!(&decision, AdmissionDecision::Reject { reason } if reason.code() == ReasonCode::BudgetExhausted),
+        "{decision:?}"
+    );
+    let smallest = Req::new(&store, "r-3", 0, "cred-e", 10).at(T0 + 13);
+    let decision = store.admit_attempt(&smallest.input()).unwrap();
+    assert!(
+        matches!(&decision, AdmissionDecision::Reject { reason } if reason.code() == ReasonCode::BudgetExhausted),
+        "{decision:?}"
+    );
+    let laddered = Req::new(&store, "r-4", 0, "cred-e", 10).at(T0 + 14).grace();
+    let decision = store.admit_attempt(&laddered.input()).unwrap();
+    assert!(
+        matches!(&decision, AdmissionDecision::Reject { reason } if reason.code() == ReasonCode::BudgetExhausted),
+        "an account that owes credit gets no grace round: {decision:?}"
+    );
+    assert_eq!(
+        store
+            .entries_of_hold(&first.attempt, "model")
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.account == "emp")
+            .map(|entry| (
+                entry.kind,
+                entry.held,
+                entry.spent,
+                entry.window_at.millis()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("reserve".to_string(), 200, 0, T0 + 9),
+            ("settle".to_string(), -200, 300, T0 + 9),
+        ],
+        "reading the old rows rewrote none of them"
+    );
     assert_clean(&store);
 }

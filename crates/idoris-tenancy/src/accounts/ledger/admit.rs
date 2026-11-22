@@ -186,12 +186,18 @@ fn provenance(
 /// 自有资金剩余里，`CreditFloor` 照样是 `PassUsingCredit`，但这一笔并没有动授信：担保人不该为它收到告警（issue #601：旧债 200、
 /// 新额度 100、花 50，旧代码记一条金额 150 的告警）。所以这些账户还要看 `reserve` 有没有超出不动授信能花的钱，没超出就不算。
 /// 不走「分开记」的账户（`None`）没有额度之外的钱可以先花，`PassUsingCredit` 就是动了授信，行为不变。
+///
+/// 金额 0 的预留（比如金额 0 的附加成本）不占任何钱，不可能动授信：账户欠着授信的钱时 S0 对它也是 `PassUsingCredit`（透支额就是已经
+/// 欠下的），不能再记一条重复的告警（Codex 复审 7c5a03fe Low）。
 fn credit_users(
     report: &AdmissionReport,
     chain: &[Account],
     books: &[Option<Books>],
     reserve: i64,
 ) -> Result<Vec<(usize, i64)>, LedgerError> {
+    if reserve == 0 {
+        return Ok(Vec::new());
+    }
     let mut users = Vec::new();
     for result in report.results() {
         let (CheckKind::CreditFloor, CheckOutcome::PassUsingCredit { overdraft }) =

@@ -366,3 +366,47 @@ pub fn scalar(db: &TempDb, sql: &str) -> i64 {
         .query_row(sql, [], |row| row.get(0))
         .unwrap()
 }
+
+/// 解冻一张凭证（平台损失会冻结凭证；账户库允许解冻，撤销才不可逆）。随机历史里损失之后接着走，要把凭证解冻。
+pub fn unfreeze_credential(db: &TempDb, credential: &str) {
+    let changed = rusqlite::Connection::open(db.path())
+        .unwrap()
+        .execute(
+            "UPDATE credentials SET status = 'active' WHERE credential_id = ?1 AND status = 'frozen'",
+            [credential],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "the credential {credential} was frozen");
+}
+
+/// 把一个预留的分录改回 **v0.5.0 写下的样子**：没迟到的结算里超出预留的部分和预留之内的部分一起记在一条 `settle` 里
+/// （已花是整笔，归属时刻是预留创建的时刻），不另记 `late_settle`。
+///
+/// v0.5.0 的库里没有 overage 的结算（夹具里所有结算都等于预留），所以测试用现在的代码写一笔，再用这个函数按旧写法改回去：
+/// 把 `late_settle` 的已花并回同一账户上的 `settle`，删掉 `late_settle`。要拆掉只追加的触发器（这个库只给这个测试用，
+/// 之后账本的代码照常读它）。迟到的结算（预留过期之后才结算）旧版本本来就写 `late_settle`，没有 `settle` 的预留不动。
+pub fn rewrite_overage_as_v0_5_0(db: &TempDb, hold_id: &str) {
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS ledger_entries_append_only_update;
+         DROP TRIGGER IF EXISTS ledger_entries_append_only_delete;",
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE ledger_entries
+            SET spent_micros = spent_micros + (
+                SELECT COALESCE(SUM(l.spent_micros), 0) FROM ledger_entries l
+                 WHERE l.hold_id = ledger_entries.hold_id
+                   AND l.account_id = ledger_entries.account_id AND l.kind = 'late_settle')
+          WHERE hold_id = ?1 AND kind = 'settle'",
+        [hold_id],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM ledger_entries
+          WHERE hold_id = ?1 AND kind = 'late_settle'
+            AND EXISTS (SELECT 1 FROM ledger_entries s WHERE s.hold_id = ?1 AND s.kind = 'settle')",
+        [hold_id],
+    )
+    .unwrap();
+}

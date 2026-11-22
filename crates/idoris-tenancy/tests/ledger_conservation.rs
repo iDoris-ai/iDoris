@@ -212,6 +212,63 @@ fn a_grace_round_inside_the_credit_floor_is_still_the_users_own_debt() {
     assert_clean(&store);
 }
 
+#[test]
+fn a_top_up_inside_the_ttl_covers_the_overage_of_a_grace_round_instead_of_freezing_the_credential()
+{
+    // Codex 复审（2026-11-22，7c5a03fe）High 2。余额 20（没有授信），组织 paid 有 100 万。宽限预留 210（放行时下限 20，平台承担缺口 190）。
+    // TTL 之内充值 90，随后按 300 结算（超出预留 90）。
+    //
+    // 手算：宽限承担 G = min(300, 210) - 20 = 190（平台批准的例外，不进用户和担保人的账）；记到链上 300 - 190 = 110，
+    // 其中预留之内 210 - 190 = 20（用户自己的），超出 90。
+    // 担保人能吸收多少要在预留之内的 20 记账**之后**读：余额 20 + 90 - 20 = 90，授信 0，能吸收 90 >= 超出 90：担保人承担 90，
+    // 平台损失 0，凭证不冻结。
+    // 旧代码先读余量、后放掉平台承担的 190：余额 110 - 在途 210 = -100，能吸收 0，超出的 90 全是平台损失，凭证被冻结。
+    // 结算之后：余额 110 - 已花 110 = 0，本月的宽限已经用掉，下一笔被拒。
+    let db = TempDb::new("conserve-grace-topup-overage");
+    let store = paid_chain(&db, 20);
+    let decision = admit_with_ladder(&store, "r-1", "cred-e", 100, T0);
+    assert!(
+        matches!(decision, AdmissionDecision::Grace { .. }),
+        "{decision:?}"
+    );
+    store
+        .fund_account(&aid("emp"), &thb(90), &key("f-emp-2"), ts(T0 + 500))
+        .unwrap();
+    let outcome = store
+        .settle_attempt(&attempt("r-1", 0), &price(300), ts(T0 + 1_000))
+        .unwrap();
+    assert!(!outcome.late, "{outcome:?}");
+    assert_eq!(outcome.grace_absorbed, thb(190), "{outcome:?}");
+    assert_eq!(outcome.user_borne, thb(20), "{outcome:?}");
+    assert_eq!(outcome.overage, thb(90), "{outcome:?}");
+    assert_eq!(outcome.sponsor_covered, thb(90), "{outcome:?}");
+    assert_eq!(outcome.platform_loss, thb(0), "{outcome:?}");
+    assert!(!outcome.credential_frozen, "{outcome:?}");
+    assert_conserved(&db, "r-1#0", "emp", 300, &outcome);
+    assert_eq!(store.loss_total("platform_loss").unwrap(), 0);
+    assert_eq!(
+        balance(&store, "emp", T0 + 2_000),
+        0,
+        "funds 110 - 20 inside the reservation - 90 overage"
+    );
+    assert_eq!(balance(&store, "paid", T0 + 2_000), 1_000_000 - 110);
+
+    // 端到端：凭证没冻结，还能解析出付款上下文；但余额 0、本月宽限已经用过，下一笔被拒
+    let next = Req::try_new(&store, "r-2", 0, "cred-e", 10, T0 + 2_000)
+        .expect("the credential is still active");
+    let decision = store.admit_attempt(&next.input()).unwrap();
+    assert!(
+        matches!(&decision, AdmissionDecision::Reject { reason } if reason.code() == ReasonCode::BudgetExhausted),
+        "{decision:?}"
+    );
+    let decision = store.admit_attempt(&next.clone().grace().input()).unwrap();
+    assert!(
+        matches!(&decision, AdmissionDecision::Reject { reason } if reason.code() == ReasonCode::BudgetExhausted),
+        "the one grace round of the month was used: {decision:?}"
+    );
+    assert_clean(&store);
+}
+
 // ------------------------------------------------------------------------------------------
 // #4 迟到的宽限结算不重复计算平台责任
 // ------------------------------------------------------------------------------------------

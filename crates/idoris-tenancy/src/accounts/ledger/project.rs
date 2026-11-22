@@ -77,6 +77,7 @@ use idoris_compute_contracts::admission::{
 };
 use idoris_compute_contracts::money::{Money, MoneyError};
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::{BTreeSet, HashMap};
 
 use super::error::{LedgerError, add, sub};
 use super::period::{period_bounds, period_of};
@@ -277,6 +278,76 @@ impl Bucket {
     }
 }
 
+/// 按归属时刻找候选额度的索引：额度的窗口 `[from, until)` 把时间轴切成若干基本区间，每个基本区间里「窗口包含它」的额度是固定的一小撮
+/// （通常是月度免费额度加几笔预付，个位数），按回放要的次序（先到期的、同时到期的先创建的）排好。一笔花费二分找到它的基本区间，只看这一撮，
+/// 不用把全部（历史上的几十到上百笔）额度从头扫一遍。
+///
+/// 建索引 `O(B log B + Σ k)`（`B` 是额度个数，`k` 是同一时刻同时生效的额度个数），一次投影建一次。`k` 异常大（一个账户同时有成千上万笔
+/// 重叠生效的额度）时快照总量会爆炸，超过 [`WindowIndex::MAX_ENTRIES`] 就不建，回放退回原来的线性扫描（结果一样，只是慢）。
+struct WindowIndex {
+    /// 基本区间的起点（升序、去重）：第 `k` 个基本区间是 `[starts[k], starts[k + 1])`，最后一个到无穷。
+    starts: Vec<i64>,
+    /// 第 `k` 个基本区间里窗口包含它的额度（`buckets` 的下标），按（到期时间，创建先后）排好。
+    candidates: Vec<Vec<usize>>,
+}
+
+impl WindowIndex {
+    /// 快照总量上限（下标个数）：每个下标 8 字节，100 万个是 8 MB。
+    const MAX_ENTRIES: usize = 1_000_000;
+
+    /// 给 `buckets` 建索引；快照总量超过 `limit` 返回 `None`（调用方退回线性扫描）。
+    fn build(buckets: &[Bucket], limit: usize) -> Option<Self> {
+        let n = buckets.len();
+        let mut boundaries: Vec<i64> = buckets
+            .iter()
+            .flat_map(|bucket| [bucket.from, bucket.until])
+            .collect();
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let mut by_from: Vec<usize> = (0..n).collect();
+        by_from.sort_by_key(|index| buckets[*index].from);
+        let mut by_until: Vec<usize> = (0..n).collect();
+        by_until.sort_by_key(|index| buckets[*index].until);
+        // 此刻窗口包含当前边界的额度，按（到期时间，创建先后）排好：和「先到期的先用，同时到期的先创建的先用」同一个次序
+        let mut active: BTreeSet<(i64, usize)> = BTreeSet::new();
+        let (mut next_start, mut next_end) = (0_usize, 0_usize);
+        let mut total = 0_usize;
+        let mut candidates = Vec::with_capacity(boundaries.len());
+        for boundary in &boundaries {
+            while next_start < n && buckets[by_from[next_start]].from <= *boundary {
+                let index = by_from[next_start];
+                next_start += 1;
+                // 左闭右开：`until <= boundary` 的窗口在这个边界上已经结束，不放进来
+                if buckets[index].until > *boundary {
+                    active.insert((buckets[index].until, index));
+                }
+            }
+            while next_end < n && buckets[by_until[next_end]].until <= *boundary {
+                let index = by_until[next_end];
+                next_end += 1;
+                active.remove(&(buckets[index].until, index));
+            }
+            total += active.len();
+            if total > limit {
+                return None;
+            }
+            candidates.push(active.iter().map(|(_, index)| *index).collect());
+        }
+        Some(Self {
+            starts: boundaries,
+            candidates,
+        })
+    }
+
+    /// 归属时刻 `at` 上窗口包含它的额度（`buckets` 的下标），按回放要的次序排好。
+    fn at(&self, at: i64) -> &[usize] {
+        match self.starts.partition_point(|start| *start <= at) {
+            0 => &[],
+            position => &self.candidates[position - 1],
+        }
+    }
+}
+
 /// 一笔花费：一个预留在这个账户上、同一个归属时刻上、同一类的全部分录的净额。
 ///
 /// 一个预留最多有两笔花费，**分得开，哪怕归属时刻是同一毫秒**：
@@ -358,27 +429,148 @@ fn load_buckets(conn: &Connection, account: &str) -> Result<Vec<Bucket>, LedgerE
     Ok(buckets)
 }
 
-/// 这个账户上的每一笔花费，按第一条分录的号（提交先后）排好。同一个预留在同一个归属时刻上、同一类（预留本身，或者结算那一刻才
-/// 发生的花费，见 [`Spend`]）的在途、已花合成一笔，净额为 0 的（放掉了、过期了）不要。
+/// 一个预留在这个账户上的分录归成的几笔花费，加上识别旧格式要的线索（见 [`load_spends`]）。
+#[derive(Debug, Default)]
+struct HoldRows {
+    /// 预留本身（`reserve` / `settle` / `release` / `expire`）：第一条分录的号、归属时刻、净额。
+    first: i64,
+    at: i64,
+    amount: i64,
+    seen: bool,
+    /// 结算那一刻才发生的花费（`late_settle`）。
+    late_first: i64,
+    late_at: i64,
+    late_amount: i64,
+    late_seen: bool,
+    /// 没迟到的结算那一条 `settle`：它的分录号、`at_ms`（结算时刻），和预留自己的 `charged - reserved`。
+    settle: Option<(i64, i64, i64)>,
+}
+
+/// 这个账户上的每一笔花费，按第一条分录的号（提交先后）排好，净额为 0 的（放掉了、过期了）不要。
 ///
-/// 分类看分录的种类（`late_settle` = 结算那一刻才发生的花费），不看归属时刻是不是同一毫秒：预留和它的 overage 可以在同一毫秒
-/// （结算和预留取到了同一个毫秒），合成一笔就会让 overage 用上预留创建时的提交序号，够不着结算之前才发的额度。
+/// 一个预留最多有两笔分得开的花费（[`Spend`]）：预留本身，和结算那一刻才发生的花费（`late_settle`）。分类看分录的种类，不看归属时刻
+/// 是不是同一毫秒：预留和它的 overage 可以在同一毫秒（结算和预留取到了同一个毫秒），合成一笔就会让 overage 用上预留创建时的提交
+/// 序号，够不着结算之前才发的额度。
+///
+/// **旧格式的分录要按同一个口径解释，但一行都不改**（Codex 复审 7c5a03fe High 1）。v0.5.0（和这个口径之前的 main）把没迟到的结算里
+/// 超出预留的部分和预留之内的部分一起记在预留创建时刻的一条 `settle` 里，没有 `late_settle`；现在的结算把超出的部分另记一条
+/// `late_settle`。所以一个没迟到、已结算的预留，`charged - reserved` 的正差（超出预留的部分）里**还留在 `settle` 里**的那一块
+/// （正差减去已经另记在 `late_settle` 里的）要从预留本身那笔花费里分出来，成为单独的一笔：归属时刻是这条 `settle` 自己的 `at_ms`
+/// （结算时刻），提交序号是这条 `settle` 自己的分录号，和新格式的 `late_settle` 一回事（同一个事务里，序号和别的花费、额度的创建 /
+/// 撤销序号比出来的先后一样）。没有这一步，旧库里超出预留的部分会一直被当成预留之内的、记在预留创建的时刻，够不着结算时才生效的
+/// 额度：担保人吸收过一次的额度又被下一个请求花一次。不迁移，不改写历史：只是读的时候多看一眼预留表里的 `charged - reserved`
+/// （只有 `settle` 那一行才查）。
+///
+/// 一遍顺序扫描（走 `(account_id, window_at_ms)` 索引，不排序），在内存里按预留聚合：比让 SQLite 先按 (预留, 归属时刻, 种类)
+/// 分组、再按第一条分录的号排序（两次排序）快。
 fn load_spends(conn: &Connection, account: &str) -> Result<Vec<Spend>, LedgerError> {
     let mut stmt = conn.prepare(
-        "SELECT window_at_ms, MIN(entry_id), SUM(held_micros + spent_micros) FROM ledger_entries
-          WHERE account_id = ?1 AND hold_id IS NOT NULL
-          GROUP BY hold_id, window_at_ms, kind = 'late_settle'
-         HAVING SUM(held_micros + spent_micros) <> 0
-          ORDER BY MIN(entry_id)",
+        "SELECT e.entry_id, e.hold_id, e.kind, e.window_at_ms, e.at_ms, e.held_micros + e.spent_micros,
+                CASE WHEN e.kind = 'settle' THEN
+                     (SELECT h.charged_micros - h.reserved_micros FROM ledger_holds h
+                       WHERE h.hold_id = e.hold_id AND h.state = 'settled' AND h.late = 0)
+                END
+           FROM ledger_entries e
+          WHERE e.account_id = ?1 AND e.hold_id IS NOT NULL
+            AND e.kind IN ('reserve', 'settle', 'release', 'expire', 'late_settle')",
     )?;
-    let rows = stmt.query_map([account], |row| {
-        Ok(Spend {
-            at: row.get(0)?,
-            first_entry: row.get(1)?,
-            amount: row.get(2)?,
-        })
-    })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    let mut rows = stmt.query([account])?;
+    let mut slots: HashMap<String, usize> = HashMap::new();
+    let mut holds: Vec<HoldRows> = Vec::new();
+    let corrupt = |what: &str, hold: &str| {
+        LedgerError::Corrupt(format!(
+            "the entries of hold {hold} on account {account} {what}"
+        ))
+    };
+    while let Some(row) = rows.next()? {
+        let entry: i64 = row.get(0)?;
+        let hold = row
+            .get_ref(1)?
+            .as_str()
+            .map_err(|e| LedgerError::Corrupt(format!("ledger entry {entry} hold id: {e}")))?;
+        let kind = row
+            .get_ref(2)?
+            .as_str()
+            .map_err(|e| LedgerError::Corrupt(format!("ledger entry {entry} kind: {e}")))?;
+        let window_at: i64 = row.get(3)?;
+        let at_ms: i64 = row.get(4)?;
+        let amount: i64 = row.get(5)?;
+        let slot = match slots.get(hold) {
+            Some(slot) => *slot,
+            None => {
+                slots.insert(hold.to_owned(), holds.len());
+                holds.push(HoldRows::default());
+                holds.len() - 1
+            }
+        };
+        let rows_of_hold = &mut holds[slot];
+        if kind == "late_settle" {
+            if rows_of_hold.late_seen && rows_of_hold.late_at != window_at {
+                return Err(corrupt(
+                    "carry two attribution moments for the settlement-time spend",
+                    hold,
+                ));
+            }
+            if !rows_of_hold.late_seen || entry < rows_of_hold.late_first {
+                rows_of_hold.late_first = entry;
+            }
+            rows_of_hold.late_at = window_at;
+            rows_of_hold.late_seen = true;
+            rows_of_hold.late_amount = add(rows_of_hold.late_amount, amount)?;
+        } else {
+            if rows_of_hold.seen && rows_of_hold.at != window_at {
+                return Err(corrupt(
+                    "carry two attribution moments for the reservation",
+                    hold,
+                ));
+            }
+            if !rows_of_hold.seen || entry < rows_of_hold.first {
+                rows_of_hold.first = entry;
+            }
+            rows_of_hold.at = window_at;
+            rows_of_hold.seen = true;
+            rows_of_hold.amount = add(rows_of_hold.amount, amount)?;
+            if kind == "settle" {
+                let over: Option<i64> = row.get(6)?;
+                rows_of_hold.settle = Some((entry, at_ms, over.unwrap_or(0)));
+            }
+        }
+    }
+    let mut spends = Vec::with_capacity(holds.len() + holds.len() / 8);
+    for hold in holds {
+        let mut reservation = hold.amount;
+        if let Some((settle_entry, settle_at, over)) = hold.settle
+            && over > 0
+        {
+            // 还留在 `settle` 里的超出部分：`charged - reserved` 减去已经另记在 `late_settle` 里的；不超过这条 `settle` 之后
+            // 预留本身剩下的净额（万一分录被改坏了，不会借此凭空多出一笔花费）
+            let inside = sub(over, hold.late_amount)?.clamp(0, reservation.max(0));
+            if inside > 0 {
+                reservation = sub(reservation, inside)?;
+                spends.push(Spend {
+                    at: settle_at,
+                    first_entry: settle_entry,
+                    amount: inside,
+                });
+            }
+        }
+        if reservation != 0 {
+            spends.push(Spend {
+                at: hold.at,
+                first_entry: hold.first,
+                amount: reservation,
+            });
+        }
+        if hold.late_amount != 0 {
+            spends.push(Spend {
+                at: hold.late_at,
+                first_entry: hold.late_first,
+                amount: hold.late_amount,
+            });
+        }
+    }
+    spends.sort_unstable_by_key(|spend| spend.first_entry);
+    Ok(spends)
 }
 
 /// 回放三本账：这个账户全期的花费按**提交先后**（第一条分录的号）一笔一笔来，每一笔先用此刻能用的额度里**先到期**的
@@ -393,35 +585,28 @@ fn load_spends(conn: &Connection, account: &str) -> Result<Vec<Spend>, LedgerErr
 /// **每一笔花费都按它自己记下的归属时刻判断，不看读的是哪一刻**（`now_ms` 只决定回放之后哪些额度此刻还能花）：读钟是调用方在进事务之前
 /// 取的，排队等写锁的请求读到的钟可以比前面已经提交的花费更早。如果把一笔已经提交的花费按读钟「压」到更早的时刻，它就可能落进
 /// 一笔更早的、甚至已经撤销的额度的窗口里，被算成这笔额度覆盖的，自有资金或授信就凭空回来了（造钱）。
-/// 回放是 `O(花费笔数 × 额度个数)`：额度个数是个位数到几十（每月一笔免费额度加预付），读花费的那一次扫描和准入已有的求和同量级。
+///
+/// **代价**（Codex 复审 7c5a03fe，Medium；设计稿 S3-24）：回放要读这个账户的**全部**历史分录，在调用方的写事务里，所以单次投影的耗时随账户
+/// 历史**线性**增长，没有压缩。找额度这一步用 [`WindowIndex`]（每笔花费只看窗口包含它的那一小撮额度），已经不是大头：10 万笔花费 × 120 笔
+/// 额度实测，找额度约 3%，其余是读分录本身（`ledger_projection_perf.rs`）。账户没有任何花费类额度时不回放，已花（含在途）就是额度之外的部分。
 fn separate_books(
     conn: &Connection,
     account: &str,
     now_ms: i64,
     funds: i64,
+    committed: i64,
 ) -> Result<Books, LedgerError> {
     let buckets = load_buckets(conn, account)?;
-    let mut left: Vec<i64> = buckets.iter().map(|bucket| bucket.capacity).collect();
-    // 先到期的先用。排序只看额度自己的到期时间（`sort_by_key` 是稳定的：同一时刻到期的保持创建先后），不看之后才发生的撤销，
-    // 所以一笔花费得到的覆盖不会因为日后撤销了某笔额度而换一笔额度来覆盖。
-    let mut order: Vec<usize> = (0..buckets.len()).collect();
-    order.sort_by_key(|index| buckets[*index].until);
-    let mut uncovered = 0_i64;
-    for spend in load_spends(conn, account)? {
-        // 万一读出负数（分录被改坏了），按 0 算：不会借此多出额度覆盖
-        let mut rest = spend.amount.max(0);
-        for index in &order {
-            if rest == 0 {
-                break;
-            }
-            if buckets[*index].covers(spend.at, spend.first_entry) {
-                let take = rest.min(left[*index]);
-                left[*index] -= take;
-                rest -= take;
-            }
-        }
-        uncovered = add(uncovered, rest)?;
-    }
+    let (uncovered, left) = if buckets.is_empty() {
+        // 没有任何额度能覆盖花费：已花（含在途）全部是额度之外的部分，不用读花费。每个预留的净额都不为负，所以和逐笔累加一样
+        (committed.max(0), Vec::new())
+    } else {
+        replay_spends(
+            &buckets,
+            &load_spends(conn, account)?,
+            WindowIndex::MAX_ENTRIES,
+        )?
+    };
     let mut allowance_left = 0_i64;
     for (index, bucket) in buckets.iter().enumerate() {
         if bucket.revoked_after.is_none() && bucket.from <= now_ms && now_ms < bucket.until {
@@ -433,6 +618,42 @@ fn separate_books(
         funds_left: sub(funds, uncovered)?.max(0),
         credit_debt: sub(uncovered, funds)?.max(0),
     })
+}
+
+/// 回放的核心（不碰数据库）：`spends`（已经按提交先后排好）一笔一笔找额度。返回（没被额度覆盖的部分之和，每笔额度回放之后的剩余）。
+/// `index_limit` 是 [`WindowIndex`] 的快照总量上限：超过就退回线性扫描全部额度（结果一样，单测对过）。
+fn replay_spends(
+    buckets: &[Bucket],
+    spends: &[Spend],
+    index_limit: usize,
+) -> Result<(i64, Vec<i64>), LedgerError> {
+    let mut left: Vec<i64> = buckets.iter().map(|bucket| bucket.capacity).collect();
+    // 先到期的先用。排序只看额度自己的到期时间（稳定排序：同一时刻到期的保持创建先后），不看之后才发生的撤销，
+    // 所以一笔花费得到的覆盖不会因为日后撤销了某笔额度而换一笔额度来覆盖。
+    let mut order: Vec<usize> = (0..buckets.len()).collect();
+    order.sort_by_key(|index| buckets[*index].until);
+    let index = WindowIndex::build(buckets, index_limit);
+    let mut uncovered = 0_i64;
+    for spend in spends {
+        // 万一读出负数（分录被改坏了），按 0 算：不会借此多出额度覆盖
+        let mut rest = spend.amount.max(0);
+        let candidates: &[usize] = match &index {
+            Some(index) => index.at(spend.at),
+            None => &order,
+        };
+        for bucket in candidates {
+            if rest == 0 {
+                break;
+            }
+            if buckets[*bucket].covers(spend.at, spend.first_entry) {
+                let take = rest.min(left[*bucket]);
+                left[*bucket] -= take;
+                rest -= take;
+            }
+        }
+        uncovered = add(uncovered, rest)?;
+    }
+    Ok((uncovered, left))
 }
 
 /// 一个账户此刻生效的限额（微单位；`None` = 不设限）。
@@ -562,7 +783,13 @@ pub(super) fn project_chain_with_books(
             && (credit_limit > 0 || ever_had_credit_line(conn, id)?)
             && (!sums.has_funds || ever_had_allocation)
         {
-            Some(separate_books(conn, id, now_ms, sums.funds)?)
+            Some(separate_books(
+                conn,
+                id,
+                now_ms,
+                sums.funds,
+                sums.committed,
+            )?)
         } else {
             None
         };
@@ -653,4 +880,242 @@ pub(super) fn credit_headroom(views: &[AncestorView]) -> Result<Option<i64>, Led
         tightest = Some(tightest.map_or(room, |current| current.min(room)));
     }
     Ok(tightest)
+}
+
+#[cfg(test)]
+mod tests {
+    //! 按归属时刻找候选额度的索引（[`WindowIndex`]）：每个时刻的候选额度必须恰好是「窗口包含它」的那些，次序是回放要的（先到期的，
+    //! 同时到期的先创建的）。期望数字手算；另外和暴力扫描对一遍随机的窗口和时刻。
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn bucket(from: i64, until: i64) -> Bucket {
+        Bucket {
+            from,
+            until,
+            capacity: 1,
+            created_after: 0,
+            revoked_after: None,
+        }
+    }
+
+    /// 暴力扫描：窗口包含 `at` 的额度，按（到期时间，创建先后）排好。
+    fn brute_force(buckets: &[Bucket], at: i64) -> Vec<usize> {
+        let mut found: Vec<usize> = (0..buckets.len())
+            .filter(|index| buckets[*index].from <= at && at < buckets[*index].until)
+            .collect();
+        found.sort_by_key(|index| (buckets[*index].until, *index));
+        found
+    }
+
+    #[test]
+    fn each_moment_finds_exactly_the_windows_that_contain_it_in_replay_order() {
+        // 0: [0, 10)  1: [5, 20)  2: [10, 15)  3: [20, 30)  4: [5, 20)（和 1 同时到期，后创建）
+        let buckets = [
+            bucket(0, 10),
+            bucket(5, 20),
+            bucket(10, 15),
+            bucket(20, 30),
+            bucket(5, 20),
+        ];
+        let index = WindowIndex::build(&buckets, WindowIndex::MAX_ENTRIES)
+            .expect("a handful of windows is indexed");
+        let expected: [(i64, &[usize]); 14] = [
+            (-1, &[]),
+            (0, &[0]),
+            (4, &[0]),
+            // 5 起 0（10 到期）先于 1 和 4（20 到期，1 先创建）
+            (5, &[0, 1, 4]),
+            (9, &[0, 1, 4]),
+            // 窗口左闭右开：10 这一刻 0 已经结束，2 刚开始；2（15 到期）先于 1、4
+            (10, &[2, 1, 4]),
+            (14, &[2, 1, 4]),
+            (15, &[1, 4]),
+            (19, &[1, 4]),
+            (20, &[3]),
+            (29, &[3]),
+            (30, &[]),
+            (1_000_000, &[]),
+            (i64::MIN, &[]),
+        ];
+        for (at, want) in expected {
+            assert_eq!(index.at(at), want, "candidates at {at}");
+        }
+    }
+
+    #[test]
+    fn empty_and_degenerate_windows_are_never_candidates() {
+        // 空窗口 [7, 7)、倒过来的窗口 [9, 3) 永远不包含任何时刻
+        let buckets = [bucket(7, 7), bucket(9, 3), bucket(1, 2)];
+        let index = WindowIndex::build(&buckets, WindowIndex::MAX_ENTRIES).unwrap();
+        for at in -2..12 {
+            assert_eq!(
+                index.at(at),
+                brute_force(&buckets, at).as_slice(),
+                "at {at}"
+            );
+        }
+        assert_eq!(index.at(1), &[2]);
+        assert!(
+            WindowIndex::build(&[], WindowIndex::MAX_ENTRIES)
+                .unwrap()
+                .at(0)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_index_agrees_with_a_scan_of_every_window_on_random_windows() {
+        // xorshift64*：不引入依赖，结果确定
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move |n: u64| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+        };
+        let mut checked = 0_u32;
+        for round in 0..300 {
+            let count = 1 + usize::try_from(next(40)).unwrap();
+            let buckets: Vec<Bucket> = (0..count)
+                .map(|_| {
+                    let from = i64::try_from(next(60)).unwrap() - 10;
+                    let length = i64::try_from(next(30)).unwrap();
+                    bucket(from, from + length)
+                })
+                .collect();
+            let index = WindowIndex::build(&buckets, WindowIndex::MAX_ENTRIES).unwrap();
+            for at in -15..90 {
+                assert_eq!(
+                    index.at(at),
+                    brute_force(&buckets, at).as_slice(),
+                    "round {round}, moment {at}, windows {:?}",
+                    buckets
+                        .iter()
+                        .map(|b| (b.from, b.until))
+                        .collect::<Vec<_>>()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 30_000);
+    }
+
+    #[test]
+    fn replaying_through_the_index_gives_what_the_linear_scan_gives() {
+        // 随机的额度（窗口、创建 / 撤销序号）和花费（归属时刻、序号、金额）：走索引的回放和退回线性扫描（限额 0 = 一个快照都不让建）
+        // 的回放，没被覆盖的总额和每笔额度的剩余必须一模一样。线性扫描就是索引之前的算法。
+        let mut state = 0xD1B5_4A32_D192_ED03_u64;
+        let mut next = move |n: u64| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+        };
+        for round in 0..400 {
+            let count = usize::try_from(next(25)).unwrap();
+            let buckets: Vec<Bucket> = (0..count)
+                .map(|_| {
+                    let from = i64::try_from(next(80)).unwrap();
+                    let created_after = i64::try_from(next(60)).unwrap();
+                    Bucket {
+                        from,
+                        until: from + i64::try_from(next(40)).unwrap(),
+                        capacity: 1 + i64::try_from(next(150)).unwrap(),
+                        created_after,
+                        revoked_after: (next(3) == 0)
+                            .then(|| created_after + i64::try_from(next(40)).unwrap()),
+                    }
+                })
+                .collect();
+            let mut spends: Vec<Spend> = (0..usize::try_from(next(60)).unwrap())
+                .map(|_| Spend {
+                    at: i64::try_from(next(130)).unwrap() - 5,
+                    first_entry: 1 + i64::try_from(next(100)).unwrap(),
+                    amount: i64::try_from(next(120)).unwrap(),
+                })
+                .collect();
+            spends.sort_by_key(|spend| spend.first_entry);
+            let through_index = replay_spends(&buckets, &spends, WindowIndex::MAX_ENTRIES).unwrap();
+            let linear = replay_spends(&buckets, &spends, 0).unwrap();
+            assert_eq!(through_index, linear, "round {round}");
+        }
+    }
+
+    #[test]
+    fn a_spend_is_covered_by_the_earliest_expiring_window_that_holds_it_and_the_rest_is_uncovered()
+    {
+        // 手算：额度 0 [0, 10) 容量 30，额度 1 [0, 20) 容量 50，额度 2 [15, 30) 容量 40，都在所有花费之前创建、没撤销。
+        // 花费按提交先后：
+        //   a  时刻 5   金额 40：窗口包含它的是 0、1，先到期的先用：0 出 30，剩下的 10 由 1 出 -> 0 剩 0，1 剩 40
+        //   b  时刻 17  金额 60：窗口包含它的是 1、2（0 已经结束）：1（20 到期）先于 2（30 到期）：1 出 40，2 出 20 -> 1 剩 0，2 剩 20
+        //   c  时刻 40  金额 7：没有额度的窗口包含它：7 没被覆盖
+        //   d  时刻 3   金额 5：窗口包含它的是 0、1，都已经用光：5 没被覆盖
+        let buckets = [
+            Bucket {
+                from: 0,
+                until: 10,
+                capacity: 30,
+                created_after: 0,
+                revoked_after: None,
+            },
+            Bucket {
+                from: 0,
+                until: 20,
+                capacity: 50,
+                created_after: 0,
+                revoked_after: None,
+            },
+            Bucket {
+                from: 15,
+                until: 30,
+                capacity: 40,
+                created_after: 0,
+                revoked_after: None,
+            },
+        ];
+        let spends = [
+            Spend {
+                at: 5,
+                first_entry: 1,
+                amount: 40,
+            },
+            Spend {
+                at: 17,
+                first_entry: 2,
+                amount: 60,
+            },
+            Spend {
+                at: 40,
+                first_entry: 3,
+                amount: 7,
+            },
+            Spend {
+                at: 3,
+                first_entry: 4,
+                amount: 5,
+            },
+        ];
+        for limit in [WindowIndex::MAX_ENTRIES, 0] {
+            let (uncovered, left) = replay_spends(&buckets, &spends, limit).unwrap();
+            assert_eq!(uncovered, 7 + 5, "index limit {limit}");
+            assert_eq!(left, [0, 0, 20], "index limit {limit}");
+        }
+    }
+
+    #[test]
+    fn an_absurd_number_of_overlapping_windows_is_not_indexed() {
+        // 1 500 笔窗口各自在不同的时刻开始、同一时刻结束：第 j 个边界上有 j 笔同时生效，快照总量 ≈ 112 万，超过上限：不建，
+        // 回放退回线性扫描（结果一样）
+        let buckets: Vec<Bucket> = (0..1_500).map(|j| bucket(j, 1_000_000)).collect();
+        assert!(WindowIndex::build(&buckets, WindowIndex::MAX_ENTRIES).is_none());
+        // 同样多的窗口，但是互不重叠（月度额度那样）：每个边界上只有一笔，当然可以建
+        let monthly: Vec<Bucket> = (0..1_500).map(|j| bucket(j * 10, j * 10 + 10)).collect();
+        let index = WindowIndex::build(&monthly, WindowIndex::MAX_ENTRIES)
+            .expect("disjoint windows are cheap to index");
+        assert_eq!(index.at(0), &[0]);
+        assert_eq!(index.at(14_995), &[1_499]);
+        assert!(index.at(15_000).is_empty());
+    }
 }

@@ -14,7 +14,6 @@
 //! 先到期的，额度之外的部分先用自有资金，用完才是授信债务）；规则里的每一个输入（归属时刻、提交先后、读钟）都各自取得。
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -129,9 +128,13 @@ fn replay(
 ///
 /// * 事件按**提交先后**排：分录号是提交的先后；额度创建 / 撤销的序号 `after_entry` 是「它提交那一刻账本里最后一条分录的号」，
 ///   所以它排在这个号的分录之后、下一个号的分录之前；毫秒只用来判断额度自己的窗口 `[valid_from, valid_until)`；
-/// * 一个预留在这个账户上最多两笔花费，按分录**种类**分：预留本身（`reserve` / `settle` / `release` / `expire`，归属时刻是预留创建的
-///   时刻）和结算那一刻才发生的花费（`late_settle`，归属时刻是结算的时刻）；先后看各自第一条分录的号。不按「同一个归属时刻」
-///   合并：预留和它的 overage 可以在同一毫秒；
+/// * **花费从预留自己的记录（`ledger_holds`：状态、预留额、实际消费、结算时刻、宽限下限）推出来，不看分录是怎么拆的**（Codex 复审 7c5a03fe）：
+///   预留本身是创建时刻上的一笔花费（在途 = 预留额；结算之后 = 预留之内的部分 `min(A, R) - 宽限承担`；放掉 / 过期 = 0；迟到的结算 = 0）；
+///   超出预留的部分是结算那一刻的另一笔花费（没迟到的结算 `max(A - R, 0)`；迟到的结算整笔 `A - 宽限承担`），归属时刻是预留收尾的时刻。
+///   所以旧格式（超出的部分和预留之内的部分一起记在一条 `settle` 里）和新格式（超出的部分另记一条 `late_settle`）在这里是同一回事，
+///   不按分录种类分组，也不按「同一个归属时刻」合并（预留和它的 overage 可以在同一毫秒）。先后看各自的分录号：预留看 `reserve` 那条，
+///   结算时刻的花费看这个账户上最后一条 `settle` / `late_settle`（同一个事务里，序号和别的事件比出来的先后一样）；
+/// * 推出来的花费和分录对账：账户的 `Σ (held + spent)` 必须等于这些花费的总和（分录的数额和预留的记录对得上），否则 panic；
 /// * 每笔花费按它**自己**记下的归属时刻判断，不看读的是哪一刻；所有额度都参与回放（包括读钟之后才开始的）；`now` 只决定哪些额度
 ///   此刻还能花；
 /// * 回放时维护「此刻已经创建、没被撤销的额度」：一笔花费先用其中窗口包含它的归属时刻的额度里**先到期**的（同时到期的先创建的先用），
@@ -190,47 +193,87 @@ pub fn model(db_path: &Path, account: &str, now: i64) -> Books {
             }
         }
         drop(stmt);
-        // 只有带在途 / 已花的分录种类才是花费；责任分录（担保人承担、平台损失、宽限）和充值不是
+        // 这个账户上有分录的每个预留：预留自己的记录，加上这个账户上 `reserve` 那条和最后一条 `settle` / `late_settle` 的分录号
         let mut stmt = conn
             .prepare(
-                "SELECT entry_id, hold_id, kind, window_at_ms, held_micros + spent_micros FROM ledger_entries
-                  WHERE account_id = ?1 AND hold_id IS NOT NULL
-                    AND kind IN ('reserve', 'settle', 'release', 'expire', 'late_settle')
-                  ORDER BY entry_id",
+                "SELECT h.hold_id, h.state, h.late, h.reserved_micros, COALESCE(h.charged_micros, 0), h.created_at_ms,
+                        COALESCE(h.closed_at_ms, 0), h.grace_floor_micros,
+                        MIN(CASE WHEN e.kind = 'reserve' THEN e.entry_id END),
+                        MAX(CASE WHEN e.kind IN ('settle', 'late_settle') THEN e.entry_id END)
+                   FROM ledger_holds h JOIN ledger_entries e ON e.hold_id = h.hold_id AND e.account_id = ?1
+                  GROUP BY h.hold_id
+                  ORDER BY h.hold_id",
             )
             .unwrap();
         let rows = stmt
             .query_map([account], |row| {
                 Ok((
-                    row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(2)? == 1,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
                 ))
             })
             .unwrap();
-        // (预留, 是不是结算那一刻的花费) -> (第一条分录的号, 归属时刻, 净额)
-        let mut groups: BTreeMap<(String, bool), (i64, i64, i64)> = BTreeMap::new();
         for row in rows {
-            let (entry, hold, kind, at, amount) = row.unwrap();
-            let group = groups
-                .entry((hold, kind == "late_settle"))
-                .or_insert((entry, at, 0));
-            assert_eq!(
-                group.1, at,
-                "the entries of one kind of spend share one attribution moment"
-            );
-            group.2 += amount;
-        }
-        for (first_entry, at, amount) in groups.into_values() {
-            assert!(amount >= 0, "a hold never nets to a negative amount");
-            if amount > 0 {
-                events.push((first_entry, 0, spends.len()));
-                spends.push(ReplaySpend { at, amount });
+            let (
+                state,
+                late,
+                reserved,
+                charged,
+                created_at,
+                closed_at,
+                floor,
+                reserve_entry,
+                settle_entry,
+            ) = row.unwrap();
+            // 宽限里平台承担的部分：预留之内、超出放行时下限的那一块（不记到付款账户链上）
+            let within = charged.min(reserved);
+            let absorbed = floor.map_or(0, |floor| (within - floor).max(0));
+            let (reservation, settled_later) = match (state.as_str(), late) {
+                ("open", _) => (reserved, 0),
+                ("settled", false) => (within - absorbed, (charged - reserved).max(0)),
+                ("settled", true) => (0, charged - absorbed),
+                // 放掉了、过期了（还没有迟到的结算）：不占任何额度
+                _ => (0, 0),
+            };
+            if reservation > 0 {
+                let first =
+                    reserve_entry.expect("a hold with money on the books has a reserve entry");
+                events.push((first, 0, spends.len()));
+                spends.push(ReplaySpend {
+                    at: created_at,
+                    amount: reservation,
+                });
+            }
+            if settled_later > 0 {
+                let first = settle_entry.expect("a settled hold has a settle or late_settle entry");
+                events.push((first, 0, spends.len()));
+                spends.push(ReplaySpend {
+                    at: closed_at,
+                    amount: settled_later,
+                });
             }
         }
         drop(stmt);
+        // 对账：预留的记录推出来的花费总和，必须等于分录里这个账户的 `Σ (held + spent)`
+        let on_the_books: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(held_micros + spent_micros), 0) FROM ledger_entries WHERE account_id = ?1",
+                [account],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let derived: i64 = spends.iter().map(|spend| spend.amount).sum();
+        assert_eq!(
+            derived, on_the_books,
+            "the spends the hold records imply must add up to what the entries book on {account}"
+        );
         funds = conn
             .query_row(
                 "SELECT COALESCE(SUM(funds_micros), 0) FROM ledger_entries WHERE account_id = ?1 AND kind = 'fund'",
@@ -270,6 +313,17 @@ struct SimSpend {
     reserved: i64,
     /// 这笔花费的事件号。
     seq: u64,
+}
+
+/// 一次没迟到的结算按手算规则应有的分摊。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimSettle {
+    /// 超出预留的部分。
+    pub overage: i64,
+    /// 担保人承担的。
+    pub sponsor: i64,
+    /// 平台损失（吸收不了的，凭证因此被冻结）。
+    pub loss: i64,
 }
 
 /// 只吃测试自己做过的事、不读库的事件模型（见模块文档）。事件按调用顺序拿号：号越大提交越晚，所以「额度在花费之前创建」
@@ -341,18 +395,31 @@ impl Sim {
         self.spends[spend].amount = 0;
     }
 
-    /// 没迟到的结算：预留之内的部分（最多预留额）留在原处，超出预留的部分是结算那一刻（`at`）的一笔新花费。
-    pub fn settle(&mut self, spend: usize, charged: i64, at: i64) {
+    /// 没迟到的结算：预留之内的部分（最多预留额）留在原处，超出预留的部分是结算那一刻（`at`）的一笔新花费。返回这次结算的分摊（手算规则）：
+    ///
+    /// * 先把预留之内的部分记账，**再**读整条链的余量（预留还占着的时候，宽限里平台承担的那一块也占着余额，不能先读）；
+    /// * 担保人能吸收 `min(超出, max(余量, 0))`（链上别的账户都很宽裕，整条链的余量就是这个账户的 `额度剩余 + 自有资金剩余 + 授信可用`）；
+    /// * 吸收不了的是平台损失，并且冻结凭证；
+    /// * 然后超出的部分才记成结算时刻的一笔新花费。
+    pub fn settle(&mut self, spend: usize, charged: i64, at: i64) -> SimSettle {
         let reserved = self.spends[spend].reserved;
         self.spends[spend].amount = charged.min(reserved);
-        if charged > reserved {
+        let overage = (charged - reserved).max(0);
+        let room = self.room(at);
+        let sponsor = overage.min(room.max(0));
+        if overage > 0 {
             let seq = self.tick();
             self.spends.push(SimSpend {
                 at,
-                amount: charged - reserved,
+                amount: overage,
                 reserved: 0,
                 seq,
             });
+        }
+        SimSettle {
+            overage,
+            sponsor,
+            loss: overage - sponsor,
         }
     }
 
