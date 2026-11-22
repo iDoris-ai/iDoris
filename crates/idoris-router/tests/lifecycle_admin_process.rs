@@ -1,4 +1,4 @@
-//! IDORIS-CORE S6（接口规范 §2.11.4、勘误七）：Admin 的 `upstreams`，起**真二进制**加有状态的假 oMLX：Admin 的接线（引擎管理器交给完整的
+//! IDORIS-CORE S6（接口规范 §2.11.4、勘误十）：Admin 的 `upstreams`，起**真二进制**加有状态的假 oMLX：Admin 的接线（引擎管理器交给完整的
 //! Admin Router）、HTTP 上的 202 与状态码、重启之后聊天恢复、停下之后数据面的 503、冻结的上游要重启 iDoris。
 //!
 //! 进程内的细节（逐条状态码、并发、G2、G3、Router 里的 Supervisor 与实时门）在 `lifecycle_admin.rs`。**全部用假引擎**

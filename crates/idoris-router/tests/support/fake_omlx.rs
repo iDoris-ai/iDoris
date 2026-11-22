@@ -122,6 +122,12 @@ impl FakeOmlx {
         std::fs::write(self.record_dir.join(what.file()), "1").unwrap();
     }
 
+    /// 让引擎（此刻在跑的、之后拉起的）把它监听的端口放掉、但**不退出**：进程活着，端口空了，别的东西可以绑上来（IDORIS-CORE S6，
+    /// Codex 审计 H3：进程活着不等于端口还是它的）。已经接受的连接不受影响。
+    pub fn release_port(&self) {
+        std::fs::write(self.record_dir.join("release-port"), "1").unwrap();
+    }
+
     /// 放开 [`Self::hold`] 的那一类请求：被扣着的请求这就回答。
     pub fn release(&self, what: Hold) {
         let _ = std::fs::remove_file(self.record_dir.join(what.file()));
@@ -394,7 +400,20 @@ host = arg("--host") or "127.0.0.1"
 port = int(arg("--port"))
 server = http.server.ThreadingHTTPServer((host, port), Handler)
 server.daemon_threads = True
+
+def release_port_on_request():
+    # The test asked the engine to give the port back **without exiting**: the process lives on, the port is free.
+    flag = os.path.join(RECORDS, "release-port")
+    while not os.path.exists(flag):
+        time.sleep(0.02)
+    server.shutdown()
+    server.server_close()
+
+threading.Thread(target=release_port_on_request, daemon=True).start()
 server.serve_forever()
+# serve_forever returned: the port was released. The process stays alive (and not listening) until it is killed.
+while True:
+    time.sleep(3600)
 "#,
         // A JSON string is a valid Python string literal.
         records = serde_json::to_string(&record_dir.display().to_string()).unwrap(),

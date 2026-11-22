@@ -1,4 +1,4 @@
-//! IDORIS-CORE S6（接口规范 §2.11.4、勘误七）：Admin 的 `upstreams` 读与 `start|stop|restart` 写，加上 S5 评审留下的三道门（G1、
+//! IDORIS-CORE S6（接口规范 §2.11.4、勘误十）：Admin 的 `upstreams` 读与 `start|stop|restart` 写，加上 S5 评审留下的三道门（G1、
 //! G2、G3）。进程内：真的引擎管理器、真的 Admin Router（经 `tower` 的 `oneshot`）、假 oMLX（`tests/support/fake_omlx.rs`）；
 //! 起真二进制的那一份在 `lifecycle_admin_process.rs`。
 //!
@@ -16,6 +16,7 @@ mod fake_omlx;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,8 @@ use idoris_router::lifecycle::{
     EngineBackend, EngineManager, ManagedPlan, ManagerConfig, OmlxBackend, Timings,
 };
 use idoris_router::readiness::{
-    GateState, HealthState, Observation, UpstreamReason, UpstreamState, UpstreamStatus,
+    GateState, HealthState, Observation, ProberContext, ProberTimings, UpstreamReason,
+    UpstreamState, UpstreamStatus, plan_upstreams,
 };
 use idoris_router::register::{JitterSource, LogSink};
 use idoris_router::runtime::RuntimeRegistry;
@@ -100,6 +102,8 @@ struct Scripted {
     teams: Mutex<BTreeMap<u32, String>>,
     /// `start_time(pid)`：编排过的 pid 报这个启动时间（造「pid 被回收给了另一个进程」），没编排的读真的 `ps`。
     start_times: Mutex<BTreeMap<u32, String>>,
+    /// `listens_on(_, port)` 一律是假的：引擎进程还活着，监听这个端口的却不再是它。
+    lost: Mutex<Vec<u16>>,
 }
 
 impl Scripted {
@@ -110,7 +114,17 @@ impl Scripted {
             listeners: Mutex::new(BTreeMap::new()),
             teams: Mutex::new(BTreeMap::new()),
             start_times: Mutex::new(BTreeMap::new()),
+            lost: Mutex::new(Vec::new()),
         })
+    }
+
+    /// 从现在起，`listens_on` 对这个端口回 `Ok(false)`（进程还活着，监听这个端口的不是它了）。
+    fn lose(&self, port: u16) {
+        self.claims
+            .lock()
+            .unwrap()
+            .retain(|claimed| *claimed != port);
+        self.lost.lock().unwrap().push(port);
     }
 
     fn pretend_start_time(&self, pid: u32, start_time: &str) {
@@ -157,6 +171,9 @@ impl ProcessInspector for Scripted {
         self.real.process_group(pid).await
     }
     async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
+        if self.lost.lock().unwrap().contains(&port) {
+            return Ok(false);
+        }
         if self.claims.lock().unwrap().contains(&port) {
             return Ok(true);
         }
@@ -1209,6 +1226,16 @@ impl Full {
     }
 
     async fn start_with(rig: Rig, inspector: Arc<dyn ProcessInspector>, timings: Timings) -> Self {
+        Self::start_with_cards(rig, inspector, timings, Vec::new()).await
+    }
+
+    /// 同 [`Self::start_with`]，Router 里除了托管的 `omlx` 卡还有这些卡（伴生卡、独立的上游……）。
+    async fn start_with_cards(
+        rig: Rig,
+        inspector: Arc<dyn ProcessInspector>,
+        timings: Timings,
+        extra_cards: Vec<ComponentCard>,
+    ) -> Self {
         let executable = rig.fake.executable.clone();
         let log: Arc<Mutex<Vec<String>>> = Arc::default();
         let sink: LogSink = {
@@ -1235,7 +1262,8 @@ impl Full {
             }],
             health.clone(),
         ));
-        let cards = vec![managed_card(&rig.endpoint())];
+        let mut cards = vec![managed_card(&rig.endpoint())];
+        cards.extend(extra_cards);
         let state_dir = rig.state_dir();
         let token = AdminSessionToken::mint();
         let secret = token.expose_secret().to_owned();
@@ -1271,13 +1299,8 @@ impl Full {
                                 &state_dir,
                                 &card.endpoint,
                             )?;
-                            let adapter = idoris_upstream::OmlxAdapter::new(
-                                idoris_upstream::OmlxAdapterConfig::for_base_url(
-                                    card.endpoint.clone(),
-                                ),
-                            )?
-                            .with_per_request_key()
-                            .with_load_fence_path(fence);
+                            let adapter = idoris_upstream::factory::create_omlx_adapter(card)?
+                                .with_load_fence_path(fence);
                             Ok(Arc::new(adapter) as Arc<dyn idoris_backend::RuntimeAdapter>)
                         },
                     )?;
@@ -2637,4 +2660,545 @@ async fn c14_while_the_old_load_is_in_flight_its_fence_stays_and_no_second_engin
     .await;
     assert!(full.rig.fake.got_sigterm(old));
     assert!(!fence.exists());
+}
+
+// ---------------------------------------------------------------------------------------------
+// 密钥治理审计（IDORIS-CORE S6，Codex 审计 H1、H2、H3）：真的 Router、真的假引擎、一个占着端口的冒名者
+// ---------------------------------------------------------------------------------------------
+//
+// 每个用例都在**子进程**里再跑一遍，子进程的环境里有金丝雀 key（环境变量 `IDORIS_OMLX_API_KEY` 与 `~/.omlx/settings.json` 的
+// `auth.api_key`）：key 取自进程环境，进程内改不了（`unsafe_code = "forbid"`），而「冒名者从不收到 `Authorization`」只有在环境里
+// 真有 key 可发的时候才证明了什么（环境里恰好没有 key 的机器上，一个会把 key 发出去的实现也能通过）。冒名者记下它收到的每个
+// 请求的头；断言是它**一个** `Authorization` 头都没收到，不只是金丝雀的值。
+
+const CANARY_ENV_KEY: &str = "canary-env-key-that-must-never-reach-an-impostor-41c7";
+const CANARY_SETTINGS_KEY: &str = "canary-settings-key-that-must-never-reach-an-impostor-8e2b";
+
+/// 当前这个用例在子进程里再跑一遍（环境里有金丝雀 key）。`true` = 这就是子进程，调用方接着做场景；`false` = 这是父进程，子进程
+/// 已经跑完并且通过了，调用方直接返回。
+fn in_a_child_with_canary_keys(test: &str) -> bool {
+    if std::env::var_os("IDORIS_KEY_AUDIT_CHILD").is_some() {
+        return true;
+    }
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".omlx")).unwrap();
+    std::fs::write(
+        home.path().join(".omlx/settings.json"),
+        format!(r#"{{"auth":{{"api_key":"{CANARY_SETTINGS_KEY}"}}}}"#),
+    )
+    .unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--test-threads=1", "--nocapture"])
+        .env("IDORIS_KEY_AUDIT_CHILD", "1")
+        .env("HOME", home.path())
+        .env("IDORIS_OMLX_API_KEY", CANARY_ENV_KEY)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the child run of {test} failed:\n--- stdout\n{}\n--- stderr\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // 名字对不上的 `--exact` 一个测试也不跑、照样成功退出：子进程必须真的跑了这一个测试。
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+        "the child did not run {test}:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    false
+}
+
+/// 占着一个端口的冒名者：什么都答（`GET /v1/models` 答一个不像 oMLX 的体），记下每个请求的头。
+struct Impostor {
+    server: wiremock::MockServer,
+}
+
+impl Impostor {
+    async fn on(listener: std::net::TcpListener) -> Self {
+        let server = wiremock::MockServer::builder()
+            .listener(listener)
+            .start()
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/models"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(json!({"hello": "world"})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    json!({"object": "list", "data": [], "models": [], "choices": []}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Self { server }
+    }
+
+    /// 绑这个端口（引擎刚放掉它时要等一会儿）。
+    async fn on_port(port: u16) -> Self {
+        let deadline = Instant::now() + PATIENT;
+        loop {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => return Self::on(listener).await,
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the port never came free: {error}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+    }
+
+    async fn requests(&self) -> Vec<wiremock::Request> {
+        self.server.received_requests().await.unwrap()
+    }
+
+    async fn count(&self) -> usize {
+        self.requests().await.len()
+    }
+
+    /// 带着 `Authorization` 头的请求（方法加路径）。
+    async fn authorized(&self) -> Vec<String> {
+        self.requests()
+            .await
+            .iter()
+            .filter(|request| request.headers.contains_key("authorization"))
+            .map(|request| format!("{} {}", request.method, request.url.path()))
+            .collect()
+    }
+
+    async fn assert_never_authorized(&self) {
+        let authorized = self.authorized().await;
+        assert!(
+            authorized.is_empty(),
+            "the impostor received credentials: {authorized:?}"
+        );
+    }
+}
+
+/// 伴生 embedding 卡（`setup omlx --bind embed=…` 生成的那种）：与主卡同一个 endpoint，resident，只声明 `embedding`，不托管。
+fn companion_card(endpoint: &str) -> ComponentCard {
+    use idoris_contracts::common::Capability;
+    let mut card = template();
+    card.provider.id = "omlx-embed".to_owned();
+    card.provider.capabilities = vec![Capability::Embedding];
+    card.endpoint = endpoint.to_owned();
+    let policy = card.load_policy.as_mut().unwrap();
+    policy.mode = LoadMode::Resident;
+    card.extensions = Some(
+        serde_json::from_value(json!({
+            "_degradation": "Removing these bindings disables aliases.",
+            "idoris_role_models": {"embed": "embed-model"}
+        }))
+        .unwrap(),
+    );
+    card
+}
+
+/// 手写的、伪装成 oMLX 的卡：`provider.id` 是 `omlx`、`version_pin` 是 `omlx@…`，但它带 `idoris_upstream`（自定义上游）。不托管。
+fn disguised_card(endpoint: &str) -> ComponentCard {
+    let mut card = template();
+    card.endpoint = endpoint.to_owned();
+    card.provider.id = "omlx".to_owned();
+    card.load_policy.as_mut().unwrap().mode = LoadMode::OnDemand;
+    card.extensions = Some(
+        serde_json::from_value(json!({
+            "_degradation": "Removing these bindings disables aliases.",
+            "idoris_upstream": {"kind": "openai_compat", "flavor": "omlx"},
+            "idoris_role_models": {"fast": "fake-model"}
+        }))
+        .unwrap(),
+    );
+    card
+}
+
+/// 真的（可以带 key 的）oMLX 卡，不托管：v0.5.0 的口径，环境变量与 `settings.json` 的 key 照旧发给它。对照用。
+fn unmanaged_omlx_card(endpoint: &str) -> ComponentCard {
+    let mut card = disguised_card(endpoint);
+    card.extensions = Some(
+        serde_json::from_value(json!({
+            "_degradation": "Removing these bindings disables aliases.",
+            "idoris_role_models": {"fast": "fake-model"}
+        }))
+        .unwrap(),
+    );
+    card
+}
+
+/// 一个什么都答 200 的 oMLX 形状的假上游（目录、状态、聊天），记下每个请求。
+async fn recording_upstream() -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "models": [{"id": "fake-model", "estimated_size": 1_000_000_000_u64, "loaded": false, "pinned": false}],
+            "data": [{"id": "up-model", "object": "model"}],
+            "choices": [{"message": {"content": "x"}}],
+            "loaded_models": [], "model_memory_used": 0, "model_memory_max": 17_179_869_184_u64,
+            "pressure": "ok"
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn request_headers(server: &wiremock::MockServer) -> Vec<(String, Option<String>)> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| {
+            (
+                format!("{} {}", request.method, request.url.path()),
+                request
+                    .headers
+                    .get("authorization")
+                    .map(|value| value.to_str().unwrap().to_owned()),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn h1_a_companion_card_inherits_the_failure_of_the_engine_it_shares_and_the_impostor_never_sees_a_credential()
+ {
+    if !in_a_child_with_canary_keys(
+        "h1_a_companion_card_inherits_the_failure_of_the_engine_it_shares_and_the_impostor_never_sees_a_credential",
+    ) {
+        return;
+    }
+    // 端口上是冒名者（先于一切占着端口）。主卡的匿名探测得到 200 加一个不像 oMLX 的体：`NotThisEngine`，终局 `failed` + `port_in_use`。
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    let impostor = Impostor::on(held).await;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let endpoint = rig.endpoint();
+    // 独立的上游（不共用这个引擎）：照常服务。
+    let independent = recording_upstream().await;
+    let cards = vec![companion_card(&endpoint), upstream_card(&independent.uri())];
+    let full = Full::start_with_cards(rig, Scripted::new(), fast(), cards.clone()).await;
+    full.wait_open().await;
+
+    let main = full.element("omlx").await;
+    assert_eq!(main["state"], "failed", "{main}");
+    assert_eq!(main["reason"], "port_in_use", "{main}");
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Blocked),
+        "the terminal failure left the endpoint closed to every credential"
+    );
+    // 主卡自己做过的匿名探测之外，冒名者此后不再收到任何东西。
+    let baseline = impostor.count().await;
+    assert!(baseline >= 1, "the main card's own anonymous probe");
+    impostor.assert_never_authorized().await;
+
+    // 数据面：伴生卡继承主卡的失败，503 带同一个原因码，一个请求都不碰那个端口。
+    let (status, body) = full
+        .data(
+            "POST",
+            "/v1/embeddings",
+            Some(json!({"model": "idoris/embed", "input": "hello"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["type"], "local_only_unavailable", "{body}");
+    assert_eq!(body["error"]["reason_code"], "port_in_use", "{body}");
+    // 预热同样。
+    let (status, body) = full
+        .data(
+            "POST",
+            "/v1/models/warmup",
+            Some(json!({"model": "idoris/embed"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["reason_code"], "port_in_use", "{body}");
+    // 模型列表：伴生卡与主卡都不被探测，只列出独立上游的模型。
+    let (status, body) = full.data("GET", "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, vec!["up-model"], "{body}");
+    // 独立的上游照常服务。
+    let (status, body) = full
+        .data(
+            "POST",
+            "/v1/chat/completions",
+            Some(json!({"model": "idoris/daily", "messages": [{"role": "user", "content": "hi"}]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Admin 的模型来源：伴生卡与主卡一样如实报「不可用」，不探测。
+    let (status, body) = full.admin("GET", "/admin/api/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let companion_source = body["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["provider_id"] == "omlx-embed")
+        .unwrap_or_else(|| panic!("no source for the companion card: {body}"));
+    assert_eq!(companion_source["state"], "error", "{companion_source}");
+    assert_eq!(
+        companion_source["error"], "unavailable",
+        "{companion_source}"
+    );
+
+    // 后台探测：伴生卡继承失败、不发请求；独立的上游照常就绪。
+    let context = ProberContext {
+        health: full.health.clone(),
+        plans: plan_upstreams(&cards).unwrap(),
+        runtimes: RuntimeRegistry::default(),
+        client: reqwest::Client::new(),
+        remote_kill_switch: Arc::new(AtomicBool::new(false)),
+        timings: ProberTimings::default(),
+    };
+    for plan in &context.plans {
+        match plan.id.as_str() {
+            "omlx-embed" => assert_eq!(
+                context.observe(plan).await,
+                Observation::Unavailable(Some(UpstreamReason::PortInUse)),
+                "the companion card inherits the engine's failure"
+            ),
+            "lmstudio" => assert_eq!(context.observe(plan).await, Observation::Ready),
+            other => panic!("unexpected plan {other}"),
+        }
+    }
+
+    assert_eq!(
+        impostor.count().await,
+        baseline,
+        "nothing but the main card's own anonymous probe ever reached the impostor"
+    );
+    impostor.assert_never_authorized().await;
+    // 独立上游收到的东西里，没有 oMLX 的 key（它不是 oMLX 卡）。
+    for (what, authorization) in request_headers(&independent).await {
+        assert_eq!(authorization, None, "{what}");
+    }
+}
+
+#[tokio::test]
+async fn h1_the_managed_endpoint_is_closed_to_every_credential_before_anything_has_probed_it() {
+    if !in_a_child_with_canary_keys(
+        "h1_the_managed_endpoint_is_closed_to_every_credential_before_anything_has_probed_it",
+    ) {
+        return;
+    }
+    // 引擎管理器一启动（`start` 同步返回）托管的端点就已经封上，先于它自己的第一次探测、也先于别的卡（伴生卡的后台探测）对同一个
+    // 端点的第一次探测：这个窗口里端点没有登记，会落进环境变量与 `settings.json` 的回退链，金丝雀 key 就发给了端口上的冒名者。
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    let impostor = Impostor::on(held).await;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let endpoint = rig.endpoint();
+    let health = HealthState::with_upstreams(0, vec![upstream_status("omlx", "omlx", true)]);
+    let manager = EngineManager::start(
+        ManagerConfig {
+            state_dir: rig.state_dir(),
+            allocated_budget_bytes: Some(16 * GIB),
+            stop_on_exit: StopOnExit::Owned,
+            executables: BTreeMap::from([("omlx".to_owned(), rig.fake.executable.clone())]),
+            launched_by: "test-instance".to_owned(),
+            timings: fast(),
+            inspector: Scripted::new(),
+            log: Arc::new(|_| {}),
+        },
+        vec![ManagedPlan {
+            id: "omlx".to_owned(),
+            endpoint: endpoint.clone(),
+            port,
+            backend: omlx_backend(&rig.work.path().join("models")),
+        }],
+        health.clone(),
+    );
+    assert_eq!(governed_endpoint(&endpoint), Some(EndpointKey::Blocked));
+    // 马上对伴生卡做一次后台探测，不等管理器做完任何事。
+    let companion = companion_card(&endpoint);
+    let plans = plan_upstreams(std::slice::from_ref(&companion)).unwrap();
+    let context = ProberContext {
+        health: health.clone(),
+        plans,
+        runtimes: RuntimeRegistry::default(),
+        client: reqwest::Client::new(),
+        remote_kill_switch: Arc::new(AtomicBool::new(false)),
+        timings: ProberTimings::default(),
+    };
+    let _ = context.observe(&context.plans[0]).await;
+    // 之后管理器自己的探测与终局的失败也不带任何凭证。
+    wait_for("the managed engine to fail", || {
+        health.view().upstreams[0].state == UpstreamState::Failed
+    })
+    .await;
+    assert!(impostor.count().await >= 1);
+    impostor.assert_never_authorized().await;
+    manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn h2_a_handwritten_card_that_claims_to_be_omlx_never_gets_an_omlx_key_while_a_real_one_does()
+{
+    if !in_a_child_with_canary_keys(
+        "h2_a_handwritten_card_that_claims_to_be_omlx_never_gets_an_omlx_key_while_a_real_one_does",
+    ) {
+        return;
+    }
+    // 两张卡各有各的 Router（各自走生产的适配器构造路径：`RuntimeRegistry` 的缺省工厂），各对着各的记录上游：手写的、带
+    // `idoris_upstream` 的伪装卡，和一张真的（不托管的）oMLX 卡。
+    let disguised_upstream = recording_upstream().await;
+    let real_upstream = recording_upstream().await;
+    let router_for = |card: ComponentCard| {
+        let cards = vec![card];
+        let runtimes = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
+            &cards,
+            &BTreeMap::new(),
+            Some(16 * GIB),
+            false,
+        )
+        .unwrap();
+        build_app(AppState {
+            cards,
+            runtimes,
+            ..AppState::default()
+        })
+    };
+    for app in [
+        router_for(disguised_card(&disguised_upstream.uri())),
+        router_for(unmanaged_omlx_card(&real_upstream.uri())),
+    ] {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("X-iDoris-Privacy", "local_only")
+                    .body(Body::from(
+                        json!({"model": "idoris/fast", "messages": [{"role": "user", "content": "hi"}]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = response.into_body().collect().await;
+    }
+
+    // 对照：真的卡收到了金丝雀 key（所以这个环境里的 key 确实会被发出去，下面的断言不是空的）。
+    let real = request_headers(&real_upstream).await;
+    assert!(!real.is_empty());
+    assert!(
+        real.iter()
+            .any(|(_, authorization)| authorization.as_deref()
+                == Some(&format!("Bearer {CANARY_ENV_KEY}"))),
+        "the control card should carry the environment key: {real:?}"
+    );
+    // 伪装卡：生命周期的流程确实去问了它（启动采样、目录），但没有一个请求带 `Authorization`。
+    let disguised = request_headers(&disguised_upstream).await;
+    assert!(!disguised.is_empty(), "the Supervisor did talk to it");
+    for (what, authorization) in &disguised {
+        assert_eq!(*authorization, None, "{what}");
+    }
+}
+
+#[tokio::test]
+async fn h2_after_the_port_changed_hands_the_cached_adapter_sends_nothing_to_whoever_took_it() {
+    if !in_a_child_with_canary_keys(
+        "h2_after_the_port_changed_hands_the_cached_adapter_sends_nothing_to_whoever_took_it",
+    ) {
+        return;
+    }
+    // 接管的外部引擎（有状态的假引擎）：聊天经 Supervisor 与它早就建好的适配器正常工作。
+    let work = tempfile::tempdir().unwrap();
+    let mut external = External::start(work.path(), &stateful());
+    let port = external.port;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let inspector = Scripted::new();
+    inspector.external_listener(port, external.pid(), Some(TEAM));
+    let full = Full::start(rig, inspector.clone()).await;
+    full.wait_open().await;
+    let (status, body) = full.chat().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 外部引擎退出，端口上换了一个冒名者；检查器说监听者是另一个进程（测试进程自己，同一个用户、没有签名团队）。
+    external.kill();
+    inspector.external_listener(port, std::process::id(), None);
+    let impostor = Impostor::on_port(port).await;
+    wait_for("failed, port_in_use", || {
+        let upstream = &full.health.view().upstreams[0];
+        upstream.state == UpstreamState::Failed
+            && upstream.reason == Some(UpstreamReason::PortInUse)
+    })
+    .await;
+    assert_eq!(
+        governed_endpoint(&full.rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
+    // 适配器、Supervisor、Router 都早就建好了：请求在运行期被挡住，冒名者什么都没收到。
+    for _ in 0..3 {
+        let (status, body) = full.chat().await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["reason_code"], "port_in_use", "{body}");
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(impostor.count().await, 0, "not one request reached it");
+    impostor.assert_never_authorized().await;
+}
+
+#[tokio::test]
+async fn h3_an_engine_that_stays_alive_but_gives_the_port_away_never_sends_its_private_key_to_the_new_listener()
+ {
+    if !in_a_child_with_canary_keys(
+        "h3_an_engine_that_stays_alive_but_gives_the_port_away_never_sends_its_private_key_to_the_new_listener",
+    ) {
+        return;
+    }
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let inspector = Scripted::claiming(port);
+    let full = Full::start(rig, inspector.clone()).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    let engine = full.rig.pid(0);
+    let private_key = full.rig.key(0);
+
+    // 引擎放掉端口、但不退出（进程活着）；检查器也不再说它在监听；之后冒名者绑上同一个端口。
+    full.rig.fake.release_port();
+    inspector.lose(port);
+    let impostor = Impostor::on_port(port).await;
+
+    // 管理器的下一个节拍：先收回私有 key（端点封上）、发布 `unavailable` 加 `port_in_use`（数据面 503），不发探测。
+    wait_for("unavailable, port_in_use", || {
+        let upstream = &full.health.view().upstreams[0];
+        upstream.state == UpstreamState::Unavailable
+            && upstream.reason == Some(UpstreamReason::PortInUse)
+    })
+    .await;
+    assert!(pid_alive(engine), "the engine process is still alive");
+    assert_eq!(
+        governed_endpoint(&full.rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
+    let (status, body) = full.chat().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    // 好几个探测间隔（`fast()` 是 100 毫秒一次）：冒名者没收到任何带 key 的请求，更没有引擎的私有 key。
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    impostor.assert_never_authorized().await;
+    for request in impostor.requests().await {
+        assert!(
+            !format!("{:?}", request.headers).contains(&private_key),
+            "the engine's private key reached the new listener"
+        );
+    }
 }

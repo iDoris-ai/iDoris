@@ -1958,18 +1958,13 @@ async fn get_capabilities(State(state): State<Arc<AppState>>) -> Response {
 /// `provider.id`, matching `server.ts`). Delegates to [`models::list_models`];
 /// authentication failures surface as structured upstream errors.
 async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // 此刻没在服务的托管卡不探测（接口规范 §2.7.6，勘误六、勘误七）：它的引擎没起来、被停下了、在重启，或者那个端口上的东西没有
+    // 此刻没在服务的托管卡不探测（接口规范 §2.7.6，勘误六、勘误十）：它的引擎没起来、被停下了、在重启，或者那个端口上的东西没有
     // 通过属主校验、不能给它发 key；探测只会得到错误（一个 401 就会把整个列表变成 502）。别的卡照常列出。
     // 每次请求读此刻的状态，不用完整的 Router 创建时拍下的名单（IDORIS-CORE S6，G1）。
     let cards: Vec<idoris_contracts::ComponentCard> = state
         .cards
         .iter()
-        .filter(|card| {
-            state
-                .health_state
-                .managed_failure(&card.provider.id)
-                .is_none()
-        })
+        .filter(|card| state.health_state.failure_of_card(card).is_none())
         .cloned()
         .collect();
     match models::list_models_with_subscriptions(
@@ -2249,7 +2244,7 @@ fn headroom_breach_confirmed(headers: &HeaderMap) -> bool {
 }
 
 /// 路由到了一个此刻没在服务的托管引擎（降级放行时就没起来的，或者运行期失败、被 Admin 停下、重启中、端口换了主人的；接口规范
-/// §2.7.6 勘误六、勘误七）：不碰引擎，直接 503 `local_only_unavailable`（和别的本地失败同一个 `type`），原因码是该上游在
+/// §2.7.6 勘误六、勘误十）：不碰引擎，直接 503 `local_only_unavailable`（和别的本地失败同一个 `type`），原因码是该上游在
 /// `/health` 里的 `reason`（`engine_not_found`、`budget_zero`、`crash_loop`、`port_in_use`……都是已有的原因码，不新增错误码）；
 /// 没有稳定原因码的失败（例如模型目录取不到、被停下、重启中）沿用这条路径上已有的 `supervisor_unavailable`。这张卡不是
 /// 没在服务的托管卡时返回 `None`。
@@ -2261,9 +2256,8 @@ fn managed_unavailable_response(
     state: &AppState,
     selected: &dispatch::Selected,
 ) -> Option<Response> {
-    let failure = state
-        .health_state
-        .managed_failure(&selected.card.provider.id)?;
+    // 共用这个引擎的卡（伴生卡）继承它的失败：见 [`readiness::HealthState::failure_of_card`]。
+    let failure = state.health_state.failure_of_card(&selected.card)?;
     let reason_code = failure
         .reason
         .map_or("supervisor_unavailable", readiness::UpstreamReason::as_str);

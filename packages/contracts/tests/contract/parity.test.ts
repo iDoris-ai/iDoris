@@ -106,7 +106,7 @@ const validInspect = {
   action: "BLOCK",
 };
 
-// Admin `upstreams` (规范 §2.11.4、勘误七): the element is the `/health.upstreams[]` fields plus Admin-only read facts.
+// Admin `upstreams` (规范 §2.11.4、勘误十): the element is the `/health.upstreams[]` fields plus Admin-only read facts.
 const managedUpstream = {
   id: "omlx", engine_kind: "omlx", state: "ready", managed: true, owned: true,
   port: 19731, pid: 51234, restart_required: false, failure_count: 0,

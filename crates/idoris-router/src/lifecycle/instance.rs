@@ -199,6 +199,9 @@ pub(super) struct Actor {
     redecide_since: Option<Instant>,
     /// 外部引擎的监听者没了（或不合格）：我们封了端点、关了 Supervisor 的门。同一个进程回来时要开回去。
     external_gap: bool,
+    /// 自有引擎活着，但此刻监听这个端口的不是它（放掉了端口，或别的进程占了）：我们收回了它的私有 key（端点封上）。它又拥有
+    /// 端口时要把私有 key 重新登记回去（IDORIS-CORE S6，Codex 审计 H3）。
+    owned_key_revoked: bool,
     /// 等待期间收到、还没有处理的命令。
     pending: Option<Request>,
 }
@@ -230,6 +233,7 @@ impl Actor {
             restart_cover: 0,
             redecide_since: None,
             external_gap: false,
+            owned_key_revoked: false,
             pending: None,
         }
     }
@@ -703,6 +707,10 @@ impl Actor {
             }
             Attempt::Terminal { state, reason } => {
                 self.redecide_since = None;
+                // 默认拒绝：终局的失败之后端点保持封上（Codex 审计 H1）。接管外部引擎时，校验通过的监听者已经被登记成「外部」
+                // （为了带 key 探测它），之后它要 key 而没有、key 被拒、围栏还在……这个上游从此不服务，也没有监督去重新校验端口：
+                // 不能让那个口径一直留着，端口上之后出现的任何东西都按它拿到 `settings.json` 的 key。
+                self.plan.backend.block(&self.plan.endpoint);
                 self.publish_terminal(state, reason);
                 self.finish_op();
                 Step::Idle(Idle::Terminal)
@@ -1176,21 +1184,20 @@ impl Actor {
         let recipe = owned.engine.instance().recipe().clone();
         let deadline = Instant::now() + t.startup_timeout;
         let mut interval = t.ready_initial_interval;
-        let mut listener_confirmed = false;
         let mut rejections = 0_u32;
         loop {
             // 读不出来（`Err`）不当作退出，下一轮再看。
             if let Ok(false) = owned.engine.is_running().await {
                 return Err(WaitFailure::Exited);
             }
-            if !listener_confirmed {
-                listener_confirmed = matches!(
-                    inspector
-                        .listens_on(owned.engine.pid(), owned.engine.port())
-                        .await,
-                    Ok(true)
-                );
-            }
+            // **每一次**带私有 key 的探测之前都重新确认监听这个端口的是这个进程，不缓存（Codex 审计 H3）：进程活着不等于端口还是
+            // 它的，引擎可以放掉端口而不退出，别的东西接着绑上来；之前确认过一次，不能让之后每一次探测都带着 key 出去。
+            let listener_confirmed = matches!(
+                inspector
+                    .listens_on(owned.engine.pid(), owned.engine.port())
+                    .await,
+                Ok(true)
+            );
             if listener_confirmed {
                 let key = owned.key.as_ref().map(EngineKey::expose);
                 match self.probe(&recipe, key).await {
@@ -1235,6 +1242,7 @@ impl Actor {
         if let Some(key) = &owned.key {
             self.plan.backend.govern_private(&self.plan.endpoint, key);
         }
+        self.owned_key_revoked = false;
         self.engine = Some(owned);
         Attempt::Ready
     }
@@ -1438,6 +1446,22 @@ impl Actor {
         if let Ok(false) = running {
             return Some(self.owned_engine_exited().await);
         }
+        // 进程活着不等于端口还是它的（Codex 审计 H3）：引擎可以放掉端口而不退出，别的进程接着绑上来。**每个节拍**重新确认一次
+        // 监听这个端口的此刻还是我们的进程（不缓存）；确认不了，先收回私有 key（端点封上）、发布 `unavailable`（`port_in_use`，数据
+        // 面立刻 503），这一轮不发探测：发往那个端口的请求不再带私有 key。又确认了，把私有 key 登记回去，接着往下探测。
+        if !self.owned_listener_confirmed().await {
+            self.revoke_owned_key();
+            self.publish(UpstreamState::Unavailable, Some(UpstreamReason::PortInUse));
+            return None;
+        }
+        if self.owned_key_revoked {
+            if let Some(owned) = self.engine.as_ref()
+                && let Some(key) = owned.key.as_ref()
+            {
+                self.plan.backend.govern_private(&self.plan.endpoint, key);
+            }
+            self.owned_key_revoked = false;
+        }
         if !probe_due {
             return None;
         }
@@ -1469,6 +1493,37 @@ impl Actor {
         };
         self.publish(state, reason);
         None
+    }
+
+    /// 自有引擎此刻还拥有它的端口吗：监听这个端口的就是它的进程（进程本身还在，由调用方先问过 `is_running`；认回的孤儿那一问还
+    /// 核对了身份）。**每一次**发带私有 key 的请求之前都要重新问，不缓存。检查器读不出来（`lsof` 没答上来）按
+    /// `unverifiable_retries` 重读，仍读不出来就当作没有确认：宁可不发。
+    async fn owned_listener_confirmed(&self) -> bool {
+        let Some(owned) = self.engine.as_ref() else {
+            return false;
+        };
+        let (pid, port) = (owned.engine.pid(), owned.engine.port());
+        let inspector = self.shared.config.inspector.clone();
+        let mut unreadable = 0;
+        loop {
+            match inspector.listens_on(pid, port).await {
+                Ok(listening) => return listening,
+                Err(_) if unreadable < self.timings().unverifiable_retries => {
+                    unreadable += 1;
+                    tokio::time::sleep(self.timings().unverifiable_pause).await;
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// 收回自有引擎的私有 key：端点封上，之后什么凭证都不发（回退链不适用），旧一代还在飞的操作也拿不到任何东西。
+    fn revoke_owned_key(&mut self) {
+        if !self.owned_key_revoked {
+            self.log("自有引擎还活着，但此刻监听这个端口的不是它：收回私有 key，端点封上");
+        }
+        self.plan.backend.block(&self.plan.endpoint);
+        self.owned_key_revoked = true;
     }
 
     /// 自有引擎的进程退出了。门控完成之前：计入熔断窗口，退避重启。门控完成之后：Supervisor 的账本已经过期，

@@ -1,5 +1,5 @@
 //! `GET /admin/api/v1/upstreams` 与受限写接口 `POST /admin/api/v1/upstreams/{id}/start|stop|restart`
-//! （接口规范 §2.11.4 与勘误七；IDORIS-CORE S6）。
+//! （接口规范 §2.11.4 与勘误十；IDORIS-CORE S6）。
 //!
 //! # 读
 //!

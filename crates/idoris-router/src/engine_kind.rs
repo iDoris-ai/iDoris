@@ -229,9 +229,20 @@ pub fn engine_identity(card: &ComponentCard) -> Result<EngineIdentity, EngineKin
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// The card-eligibility predicate for oMLX keys lives in `idoris-upstream` (the proxy and the adapter factory share
+    /// it) and names the same extension this module does; the two strings cannot drift apart.
+    #[test]
+    fn the_upstream_extension_name_is_the_one_the_key_predicate_uses() {
+        assert_eq!(
+            super::UPSTREAM_EXTENSION,
+            idoris_upstream::omlx::key::UPSTREAM_EXTENSION
+        );
+    }
     use serde_json::json;
 
     fn card(version_pin: &str, extensions: Option<serde_json::Value>) -> ComponentCard {

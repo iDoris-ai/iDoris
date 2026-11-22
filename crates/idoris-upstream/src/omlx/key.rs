@@ -65,6 +65,45 @@ pub fn is_loopback_base_url(base_url: &str) -> bool {
         })
 }
 
+/// 卡声明自己是自定义 OpenAI 兼容上游的扩展名（`setup upstream` 的卡必带）。与 `idoris-router` 的
+/// `engine_kind::UPSTREAM_EXTENSION` 是同一个字符串（router 的测试钉住两处一致）。
+pub const UPSTREAM_EXTENSION: &str = "idoris_upstream";
+
+/// 这张卡能不能带 oMLX 的 key（IDORIS-CORE S6，Codex 审计 H2）。**代理、模型列表、就绪探测、预热与生命周期适配器的工厂共用这
+/// 一处判断**，所以没有哪一条路径会对一张手写的、伪装成 oMLX 的卡发 key。
+///
+/// 规则按卡识别：本地族、loopback、`version_pin` 的产品名是 `omlx`、端点是不带凭据的 loopback 主机，**且卡不带
+/// `extensions.idoris_upstream`**。`omlx` 与伴生卡 `omlx-embed` 都满足；自定义 OpenAI 兼容上游（`setup upstream` 的卡必带
+/// `idoris_upstream`）即使把 `flavor`、`version_pin` 写成 oMLX、端口写成 oMLX 的，也不带 key。key 的来源不在这里（见本模块
+/// 的其余部分）。
+pub fn card_may_carry_omlx_key(card: &idoris_contracts::ComponentCard) -> bool {
+    if card.provider.family != idoris_contracts::provider::Family::Local
+        || card.provider.locality != idoris_contracts::provider::Locality::Loopback
+        || !card.version_pin.starts_with("omlx@")
+        || card
+            .extensions
+            .as_ref()
+            .is_some_and(|ext| ext.contains_key(UPSTREAM_EXTENSION))
+    {
+        return false;
+    }
+    let Ok(url) = reqwest::Url::parse(&card.endpoint) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+}
+
 /// 当前进程环境下、发往 `base_url` 的 key（UTF-8）。引擎管理器接管的端点按它登记的口径（[`EndpointKey`]）。
 pub fn resolve_omlx_api_key_for(base_url: &str) -> Option<String> {
     resolve_omlx_api_key_os_for(base_url)?.into_string().ok()

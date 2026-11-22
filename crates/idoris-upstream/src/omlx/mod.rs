@@ -265,7 +265,17 @@ impl OmlxAdapter {
     /// [`OmlxAdapterConfig`] keeps its fixed key unless this is called.
     pub fn with_per_request_key(mut self) -> Self {
         self.per_request_key = true;
+        // Cache no key (IDORIS-CORE S6, Codex audit H2): the adapter reads the endpoint's current authorization, and
+        // its generation, right before each send. A key string read at construction is the old engine's the moment
+        // the engine is replaced, and must not even be held.
+        self.api_key = None;
         self
+    }
+
+    /// Test-only: the key string this adapter holds (always `None` in per-request mode).
+    #[cfg(test)]
+    fn held_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
     }
 
     /// The credential for the request about to be made — the **one place** this adapter resolves one.
@@ -752,6 +762,28 @@ mod tests {
         assert_ne!(after_release.as_deref(), Some("Bearer second-engine"));
         assert_ne!(after_release.as_deref(), Some("Bearer first-engine"));
         assert_ne!(after_release.as_deref(), Some("Bearer constructed"));
+    }
+
+    /// IDORIS-CORE S6 (Codex audit H2b): a per-request adapter holds no key at all, whatever it was constructed with
+    /// (a string read at construction is the old engine's after a restart); a fixed adapter keeps its key.
+    #[tokio::test]
+    async fn a_per_request_adapter_holds_no_key_string() {
+        let config = || OmlxAdapterConfig {
+            base_url: "http://127.0.0.1:1".to_owned(),
+            api_key: Some("read-at-construction".to_owned()),
+            call_timeout: Duration::from_millis(500),
+        };
+        assert_eq!(
+            OmlxAdapter::new(config())
+                .unwrap()
+                .with_per_request_key()
+                .held_key(),
+            None
+        );
+        assert_eq!(
+            OmlxAdapter::new(config()).unwrap().held_key(),
+            Some("read-at-construction")
+        );
     }
 
     /// The registry's verdict decides on every request, in both directions: an external engine whose listener
