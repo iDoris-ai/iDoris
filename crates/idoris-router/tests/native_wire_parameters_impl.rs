@@ -1,4 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -60,7 +63,11 @@ async fn check(field: &str, value: Value) {
         .unwrap(),
     );
     let app = build_app(AppState {
-        runtimes: Some(BoundSupervisor::spawn_omlx(&card).unwrap()).into(),
+        runtimes: Some(
+            BoundSupervisor::spawn_omlx_in_state_dir(&card, &state_isolation::fresh_state_dir())
+                .unwrap(),
+        )
+        .into(),
         cards: vec![card],
         ..AppState::default()
     });
@@ -159,7 +166,11 @@ async fn native_app_with_memory(upstream: &MockServer, estimated_size: u64) -> a
         .unwrap(),
     );
     build_app(AppState {
-        runtimes: Some(BoundSupervisor::spawn_omlx(&card).unwrap()).into(),
+        runtimes: Some(
+            BoundSupervisor::spawn_omlx_in_state_dir(&card, &state_isolation::fresh_state_dir())
+                .unwrap(),
+        )
+        .into(),
         cards: vec![card],
         ..AppState::default()
     })
@@ -351,7 +362,11 @@ async fn parameters_cannot_bypass_spend_admission() {
         .configure_tenant("personal", 1, "UTC", SpendGate::PaidOnly)
         .unwrap();
     let app = build_app(AppState {
-        runtimes: Some(BoundSupervisor::spawn_omlx(&card).unwrap()).into(),
+        runtimes: Some(
+            BoundSupervisor::spawn_omlx_in_state_dir(&card, &state_isolation::fresh_state_dir())
+                .unwrap(),
+        )
+        .into(),
         cards: vec![card],
         budget_ledger: Some(std::sync::Arc::new(ledger)),
         ..AppState::default()

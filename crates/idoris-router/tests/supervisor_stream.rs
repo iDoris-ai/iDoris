@@ -3,6 +3,9 @@
 #[path = "../src/supervisor_stream.rs"]
 mod supervisor_stream;
 
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use idoris_contracts::ComponentCard;
@@ -59,7 +62,11 @@ fn supervisor_stream_validator_accepts_only_false_or_absent() {
 #[tokio::test]
 async fn stream_true_is_400_before_any_omlx_request() {
     let upstream = MockServer::start().await;
-    let supervisor = BoundSupervisor::spawn_omlx(&card(&upstream.uri())).unwrap();
+    let supervisor = BoundSupervisor::spawn_omlx_in_state_dir(
+        &card(&upstream.uri()),
+        &state_isolation::fresh_state_dir(),
+    )
+    .unwrap();
     let app = build_app(AppState {
         cards: vec![card(&upstream.uri())],
         runtimes: Some(supervisor).into(),
@@ -135,7 +142,11 @@ async fn stream_false_uses_buffered_omlx_completion() {
         })))
         .mount(&upstream)
         .await;
-    let supervisor = BoundSupervisor::spawn_omlx(&card(&upstream.uri())).unwrap();
+    let supervisor = BoundSupervisor::spawn_omlx_in_state_dir(
+        &card(&upstream.uri()),
+        &state_isolation::fresh_state_dir(),
+    )
+    .unwrap();
     let app = build_app(AppState {
         cards: vec![card(&upstream.uri())],
         runtimes: Some(supervisor).into(),

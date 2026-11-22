@@ -68,12 +68,35 @@ impl BoundSupervisor {
         self.handle.is_ready(model_id).await
     }
 
-    /// Constructs the adapter from the same card used for the binding.
+    /// Constructs the adapter from the same card used for the binding. The load fence lives under the state
+    /// directory resolved from `IDORIS_STATE_DIR` / `HOME`; tests use [`Self::spawn_omlx_in_state_dir`].
     pub fn spawn_omlx(card: &ComponentCard) -> Result<Self, String> {
-        let adapter = idoris_upstream::OmlxAdapter::new(
+        Self::spawn_omlx_with(card, None)
+    }
+
+    /// [`Self::spawn_omlx`] with an explicit state directory: the load fence is
+    /// `idoris_upstream::omlx::load_fence_path_in(state_dir, <card endpoint>)`, so nothing is read from or written
+    /// under the real user state directory (an in-process caller cannot change the process environment).
+    pub fn spawn_omlx_in_state_dir(
+        card: &ComponentCard,
+        state_dir: &std::path::Path,
+    ) -> Result<Self, String> {
+        Self::spawn_omlx_with(card, Some(state_dir))
+    }
+
+    fn spawn_omlx_with(
+        card: &ComponentCard,
+        state_dir: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
+        let mut adapter = idoris_upstream::OmlxAdapter::new(
             idoris_upstream::OmlxAdapterConfig::for_base_url(card.endpoint.clone()),
         )
         .map_err(|err| format!("无法构造 oMLX 适配器（{}）：{err}", card.provider.id))?;
+        if let Some(state_dir) = state_dir {
+            let fence = idoris_upstream::omlx::load_fence_path_in(state_dir, &card.endpoint)
+                .map_err(|err| format!("无法确定加载围栏路径（{}）：{err}", card.provider.id))?;
+            adapter = adapter.with_load_fence_path(fence);
+        }
         let handle = idoris_backend::Supervisor::spawn(
             std::sync::Arc::new(adapter),
             idoris_backend::SupervisorConfig::default(),
