@@ -27,6 +27,17 @@ use nix::unistd::Pid;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
+/// Upper bound that only exists to stop a genuinely hung test. Every wait below
+/// is event/condition driven and returns as soon as its condition holds, so a
+/// generous value costs nothing on success; a tight one turns host CPU load
+/// (the whole process stalls for seconds under a loaded workspace test run)
+/// into false failures.
+const WAIT_GUARD: Duration = Duration::from_secs(60);
+/// SIGTERM->SIGKILL grace handed to the relay. Too small a value lets a loaded
+/// host miss the post-KILL "group gone" window and the relay reports
+/// CleanupFailed instead of reaping (workspace then intentionally kept).
+const TEST_GRACE: Duration = Duration::from_secs(5);
+
 #[derive(Clone)]
 struct HarnessState {
     service: SubscriptionService,
@@ -136,9 +147,9 @@ fn service(fake: &FakeBin) -> SubscriptionService {
         SandboxProfile::fixed(SubscriptionCli::Claude),
         fake.env(),
     );
-    config.process_timeout = Duration::from_secs(30);
-    config.termination_grace = Duration::from_millis(100);
-    SubscriptionService::new(SubscriptionRelay::new(config), Duration::from_secs(3))
+    config.process_timeout = Duration::from_secs(300);
+    config.termination_grace = TEST_GRACE;
+    SubscriptionService::new(SubscriptionRelay::new(config), WAIT_GUARD)
 }
 
 struct Server {
@@ -183,7 +194,7 @@ async fn send_request(stream: &mut tokio::net::TcpStream, body: &str) {
 }
 
 async fn read_response(stream: &mut tokio::net::TcpStream) -> String {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(WAIT_GUARD, async {
         let mut response = Vec::new();
         loop {
             if let Some(header_end) = response
@@ -226,7 +237,7 @@ struct Marker {
 }
 
 async fn wait_marker(path: &Path) -> Marker {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(WAIT_GUARD, async {
         loop {
             if let Ok(text) = fs::read_to_string(path) {
                 let mut parent_group = None;
@@ -263,7 +274,7 @@ fn group_is_alive(group: i32) -> bool {
 }
 
 async fn wait_clean(marker: &Marker) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(WAIT_GUARD, async {
         loop {
             if !group_is_alive(marker.parent_group) && !marker.workspace.exists() {
                 return;

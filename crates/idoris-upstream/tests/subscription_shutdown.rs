@@ -15,6 +15,13 @@ use nix::sys::signal::killpg;
 use nix::unistd::Pid;
 use tokio_util::sync::CancellationToken;
 
+/// Hung-test guard only: waits return as soon as their condition holds. Tight
+/// wall-clock values made these tests fail whenever the host was CPU-starved.
+const WAIT_GUARD: Duration = Duration::from_secs(60);
+/// SIGTERM->SIGKILL grace; large enough that a loaded host still completes the
+/// post-KILL group-gone check instead of reporting CleanupFailed.
+const TEST_GRACE: Duration = Duration::from_secs(5);
+
 struct FakeBin {
     dir: tempfile::TempDir,
     markers: tempfile::TempDir,
@@ -59,7 +66,7 @@ while :; do sleep 1; done
     }
 
     async fn groups(&self, count: usize) -> Vec<i32> {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(WAIT_GUARD, async {
             loop {
                 let mut groups = fs::read_dir(self.markers.path())
                     .unwrap()
@@ -85,9 +92,9 @@ fn service(fake: &FakeBin) -> SubscriptionService {
         SandboxProfile::fixed(SubscriptionCli::Claude),
         fake.env(),
     );
-    config.process_timeout = Duration::from_secs(30);
-    config.termination_grace = Duration::from_millis(100);
-    SubscriptionService::new(SubscriptionRelay::new(config), Duration::from_secs(3))
+    config.process_timeout = Duration::from_secs(300);
+    config.termination_grace = TEST_GRACE;
+    SubscriptionService::new(SubscriptionRelay::new(config), WAIT_GUARD)
 }
 
 fn request(id: &str) -> ChatRequest {
