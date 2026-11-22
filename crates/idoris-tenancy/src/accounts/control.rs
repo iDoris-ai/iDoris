@@ -57,9 +57,10 @@ use super::pairing::{
     MAX_ACTIVE_DEVICES_PER_MEMBERSHIP, PairingRow, occupied_device_slots, resolve_pairing_caller,
 };
 use super::rows::{
-    AllocationRecord, load_account, load_allocation_record, load_ancestors, load_credential,
-    load_membership, load_membership_within, load_memberships_of, load_platform_roots,
-    load_principal, merge_chains,
+    AllocationRecord, load_account, load_allocation_record, load_allocation_record_within,
+    load_ancestors, load_credential, load_credential_within, load_membership,
+    load_membership_within, load_memberships_of, load_platform_roots, load_principal, merge_chains,
+    principal_within_roots,
 };
 use super::store::{
     AccountStore, AllocationOutcome, check_new_membership_in, create_account_in,
@@ -773,7 +774,13 @@ pub(super) fn authorize_op(
         anchors.push(anchor);
     }
     let dir = slice_directory(conn, &anchors, &[], Vec::new())?;
-    authorize(&dir, credential, now, op, target, amount).map_err(Failure::new)?;
+    // 契约的 `authorize` 对存在的目标先判金额是不是负数（`invalid_amount`），对不存在的目标先判 `out_of_scope`：带负金额的请求能把
+    // 「目标账户存在」和「不存在」区分开。范围先用不小于 0 的金额判，负数留到范围判过之后再拒。
+    let ranged = amount.map(|amount| Money::new(amount.unit.clone(), amount.micros.max(0)));
+    authorize(&dir, credential, now, op, target, ranged.as_ref()).map_err(Failure::new)?;
+    if amount.is_some_and(|amount| amount.micros < 0) {
+        return Err(Failure::new(ControlReason::InvalidAmount));
+    }
     Ok(Some(dir))
 }
 
@@ -977,6 +984,13 @@ impl AccountStore {
                 &request.org,
                 None,
             )?;
+            // 主体 id 是全局的假名：调用者管不到的已有主体（登记它的组织或它的某个成员关系在调用者的范围之外）和不存在的主体
+            // 一样先按「读不到」处理，数据库执行同样的语句（一条探针），不再先读出整个足迹再去逐个授权
+            if let Some(roots) = manageable_roots(caller, ControlOp::RevokePrincipal)
+                && !principal_within_roots(conn, &request.principal, &roots)?
+            {
+                return Err(out_of_scope());
+            }
             let Some(principal) = load_principal(conn, &request.principal)? else {
                 return Err(out_of_scope());
             };
@@ -1204,29 +1218,89 @@ pub(super) fn authority_is_visible<T>(result: Result<T, Failure>) -> Result<bool
     }
 }
 
-/// 成员关系 `id`，读的时候限定在调用者对 `manage_membership` 管得到的范围里：管不到的和不存在的一样返回 `None`
-/// （一条语句，见 [`load_membership_within`]）。本机运维管得到全部；凭证管得到的范围是它身上 `manage_membership` 权限的子树
-/// （带额度上限的权限不算：契约的 `scope_covers` 对没有额度的请求不认带上限的授权。签发时已经拒绝带上限的 `manage_membership`
-/// 范围，这里照同一口径再滤一次，让这个读和授权判定保持一致，将来放宽签发校验时可见范围仍与授权判定同步）；配对码身份没有任何授权。
+/// 调用者对 `op` 管得到的那些子树的根：凭证身上这个操作的每一条权限的子树。本机运维不受授权约束，是 `None`（读的时候不加限定）；
+/// 配对码身份没有任何授权，是空范围。
+///
+/// 带额度上限的权限对 `grant_allocation` 才有意义，签发时就拒绝别的操作带上限；别的操作照契约 `scope_covers` 的口径再滤一次
+/// （没有金额的请求不认带上限的权限），让「管得到」和授权判定保持一致，将来放宽签发校验时也同步。`grant_allocation` 的「管得到」
+/// 不看上限：上限不够时是 `amount_exceeds_authority`，这个回答涉及的是调用者自己范围里的额度。
+pub(super) fn manageable_roots(caller: &Caller, op: ControlOp) -> Option<Vec<AccountId>> {
+    match &caller.identity {
+        Identity::Operator => None,
+        Identity::Credential { credential, .. } => Some(
+            credential
+                .admin_scopes()
+                .iter()
+                .filter(|scope| {
+                    scope.op == op
+                        && (op == ControlOp::GrantAllocation || scope.max_amount.is_none())
+                })
+                .map(|scope| scope.subtree.clone())
+                .collect(),
+        ),
+        Identity::PairingCode(_) => Some(Vec::new()),
+    }
+}
+
+/// 成员关系 `id`，读的时候限定在调用者对 `op` 管得到的范围里：管不到的和不存在的一样返回 `None`（一条探针语句，见
+/// [`manageable_roots`]、[`load_membership_within`]）。
 ///
 /// 管得到的成员关系，行为和以前的「读出来再授权」完全一样；管不到的不再被读出来，所以后面没有已有 id 独有的授权查询
 /// （issue #603 N7 残余，Codex 预审 H1 / M3）。
-fn load_manageable_membership(
+pub(super) fn load_manageable_membership(
     conn: &Connection,
     caller: &Caller,
+    op: ControlOp,
     id: &MembershipId,
 ) -> Result<Option<Membership>, Failure> {
-    let roots: Vec<AccountId> = match &caller.identity {
-        Identity::Operator => return Ok(load_membership(conn, id)?),
-        Identity::Credential { credential, .. } => credential
-            .admin_scopes()
-            .iter()
-            .filter(|scope| scope.op == ControlOp::ManageMembership && scope.max_amount.is_none())
-            .map(|scope| scope.subtree.clone())
-            .collect(),
-        Identity::PairingCode(_) => Vec::new(),
-    };
-    Ok(load_membership_within(conn, id, &roots)?)
+    Ok(match manageable_roots(caller, op) {
+        None => load_membership(conn, id)?,
+        Some(roots) => load_membership_within(conn, id, &roots)?,
+    })
+}
+
+/// 凭证 `id`，读的时候限定在它绑定的账户落在调用者对 `op` 管得到的范围里（和 [`load_manageable_membership`] 同一个用意）。
+fn load_manageable_credential(
+    conn: &Connection,
+    caller: &Caller,
+    op: ControlOp,
+    id: &CredentialId,
+) -> Result<Option<Credential>, Failure> {
+    Ok(match manageable_roots(caller, op) {
+        None => load_credential(conn, id)?,
+        Some(roots) => load_credential_within(conn, id, &roots)?,
+    })
+}
+
+/// 额度 `id`（不管有没有被撤销），读的时候限定在授权方（父）账户落在调用者对 `grant_allocation` 管得到的范围里。
+fn load_manageable_allocation(
+    conn: &Connection,
+    caller: &Caller,
+    id: &AllocationId,
+) -> Result<Option<AllocationRecord>, Failure> {
+    Ok(match manageable_roots(caller, ControlOp::GrantAllocation) {
+        None => load_allocation_record(conn, id)?,
+        Some(roots) => load_allocation_record_within(conn, id, &roots)?,
+    })
+}
+
+/// 签发凭证时绑定对应的账户：`Service` / `Node` 是绑定的账户，`Member` 是成员关系的付款账户，成员关系读的时候限定在调用者对 `op`
+/// 管得到的范围里（管不到的和不存在的一样是 `None`）。
+fn manageable_binding_anchor(
+    conn: &Connection,
+    caller: &Caller,
+    op: ControlOp,
+    binding: &CredentialBinding,
+) -> Result<Option<AccountId>, Failure> {
+    match binding {
+        CredentialBinding::Service { account } | CredentialBinding::Node { account } => {
+            Ok(Some(account.clone()))
+        }
+        CredentialBinding::Member { membership } => {
+            Ok(load_manageable_membership(conn, caller, op, membership)?
+                .and_then(|found| found.account))
+        }
+    }
 }
 
 /// 调用者有没有资格知道这个主体现在是什么状态。
@@ -1376,7 +1450,12 @@ impl AccountStore {
             // 已有的成员关系读的时候限定在调用者管得到的范围里（一条语句里按子树过滤，见 `load_manageable_membership`）：管不到的和
             // 不存在的一样得到空结果，这个 id 对调用者按「不存在」走，既不泄露它存在，也不让「读到之后再去做授权」多出一串已有 id
             // 独有的查询（数据库工作量和响应时间都会把两种 id 区分开，Codex 预审 M3）。replayed / already_exists 留给管得到它的人。
-            if let Some(existing) = load_manageable_membership(conn, caller, &membership.id)? {
+            if let Some(existing) = load_manageable_membership(
+                conn,
+                caller,
+                ControlOp::ManageMembership,
+                &membership.id,
+            )? {
                 return if existing == *membership {
                     Ok(Written {
                         result: WriteResult::Replayed,
@@ -1439,7 +1518,13 @@ impl AccountStore {
         self.control_write(who, meta, spec, |conn, caller, spec| {
             // 先做与目标无关的授权判定，再按 id 去查（见 `require_op_capability`）
             require_op_capability(conn, caller, meta.now, ControlOp::ManageMembership)?;
-            let Some(found) = load_membership(conn, &request.membership)? else {
+            let Some(found) = load_manageable_membership(
+                conn,
+                caller,
+                ControlOp::ManageMembership,
+                &request.membership,
+            )?
+            else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
             authorize_op(
@@ -1639,8 +1724,13 @@ impl AccountStore {
             // 被冻结的调用者，对已有的和不存在的成员关系得到同一个答案，没法靠错误码探测别的组织有哪些成员关系 id（issue #603 N7 同类）
             require_op_capability(conn, caller, meta.now, ControlOp::IssueCredential)?;
             // 目标账户 = 新凭证的绑定账户。绑定的成员关系不存在，和「不在范围内」是同一个答案。
-            let anchor = binding_anchor(conn, &request.binding)?
-                .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;
+            let anchor = manageable_binding_anchor(
+                conn,
+                caller,
+                ControlOp::IssueCredential,
+                &request.binding,
+            )?
+            .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;
             // **先授权、后校验**：没有资格的调用者永远得到授权类的答案，不会因为请求体写得不对而得到另一种答案。
             authorize_op(
                 conn,
@@ -1754,7 +1844,8 @@ impl AccountStore {
         self.control_write(who, meta, spec, |conn, caller, spec| {
             // 先做与目标无关的授权判定，再按 id 去查（见 `require_op_capability`）
             require_op_capability(conn, caller, meta.now, op)?;
-            let Some(found) = load_credential(conn, &request.credential)? else {
+            let Some(found) = load_manageable_credential(conn, caller, op, &request.credential)?
+            else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
             let anchor = binding_anchor(conn, found.binding())?
@@ -1979,7 +2070,7 @@ impl AccountStore {
         self.control_write(who, meta, spec, |conn, caller, spec| {
             // 先做与目标无关的授权判定，再按 id 去查（见 `require_op_capability`）
             require_op_capability(conn, caller, meta.now, ControlOp::GrantAllocation)?;
-            let Some(record) = load_allocation_record(conn, &request.id)? else {
+            let Some(record) = load_manageable_allocation(conn, caller, &request.id)? else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
             authorize_op(

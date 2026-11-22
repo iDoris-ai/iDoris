@@ -14,7 +14,8 @@ use idoris_compute_contracts::reason::ReasonCode;
 use idoris_contracts::common::PrivacyClass;
 
 use super::control_tests::{
-    AuditEntry, DAY_MS, Env, Issue, Minted, T0, aid, all_ops, cid, failure_reason, mid, pid,
+    AuditEntry, DAY_MS, Env, Issue, Minted, T0, aid, all_ops,
+    assert_hidden_costs_what_missing_costs, call, cid, failure_reason, mid, narrow_for, pid,
     reader_wider_than_its_writer, sc, ts,
 };
 use super::{
@@ -1783,4 +1784,77 @@ fn a_credential_with_admin_scopes_is_also_a_data_plane_credential_and_its_scopes
         raw.execute("UPDATE credentials SET scope_count = scope_count + 1", [])
             .is_err()
     );
+}
+
+/// 按 id 查目标的写操作（Codex 预审 M3 的泛化）：创建配对码时，调用者管不到的已有成员关系和不存在的成员关系，数据库执行的语句一模一样。
+#[test]
+fn creating_a_pairing_code_for_a_hidden_or_missing_membership_runs_the_same_statements() {
+    let (env, _service) = setup();
+    let narrow = narrow_for(&env, ControlOp::IssueCredential);
+    let who = narrow.who();
+    assert_hidden_costs_what_missing_costs(
+        &env,
+        "create_pairing_code",
+        |membership| {
+            call(&env, T0 + 1, |meta| {
+                env.store.control_create_pairing_code(
+                    &who,
+                    meta,
+                    &create_request(&new_code("hid"), membership, TTL),
+                )
+            })
+        },
+        &["m-kid2", "m-kb1"],
+        "m-ghost",
+    );
+    // 管得到的成员关系（付款账户在 teacher 子树里）照常创建
+    create_code(&env, &who, &new_code("vis"), "m-kid1", T0 + 2);
+}
+
+/// 撤销配对码时，调用者管不到的已有码（别的成员关系的、别的组织的）和不存在的码，数据库执行的语句一模一样。
+#[test]
+fn revoking_a_hidden_or_missing_pairing_code_runs_the_same_statements() {
+    let (env, service) = setup();
+    let sibling = new_code("sibling");
+    create_code(&env, &service.who(), &sibling, "m-kid2", T0);
+    let school_b = env.issue_as_operator(Issue::service(
+        "school-b",
+        vec![sc(ControlOp::IssueCredential, "school-b", None)],
+    ));
+    let foreign = new_code("foreign");
+    create_code(&env, &school_b.who(), &foreign, "m-kb1", T0);
+    let narrow = narrow_for(&env, ControlOp::IssueCredential);
+    let who = narrow.who();
+    assert_hidden_costs_what_missing_costs(
+        &env,
+        "revoke_pairing_code",
+        |pairing_id| {
+            call(&env, T0 + 1, |meta| {
+                env.store.control_revoke_pairing_code(
+                    &who,
+                    meta,
+                    &RevokePairingCode {
+                        pairing_id: pairing_id.to_string(),
+                    },
+                )
+            })
+        },
+        &[sibling.pairing_id.as_str(), foreign.pairing_id.as_str()],
+        "pc_nope",
+    );
+    // 管得到的码（成员关系的付款账户在 teacher 子树里）照常撤销
+    let visible = new_code("visible");
+    create_code(&env, &who, &visible, "m-kid1", T0 + 2);
+    let rid = env.rid();
+    let revoked = env
+        .store
+        .control_revoke_pairing_code(
+            &who,
+            &env.meta(T0 + 3, &rid),
+            &RevokePairingCode {
+                pairing_id: visible.pairing_id.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(revoked.value.status, PairingStatus::Revoked);
 }
