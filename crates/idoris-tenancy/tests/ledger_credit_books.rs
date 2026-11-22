@@ -1556,13 +1556,14 @@ fn concurrent_admissions_never_exceed_allowance_plus_credit_line() {
 }
 
 // ------------------------------------------------------------------------------------------
-// 对照：有充值的账户行为不变
+// 有充值的账户（issue #601）：第五轮留着不动的对照，现在也按方案 C 记账
 // ------------------------------------------------------------------------------------------
 
 #[test]
-fn an_account_with_funds_is_unchanged_by_separate_books() {
-    // 有充值的账户：余额 = 充值 - 全期已花，本来就带着欠下的钱，新额度不会重置它，也不是花费的来源（可用额 = 余额与额度剩余里较小的）。
-    // 这条对照在「分开记」落地前后必须逐字一样。
+fn an_account_with_funds_keeps_its_old_debt_apart_from_a_new_allowance() {
+    // 第五轮这里是一条「有充值的账户行为不变」的对照：余额 = 充值 - 全期已花，带着欠下的钱，新额度不是花费的来源（可用额 = 余额与
+    // 额度剩余里较小的），余额 -100 时新额度 100 一分也花不出去。issue #601 把方案 C 延伸到有充值的账户（S3-22）：同样的历史，
+    // 新额度照常可花，不抵旧债，授信仍是占满的。（范围、顺序、告警、并发的场景在 `ledger_credit_books_funded.rs`。）
     let db = TempDb::new("books-funded-control");
     let store = credit_only_world(&db);
     store
@@ -1572,30 +1573,37 @@ fn an_account_with_funds_is_unchanged_by_separate_books() {
     for (request, at) in [("r-1", T0 + 1_000), ("r-2", T0 + 2_000)] {
         assert!(spend(&store, request, at, M100).is_admitted(), "{request}");
     }
-    assert_eq!(view(&store, T0 + 3_000).balance, Some(thb(-100)));
+    assert_eq!(
+        view(&store, T0 + 3_000).balance,
+        Some(thb(-100)),
+        "还没有任何额度：S0 自己的余额，没变"
+    );
 
     let later = T0 + 10_000;
     prepaid(&store, "emp-prepaid-1", 100, later, later + 30 * DAY, later);
     let v = view(&store, later + 1);
+    assert_eq!(v.balance, None, "自有资金并进了净头寸");
     assert_eq!(
-        v.balance,
-        Some(thb(-100)),
-        "全期求和：不会因为新额度窗口而重置"
+        v.ceiling_remaining,
+        Some(thb(0)),
+        "额度 100，旧债 100 仍占满授信 100：净头寸 0，不是旧代码的 -100"
     );
-    assert_eq!(v.ceiling_remaining, Some(thb(100)), "额度窗口自 later 起");
     assert_eq!(v.credit_limit, thb(100));
-    let blocked = admit_with_ladder(&store, "cred-e", "r-3", M30, later + 1_000);
+    // 新额度 100 照常可花（30 + 70），授信一分没动
+    assert!(spend(&store, "r-3", later + 1_000, M30).is_admitted());
+    assert!(spend(&store, "r-4", later + 2_000, 30).is_admitted());
+    let blocked = admit_with_ladder(&store, "cred-e", "r-5", M30, later + 3_000);
     assert_eq!(
         denied(&blocked),
         Some(ReasonCode::BudgetExhausted),
-        "可用额 = min(余额 -100, 额度 100) = -100，加授信 100 = 0：{blocked:?}"
+        "额度 100 花完了，授信仍被旧债占满：{blocked:?}"
     );
     assert_eq!(
         scalar(
             &db,
             "SELECT COALESCE(SUM(spent_micros), 0) FROM ledger_entries WHERE account_id = 'emp'"
         ),
-        200
+        300
     );
     assert_clean(&store);
 }

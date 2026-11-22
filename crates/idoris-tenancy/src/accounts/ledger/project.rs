@@ -4,8 +4,8 @@
 //!
 //! | `AncestorView` 的字段 | 怎么得到 |
 //! |---|---|
-//! | `balance`（自有资金） | 有充值分录才有：`Σ funds − Σ (held + spent)`（所有时间）。没有充值过 = `None` |
-//! | `ceiling_remaining`（授权额度剩余） | 流入这个账户的、此刻有效的**花费类**额度（免费额度、预付、组织配额，不含授信）之和，减去这些额度**窗口内**（从最早的有效起点算起）的 `Σ (held + spent)`。曾经有过额度、现在一个都不生效（比如上个月的免费额度过期了）= `Some(0)`，**不是** `None`。例外：没充值、有过授信的账户走下面「授信的旧债与新额度分开记」的口径 |
+//! | `balance`（自有资金） | 有充值分录才有：`Σ funds − Σ (held + spent)`（所有时间）。没有充值过 = `None`。例外：有过授信、又有过花费类额度的充值账户走下面「授信的旧债与新额度分开记」的口径，自有资金并进 `ceiling_remaining` 的净头寸，这里是 `None` |
+//! | `ceiling_remaining`（授权额度剩余） | 流入这个账户的、此刻有效的**花费类**额度（免费额度、预付、组织配额，不含授信）之和，减去这些额度**窗口内**（从最早的有效起点算起）的 `Σ (held + spent)`。曾经有过额度、现在一个都不生效（比如上个月的免费额度过期了）= `Some(0)`，**不是** `None`。例外：有过授信的账户（没充值的，或者充了值又有过花费类额度的）走下面「授信的旧债与新额度分开记」的口径 |
 //! | `credit_limit` | 此刻有效的**授信额度**（`allocations` 里 purpose = `credit_line`、窗口内、没被撤销的）之和，没有 = 0 |
 //! | `rate_windows` | 配了分钟 / 小时上限才有：`Σ (held + spent)` 里 `window_at` 落在最近 60 秒 / 3600 秒（滑动窗口，不是日历桶：任意一个窗口长度的区间里都不会超过上限）的部分 |
 //! | `in_flight` | 配了在途上限才有：当前在途 = `Σ held`；过期的预留已经有 `expire` 分录冲掉 |
@@ -15,19 +15,28 @@
 //! （不是 `None`）。S0 把 `None` 解释成「没配置、不设限」，对一个会花钱的账户这是最危险的默认值：
 //! 新开的组织、新加的成员什么都没配置就能无限花平台的钱。所以默认是什么都不允许，要先发额度或充值。
 //!
-//! **授信的旧债与新额度分开记**（owner 2026-11-15 拍板，方案 C；PR #600 第三轮复审 M1 / L1）。授信是「有担保的负值」，
-//! 它限制的是**累计**透支，不是单笔。有充值的账户，余额 `funds − Σ (held + spent)` 本来就是全期求和，带着已欠的钱。
-//! **没充值、有过授信**的账户（经控制面开通授信的成员；授信此刻有效，或者已经关掉、过期、被撤销）没有这个余额，
-//! 账本替它把「先额度后授信」的账记出来：
+//! **授信的旧债与新额度分开记**（owner 2026-11-15 拍板，方案 C；PR #600 第三轮复审 M1 / L1；issue #601 把它延伸到充过值的账户）。
+//! 授信是「有担保的负值」，它限制的是**累计**透支，不是单笔。**有过授信额度**的账户（授信此刻有效，或者已经关掉、过期、被撤销）
+//! 走这套账：账本把额度、自有资金、授信债务三本分开记出来。
+//!
+//! * 没充值的账户：一直走这套账（没有余额可读，账只能记出来）。
+//! * 充过值的账户：**有过花费类额度**才走。没有任何额度的充值账户，没有额度能覆盖花费，能花的钱就是 S0 的 `余额 + 授信`
+//!   （`余额 = 充值 − 全期已花`；债务超过授信额度时 S0 的余额更负，这套账按授信额度算，两边能花的都是 0），视图仍是 `balance`。
+//! * 从没有过授信额度的账户（充了值的也一样）不走：没有授信就没有「授信旧债」，额度窗口口径（没充值）和 S0 的
+//!   `min(余额, 额度剩余)`（充了值，额度是上限）都不变。
+//!
+//! 三本账的记法：
 //!
 //! * 它名下每一笔花费类额度是一个「桶」：只覆盖**自己窗口内、自己存在之后**的花费。窗口是额度自己声明的有效期
 //!   `[valid_from, valid_until)`（左闭右开，按花费的归属时间判断）；「存在之后」看**提交顺序**：额度创建那一刻账本里最后一条
 //!   分录的号记在 `ledger_allocation_marks`（迁移 0004），分录号大于它的花费才是它存在之后的。迟发的、起点倒填的额度不会回头替
 //!   更早的花费还债；
 //! * 一笔花费（一个预留在这个账户上的全部分录：预留、结算、释放、过期；先后看它**第一条**分录的号，迟到的结算是另一笔新的花费）
-//!   先用此刻生效的桶里**先到期**的，用完才记成授信债务。所以同一个请求先用免费额度，免费额度用完才动授信；
-//! * **授信债务 = 全期累计里没被额度覆盖的部分**（已花加在途预留）。它不因新额度的窗口而重置，不因额度到期（哪怕一分没花）
-//!   而勾销，也不因授信被重设、关掉再开而勾销。债务只因上级充值而减少：有了充值，账户就按上面有充值的口径记账，余额带着全部已花；
+//!   先用此刻生效的桶里**先到期**的；额度之外的部分 `U` 先用自有资金（全部充值：充值不过期，所以不分先后，只看总数），
+//!   用完才记成授信债务。所以同一个请求先用免费额度，再用自有资金，最后才动授信；
+//! * **授信债务 = `max(全期 U 之和 − 全部充值, 0)`**（已花加在途预留）。它不因新额度的窗口而重置，不因额度到期（哪怕一分没花）
+//!   而勾销，也不因授信被重设、关掉再开而勾销。债务只因上级充值而减少：充值先还债，还清之后多出来的才是自有资金剩余
+//!   `max(全部充值 − 全期 U 之和, 0)`。额度覆盖的花费不扣自有资金，所以补钱不会让能花的变少（补 X，授信至多恢复 X，额度一分不动）；
 //! * 被撤销的额度此刻不再给任何人授权（不计入额度剩余），但撤销**之前**它覆盖过的花费照样是它覆盖的（L1：预付额度 1000
 //!   下已花 900，撤销后再开 100 授信，授信可用是 100，不是 -800）。撤销提交之后才提交的花费不再被它覆盖（撤销同样记一个分录号）。
 //!
@@ -36,15 +45,19 @@
 //! 拿毫秒比先后，后来才存在的额度会追溯偿还它存在之前的授信债务（债务凭空少一块，额度没人用、到期了授信还是空出来），
 //! 已撤销的额度会回头覆盖撤销之后才提交的花费。分录号（AUTOINCREMENT）在串行的写事务里追加，大小就是提交的先后。
 //!
-//! 视图里记成净头寸：`ceiling_remaining = 额度剩余 − min(债务, 授信额度)`，授信额度原样放在 `credit_limit`。S0 的
-//! `可用额度 + 授信` 因此恰好是 `额度剩余 + 授信可用`（授信可用 = 授信额度 − 债务，不为负）：授信 200 已用光，月初发 10 的
-//! 免费额度，这个月能花 10，授信可用仍是 0；10 花完或月底作废，债务仍是 200。债务超过授信额度的部分（授信被调小，或 overage
-//! 之后）不再往额度里扣：它再也花不出去，新额度不该被它吃掉。授信此刻失效的账户授信额度是 0、没有授信可用，但欠下的债还在，
+//! 视图里记成净头寸：`ceiling_remaining = 额度剩余 + 自有资金剩余 − min(债务, 授信额度)`（`balance` 是 `None`，自有资金已经
+//! 并在里面；没充值的账户自有资金剩余是 0），授信额度原样放在 `credit_limit`。S0 的 `可用额度 + 授信` 因此恰好是
+//! `额度剩余 + 自有资金剩余 + 授信可用`（授信可用 = 授信额度 − 债务，不为负）：授信 200 已用光，月初发 10 的免费额度，这个月能花 10，
+//! 授信可用仍是 0；10 花完或月底作废，债务仍是 200。债务超过授信额度的部分（授信被调小，或 overage 之后）不再往额度里扣：
+//! 它再也花不出去，新额度不该被它吃掉。授信此刻失效的账户授信额度是 0、没有授信可用，但欠下的债还在，
 //! 所以同样走这条路：新额度照常可花（不被旧债吃掉），授信再开时债务照样从全期分录里算出来，不会因为授信关过一阵就忘掉；
-//! 宽限那边另看一眼这笔债（[`owes_credit`]）：欠着授信的钱不给宽限。从没有过授信的账户不走这条路，仍是上面的额度窗口口径。
+//! 宽限那边另看一眼这笔债（[`owes_credit`]）：欠着授信的钱不给宽限（净头寸可能不是负的：新额度比欠的债大）。
 //!
-//! 准入告警 `credit_used` 的 `amount` 是准入时的净头寸口径（和有充值的账户一样：欠额含已经欠下的）。
-//! 没有授信、也没有任何额度的账户仍是 `Some(0)`：什么都不允许，用不着算债务。
+//! 准入告警 `credit_used` 要通知担保人「有人动了授信」：S0 只看净头寸，旧债未清时哪怕这一笔完全落在新额度里，净头寸也是负的，
+//! `CreditFloor` 照样是 `PassUsingCredit`。所以走这套账的账户，这一笔没超出 [`Books::spendable_without_credit`]（额度剩余加自有资金
+//! 剩余）就不记告警（`admit.rs` 的 `credit_users`）；动了授信的，`amount` 仍是准入时的净头寸口径（准入之后授信已占用的总额，
+//! 含已经欠下的），和没有额度的充值账户一样。
+//! 既没充值、也没有授信、没有任何额度的账户仍是 `Some(0)`：什么都不允许，用不着算债务。
 //!
 //! 所有求和都在调用方已经开着的写事务里读，所以和同一事务里随后写下的预留之间没有缝。
 //! SQLite 的 `SUM` 溢出会报错（不是回绕），那个错误原样往上走：准入失败即关闭。
@@ -53,7 +66,6 @@ use idoris_compute_contracts::account::{Account, AccountKind};
 use idoris_compute_contracts::admission::{
     AncestorView, InFlightView, RateWindowKind, RateWindowView,
 };
-use idoris_compute_contracts::ids::AccountId;
 use idoris_compute_contracts::money::{Money, MoneyError};
 use rusqlite::{Connection, OptionalExtension};
 
@@ -194,35 +206,41 @@ fn ever_had_credit_line(conn: &Connection, account: &str) -> Result<bool, Ledger
     )?)
 }
 
-/// 这个账户此刻是不是还欠着授信的钱：没充值、有过授信，并且累计授信债务（含在途预留）大于 0。
+/// 这个账户此刻是不是还欠着授信的钱：走「分开记」的账户（`books` 是 `Some`），并且累计授信债务（含在途预留）大于 0。
 ///
-/// 给宽限用：宽限是「额度用完之后的最后一单」，不是给欠着钱的账户续命。授信此刻有效时，债务已经带在可用额度里（为负），
-/// S0 的 `check_grace` 自己就拒绝；授信关掉、过期之后授信额度是 0，债务不再往额度里扣（新额度不被旧债吃掉），
-/// 可用额度可能恰好是 0，所以宽限要单独看一眼这笔债。有充值的、从没有过授信的账户不走这条路（它们的透支体现在余额里）。
-pub(super) fn owes_credit(
-    conn: &Connection,
-    account: &AccountId,
-    now_ms: i64,
-) -> Result<bool, LedgerError> {
-    let id = account.as_str();
-    let funded: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM ledger_entries WHERE account_id = ?1 AND kind = 'fund')",
-        [id],
-        |row| row.get(0),
-    )?;
-    if funded || !ever_had_credit_line(conn, id)? {
-        return Ok(false);
-    }
-    Ok(separate_books(conn, id, now_ms)?.credit_debt > 0)
+/// 给宽限用：宽限是「额度用完之后的最后一单」，不是给欠着钱的账户续命。授信此刻有效、又没有新额度时，债务已经带在可用额度里
+/// （为负），S0 的 `check_grace` 自己就拒绝；但新额度比欠的债大时净头寸不是负的，授信关掉、过期之后授信额度是 0，债务不再往
+/// 额度里扣（新额度不被旧债吃掉），可用额度也可能恰好是 0，所以宽限要单独看一眼这笔债。不走「分开记」的账户（从没有过授信，
+/// 或者充了值却没有过额度）没有这条路：它们的透支体现在余额里，S0 自己会拒绝。
+pub(super) fn owes_credit(books: Option<&Books>) -> bool {
+    books.is_some_and(|books| books.credit_debt > 0)
 }
 
-/// 一个没充值、有过授信的账户上，「先额度后授信」的账（口径见模块文档「授信的旧债与新额度分开记」）。
+/// 一个走「分开记」的账户上，额度、自有资金、授信债务三本账（口径见模块文档「授信的旧债与新额度分开记」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SeparateBooks {
+pub(super) struct Books {
     /// 此刻还能花的额度：没被撤销、此刻生效的花费类额度，扣掉它们已经覆盖的花费之后的剩余。
     allowance_left: i64,
-    /// 累计授信债务：全期已花（含在途预留）里没被额度覆盖的部分。
+    /// 自有资金剩余：`max(全部充值 − 没被额度覆盖的花费, 0)`（没充值的账户是 0）。
+    funds_left: i64,
+    /// 累计授信债务：`max(没被额度覆盖的花费 − 全部充值, 0)`，花费含在途预留。
     credit_debt: i64,
+}
+
+impl Books {
+    /// 不动授信还能花的钱：额度剩余加自有资金剩余。
+    pub(super) fn spendable_without_credit(&self) -> Result<i64, LedgerError> {
+        add(self.allowance_left, self.funds_left)
+    }
+
+    /// 视图里的净头寸：`额度剩余 + 自有资金剩余 − min(债务, 授信额度)`。债务超过授信额度的部分不再往里扣：
+    /// 它再也花不出去，新额度和自有资金不该被它吃掉。
+    fn net_position(&self, credit_limit: i64) -> Result<i64, LedgerError> {
+        sub(
+            self.spendable_without_credit()?,
+            self.credit_debt.min(credit_limit),
+        )
+    }
 }
 
 /// 一笔花费类额度在回放里的样子：只覆盖窗口 `[from, until)` 里归属的、它存在期间提交的花费，总共不超过 `capacity`。
@@ -336,26 +354,29 @@ fn load_spends(conn: &Connection, account: &str) -> Result<Vec<Spend>, LedgerErr
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// 回放「先额度后授信」：这个账户全期的花费按**提交先后**（第一条分录的号）一笔一笔来，每一笔先用此刻能用的额度里**先到期**的
-/// （同一时刻到期的按创建先后），用不完的额度留给后面，用不到额度的部分记成授信债务。
+/// 回放三本账：这个账户全期的花费按**提交先后**（第一条分录的号）一笔一笔来，每一笔先用此刻能用的额度里**先到期**的
+/// （同一时刻到期的按创建先后），用不完的额度留给后面；额度之外的部分 `U` 累加起来，先用自有资金 `funds`（全部充值），
+/// 用完才是授信债务。
 ///
 /// 一笔花费能用哪些额度，只看这笔花费和额度自己的记录：额度的窗口包含它的归属时刻、额度是在它**之前**创建的、
 /// 没有在它之前被撤销（口径见模块文档）。所以后来才创建的额度动不了它存在之前的任何一笔花费，往账本里追加新的额度或撤销，
 /// 都不会改变之前那些花费已经得到的覆盖（只有结算、释放、过期会改一笔花费的净额）。
+/// 自有资金不参与哪一笔花费用哪一笔额度：充值不过期、不分先后，只有总数 `funds`，所以「额度之外的部分」累加之后一次扣掉。
 /// 归属时刻晚于 `now` 的花费按 `now` 算（读的是过去的某一刻时，往后的花费照样占着此刻生效的额度，只会更保守）。
 /// 回放是 `O(花费笔数 × 额度个数)`：额度个数是个位数到几十（每月一笔免费额度加预付），读花费的那一次扫描和准入已有的求和同量级。
 fn separate_books(
     conn: &Connection,
     account: &str,
     now_ms: i64,
-) -> Result<SeparateBooks, LedgerError> {
+    funds: i64,
+) -> Result<Books, LedgerError> {
     let buckets = load_buckets(conn, account, now_ms)?;
     let mut left: Vec<i64> = buckets.iter().map(|bucket| bucket.capacity).collect();
     // 先到期的先用。排序只看额度自己的到期时间（`sort_by_key` 是稳定的：同一时刻到期的保持创建先后），不看之后才发生的撤销，
     // 所以一笔花费得到的覆盖不会因为日后撤销了某笔额度而换一笔额度来覆盖。
     let mut order: Vec<usize> = (0..buckets.len()).collect();
     order.sort_by_key(|index| buckets[*index].until);
-    let mut credit_debt = 0_i64;
+    let mut uncovered = 0_i64;
     for spend in load_spends(conn, account)? {
         let at = spend.at.min(now_ms);
         // 万一读出负数（分录被改坏了），按 0 算：不会借此多出额度覆盖
@@ -370,7 +391,7 @@ fn separate_books(
                 rest -= take;
             }
         }
-        credit_debt = add(credit_debt, rest)?;
+        uncovered = add(uncovered, rest)?;
     }
     let mut allowance_left = 0_i64;
     for (index, bucket) in buckets.iter().enumerate() {
@@ -378,9 +399,10 @@ fn separate_books(
             allowance_left = add(allowance_left, left[index])?;
         }
     }
-    Ok(SeparateBooks {
+    Ok(Books {
         allowance_left,
-        credit_debt,
+        funds_left: sub(funds, uncovered)?.max(0),
+        credit_debt: sub(uncovered, funds)?.max(0),
     })
 }
 
@@ -435,10 +457,22 @@ pub(super) fn project_chain(
     now_ms: i64,
     config: &LedgerConfig,
 ) -> Result<Vec<AncestorView>, LedgerError> {
+    Ok(project_chain_with_books(conn, chain, now_ms, config)?.0)
+}
+
+/// 同 [`project_chain`]，另外把走「分开记」的账户的三本账也交出来（顺序与 `chain` 一致，不走的是 `None`）：准入要用它判断
+/// 这一笔有没有真的动授信（告警）、账户欠不欠授信的钱（宽限），S0 的视图里只有净头寸，看不出来。
+pub(super) fn project_chain_with_books(
+    conn: &Connection,
+    chain: &[Account],
+    now_ms: i64,
+    config: &LedgerConfig,
+) -> Result<(Vec<AncestorView>, Vec<Option<Books>>), LedgerError> {
     let period = period_of(now_ms, &config.billing_timezone)?;
     let (period_start, period_end) = period_bounds(period, &config.billing_timezone)?;
     let not_revoked = not_revoked_clause(conn)?;
     let mut views = Vec::with_capacity(chain.len());
+    let mut all_books = Vec::with_capacity(chain.len());
     for account in chain {
         let unit = &account.unit;
         let money = |micros: i64| Money::new(unit.clone(), micros);
@@ -465,7 +499,7 @@ pub(super) fn project_chain(
 
         let sums = entry_sums(conn, id, window_start.unwrap_or(now_ms), now_ms)?;
 
-        let balance = if sums.has_funds {
+        let mut balance = if sums.has_funds {
             Some(money(sub(sums.funds, sums.committed)?))
         } else {
             None
@@ -488,18 +522,26 @@ pub(super) fn project_chain(
         }
         // 此刻有效的授信额度。
         let credit_limit = credit_limit_micros(conn, id, now_ms)?;
-        // 没充值、有过授信的账户：授信限制的是它的累计债务，旧债和新额度分开记（见模块文档）。
-        // `ceiling_remaining` 记成净头寸 `额度剩余 - min(债务, 授信额度)`，S0 的 `可用额度 + 授信额度` 就是
-        // `额度剩余 + 授信可用`：同一笔花费先用额度，额度用完才动授信；新额度照常可花，但不抵旧债；债务超过授信额度的部分
-        // 不再往额度里扣。已花和在途预留都在债务里，重复请求、并发请求每一次都看得到前面欠下的。
-        // 授信此刻失效（关掉、过期、被撤销）的账户授信额度是 0，没有授信可用，但欠下的债还在，所以也走这条路：
+        // 有过授信的账户：授信限制的是它的累计债务，旧债和新额度分开记（见模块文档）。没充值的一直走；充过值的要有过花费类额度才走
+        // （没有额度时能花的钱就是 S0 的 `余额 + 授信`，视图保持 `balance`）。从没有过授信的账户不走。
+        // `ceiling_remaining` 记成净头寸 `额度剩余 + 自有资金剩余 - min(债务, 授信额度)`，自有资金并在里面，所以 `balance` 是 `None`：
+        // S0 的 `可用额度 + 授信额度` 就是 `额度剩余 + 自有资金剩余 + 授信可用`，同一笔花费先用额度，再用自有资金，最后才动授信；
+        // 新额度照常可花，但不抵旧债；债务超过授信额度的部分不再往额度里扣。已花和在途预留都在债务里，重复请求、并发请求每一次
+        // 都看得到前面欠下的。授信此刻失效（关掉、过期、被撤销）的账户授信额度是 0，没有授信可用，但欠下的债还在，所以也走这条路：
         // 新额度照常可花，不被旧债吃掉（回退到上面的额度窗口，窗口里更早的债会被算成这笔额度的消耗）。
-        if spends_money && !sums.has_funds && (credit_limit > 0 || ever_had_credit_line(conn, id)?)
+        let books = if spends_money
+            && (credit_limit > 0 || ever_had_credit_line(conn, id)?)
+            && (!sums.has_funds || ever_had_allocation)
         {
-            let books = separate_books(conn, id, now_ms)?;
-            let debt_on_credit = books.credit_debt.min(credit_limit);
-            ceiling_remaining = Some(money(sub(books.allowance_left, debt_on_credit)?));
+            Some(separate_books(conn, id, now_ms, sums.funds)?)
+        } else {
+            None
+        };
+        if let Some(books) = &books {
+            balance = None;
+            ceiling_remaining = Some(money(books.net_position(credit_limit)?));
         }
+        all_books.push(books);
 
         let LimitMicros {
             inflight: inflight_cap,
@@ -548,7 +590,7 @@ pub(super) fn project_chain(
             subsidy_pool_remaining,
         });
     }
-    Ok(views)
+    Ok((views, all_books))
 }
 
 /// 一个账户自己的可用额度：自有余额与授权额度剩余里**较小**的（两者都有就两者都要满足）。

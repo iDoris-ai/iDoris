@@ -40,7 +40,9 @@ use idoris_compute_contracts::grant::Purpose;
 use idoris_compute_contracts::ids::{AllocationId, IdempotencyKey};
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_tenancy::accounts::AccountStore;
-use idoris_tenancy::accounts::ledger::{AlertKind, CreditLineSetting, SettleResult};
+use idoris_tenancy::accounts::ledger::{
+    AlertKind, ComponentDecision, CreditLineSetting, SettleResult,
+};
 
 /// `max_tokens = 45`：预留 100。
 const M100: u64 = 45;
@@ -551,6 +553,28 @@ fn the_credit_used_alert_is_quiet_when_the_new_allowance_covers_the_spend() {
 }
 
 #[test]
+fn a_degraded_request_that_fits_the_new_allowance_raises_no_alert() {
+    // 想要 102（max_tokens = 46），额度只有 100：压到 100 放行，整笔落在新额度里，没动授信，不记告警。
+    // 旧代码按净头寸（-100）算：压低后的 100 要「透支 200」，记一条金额 200 的告警。
+    let db = TempDb::new("alert-degrade-covered");
+    let store = credit_world(&db);
+    credit_line(&store, 200, T0);
+    for (request, at) in [("r-1", T0 + 1_000), ("r-2", T0 + 2_000)] {
+        assert!(spend(&store, request, at, M100).is_admitted(), "{request}");
+    }
+    let later = T0 + 10_000;
+    prepaid(&store, "emp-allow", 100, later, later + 30 * DAY, later);
+    let degraded = spend(&store, "r-3", later + 1_000, 46);
+    assert!(
+        matches!(degraded, AdmissionDecision::Degrade { .. }),
+        "{degraded:?}"
+    );
+    assert_eq!(price_of(&degraded), Some(100), "{degraded:?}");
+    assert_eq!(credit_used_amounts(&store), [100, 200]);
+    assert_clean(&store);
+}
+
+#[test]
 fn the_credit_used_alert_is_quiet_for_a_funded_account_too() {
     // 同样的噪声，有充值的账户：充值 100、授信 100，花到余额 -100（第二笔动了授信，告警一条），新额度 100 覆盖的花费不再告警。
     let db = TempDb::new("alert-noise-funded");
@@ -886,6 +910,113 @@ fn grace_is_still_given_to_a_funded_account_in_the_books_that_owes_nothing() {
     assert_clean(&store);
 }
 
+#[test]
+fn an_expired_reservation_gives_the_allowance_and_the_funds_back_and_its_late_settlement_is_a_new_spend()
+ {
+    // 充值 100、授信 100、额度 100。一笔 250 的预留占着三本账（额度 100、自有资金 100、授信 50），迟迟没结算，过了 TTL 被过期：
+    // 额度、自有资金、授信都回来。之后它迟到的结算是一笔新的花费（记在结算的那一刻），照样先用额度、再用自有资金、最后才动授信。
+    let db = TempDb::new("funded-expiry");
+    let store = credit_world(&db);
+    top_up(&store, 100, "emp", T0);
+    credit_line(&store, 100, T0);
+    prepaid(&store, "emp-allow", 100, T0 - DAY, T0 + 30 * DAY, T0);
+    let first = Req::new(&store, "r-1", 0, "cred-e", 120).at(T0 + 1_000);
+    assert_eq!(price_of(&admit(&store, &first)), Some(250));
+    let books = check_books(&store, &db, "emp", T0 + 2_000);
+    assert_eq!(
+        (
+            books.allowance_left,
+            books.funds_left,
+            books.credit_debt,
+            books.spent
+        ),
+        (0, 0, 50, 250),
+        "in flight, the reservation already uses all three books"
+    );
+
+    // 默认的预留 TTL 是 30 分钟
+    let expired = T0 + 31 * MINUTE;
+    assert_eq!(store.sweep_expired_holds(ts(expired)).unwrap(), 1);
+    let books = check_books(&store, &db, "emp", expired + 1);
+    assert_eq!(
+        (
+            books.allowance_left,
+            books.funds_left,
+            books.credit_debt,
+            books.spent
+        ),
+        (100, 100, 0, 0),
+        "expiry gives all three back"
+    );
+    assert_eq!(headroom(&view(&store, expired + 1)), 300);
+
+    let outcome = store
+        .settle_attempt(&first.attempt, &price(250), ts(expired + 1_000))
+        .unwrap();
+    assert!(outcome.late, "{outcome:?}");
+    assert_eq!(
+        outcome.platform_loss,
+        thb(0),
+        "the chain has room for all of it: {outcome:?}"
+    );
+    let books = check_books(&store, &db, "emp", expired + 2_000);
+    assert_eq!(
+        (
+            books.allowance_left,
+            books.covered,
+            books.funds_left,
+            books.credit_debt,
+            books.spent
+        ),
+        (0, 100, 0, 50, 250),
+        "the late settlement is a new spend: allowance first, then funds, then credit"
+    );
+    assert_clean(&store);
+}
+
+#[test]
+fn extra_costs_are_checked_against_the_same_three_books() {
+    // 附加成本（比如安全检查）的预留只放行或拒绝，走的是同一份视图：充值 100、授信 100、额度 100，一共 300。
+    let db = TempDb::new("funded-extra-cost");
+    let store = credit_world(&db);
+    top_up(&store, 100, "emp", T0);
+    credit_line(&store, 100, T0);
+    prepaid(&store, "emp-allow", 100, T0 - DAY, T0 + 30 * DAY, T0);
+    let reserve = |request: &str, micros: i64| {
+        store
+            .reserve_request_component(
+                &idoris_compute_contracts::ids::RequestId::new(request).unwrap(),
+                "safety_input",
+                &payment(&store, "cred-e"),
+                &price(micros),
+                ts(T0 + 1_000),
+            )
+            .unwrap()
+    };
+    assert!(
+        matches!(reserve("c-1", 300), ComponentDecision::Reserved { .. }),
+        "allowance 100 + funds 100 + credit 100"
+    );
+    assert!(
+        matches!(
+            reserve("c-2", 30),
+            ComponentDecision::Rejected(ReasonCode::BudgetExhausted)
+        ),
+        "nothing is left"
+    );
+    let books = check_books(&store, &db, "emp", T0 + 2_000);
+    assert_eq!(
+        (
+            books.covered,
+            books.funds_left,
+            books.credit_debt,
+            books.spent
+        ),
+        (100, 0, 100, 300)
+    );
+    assert_clean(&store);
+}
+
 // ------------------------------------------------------------------------------------------
 // 范围：哪些账户走这套账，哪些行为不变
 // ------------------------------------------------------------------------------------------
@@ -1182,7 +1313,7 @@ fn settlement_world(db: &TempDb) -> (AccountStore, Vec<Req>) {
 
 /// 第 `i` 个预留的收尾：每五个里一个释放（0），其余按 `55 + 6i` 结算（比预留 120 少的、多的、整好相等的都有）。
 fn charge_of(i: usize) -> i64 {
-    if i % 5 == 0 {
+    if i.is_multiple_of(5) {
         0
     } else {
         55 + 6 * i64::try_from(i).unwrap()
@@ -1367,7 +1498,7 @@ fn settling_while_others_are_being_admitted_never_over_commits_the_account() {
             let store = AccountStore::open(&path).unwrap();
             barrier.wait();
             // 偶数号按预留收，奇数号只收 40（少收，把额度还回去）
-            let charge = if i % 2 == 0 { 100 } else { 40 };
+            let charge = if i.is_multiple_of(2) { 100 } else { 40 };
             store
                 .settle_attempt(&request.attempt, &price(charge), ts(T0 + 4_000))
                 .unwrap();
@@ -1641,16 +1772,16 @@ fn random_histories_with_top_ups_agree_with_the_independent_model_decisions_and_
     }
     eprintln!("funded random histories reached: {total:?}");
     // 没有走到这些状态，上面「四方对得上」就没有说服力
-    assert!(total.allowed >= 60, "{total:?}");
-    assert!(total.degraded >= 5, "{total:?}");
-    assert!(total.rejected >= 15, "{total:?}");
-    assert!(total.allowance_and_debt >= 15, "{total:?}");
-    assert!(total.allowance_and_funds >= 15, "{total:?}");
-    assert!(total.top_up_with_debt >= 3, "{total:?}");
-    assert!(total.credit_full >= 15, "{total:?}");
-    assert!(total.covered_while_owing >= 5, "{total:?}");
-    assert!(total.alerted >= 15, "{total:?}");
-    assert!(total.revoked_after_cover >= 1, "{total:?}");
-    assert!(total.released >= 3, "{total:?}");
-    assert!(total.half_settled >= 3, "{total:?}");
+    assert!(total.allowed >= 100, "{total:?}");
+    assert!(total.degraded >= 15, "{total:?}");
+    assert!(total.rejected >= 40, "{total:?}");
+    assert!(total.allowance_and_debt >= 60, "{total:?}");
+    assert!(total.allowance_and_funds >= 25, "{total:?}");
+    assert!(total.top_up_with_debt >= 15, "{total:?}");
+    assert!(total.credit_full >= 60, "{total:?}");
+    assert!(total.covered_while_owing >= 30, "{total:?}");
+    assert!(total.alerted >= 40, "{total:?}");
+    assert!(total.revoked_after_cover >= 15, "{total:?}");
+    assert!(total.released >= 5, "{total:?}");
+    assert!(total.half_settled >= 8, "{total:?}");
 }

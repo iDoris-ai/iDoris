@@ -42,7 +42,8 @@ use super::holds::{
 };
 use super::period::period_of;
 use super::project::{
-    SPENDABLE_PURPOSES, available_of, load_config, not_revoked_clause, owes_credit, project_chain,
+    Books, SPENDABLE_PURPOSES, available_of, load_config, not_revoked_clause, owes_credit,
+    project_chain, project_chain_with_books,
 };
 use super::types::{AdmitInput, AlertKind, MODEL_COMPONENT};
 use crate::accounts::rows::{load_ancestors, load_credential};
@@ -179,19 +180,39 @@ fn provenance(
     )
 }
 
-/// 链上哪些账户靠授信放行（`CreditFloor` 是 `PassUsingCredit`）。
-fn credit_users(report: &AdmissionReport, chain: &[Account]) -> Vec<(usize, i64)> {
-    report
-        .results()
-        .iter()
-        .filter_map(|result| match (&result.check, &result.outcome) {
-            (CheckKind::CreditFloor, CheckOutcome::PassUsingCredit { overdraft }) => chain
-                .iter()
-                .position(|account| account.id == result.account)
-                .map(|index| (index, overdraft.micros)),
-            _ => None,
-        })
-        .collect()
+/// 链上哪些账户靠授信放行（`CreditFloor` 是 `PassUsingCredit`），以及 S0 算出的透支额（准入之后授信已占用的总额）。
+///
+/// S0 只看净头寸。走「分开记」的账户（`books` 是 `Some`）旧债未清时净头寸是负的，哪怕这一笔 `reserve` 完全落在额度剩余和
+/// 自有资金剩余里，`CreditFloor` 照样是 `PassUsingCredit`，但这一笔并没有动授信：担保人不该为它收到告警（issue #601：旧债 200、
+/// 新额度 100、花 50，旧代码记一条金额 150 的告警）。所以这些账户还要看 `reserve` 有没有超出不动授信能花的钱，没超出就不算。
+/// 不走「分开记」的账户（`None`）没有额度之外的钱可以先花，`PassUsingCredit` 就是动了授信，行为不变。
+fn credit_users(
+    report: &AdmissionReport,
+    chain: &[Account],
+    books: &[Option<Books>],
+    reserve: i64,
+) -> Result<Vec<(usize, i64)>, LedgerError> {
+    let mut users = Vec::new();
+    for result in report.results() {
+        let (CheckKind::CreditFloor, CheckOutcome::PassUsingCredit { overdraft }) =
+            (&result.check, &result.outcome)
+        else {
+            continue;
+        };
+        let Some(index) = chain
+            .iter()
+            .position(|account| account.id == result.account)
+        else {
+            continue;
+        };
+        if let Some(Some(books)) = books.get(index)
+            && reserve <= books.spendable_without_credit()?
+        {
+            continue;
+        }
+        users.push((index, overdraft.micros));
+    }
+    Ok(users)
 }
 
 /// 这个账户有没有被配置过：充值过，或者有过花费类额度（不管现在还生不生效，**但被撤销的不算**）。
@@ -270,7 +291,7 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
     }
 
     let full = reserve(input.policy, &input.sizing, input.price_rates)?;
-    let views = project_chain(conn, &chain, now_ms, &config)?;
+    let (views, books) = project_chain_with_books(conn, &chain, now_ms, &config)?;
     let report = evaluate_admission(&full.amount, &views)?;
     let period = period_of(now_ms, &config.billing_timezone)?;
 
@@ -319,10 +340,10 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
                         conn,
                         &chain,
                         &views,
+                        books.first().and_then(Option::as_ref),
                         &report,
                         &full.amount,
                         &period.to_string(),
-                        now_ms,
                     )?
                 } else {
                     None
@@ -378,7 +399,7 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
     Ok(AdmitPlan {
         decision,
         write: Some(HoldWrite {
-            credit_used: credit_users(&final_report, &chain),
+            credit_used: credit_users(&final_report, &chain, &books, price.micros())?,
             chain,
             unit: unit.clone(),
             reserved: price.micros(),
@@ -397,16 +418,17 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
 /// - 本账期这个账户还没用过宽限（没作废的）；
 /// - 账户没有透支（可用额度 >= 0），缺口不超过一次预留。后两条由 S0 的 [`check_grace`] 判定，
 ///   **不读 settle 的 overage**（评审 B4）；
-/// - 账户没有欠着授信的钱（[`owes_credit`]）：授信此刻有效时债务已经带在可用额度里，S0 自己会拒绝；授信关掉、过期之后
-///   债务不再往额度里扣（新额度不被旧债吃掉），可用额度可能恰好是 0，所以这里单独看一眼。
+/// - 账户没有欠着授信的钱（[`owes_credit`]，`payer_books` 是付款账户走「分开记」时的三本账）：没有新额度、授信此刻有效时债务
+///   已经带在可用额度里，S0 自己会拒绝；新额度比欠的债大，或者授信关掉、过期之后债务不再往额度里扣（新额度不被旧债吃掉），
+///   净头寸不是负的，S0 不会拒绝，所以这里单独看一眼。
 fn try_grace(
     conn: &Connection,
     chain: &[Account],
     views: &[idoris_compute_contracts::admission::AncestorView],
+    payer_books: Option<&Books>,
     report: &AdmissionReport,
     reserve_price: &Price,
     period: &str,
-    now_ms: i64,
 ) -> Result<Option<(i64, i64)>, LedgerError> {
     let (Some(payer_account), Some(payer_view)) = (chain.first(), views.first()) else {
         return Ok(None);
@@ -426,7 +448,7 @@ fn try_grace(
     if !is_provisioned(conn, &payer_account.id)? {
         return Ok(None);
     }
-    if owes_credit(conn, &payer_account.id, now_ms)? {
+    if owes_credit(payer_books) {
         return Ok(None);
     }
     let used = active_grace_uses(conn, &payer_account.id, period)?;
