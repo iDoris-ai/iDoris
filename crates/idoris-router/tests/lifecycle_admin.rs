@@ -2314,14 +2314,16 @@ async fn c8_an_external_engine_that_is_replaced_by_another_process_gets_a_rebuil
     assert_eq!(a.fake.model_loads(), 1);
     assert_eq!(loaded_models(&full).await, json!(["fake-model"]));
 
-    // 用户把 A 关了：没有监听者。`unavailable`，端点封上，请求立刻 503，没有东西发出去。
-    a.kill();
+    // 用户把 A 关了：端口上没有监听者了。`unavailable`，端点封上，请求立刻 503，没有东西发出去。先让监听者消失、等管理器看到它
+    // （此刻状态与封上是同一个周期里一起发生的），再让进程退出：反过来的话，进程先退出，探测被拒的那个周期可能赶在「没有监听者」的
+    // 那个周期之前发布 `unavailable`，端点这时还没封上。
     inspector.forget_listener(port);
     full.until_unavailable().await;
     assert_eq!(
         governed_endpoint(&full.rig.endpoint()),
         Some(EndpointKey::Blocked)
     );
+    a.kill();
     assert_eq!(full.chat().await.0, StatusCode::SERVICE_UNAVAILABLE);
 
     // B 在同一个端口上起来了（另一个进程）。它的 `/api/status` 被扣着：管理器认出它换了进程（pid 与启动时间都变了），封上端点、

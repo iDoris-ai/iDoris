@@ -169,6 +169,9 @@ struct GenAdapter {
     sent: Mutex<Vec<&'static str>>,
     /// 非 `None` 时，`chat` 在核对**之前**先等它放行（模拟「聊天任务还没来得及写请求」）。
     chat_gate: Option<tokio::sync::Semaphore>,
+    /// 同上，`list`（目录读取）：模拟「目录读取任务还没来得及写请求」。`list_entered` 记下有几个 `list` 已经走到这一步。
+    list_gate: Option<tokio::sync::Semaphore>,
+    list_entered: std::sync::atomic::AtomicUsize,
 }
 
 impl GenAdapter {
@@ -179,6 +182,8 @@ impl GenAdapter {
             seen: Mutex::new(Vec::new()),
             sent: Mutex::new(Vec::new()),
             chat_gate: None,
+            list_gate: None,
+            list_entered: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -189,6 +194,20 @@ impl GenAdapter {
             seen: Mutex::new(Vec::new()),
             sent: Mutex::new(Vec::new()),
             chat_gate: Some(tokio::sync::Semaphore::new(0)),
+            list_gate: None,
+            list_entered: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn with_list_gate(generation: u64) -> Arc<Self> {
+        Arc::new(Self {
+            inner: MockAdapter::new(catalog()),
+            current: Some(AtomicU64::new(generation)),
+            seen: Mutex::new(Vec::new()),
+            sent: Mutex::new(Vec::new()),
+            chat_gate: None,
+            list_gate: Some(tokio::sync::Semaphore::new(0)),
+            list_entered: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -250,6 +269,10 @@ impl RuntimeAdapter for GenAdapter {
             .map(|current| current.load(Ordering::SeqCst))
     }
     async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+        self.list_entered.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &self.list_gate {
+            gate.acquire().await.unwrap().forget();
+        }
         self.check("list")?;
         self.inner.list().await
     }
@@ -360,6 +383,33 @@ async fn a_chat_admitted_before_the_engine_was_replaced_is_refused_when_it_final
     // 它完结之后账本里没有在途的聊天：可以排空、可以复位。
     wait_quiescent(&handle, true).await;
     handle.engine_replaced(true).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_catalog_read_admitted_before_the_engine_was_replaced_is_refused_when_it_finally_runs() {
+    // 目录读取（聊天与预热在加载之前先读它）已经准入、它的任务在等，这时引擎被换掉：任务放开之后它的请求被拒绝，没有发给新引擎。
+    let adapter = GenAdapter::with_list_gate(1);
+    let handle = Supervisor::spawn(adapter.clone(), config()).unwrap();
+    let listing = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.list().await })
+    };
+    wait_for("the catalog read to be admitted and running", || {
+        adapter.list_entered.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let old = adapter.generation();
+    adapter.advance_generation();
+    adapter.list_gate.as_ref().unwrap().add_permits(1);
+
+    let error = listing.await.unwrap().unwrap_err();
+    assert_eq!(error.reason_code(), "upstream_error");
+    assert_eq!(
+        adapter.sent("list"),
+        0,
+        "nothing was sent to the new engine"
+    );
+    assert_eq!(adapter.seen("list"), vec![Some(old)]);
 }
 
 #[tokio::test]
