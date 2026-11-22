@@ -345,11 +345,26 @@ async fn out_dir_rules() {
         "out_dir_not_empty"
     );
     assert!(!out.join("omlx.yaml").exists());
-    // 带 --force：别的文件（#626）原样保留，oMLX 自己的文件生成。
+    // 带 --force，但目录里没有任何组件卡、也没有 oMLX 自己的文件：多半是目录写错了，拒绝（#633 N4）。
+    let o = setup(&server.uri(), &out, &["--force"], None).await;
+    assert_eq!(err_code(&o), "out_dir_not_empty");
+    assert!(
+        o.json["message"].as_str().unwrap().contains("写错"),
+        "{}",
+        o.stdout
+    );
+    assert!(!out.join("omlx.yaml").exists());
+    // 目录里有一张别的卡：带 --force，别的文件（#626）原样保留，oMLX 自己的文件生成。
+    fs::write(
+        out.join("kept.yaml"),
+        include_str!("../../../config/components/omlx.yaml").replace("id: omlx", "id: kept"),
+    )
+    .unwrap();
     let o = setup(&server.uri(), &out, &["--force"], None).await;
     assert_eq!(o.code, 0, "{}", o.stdout);
     assert_eq!(fs::read_to_string(out.join("other.txt")).unwrap(), "x");
     fs::remove_file(out.join("other.txt")).unwrap();
+    fs::remove_file(out.join("kept.yaml")).unwrap();
     fs::remove_file(out.join("omlx.yaml")).unwrap();
     fs::remove_file(out.join("subscription.yaml")).unwrap();
     fs::write(out.join("omlx.yaml"), "stale").unwrap();
