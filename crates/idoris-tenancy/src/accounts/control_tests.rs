@@ -5258,3 +5258,45 @@ fn the_scoped_readers_see_exactly_the_targets_inside_the_given_roots() {
     assert!(!principal("p-reg", &["teacher"]));
     assert!(principal("p-reg", &["eduai"]));
 }
+
+/// `authorize_op` 的金额语义：范围先判、金额后判。范围里的账户：金额不超过权限上限是通过，超过是 `amount_exceeds_authority`，负数是 `invalid_amount`；
+/// 范围外的、不存在的账户：金额是什么都一样是 `out_of_scope`（契约的 `authorize` 对存在的目标先判负金额，会把账户存在与否漏出去）。
+#[test]
+fn authorize_op_judges_the_scope_before_the_amount() {
+    use super::control::{authorize_op, resolve_caller};
+    let env = Env::new();
+    env.tree();
+    let narrow = narrow_for(&env, ControlOp::GrantAllocation);
+    let conn = env.raw();
+    let caller = resolve_caller(&conn, &narrow.who(), ts(T0 + 1))
+        .unwrap_or_else(|(_, failure)| panic!("{failure:?}"));
+    let check = |target: &str, micros: i64| {
+        authorize_op(
+            &conn,
+            &caller,
+            ts(T0 + 1),
+            ControlOp::GrantAllocation,
+            &aid(target),
+            Some(&thb(micros)),
+        )
+        .map(|_| ())
+        .map_err(|failure| failure.reason)
+    };
+    // 范围里（teacher 子树，单笔上限 1_000_000_000）
+    assert_eq!(check("teacher", 1_000_000), Ok(()));
+    assert_eq!(
+        check("teacher", 2_000_000_000),
+        Err(ControlReason::AmountExceedsAuthority)
+    );
+    assert_eq!(check("teacher", -5), Err(ControlReason::InvalidAmount));
+    // 范围外的、不存在的：先判范围
+    for target in ["eduai", "school-b", "ghost"] {
+        for micros in [1_000_000, -5] {
+            assert_eq!(
+                check(target, micros),
+                Err(ControlReason::OutOfScope),
+                "{target} {micros}"
+            );
+        }
+    }
+}
