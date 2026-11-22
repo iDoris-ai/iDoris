@@ -66,8 +66,12 @@ const ACK_LABEL: &str = "idoris-ack/v1";
 // 停止原因与退出码
 // ---------------------------------------------------------------------------------------------------------------
 
-/// 停止的原因。三者走同一条优雅停止路径（规范 §2.7.5）；区别在退出码、是否发 `bye`、结束时打印的日志（信号写 stdout，
-/// 另两种写 stderr），以及 S3、S5 接入引擎之后是否停掉自己拉起的引擎（[`StopCause::stops_owned_engines`]）。
+/// 停止的原因。四者走同一条优雅停止路径（规范 §2.7.5）；区别在退出码、是否发 `bye`、结束时打印的日志（信号写 stdout，
+/// 另三种写 stderr），以及 S3、S5 接入引擎之后是否停掉自己拉起的引擎（[`StopCause::stops_owned_engines`]）。
+///
+/// **同一轮里几个原因同时成立时的优先级是 5（`EngineFailed`）> 4（`OrphanTimeout`）> 3（`InstanceConflict`）> 信号（0）**，
+/// 先到先得地只锁存一次，退出码、`bye`、引擎处置都从这一个结果推出（`crate::stop`，规范勘误十二）。登记客户端发布一个原因就结束，
+/// 所以 3 与 4 不会同时发布。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopCause {
     /// SIGTERM、SIGINT：退出码 0，在已有的登记会话上尽力发 `bye`。
@@ -104,11 +108,13 @@ impl StopCause {
         }
     }
 
-    /// 停止时要不要停掉**自己拉起**的引擎（规范 §2.7.5）：`engine.stop_on_exit:"never"` **只对退出码 0 有效**
-    /// （正常停止，升级重启时保留引擎给下一个 iDoris 接管）；孤儿超时（4）、因 `instance_conflict` 退出的 3
+    /// 停止原因一确定，要不要**立刻**开始停掉自己拉起的引擎（与 HTTP 排空并行，规范 §2.7.5）：`engine.stop_on_exit:"never"`
+    /// **只对退出码 0 有效**（正常停止，升级重启时保留引擎给下一个 iDoris 接管）；孤儿超时（4）、因 `instance_conflict` 退出的 3
     /// 与 5（自有引擎失效）一律停，否则会留下没有任何管理者的引擎，正是孤儿策略要避免的「孤儿占内存」。
     ///
-    /// `bin` 的停止路径（引擎管理器的 `shutdown`）按这里的判定停或不停。
+    /// 返回 `false`（只有 `never` 的信号停止）**不等于放手**：此刻不停，也不放下所有权句柄；排空期间引擎照常跑，排空结束、
+    /// 退出结果出来之后才定：以 0 退出才移交，排空失败（退出码 1）就停止并回收（`crate::stop::EnginePlan::DecideAfterDrain`，
+    /// 规范勘误十二（2））。
     pub fn stops_owned_engines(self, stop_on_exit: StopOnExit) -> bool {
         match self {
             Self::Signal => stop_on_exit == StopOnExit::Owned,
@@ -937,6 +943,9 @@ impl Registration {
 
     /// 登记客户端要求 iDoris 停止时返回原因（`instance_conflict` 或孤儿超时）。没有客户端、或客户端没有这样的要求时
     /// 永不返回，所以可以直接放进 `select!` 与信号并列。
+    ///
+    /// **已经发布的原因在第一次被 poll 时就就绪**（读 `watch` 里的当前值，不等下一次变化）：`crate::stop::StopSources` 靠这一点
+    /// 让已经成立的退出原因排在信号前面（同一轮里两者都就绪时，不让信号盖掉它们）。
     pub async fn wants_stop(&self) -> StopCause {
         let mut exit = self.inner.exit.subscribe();
         loop {

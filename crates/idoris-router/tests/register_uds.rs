@@ -1796,6 +1796,11 @@ async fn instance_conflict_requests_exit_3_and_the_client_never_reconnects_or_sa
         .expect("instance_conflict must request a stop");
     assert_eq!(cause, StopCause::InstanceConflict);
     assert_eq!(cause.exit_code(), 3);
+    // 已经发布的原因在第一次被 poll 时就就绪，不用等下一次变化（见孤儿超时那条同样的断言）。
+    assert_eq!(
+        futures_util::FutureExt::now_or_never(registration.wants_stop()),
+        Some(StopCause::InstanceConflict)
+    );
     // 连接被关闭，而且之后什么也没写（没有 ack 的会话，所以没有 bye）。
     let frames = peer.drain_until_eof(secs(10)).await;
     assert!(frames.is_empty(), "{frames:?}");
@@ -1816,6 +1821,71 @@ async fn instance_conflict_requests_exit_3_and_the_client_never_reconnects_or_sa
             .count(|e| matches!(e, Event::ExitRequested(StopCause::InstanceConflict))),
         1
     );
+    registration.finish().await;
+}
+
+/// 规范勘误十二（1）（H4）：登记任务已经**发布**了停止原因（孤儿超时 4 / `instance_conflict` 3），同一轮里信号也就绪：停止原因是登记的
+/// 那个，不是信号（此前无 `biased` 的 `select!` 随机挑，信号能把它们盖成退出码 0）。真的登记客户端、真的发布出来的原因、
+/// 真的 `StopSources`；每次结果都一样（随机挑的话，64 次里总有几次挑中信号）。
+#[tokio::test]
+async fn a_published_registration_cause_outranks_a_signal_that_is_ready_in_the_same_round() {
+    use idoris_router::stop::{StopSources, StopVerdict};
+
+    async fn verdict_with_a_ready_signal(registration: &Registration) -> StopVerdict {
+        StopSources {
+            engine_failed: std::future::pending::<()>(),
+            registration: registration.wants_stop(),
+            gate_failed: std::future::pending::<String>(),
+            signal: std::future::ready(()),
+        }
+        .first()
+        .await
+    }
+
+    // 孤儿超时（4）：没有任何会话，超时之后发布。
+    let rig = Rig::new();
+    let registration = rig.start_with(StartOptions {
+        orphan: Some(ms(100)),
+        ..StartOptions::new(fast())
+    });
+    // 等它发布（按事件等，不断言墙钟）；发布之后信号才「到」。
+    let published = tokio::time::timeout(secs(10), registration.wants_stop())
+        .await
+        .expect("the orphan timeout must fire");
+    assert_eq!(published, StopCause::OrphanTimeout);
+    for round in 0..64 {
+        assert_eq!(
+            verdict_with_a_ready_signal(&registration).await,
+            StopVerdict::Stop(StopCause::OrphanTimeout),
+            "round {round}"
+        );
+    }
+    registration.finish().await;
+
+    // `instance_conflict`（3）：agent24d 在 `register` 之后拒绝。
+    let rig = Rig::new();
+    let server = rig.server();
+    let registration = rig.start(fast());
+    let mut peer = server.accept().await;
+    let (conn_id, nonce, _) = fresh_ids();
+    let (register, _) = peer.challenge(&conn_id, &nonce).await;
+    assert_eq!(register["op"], "register");
+    peer.send(&json!({
+        "v": 1, "op": "error", "code": "instance_conflict",
+        "message": "another healthy instance is registered"
+    }))
+    .await;
+    let published = tokio::time::timeout(secs(10), registration.wants_stop())
+        .await
+        .expect("instance_conflict must request a stop");
+    assert_eq!(published, StopCause::InstanceConflict);
+    for round in 0..64 {
+        assert_eq!(
+            verdict_with_a_ready_signal(&registration).await,
+            StopVerdict::Stop(StopCause::InstanceConflict),
+            "round {round}"
+        );
+    }
     registration.finish().await;
 }
 
@@ -2127,6 +2197,12 @@ async fn without_any_session_the_orphan_timeout_requests_exit_4() {
         started.elapsed() >= ms(280),
         "it must not fire early: {:?}",
         started.elapsed()
+    );
+    // 已经发布的原因在第一次被 poll 时就就绪，不用等下一次变化：停止流程（`stop::StopSources`，规范勘误十二）靠这一点让已经成立的
+    // 退出原因排在同一轮到达的信号前面。
+    assert_eq!(
+        futures_util::FutureExt::now_or_never(registration.wants_stop()),
+        Some(StopCause::OrphanTimeout)
     );
     registration.finish().await;
 }

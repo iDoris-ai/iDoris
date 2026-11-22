@@ -1294,3 +1294,323 @@ async fn an_engine_that_dies_after_the_gate_makes_idoris_stop_with_exit_code_5_a
     assert_eq!(fs::read_dir(&record_dir).map(|d| d.count()).unwrap_or(0), 0);
     assert!(!env.discovery_path().exists());
 }
+
+// ---------------------------------------------------------------------------------------------
+// 发版前集成审计（接口规范勘误十二）：退出路径与启动校验
+// ---------------------------------------------------------------------------------------------
+
+/// H5：`stop_on_exit:"never"` 只在以退出码 0 退出时保留引擎。收到信号之后 HTTP 排空失败（超过 10 秒）、以退出码 1 退出：
+/// 引擎必须被停掉，所有权记录清理，不留一个没人管的引擎。（此前信号一到就放下所有权句柄，排空失败时引擎已无人停。）
+///
+/// 排空等不完的请求：请求头发完、声明了 1 MB 正文而一个字节不发（连接一直挂着）。`Expect: 100-continue` 让服务端在处理函数开始读
+/// 正文的那一刻回 `100 Continue`：收到它就确知请求已经在途，不靠固定的等待时间。
+#[tokio::test]
+async fn stop_on_exit_never_stops_and_reclaims_the_engine_when_the_drain_fails_and_the_exit_is_1() {
+    if !require_lsof(
+        "stop_on_exit_never_stops_and_reclaims_the_engine_when_the_drain_fails_and_the_exit_is_1",
+    ) {
+        return;
+    }
+    let env = Env::new();
+    let fake = env.fake("engine", &Behavior::default());
+    let frame = env.frame(
+        &fake.executable,
+        json!({"stop_on_exit": "never"}),
+        json!({}),
+    );
+    let client = http();
+    let (mut child, data_port, _) = env.start(&frame);
+    health_until(&client, data_port, |body| body["phase"] == "ready").await;
+    let engine_pid = fake.launch(0)["pid"].as_u64().unwrap();
+    env.reaper.track(engine_pid);
+    let record_dir = env.state_dir().join("engines-owned/omlx");
+    assert_eq!(fs::read_dir(&record_dir).unwrap().count(), 1);
+
+    let mut stuck =
+        std::net::TcpStream::connect(("127.0.0.1", u16::try_from(data_port).unwrap())).unwrap();
+    stuck.set_read_timeout(Some(PATIENT)).unwrap();
+    stuck
+        .write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: idoris\r\nContent-Type: application/json\r\nExpect: 100-continue\r\nContent-Length: 1000000\r\n\r\n",
+        )
+        .unwrap();
+    let mut answer = [0_u8; 64];
+    let read = stuck.read(&mut answer).unwrap();
+    assert!(
+        String::from_utf8_lossy(&answer[..read]).starts_with("HTTP/1.1 100 Continue"),
+        "the server must be waiting for this request's body: {:?}",
+        String::from_utf8_lossy(&answer[..read])
+    );
+
+    send("-TERM", child.id());
+    let status = wait_exit(&mut child, Duration::from_secs(60));
+    drop(stuck);
+    let stderr = stderr_of(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a drain that cannot finish is a stop failure: {stderr}"
+    );
+    assert!(stderr.contains("停止失败"), "{stderr}");
+    // 即便 `stop_on_exit:"never"`：退出码 1 不是「正常退出」，引擎被停掉、所有权记录清理。
+    wait_dead(engine_pid);
+    assert_eq!(
+        fs::read_dir(&record_dir).map(|d| d.count()).unwrap_or(0),
+        0,
+        "the ownership record is reclaimed together with the engine"
+    );
+}
+
+/// H4（引擎处置）：`stop_on_exit:"never"` 只对退出码 0 有效。孤儿超时（退出码 4）照样停掉自己拥有的引擎、清理所有权记录；
+/// 这个结果与同一轮里是否还有信号无关，都从锁存的那一个停止原因来（`stop::StopPlan`）。
+/// 孤儿计时从启动算起：登记 socket 没有人监听，所以永远登记不上，到点以退出码 4 停止（引擎在这之前早已就绪）。
+#[tokio::test]
+async fn an_orphan_timeout_stops_the_owned_engine_even_with_stop_on_exit_never() {
+    if !require_lsof("an_orphan_timeout_stops_the_owned_engine_even_with_stop_on_exit_never") {
+        return;
+    }
+    let env = Env::new();
+    let fake = env.fake("engine", &Behavior::default());
+    let socket = env.run_dir.join("register.sock");
+    let frame = env.frame(
+        &fake.executable,
+        json!({"stop_on_exit": "never"}),
+        json!({"register_socket": socket, "orphan_timeout_s": 12}),
+    );
+    let client = http();
+    let (mut child, data_port, _) = env.start(&frame);
+    health_until(&client, data_port, |body| body["phase"] == "ready").await;
+    let engine_pid = fake.launch(0)["pid"].as_u64().unwrap();
+    env.reaper.track(engine_pid);
+    let record_dir = env.state_dir().join("engines-owned/omlx");
+    assert_eq!(fs::read_dir(&record_dir).unwrap().count(), 1);
+
+    let status = wait_exit(&mut child, Duration::from_secs(60));
+    let stderr = stderr_of(&mut child);
+    assert_eq!(status.code(), Some(4), "{stderr}");
+    assert!(
+        stderr.contains("无启动器登记超过 12 秒，已停止"),
+        "{stderr}"
+    );
+    wait_dead(engine_pid);
+    assert_eq!(
+        fs::read_dir(&record_dir).map(|d| d.count()).unwrap_or(0),
+        0,
+        "never keeps the engine only for exit 0: an orphan timeout reclaims it"
+    );
+}
+
+/// M4：非法的 `IDORIS_LOAD_TIMEOUT_S` 一律启动失败，不随引擎是否可用而不同：退出码 1，错误点名该变量，发现文件没发布，没登记，
+/// 引擎没拉起。（此前引擎就绪时在门控放行处失败——发现文件已发布、引擎已拉起；引擎降级时这张卡被拿掉，非法值被静默忽略，进程照常运行。）
+#[tokio::test]
+async fn an_invalid_load_timeout_fails_startup_before_anything_starts_whether_or_not_the_engine_is_available()
+ {
+    for engine_available in [true, false] {
+        let case = format!("engine_available={engine_available}");
+        let env = Env::new().with_env("IDORIS_LOAD_TIMEOUT_S", "abc");
+        let fake = env.fake("engine", &Behavior::default());
+        let executable = if engine_available {
+            fake.executable.clone()
+        } else {
+            env.missing_executable()
+        };
+        let socket = env.run_dir.join("register.sock");
+        let agent = FakeAgent24d::start(&socket, env.discovery_path());
+        let frame = env.frame(&executable, json!({}), json!({"register_socket": socket}));
+        let mut child = env.spawn(&frame);
+        let status = wait_exit(&mut child, Duration::from_secs(30));
+        let stderr = stderr_of(&mut child);
+        assert_eq!(status.code(), Some(1), "{case}: {stderr}");
+        assert!(stderr.contains("IDORIS_LOAD_TIMEOUT_S"), "{case}: {stderr}");
+        assert!(stderr.contains("启动失败"), "{case}: {stderr}");
+        assert!(
+            !env.discovery_path().exists(),
+            "{case}: the discovery file was never published"
+        );
+        assert!(
+            agent.ops().is_empty(),
+            "{case}: never registered: {:?}",
+            agent.ops()
+        );
+        assert_eq!(fake.launches(), 0, "{case}: the engine was never spawned");
+    }
+}
+
+/// M5：一条合法的本地 runtime 配置（`IDORIS_LOCAL_RUNTIME_CONFIG`）绑在托管的非 resident 卡上，该卡降级（没装 oMLX）：
+/// 没就绪的托管卡不建 Supervisor，它的配置随它一起拿掉，进程继续服务健康的上游。（此前降级放行时只拿掉卡、留着配置，
+/// 再校验一次得到「没有对应的组件卡」，门控放行失败，整个进程以退出码 1 退出。）
+#[tokio::test]
+async fn a_legal_local_runtime_config_on_a_degraded_managed_card_does_not_take_the_process_down() {
+    let lm_studio = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(url_path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"object": "list", "data": [{"id": "up-model", "object": "model"}]}),
+        ))
+        .mount(&lm_studio)
+        .await;
+    Mock::given(method("POST"))
+        .and(url_path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "up-model",
+            "choices": [{"message": {"content": "hello from the upstream"}}]
+        })))
+        .mount(&lm_studio)
+        .await;
+    let mut env = Env::new();
+    env.write_card(&managed_card_with_a_role(env.port));
+    fs::write(
+        env.components.path().join("lmstudio.yaml"),
+        upstream_card(&lm_studio.uri()),
+    )
+    .unwrap();
+    // 配置的 provider_id 与端口都对得上托管卡 `omlx`（端点一致、不是 resident）：对原始卡集是合法的。
+    let config = env.work.path().join("local-runtimes.yaml");
+    fs::write(
+        &config,
+        format!(
+            "version: 1\nruntimes:\n  - provider_id: omlx\n    kind: mlx_lm_server\n    executable: /usr/bin/python3\n    model_path: {}\n    port: {}\n    model_id: managed-model\n    memory_gb: 1.0\n    load_fence_path: {}\n",
+            env.work.path().join("model").display(),
+            env.port,
+            env.work.path().join("local.pending").display()
+        ),
+    )
+    .unwrap();
+    env.extra_env.push((
+        "IDORIS_LOCAL_RUNTIME_CONFIG".to_owned(),
+        config.to_str().unwrap().to_owned(),
+    ));
+    let (mut child, data_port, _) =
+        env.start(&env.frame(&env.missing_executable(), json!({}), json!({})));
+    let client = http();
+    // 门控放行之后非托管卡的探测器才起：上游卡 `ready` 说明数据面已经是完整的 Router，进程没有因为配置退出。
+    let body = health_until(&client, data_port, |body| {
+        upstream(body, "lmstudio")["state"] == "ready"
+    })
+    .await;
+    assert_eq!(body["phase"], "degraded", "{body}");
+    assert_eq!(upstream(&body, "omlx")["reason"], "engine_not_found");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the process keeps running"
+    );
+    let response = client
+        .post(format!("http://127.0.0.1:{data_port}/v1/chat/completions"))
+        .header("X-iDoris-Privacy", "local_only")
+        .json(&json!({"model": "idoris/daily", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let answer: Value = response.json().await.unwrap();
+    assert!(
+        answer.to_string().contains("hello from the upstream"),
+        "{answer}"
+    );
+    send("-TERM", child.id());
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(30)).code(),
+        Some(0),
+        "stderr: {}",
+        stderr_of(&mut child)
+    );
+}
+
+/// 一个 `/v1/models` 答得很慢（5 秒，探测的期限是 2 秒）的 resident 上游卡：它在探测超时之前一直没有第一次观测（`starting`）。
+async fn slow_upstream() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(url_path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"object": "list", "data": [{"id": "up-model"}]}))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+/// 数据面是不是已经在服务：一个无效 JSON 的聊天请求，启动门控未开时是 503 `idoris_starting`，开了之后是 400。
+async fn data_plane_status(client: &reqwest::Client, data_port: u64) -> u16 {
+    client
+        .post(format!("http://127.0.0.1:{data_port}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("X-iDoris-Privacy", "local_only")
+        .body("not json")
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// M6 (a)：门控已开之后，托管引擎的终局失败不被「别的上游还没有第一次观测」遮住：`phase` 是 `degraded`，不是 `starting`。
+/// 门控放行的那一刻探测器才起，健康卡此刻还没有观测（它的 `/v1/models` 答得很慢）；此前这个 `starting` 一直遮到探测超时。
+#[tokio::test]
+async fn a_managed_terminal_failure_is_degraded_even_while_another_upstream_has_no_first_observation()
+ {
+    let slow = slow_upstream().await;
+    let env = Env::new();
+    env.write_card(&managed_card_with_a_role(env.port));
+    fs::write(
+        env.components.path().join("lmstudio.yaml"),
+        upstream_card(&slow.uri()),
+    )
+    .unwrap();
+    let (mut child, data_port, _) =
+        env.start(&env.frame(&env.missing_executable(), json!({}), json!({})));
+    let client = http();
+    // 等门控放行（数据面不再是 503 `idoris_starting`），然后马上读 `/health`：探测器刚起，慢上游还没有第一次观测。
+    let deadline = Instant::now() + PATIENT;
+    while data_plane_status(&client, data_port).await == 503 {
+        assert!(Instant::now() < deadline, "the gate never opened");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let body = health(&client, data_port).await;
+    assert_eq!(
+        upstream(&body, "lmstudio")["state"],
+        "starting",
+        "the slow upstream has no first observation yet: {body}"
+    );
+    assert_eq!(
+        upstream(&body, "omlx")["state"],
+        "absent",
+        "the managed engine is in a terminal failure: {body}"
+    );
+    assert_eq!(body["phase"], "degraded", "{body}");
+    assert_eq!(body["ready"], false);
+    send("-TERM", child.id());
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(30)).code(),
+        Some(0)
+    );
+}
+
+/// M6 (b)：没有托管卡（没有启动门控）、一张还没有第一次观测的 resident 卡：`phase` 是 `starting`，**而数据面此刻已经在服务**
+/// （不是 503 `idoris_starting`）。规范 §2.11.1：`starting` 只在全局门控未开时意味着数据面 503。
+#[tokio::test]
+async fn phase_starting_without_a_gate_means_only_that_an_upstream_has_no_first_observation_the_data_plane_serves()
+ {
+    let slow = slow_upstream().await;
+    let env = Env::new();
+    // 没有托管卡：只有这一张 resident 卡。
+    env.write_card(&upstream_card(&slow.uri()));
+    let (mut child, data_port, _) =
+        env.start(&env.frame(&env.missing_executable(), json!({}), json!({})));
+    let client = http();
+    let body = health(&client, data_port).await;
+    assert_eq!(body["phase"], "starting", "{body}");
+    assert_eq!(body["ready"], false);
+    assert_eq!(upstream(&body, "lmstudio")["state"], "starting", "{body}");
+    assert_eq!(
+        data_plane_status(&client, data_port).await,
+        400,
+        "the data plane is serving (an invalid body is a 400, not the gate's 503 idoris_starting)"
+    );
+    send("-TERM", child.id());
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(30)).code(),
+        Some(0)
+    );
+}

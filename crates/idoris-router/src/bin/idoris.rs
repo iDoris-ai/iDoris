@@ -44,6 +44,7 @@ use idoris_router::{
     runtime::RuntimeRegistry,
     runtime_launch_config,
     startup_form::StartupForm,
+    stop::{self, EngineControl, StopLatch, StopPlan, StopSources, StopVerdict},
     storage,
     subscription::{
         config::SubscriptionConfig,
@@ -178,6 +179,26 @@ fn stop_report(
     StopReport {
         lines,
         result: Ok(cause.exit_code()),
+    }
+}
+
+/// 退出结果：锁存的停止原因 `verdict`（`None` = 停止流程没有走到决定这一步，服务自己倒了）加上排空的结果 `served`。
+/// 引擎的收尾（[`stop::engines_stop_after_drain`]）、退出码与日志行都从这**一个**结果来。
+///
+/// - 启动失败（门控创建完整服务体失败）：`Err`，退出码 1，排空的结果不重要，也没有原因行。
+/// - 预期的停止：[`stop_report`]（排空失败不能盖掉已经确定的 3、4、5）。
+fn exit_report(
+    verdict: Option<&StopVerdict>,
+    served: Result<(), String>,
+    orphan_timeout_s: u32,
+) -> StopReport {
+    match verdict {
+        Some(StopVerdict::StartupFailed(message)) => StopReport {
+            lines: Vec::new(),
+            result: Err(message.clone()),
+        },
+        Some(StopVerdict::Stop(cause)) => stop_report(Some(*cause), served, orphan_timeout_s),
+        None => stop_report(None, served, orphan_timeout_s),
     }
 }
 
@@ -513,8 +534,11 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
         parse_bind_host(bind_host_raw.as_deref())?
     };
 
-    let components_dir =
-        config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
+    // 接口规范 §2.7.3（勘误十二（5））：canonical 路径在加载之前确定，加载与发布 `launch.components_dir` 用的是同一个结果。
+    let components_dir = canonical_components_dir(&config::resolve_env(
+        "IDORIS_COMPONENTS_DIR",
+        components::DEFAULT_COMPONENTS_DIR,
+    )?)?;
     let allow_mock = env_flag("IDORIS_ALLOW_MOCK");
     let cards = components::load_components(&components_dir, allow_mock).map_err(|err| {
         format!(
@@ -597,16 +621,20 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     let remote_kill_switch = env_flag("IDORIS_REMOTE_KILL_SWITCH");
     // 有托管卡时，Supervisor 要等托管引擎落定（就绪，或终局的失败）才能创建（它在创建时对引擎采样一次，引擎还没好就会把启动错误粘滞住）：
     // 这里只做不启动任何任务的校验，完整的 Router（含 Supervisor）在启动门控完成时才创建并替换上去（接口规范 §2.7.6）。
-    let runtimes = if managed.is_some() {
+    // 规范勘误十二（3）：对**原始卡集**一次完整校验本地 runtime 配置，并解析适配器的环境参数（`IDORIS_LOAD_TIMEOUT_S`）：都在启动引擎、
+    // 发布发现文件、登记之前，非法值一律启动失败，不随引擎是否就绪而不同。门控放行时用解析好的参数建适配器，不再读环境。
+    let (runtimes, adapter_params) = if managed.is_some() {
         RuntimeRegistry::validate_local_configs(&cards, &local_runtime_configs)?;
-        RuntimeRegistry::default()
+        let params = RuntimeRegistry::resolve_adapter_params(&cards, &local_runtime_configs)?;
+        (RuntimeRegistry::default(), params)
     } else {
-        RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
+        let runtimes = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
             &cards,
             &local_runtime_configs,
             allocated_budget_bytes,
             remote_kill_switch,
-        )?
+        )?;
+        (runtimes, idoris_upstream::factory::AdapterParams::default())
     };
     // Preserve startup-gate precedence: component/policy/runtime validation
     // (including subscription authorization and fixed card gates) must fail
@@ -877,10 +905,11 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
             contract_version: idoris_contracts::CONTRACT_VERSION.to_string(),
             started_at_ms,
             launch: Some(launch_snapshot(
+                &storage::canonical_process_db_path()?,
                 &components_dir,
                 allocated_budget_bytes,
                 &upstream_plans,
-            )?),
+            )),
         })),
         None => None,
     };
@@ -961,14 +990,14 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     // 有托管卡时探测器等门控完成之后才起（那时 Supervisor 表才有），之前数据面本来就是 503。
     let prober_cancel = CancellationToken::new();
     let prober_slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
-    // 停止的原因：SIGTERM、SIGINT，登记客户端要求停止（`instance_conflict`、孤儿超时），或自己拉起的引擎失效（退出码 5）。
-    // 走同一条停止路径（接口规范 §2.7.5），原因在这里记下来，决定退出码、日志、是否发 `bye`、停不停引擎。
-    let stop_cause: Arc<Mutex<Option<StopCause>>> = Arc::new(Mutex::new(None));
-    // 引擎的停止与 HTTP 排空并行（接口规范 §2.7.5 第 1 到 3 步）：停止原因一确定就在后台开始，之后等它做完。
+    // 停止的原因（接口规范 §2.7.5，勘误十二）：SIGTERM、SIGINT，登记客户端要求停止（`instance_conflict`、孤儿超时），自己拉起的引擎失效
+    // （退出码 5），或门控创建完整服务体失败（启动失败）。它们走同一条停止路径，原因只在这里**锁存一次**（先到先得）；同一轮里几个同时
+    // 成立时按 5 > 4 > 3 > 启动失败 > 信号取一个（`stop::StopSources`）。退出码、是否发 `bye`、对自有引擎的处置都从这一个结果推出。
+    let stop_latch: Arc<StopLatch> = Arc::new(StopLatch::default());
+    // 引擎的停止与 HTTP 排空并行（接口规范 §2.7.5 第 1 到 3 步）：停止原因一确定就在后台开始，之后等它做完。`stop_on_exit:"never"` 的
+    // 信号停止是例外：排空期间保留所有权句柄，这里一直是空的，排空结束、退出结果出来之后才定（`stop::finish_engines`）。
     let engines_stopping: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(None));
-    // 完整的服务体创建失败（门控完成时）：启动失败，退出码 1。
-    let gate_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let (gate, bodies) = match &engines {
         Some(engines) => {
             // 门控：数据面与 Admin 先服务「starting 体」。
@@ -992,19 +1021,15 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
                 Box::new(move |outcome: &lifecycle::GateOutcome| {
                     // 降级放行（有托管引擎终局失败，接口规范 §2.7.6 勘误六）：没就绪的托管卡不建 Supervisor——它会去采样一个没起来、
                     // 或者没通过属主校验的端点；路由到这些卡的请求由 `managed_failures` 直接 503（带原因），别的卡照常服务。
-                    let runtime_cards: Vec<_> = state
-                        .cards
-                        .iter()
-                        .filter(|card| !outcome.degraded.contains_key(&card.provider.id))
-                        .cloned()
-                        .collect();
-                    let runtimes =
-                        RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
-                            &runtime_cards,
-                            &local_runtime_configs,
-                            allocated_budget_bytes,
-                            remote_kill_switch,
-                        )?;
+                    // 卡集与本地 runtime 配置表一起投影（被拿掉的卡的配置随它走），适配器参数用启动时按原始卡集解析好的（勘误十二（3））。
+                    let runtimes = RuntimeRegistry::spawn_after_gate(
+                        &state.cards,
+                        &local_runtime_configs,
+                        |provider_id| outcome.degraded.contains_key(provider_id),
+                        allocated_budget_bytes,
+                        remote_kill_switch,
+                        &adapter_params,
+                    )?;
                     state.runtimes = runtimes.clone();
                     state.managed_failures = Arc::new(outcome.degraded.clone());
                     state.capabilities = capabilities_inputs.take().map(|(catalog, facts)| {
@@ -1073,17 +1098,16 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     let launcher_stop_on_exit = launcher.engine.stop_on_exit;
     let shutdown_signal = {
         let registration = registration.clone();
-        let stop_cause = stop_cause.clone();
+        let stop_latch = stop_latch.clone();
         let engines = engines.clone();
         let engines_stopping = engines_stopping.clone();
-        let gate_failure = gate_failure.clone();
         async move {
             // 引擎失效通常只在门控完成之后才会有（之前走重启与熔断；实例任务自己 panic 是例外，也报在这里）。
             // 没有引擎管理器时永不返回。
             let engine_failed = async {
                 match &engines {
-                    Some(engines) => engines.engine_failed().await,
-                    None => std::future::pending().await,
+                    Some(engines) => engines.failed().await,
+                    None => std::future::pending::<()>().await,
                 }
             };
             let registration_stop = async {
@@ -1092,31 +1116,30 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
                     None => std::future::pending().await,
                 }
             };
-            let cause = tokio::select! {
-                _ = termination_signal() => Some(StopCause::Signal),
-                cause = registration_stop => Some(cause),
-                _ = engine_failed => Some(StopCause::EngineFailed),
-                message = gate_failed => {
-                    // 启动失败：不是任何一种「预期的停止」，不发 `bye`，退出码 1（调用方读到 `gate_failure` 后返回 `Err`）。
-                    *gate_failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(message);
-                    None
-                }
-            };
-            if let (Some(registration), Some(cause)) = (&registration, cause) {
-                // 立即返回：自愈马上停止；信号与引擎失效时 `bye`（至多 0.5 秒）与下面的 HTTP 排空并行。
+            // 同一轮里几个来源同时成立：已经发布的 5、4、3 与启动失败排在信号前面，不随机挑（`select!` 在这里是 `biased` 的）。
+            let verdict = StopSources {
+                engine_failed,
+                registration: registration_stop,
+                gate_failed,
+                signal: termination_signal(),
+            }
+            .first()
+            .await;
+            // `bye` 与引擎处置都从这**一个**结果推出。
+            let plan = StopPlan::new(&verdict, launcher_stop_on_exit);
+            if let (Some(registration), Some(cause)) = (&registration, plan.registration) {
+                // 立即返回：自愈马上停止；信号与引擎失效时 `bye`（至多 0.5 秒）与下面的 HTTP 排空并行。启动失败不是预期的停止，不发 `bye`。
                 registration.begin_stop(cause);
             }
             // 引擎的停止与 HTTP 排空并行：`stop_on_exit:"never"` 只对退出码 0 有效，退出码 4、5 与 3 一律停（接口规范 §2.7.5）；
-            // 启动失败当作要停（没有对外服务过，留着引擎没有意义）。
-            if let Some(engines) = engines {
-                let stop =
-                    cause.is_none_or(|cause| cause.stops_owned_engines(launcher_stop_on_exit));
-                let handle = tokio::spawn(async move { engines.shutdown(stop).await });
+            // 启动失败当作要停（没有对外服务过，留着引擎没有意义）。`never` 的信号停止此刻不动，保留所有权句柄。
+            if let Some(engines) = &engines {
                 *engines_stopping
                     .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(handle);
+                    .unwrap_or_else(PoisonError::into_inner) =
+                    stop::begin_engines(engines, plan.engines);
             }
-            *stop_cause.lock().unwrap_or_else(PoisonError::into_inner) = cause;
+            stop_latch.latch(verdict);
         }
     };
     let served = match bodies {
@@ -1156,20 +1179,28 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     if let Some(prober) = prober {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), prober).await;
     }
-    // 引擎的收尾：停止在停止原因确定时就已经开始（与排空并行），这里等它做完；服务自己倒了（没有走停止原因）时现在才停。
+    // 退出结果只在这里算一次：停止原因（锁存的那一个）与排空的结果都已经知道。引擎的收尾、退出码、日志行都从它来，没有第二处各自再判断。
+    let verdict = stop_latch.get().cloned();
+    let report = exit_report(verdict.as_ref(), served, launcher.orphan_timeout_s);
+    // 引擎的收尾：停止在停止原因确定时就已经开始（与排空并行），这里等它做完；`stop_on_exit:"never"` 的信号停止一直保留着所有权句柄，
+    // 到这里退出结果出来了才定：以 0 退出就移交，排空失败（退出 1）就停止并回收（接口规范 §2.7.5：保留引擎只限退出码 0）；
+    // 服务自己倒了（没有锁存任何原因）时现在才停。
     if let Some(engines) = &engines {
-        let stopping = engines_stopping
+        let started = engines_stopping
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        match stopping {
-            Some(handle) => {
-                let _ = tokio::time::timeout(ENGINE_STOP_WAIT, handle).await;
-            }
-            None => {
-                let _ = tokio::time::timeout(ENGINE_STOP_WAIT, engines.shutdown(true)).await;
-            }
-        }
+        let plan = verdict
+            .as_ref()
+            .map(|verdict| StopPlan::new(verdict, launcher_stop_on_exit).engines);
+        stop::finish_engines(
+            engines.as_ref(),
+            started,
+            plan,
+            &report.result,
+            ENGINE_STOP_WAIT,
+        )
+        .await;
     }
     // 登记客户端与自愈先收尾（`bye` 已在排空期间并行发出），之后才删发现文件：否则自愈可能在删除之后又把它写回来。
     if let Some(registration) = &registration {
@@ -1180,19 +1211,6 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     if let Some(target) = discovery_target {
         remove_discovery_file(target, instance_id).await;
     }
-    if let Some(message) = gate_failure
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take()
-    {
-        return Err(message);
-    }
-    let cause = stop_cause
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
-    // 排空失败不能盖掉已经确定的停止原因（3、4、5）：决定在 `stop_report` 里，那里有测试。
-    let report = stop_report(cause, served, launcher.orphan_timeout_s);
     for line in report.lines {
         match line {
             StopLine::Stdout(text) => say(std::io::stdout(), &text),
@@ -1281,21 +1299,34 @@ impl ManagedEngines {
     }
 }
 
-/// 发现文件的 `launch`：启动输入快照（接口规范 §2.7.3）。
+/// `IDORIS_COMPONENTS_DIR` 的 canonical 路径（接口规范 §2.7.3，勘误十二（5））。启动时**在加载组件卡之前**确定一次：加载与发布
+/// `launch.components_dir` 用同一个结果。此前加载用原路径、发布时再 `canonicalize` 一次（失败退回绝对路径），两次之间目录
+/// 被换掉时发布的不是加载的那一个，`canonicalize` 失败时发布的还不是 canonical。失败就是启动失败，不退回绝对路径；
+/// 说明沿用加载失败的那一句（点名 `IDORIS_COMPONENTS_DIR`）。
+fn canonical_components_dir(
+    components_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    std::fs::canonicalize(components_dir).map_err(|error| {
+        format!(
+            "无法加载组件目录 \"{}\"（IDORIS_COMPONENTS_DIR）：无法解析 canonical 路径：{error}",
+            components_dir.display()
+        )
+    })
+}
+
+/// 发现文件的 `launch`：启动输入快照（接口规范 §2.7.3）。`db_path` 是与实例锁用的同一个 canonical 基路径；`components_dir` 必须是
+/// [`canonical_components_dir`] 的结果（加载组件卡用的那一个）：这里**不再**解析路径，原样发布。
 fn launch_snapshot(
+    db_path: &std::path::Path,
     components_dir: &std::path::Path,
     allocated_budget_bytes: Option<u64>,
     plans: &[readiness::UpstreamPlan],
-) -> Result<discovery::LaunchSnapshot, String> {
+) -> discovery::LaunchSnapshot {
     let lossy = |path: &std::path::Path| path.to_string_lossy().into_owned();
-    // 与实例锁用的同一个 canonical 基路径；组件目录同样给 canonical（拿不到就退到绝对路径）。
-    let components_dir = std::fs::canonicalize(components_dir)
-        .or_else(|_| std::path::absolute(components_dir))
-        .map_err(|error| format!("无法解析组件目录的绝对路径：{error}"))?;
-    Ok(discovery::LaunchSnapshot {
-        db_path: lossy(&storage::canonical_process_db_path()?),
+    discovery::LaunchSnapshot {
+        db_path: lossy(db_path),
         state_dir: discovery::resolve_state_dir().map(|path| lossy(&path)),
-        components_dir: lossy(&components_dir),
+        components_dir: lossy(components_dir),
         allocated_budget_bytes,
         engines: plans
             .iter()
@@ -1305,7 +1336,7 @@ fn launch_snapshot(
                 managed: plan.identity.managed,
             })
             .collect(),
-    })
+    }
 }
 
 fn read_admin_token_from_stdin() -> Result<AdminSessionToken, String> {
@@ -1784,6 +1815,120 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// 退出结果与引擎的处置从同一个锁存的结果来（H4、H5）：门控启动失败是退出 1（排空的结果不重要），预期的停止按原因退出；
+    /// `stop_on_exit:"never"` 的信号停止，引擎只在以退出码 0 退出时保留，排空失败（退出 1）就停止并回收。
+    #[test]
+    fn the_exit_report_and_the_engine_fate_both_come_from_the_one_latched_verdict() {
+        let drain_failed = || Err(shutdown_timeout_message());
+        // 启动失败：`Err`（退出码 1），没有原因行，排空是否成功都一样；引擎一律停。
+        for served in [Ok(()), drain_failed()] {
+            let report = exit_report(
+                Some(&StopVerdict::StartupFailed("门控失败".to_string())),
+                served,
+                900,
+            );
+            assert_eq!(
+                report,
+                StopReport {
+                    lines: Vec::new(),
+                    result: Err("门控失败".to_string()),
+                }
+            );
+            assert!(stop::engines_stop_after_drain(&report.result));
+        }
+        // 信号停止：排空成功是退出码 0，引擎（`never`）保留；排空失败是 `Err`（退出码 1），引擎停止并回收。
+        let clean = exit_report(Some(&StopVerdict::Stop(StopCause::Signal)), Ok(()), 0);
+        assert_eq!(clean.result, Ok(0));
+        assert!(!stop::engines_stop_after_drain(&clean.result));
+        let failed = exit_report(
+            Some(&StopVerdict::Stop(StopCause::Signal)),
+            drain_failed(),
+            0,
+        );
+        assert_eq!(failed.result, Err(shutdown_timeout_message()));
+        assert!(stop::engines_stop_after_drain(&failed.result));
+        // 3、4、5：排空成功与否退出码都不变，引擎都停（这些原因一确定就已经在并行地停了）。
+        for (cause, code) in [
+            (StopCause::InstanceConflict, 3),
+            (StopCause::OrphanTimeout, 4),
+            (StopCause::EngineFailed, 5),
+        ] {
+            for served in [Ok(()), drain_failed()] {
+                let report = exit_report(Some(&StopVerdict::Stop(cause)), served, 900);
+                assert_eq!(report.result, Ok(code), "{cause:?}");
+                assert!(stop::engines_stop_after_drain(&report.result), "{cause:?}");
+            }
+        }
+        // 没有锁存任何原因（服务自己倒了）：排空的错误带出去，退出码 1。
+        assert_eq!(
+            exit_report(None, Err("data server exited unexpectedly".to_string()), 0).result,
+            Err("data server exited unexpectedly".to_string())
+        );
+    }
+
+    /// 勘误十二（5）：`IDORIS_COMPONENTS_DIR` 在加载之前确定 canonical 路径，加载与发布用同一个结果；失败是启动失败，不退回绝对路径。
+    #[cfg(unix)]
+    #[test]
+    fn the_components_dir_is_resolved_to_one_canonical_path_that_loading_and_publishing_share() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+
+        // 经符号链接给的路径，解析成真实目录的 canonical 路径（macOS 的 `/var` 实为 `/private/var`：临时目录自己也不是 canonical）。
+        let resolved = canonical_components_dir(&link).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&first).unwrap());
+        assert_ne!(resolved, link);
+
+        // 解析之后、发布之前，符号链接被换成指向另一个目录：发布的仍是加载用的那一个，不是再解析一次的结果。
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&second, &link).unwrap();
+        let snapshot = launch_snapshot(
+            std::path::Path::new("/db/idoris.sqlite3"),
+            &resolved,
+            Some(7),
+            &[],
+        );
+        assert_eq!(snapshot.components_dir, resolved.to_string_lossy());
+        assert_ne!(
+            snapshot.components_dir,
+            std::fs::canonicalize(&second).unwrap().to_string_lossy(),
+            "the swapped link must not leak into the published snapshot"
+        );
+        assert_eq!(snapshot.db_path, "/db/idoris.sqlite3");
+        assert_eq!(snapshot.allocated_budget_bytes, Some(7));
+        // `launch_snapshot` 自己从不解析路径：给它符号链接本身，发布的就是这个字符串（解析是 `canonical_components_dir` 的事，
+        // 而且只在启动时做一次）。
+        assert_eq!(
+            launch_snapshot(std::path::Path::new("/db"), &link, None, &[]).components_dir,
+            link.to_string_lossy()
+        );
+
+        // 发布时**不再**做 I/O：一个根本不存在的路径也原样发布（调用方负责给 canonical 的）。
+        let ghost = std::path::Path::new("/definitely/not/there");
+        assert_eq!(
+            launch_snapshot(std::path::Path::new("/db"), ghost, None, &[]).components_dir,
+            "/definitely/not/there"
+        );
+    }
+
+    #[test]
+    fn a_components_dir_that_cannot_be_canonicalized_is_a_startup_failure_not_an_absolute_path() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let error = canonical_components_dir(&missing).unwrap_err();
+        assert!(error.starts_with("无法加载组件目录"), "{error}");
+        assert!(error.contains("IDORIS_COMPONENTS_DIR"), "{error}");
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        // 一个相对路径：解析成绝对的 canonical 路径（相对 cwd），不是原样保留。
+        let relative = canonical_components_dir(std::path::Path::new(".")).unwrap();
+        assert!(relative.is_absolute());
+        assert_eq!(relative, std::fs::canonicalize(".").unwrap());
     }
 
     #[cfg(unix)]

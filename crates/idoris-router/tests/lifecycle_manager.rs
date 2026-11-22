@@ -566,6 +566,32 @@ async fn an_engine_that_exits_after_the_gate_opened_is_an_engine_failure_not_a_r
         .await
         .expect("the exit after the gate is reported");
     assert_eq!(failure.upstream_id, "omlx");
+    // 已经发布的失败在第一次被 poll 时就就绪，不用等下一次变化：停止流程（`stop::StopSources`，规范勘误十二）靠这一点让它排在
+    // 同一轮到达的信号前面（`EngineControl::failed` 就是它）。
+    assert_eq!(
+        futures_util::FutureExt::now_or_never(h.manager.engine_failed())
+            .map(|failure| failure.upstream_id),
+        Some("omlx".to_owned())
+    );
+    // 规范勘误十二（1）（H4）：失败已经发布、同一轮里信号也就绪：停止原因是引擎失效（退出码 5），不是信号（0）。真的管理器，
+    // 真的发布出来的失败；每次都是同一个结果（`select!` 随机挑的话，64 次里总有几次挑中信号）。
+    for round in 0..64 {
+        let verdict = idoris_router::stop::StopSources {
+            engine_failed: idoris_router::stop::EngineControl::failed(&h.manager),
+            registration: std::future::pending::<idoris_router::register::StopCause>(),
+            gate_failed: std::future::pending::<String>(),
+            signal: std::future::ready(()),
+        }
+        .first()
+        .await;
+        assert_eq!(
+            verdict,
+            idoris_router::stop::StopVerdict::Stop(
+                idoris_router::register::StopCause::EngineFailed
+            ),
+            "round {round}"
+        );
+    }
     // 进程内无法恢复（Supervisor 的账本已经过期，热恢复是 v0.6.1）：不重启，状态是 failed，等 iDoris 以退出码 5 停止。
     assert_eq!(h.view().state, UpstreamState::Failed);
     assert!(!h.view().owned);
