@@ -358,6 +358,22 @@ fn is_trusted_local_card(card: &ComponentCard) -> bool {
     })
 }
 
+/// 运行时能不能为这张卡构造运行时（纯函数）：订阅卡与 resident 的 HTTP 卡不走运行时（Ok）；其余的卡只有 `http_service`
+/// 形态有运行时构造器，别的形态是确定的拒绝。`spawn_runtime_with_factory`（serve 启动）与 `setup` 的落盘前校验
+/// （[`crate::preflight`]）共用它，所以 `setup` 放行的目录不会再因为卡的 `form` 让 serve 起不来。
+pub fn check_runtime_form(card: &ComponentCard) -> Result<(), String> {
+    if is_subscription_provider_id(&card.provider.id)
+        || crate::dispatch::is_resident_http_service(card)
+        || card.form == Form::HttpService
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "provider {} with form {:?} has no runtime constructor",
+        card.provider.id, card.form
+    ))
+}
+
 fn spawn_runtime_with_factory<F>(
     card: &ComponentCard,
     factory: &F,
@@ -374,12 +390,7 @@ where
     if crate::dispatch::is_resident_http_service(card) {
         return Ok(None);
     }
-    if card.form != Form::HttpService {
-        return Err(format!(
-            "provider {} with form {:?} has no runtime constructor",
-            card.provider.id, card.form
-        ));
-    }
+    check_runtime_form(card)?;
     let adapter =
         factory(card).map_err(|error| format!("provider {}: {error}", card.provider.id))?;
     // Engaged at boot: do not status-probe a card that fails `is_local_capable`.

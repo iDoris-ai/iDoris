@@ -90,6 +90,7 @@ pub mod launcher_frame;
 /// IDORIS-CORE S5（接口规范 §2.7.6、§2.7.7）：引擎管理器（状态机、退避、熔断、探测、所有权与孤儿接管、私有 key、
 /// 围栏）与启动门控。和发现文件（`discovery`）一样只支持 unix。
 pub mod lifecycle;
+pub mod preflight;
 pub mod readiness;
 /// IDORIS-CORE S2（接口规范 §2.10，修订 1.6）：向 agent24d 登记与心跳（UDS 客户端）、发现文件自愈、孤儿计时。
 pub mod register;
