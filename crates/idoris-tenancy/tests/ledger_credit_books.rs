@@ -1431,6 +1431,168 @@ fn a_settle_entry_on_a_hold_that_is_neither_being_settled_nor_settled_on_time_fa
     }
 }
 
+/// 让一个预留在 `account` 上的净额变成 `-(release_more - reserved)`（库被改坏了的样子）：先拆掉「在途净额必须落在 [0, 预留额]」的触发器，
+/// 再多插一条 `release`，把预留 `reserved` 之外又放掉 `release_more - reserved`。账户、预留、币种、归属时刻抄这个预留的 `reserve` 那条。
+fn make_the_net_negative(db: &TempDb, account: &str, hold_id: &str, release_more: i64) {
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute_batch("DROP TRIGGER ledger_entries_held_bounds")
+        .unwrap();
+    let inserted = conn
+        .execute(
+            "INSERT INTO ledger_entries
+                 (account_id, hold_id, kind, unit, held_micros, spent_micros, funds_micros, liability_micros,
+                  window_at_ms, at_ms, idempotency_key)
+             SELECT account_id, hold_id, 'release', unit, ?3, 0, 0, 0, window_at_ms, at_ms, 'tampered-negative-' || hold_id
+               FROM ledger_entries WHERE hold_id = ?2 AND account_id = ?1 AND kind = 'reserve'",
+            rusqlite::params![account, hold_id, -release_more],
+        )
+        .unwrap();
+    assert_eq!(
+        inserted, 1,
+        "the reservation has one reserve entry on {account}"
+    );
+}
+
+/// 给一个预留在 `account` 上插一条负的 `late_settle`（结算那一刻才发生的花费的净额变成负数）：CHECK 要求 `spent >= 0`，所以这里把检查关掉。
+fn make_the_settlement_time_spend_negative(db: &TempDb, account: &str, hold_id: &str, spent: i64) {
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+        .unwrap();
+    let inserted = conn
+        .execute(
+            "INSERT INTO ledger_entries
+                 (account_id, hold_id, kind, unit, held_micros, spent_micros, funds_micros, liability_micros,
+                  window_at_ms, at_ms, idempotency_key)
+             SELECT account_id, hold_id, 'late_settle', unit, 0, ?3, 0, 0, window_at_ms + 5, at_ms + 5, 'tampered-late-' || hold_id
+               FROM ledger_entries WHERE hold_id = ?2 AND account_id = ?1 AND kind = 'reserve'",
+            rusqlite::params![account, hold_id, spent],
+        )
+        .unwrap();
+    assert_eq!(
+        inserted, 1,
+        "the reservation has one reserve entry on {account}"
+    );
+}
+
+#[test]
+fn a_negative_amount_cannot_offset_the_debt_of_a_reservation_with_or_without_allowances() {
+    // Codex 三复审 Medium：账户上没有任何花费类额度时，三本账不逐笔回放，已花（含在途）全是额度之外的部分。原来直接取整个账户的
+    // `Σ (held + spent)`：一个被改坏了的预留的负净额抵掉别的预留真实的债务。授信 200；r-1 预留 90（净额 +90）、r-2 预留 30（净额 +30），
+    // 债务 120，净头寸 -120。把 r-2 的净额改成 -40（在 30 的预留之外又放掉 70）：90 和 -40 并存，整个账户的求和是 50，旧代码读出债务 50、
+    // 净头寸 -50，多出 70 的授信。现在失败即关闭：每个预留的净额必须不为负，读到负的返回 `Corrupt`，准入和视图都不例外。
+    // 结算那一刻才发生的花费（`late_settle`）的净额同理（负的 `late_settle` 要关掉 CHECK 才插得进去）。
+    // 有额度时的回放（逐笔找额度）是同一条规矩：原来把负的花费按 0 算，现在也失败即关闭，两条路一致。
+    for (label, with_allowance, negative_settlement_spend) in [
+        ("no allowances, negative reservation", false, false),
+        ("with an allowance, negative reservation", true, false),
+        ("no allowances, negative settlement-time spend", false, true),
+        (
+            "with an allowance, negative settlement-time spend",
+            true,
+            true,
+        ),
+    ] {
+        let db = TempDb::new(&format!(
+            "books-negative-net-{with_allowance}-{negative_settlement_spend}"
+        ));
+        let store = credit_only_world(&db);
+        credit_line(&store, "emp", 200, T0);
+        if with_allowance {
+            // 额度 10，一直有效：回放要读花费；r-1 的 90 先用掉这 10，债务 80 + 30 = 110，净头寸 0 - 110 = -110
+            prepaid(&store, "emp-small", 10, T0 - DAY, T0 + 30 * DAY, T0);
+        }
+        let big = Req::new(&store, "r-1", 0, "cred-e", 40).at(T0 + 1);
+        assert_eq!(
+            admit(&store, &big)
+                .admitted()
+                .map(|a| a.reservation.price.micros()),
+            Some(90),
+            "{label}"
+        );
+        let small = Req::new(&store, "r-2", 0, "cred-e", M30).at(T0 + 2);
+        assert_eq!(
+            admit(&store, &small)
+                .admitted()
+                .map(|a| a.reservation.price.micros()),
+            Some(30),
+            "{label}"
+        );
+        assert_eq!(
+            view(&store, T0 + 3).ceiling_remaining,
+            Some(thb(if with_allowance { -110 } else { -120 })),
+            "{label}: sound before the tampering (debt 90 + 30, minus the 10 the allowance covers)"
+        );
+        drop(store);
+        if negative_settlement_spend {
+            make_the_settlement_time_spend_negative(&db, "emp", "r-2#0", -40);
+        } else {
+            make_the_net_negative(&db, "emp", "r-2#0", 70);
+        }
+
+        let store = AccountStore::open(db.path()).unwrap();
+        let error = store
+            .account_view(&aid("emp"), ts(T0 + 4))
+            .expect_err("the view must fail closed");
+        assert!(
+            matches!(error, LedgerError::Corrupt(_)),
+            "{label}: {error:?}"
+        );
+        let next = Req::new(&store, "r-3", 0, "cred-e", M30).at(T0 + 4);
+        let error = store
+            .admit_attempt(&next.input())
+            .expect_err("admission must fail closed");
+        assert!(
+            matches!(error, LedgerError::Corrupt(_)),
+            "{label}: {error:?}"
+        );
+        assert!(
+            store.hold(&next.attempt, "model").unwrap().is_none(),
+            "{label}: nothing was reserved"
+        );
+    }
+}
+
+#[test]
+fn a_settle_entry_that_holds_less_than_the_overage_its_hold_claims_never_books_more_than_it_holds()
+{
+    // 库被改坏了：预留的记录说预留 100、实际 200（超出 100，旧格式：整笔 200 记在 `settle` 里），可这条 `settle` 的已花被改成了 60，
+    // 连预留之内的部分都不够。分出来的超出部分夹到这个预留在这个账户上剩下的净额（60），预留本身是 0；不夹就是分出 100，预留本身 -40，
+    // 凭空多出 40 的额度覆盖。
+    //
+    // 授信 100，额度 100 的窗口从 T0 + 10 起（T0 + 5 创建）；T0 + 9 预留 100，T0 + 10 按 200 结算，分录改回旧格式，再把 `settle` 的已花改成 60。
+    // 读：超出的 60 在 T0 + 10，额度覆盖，剩 40；预留之内 0。净头寸 40 - 0 = 40。（不夹：覆盖 100，剩 0，净头寸 0。）
+    let db = TempDb::new("books-settle-holds-less-than-claimed");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 100, T0);
+    prepaid(&store, "emp-new", 100, T0 + 10, T0 + 10 + 30 * DAY, T0 + 5);
+    let first = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 9);
+    assert_eq!(
+        admit(&store, &first)
+            .admitted()
+            .map(|a| a.reservation.price.micros()),
+        Some(100)
+    );
+    settle_at(&store, &first, 200, T0 + 10);
+    drop(store);
+    rewrite_overage_as_v0_5_0(&db, "r-1#0");
+    let changed = rusqlite::Connection::open(db.path())
+        .unwrap()
+        .execute(
+            "UPDATE ledger_entries SET spent_micros = 60
+              WHERE hold_id = 'r-1#0' AND account_id = 'emp' AND kind = 'settle'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let store = AccountStore::open(db.path()).unwrap();
+    assert_eq!(
+        view(&store, T0 + 11).ceiling_remaining,
+        Some(thb(40)),
+        "the 60 the settle entry holds is the most it can move: allowance 100 - 60 = 40, nothing inside the reservation"
+    );
+}
+
 // ------------------------------------------------------------------------------------------
 // Codex 复审（2026-11-22）：超出预留的部分、读钟乱序——没充值的账户在 main 上就有同样的两条造钱的路径
 // ------------------------------------------------------------------------------------------
@@ -1767,12 +1929,17 @@ fn an_unexpired_overage_booked_whole_in_the_old_shape_is_split_when_the_books_ar
     // 下一笔 100 照样放行。）
     // 两种发额度的方式，期望一样：窗口在预留之后才开始（额度先创建），或者额度在预留提交之后、结算之前才创建（窗口早就开始了）。
     // 后一种要求超出的部分用**结算这条 `settle` 自己的分录号**（不是预留那条）：额度在预留之后才存在，只有结算的序号比它的创建序号大。
-    for (label, allowance_exists_before_the_reservation) in [
-        ("the window starts after the reservation", true),
-        ("the allowance is created after the reservation", false),
+    // 再加一个维度（Codex 三复审 Low）：超出的 100 在 `settle` 里是整笔留着（旧格式，`late_settle` 里 0），还是只搬了一半
+    // （`settle` 已花 160 + `late_settle` 40）。两种读出来是同一本账：`settle` 里还留着的 100 - 40 = 60 在 T0 + 10，加上 `late_settle`
+    // 的 40，结算时刻一共 100。
+    for (label, allowance_exists_before_the_reservation, keep_in_late) in [
+        ("the window starts after the reservation", true, 0),
+        ("the allowance is created after the reservation", false, 0),
+        ("half of it moved, window starts after", true, 40),
+        ("half of it moved, allowance created after", false, 40),
     ] {
         let db = TempDb::new(&format!(
-            "books-legacy-overage-split-{allowance_exists_before_the_reservation}"
+            "books-legacy-overage-split-{allowance_exists_before_the_reservation}-{keep_in_late}"
         ));
         let store = credit_only_world(&db);
         credit_line(&store, "emp", 100, T0);
@@ -1792,9 +1959,16 @@ fn an_unexpired_overage_booked_whole_in_the_old_shape_is_split_when_the_books_ar
         }
         settle_at(&store, &first, 200, T0 + 10);
         drop(store);
-        rewrite_overage_as_v0_5_0(&db, "r-1#0");
+        rewrite_overage_partially(&db, "r-1#0", keep_in_late);
 
         let store = AccountStore::open(db.path()).unwrap();
+        let mut expected = vec![
+            ("reserve".to_string(), 100, 0, T0 + 9),
+            ("settle".to_string(), -100, 200 - keep_in_late, T0 + 9),
+        ];
+        if keep_in_late > 0 {
+            expected.push(("late_settle".to_string(), 0, keep_in_late, T0 + 10));
+        }
         assert_eq!(
             store
                 .entries_of_hold(&first.attempt, "model")
@@ -1808,17 +1982,20 @@ fn an_unexpired_overage_booked_whole_in_the_old_shape_is_split_when_the_books_ar
                     entry.window_at.millis()
                 ))
                 .collect::<Vec<_>>(),
-            [
-                ("reserve".to_string(), 100, 0, T0 + 9),
-                ("settle".to_string(), -100, 200, T0 + 9),
-            ],
-            "{label}: the old shape: the overage is inside the settle entry"
+            expected,
+            "{label}: the overage is (partly) still inside the settle entry"
         );
         let v = view(&store, T0 + 11);
         assert_eq!(
             v.ceiling_remaining,
             Some(thb(-100)),
             "{label}: allowance 0 - debt 100"
+        );
+        let books = check_books(&store, &db, "emp", T0 + 11);
+        assert_eq!(
+            (books.allowance_left, books.covered, books.credit_debt),
+            (0, 100, 100),
+            "{label}"
         );
         assert_eq!(headroom(&v), 0, "{label}");
         let next = Req::new(&store, "r-2", 0, "cred-e", M100).at(T0 + 12);

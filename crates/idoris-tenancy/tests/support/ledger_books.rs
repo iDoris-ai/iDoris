@@ -124,6 +124,80 @@ fn replay(
     }
 }
 
+/// 一个预留的记录（状态、预留额、实际消费、宽限下限）按手算规则推出的两笔花费：（预留本身，结算那一刻才发生的花费）。
+///
+/// 预留本身是预留创建时刻上的一笔（在途 = 预留额；结算之后 = 预留之内的部分 `min(实际, 预留) - 宽限承担`；放掉 / 过期 = 0；迟到的结算 = 0）；
+/// 超出预留的部分是结算那一刻的另一笔（没迟到的结算 `max(实际 - 预留, 0)`；迟到的结算整笔 `实际 - 宽限承担`）。宽限里平台承担的部分
+/// （预留之内、超出放行时下限的那一块）不记到付款账户链上。分录是旧格式、中间形态还是新格式，这里是同一回事。
+fn pieces_of(
+    state: &str,
+    late: bool,
+    reserved: i64,
+    charged: i64,
+    floor: Option<i64>,
+) -> (i64, i64) {
+    let within = charged.min(reserved);
+    let absorbed = floor.map_or(0, |floor| (within - floor).max(0));
+    match (state, late) {
+        ("open", _) => (reserved, 0),
+        ("settled", false) => (within - absorbed, (charged - reserved).max(0)),
+        ("settled", true) => (0, charged - absorbed),
+        // 放掉了、过期了（还没有迟到的结算）：不占任何额度
+        _ => (0, 0),
+    }
+}
+
+/// 读原始表（`ledger_holds` 和这个账户上有分录的预留），一个账户上每个预留按手算规则（[`pieces_of`]）推出的花费：（归属时刻，净额）。
+/// **不看分录的 `window_at_ms`**：预留本身在预留创建的时刻，结算那一刻才发生的花费在结算的时刻（预留记录里的 `closed_at_ms`）。
+/// 窗口求和（额度窗口、速率窗口、补贴池的账期）的期望从这里来，旧格式、中间形态、新格式的分录读出来必须是同一份。
+pub fn attributed_spends(db_path: &Path, account: &str) -> Vec<(i64, i64)> {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT h.state, h.late, h.reserved_micros, COALESCE(h.charged_micros, 0), h.created_at_ms,
+                    COALESCE(h.closed_at_ms, 0), h.grace_floor_micros
+               FROM ledger_holds h
+              WHERE EXISTS (SELECT 1 FROM ledger_entries e WHERE e.hold_id = h.hold_id AND e.account_id = ?1)
+              ORDER BY h.hold_id",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([account], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? == 1,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })
+        .unwrap();
+    let mut spends = Vec::new();
+    for row in rows {
+        let (state, late, reserved, charged, created_at, closed_at, floor) = row.unwrap();
+        let (reservation, settled_later) = pieces_of(&state, late, reserved, charged, floor);
+        if reservation != 0 {
+            spends.push((created_at, reservation));
+        }
+        if settled_later != 0 {
+            spends.push((closed_at, settled_later));
+        }
+    }
+    spends
+}
+
+/// [`attributed_spends`] 里归属时刻满足 `window` 的花费之和。
+pub fn spent_where(db_path: &Path, account: &str, window: impl Fn(i64) -> bool) -> i64 {
+    attributed_spends(db_path, account)
+        .into_iter()
+        .filter(|(at, _)| window(*at))
+        .map(|(_, amount)| amount)
+        .sum()
+}
+
 /// 读原始表，按事件逐笔回放（不经过被测代码）：
 ///
 /// * 事件按**提交先后**排：分录号是提交的先后；额度创建 / 撤销的序号 `after_entry` 是「它提交那一刻账本里最后一条分录的号」，
@@ -232,16 +306,7 @@ pub fn model(db_path: &Path, account: &str, now: i64) -> Books {
                 reserve_entry,
                 settle_entry,
             ) = row.unwrap();
-            // 宽限里平台承担的部分：预留之内、超出放行时下限的那一块（不记到付款账户链上）
-            let within = charged.min(reserved);
-            let absorbed = floor.map_or(0, |floor| (within - floor).max(0));
-            let (reservation, settled_later) = match (state.as_str(), late) {
-                ("open", _) => (reserved, 0),
-                ("settled", false) => (within - absorbed, (charged - reserved).max(0)),
-                ("settled", true) => (0, charged - absorbed),
-                // 放掉了、过期了（还没有迟到的结算）：不占任何额度
-                _ => (0, 0),
-            };
+            let (reservation, settled_later) = pieces_of(&state, late, reserved, charged, floor);
             if reservation > 0 {
                 let first =
                     reserve_entry.expect("a hold with money on the books has a reserve entry");

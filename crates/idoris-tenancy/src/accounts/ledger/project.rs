@@ -5,11 +5,18 @@
 //! | `AncestorView` 的字段 | 怎么得到 |
 //! |---|---|
 //! | `balance`（自有资金） | 有充值分录才有：`Σ funds − Σ (held + spent)`（所有时间）。没有充值过 = `None`。例外：有过授信、又有过花费类额度的充值账户走下面「授信的旧债与新额度分开记」的口径，自有资金并进 `ceiling_remaining` 的净头寸，这里是 `None` |
-//! | `ceiling_remaining`（授权额度剩余） | 流入这个账户的、此刻有效的**花费类**额度（免费额度、预付、组织配额，不含授信）之和，减去这些额度**窗口内**（从最早的有效起点算起）的 `Σ (held + spent)`。曾经有过额度、现在一个都不生效（比如上个月的免费额度过期了）= `Some(0)`，**不是** `None`。例外：有过授信的账户（没充值的，或者充了值又有过花费类额度的）走下面「授信的旧债与新额度分开记」的口径 |
+//! | `ceiling_remaining`（授权额度剩余） | 流入这个账户的、此刻有效的**花费类**额度（免费额度、预付、组织配额，不含授信）之和，减去这些额度**窗口内**（从最早的有效起点算起）的 `Σ (held + spent)`（超出预留的部分按结算时刻算，见下「按归属时刻切的窗口」）。曾经有过额度、现在一个都不生效（比如上个月的免费额度过期了）= `Some(0)`，**不是** `None`。例外：有过授信的账户（没充值的，或者充了值又有过花费类额度的）走下面「授信的旧债与新额度分开记」的口径 |
 //! | `credit_limit` | 此刻有效的**授信额度**（`allocations` 里 purpose = `credit_line`、窗口内、没被撤销的）之和，没有 = 0 |
-//! | `rate_windows` | 配了分钟 / 小时上限才有：`Σ (held + spent)` 里 `window_at` 落在最近 60 秒 / 3600 秒（滑动窗口，不是日历桶：任意一个窗口长度的区间里都不会超过上限）的部分 |
+//! | `rate_windows` | 配了分钟 / 小时上限才有：`Σ (held + spent)` 里归属时刻落在最近 60 秒 / 3600 秒（滑动窗口，不是日历桶：任意一个窗口长度的区间里都不会超过上限）的部分（超出预留的部分按结算时刻算） |
 //! | `in_flight` | 配了在途上限才有：当前在途 = `Σ held`；过期的预留已经有 `expire` 分录冲掉 |
-//! | `subsidy_pool_remaining` | 只有补贴池账户：当前账期的总上限（`ledger_pool_caps` 最新一条，没有 = 0）减去该账期池账户上的 `Σ (held + spent)` |
+//! | `subsidy_pool_remaining` | 只有补贴池账户：当前账期的总上限（`ledger_pool_caps` 最新一条，没有 = 0）减去该账期池账户上的 `Σ (held + spent)`（超出预留的部分按结算时刻算；报表 `pool_report` 是同一个数） |
+//!
+//! **按归属时刻切的窗口，超出预留的部分用同一条规则**（Codex 三复审 High 1）。一条花费有两个时刻：预留之内的部分归属预留创建的时刻
+//! （`window_at_ms`），超出预留的部分（overage）归属结算的时刻——担保人能吸收多少读的是结算那一刻生效的额度，这块花费就该占结算那一刻的
+//! 额度窗口、速率窗口、补贴池账期。现在的结算把它另记一条 `late_settle`（`window_at_ms` = 结算时刻）；旧格式（v0.5.0 / main）把它和预留之内
+//! 的部分一起记在一条 `settle` 里，也可能只搬了一半，读的时候都按同一口径分开，一行不改（[`LEGACY_OVERAGE_SQL`]）。**所有**按归属时刻
+//! 切的求和和回放用同一条规则：额度窗口、分钟 / 小时速率窗口（[`entry_sums`]）、补贴池账期（[`pool_consumed_micros`]，视图和报表共用）、
+//! 三本账的回放（[`load_spends`]）；各个窗口自己的开闭边界照旧，只是这一块按结算时刻判。
 //!
 //! **失败即关闭**：除了平台根和补贴池，一个账户既没有充值也从没有过额度，它的 `ceiling_remaining` 是 `Some(0)`
 //! （不是 `None`）。S0 把 `None` 解释成「没配置、不设限」，对一个会花钱的账户这是最危险的默认值：
@@ -155,6 +162,127 @@ struct EntrySums {
     hour: i64,
 }
 
+/// 一条 `settle` 分录里**还留在里面的超出预留的部分**（SQL 表达式；`e` 是 `ledger_entries` 的别名）。
+///
+/// 旧格式（v0.5.0 / main）把没迟到的结算里超出预留的部分 `charged - reserved` 和预留之内的部分一起记在一条 `settle` 里，归属时刻是
+/// 预留创建的时刻；现在的结算把超出的部分另记一条 `late_settle`，归属时刻是结算的时刻（再复审 7c5a03fe High 1 / 三复审 High 1）。
+/// 读旧分录、或者只搬了一半的中间形态（`settle` 里还留着一部分，`late_settle` 里已经有一部分）时要按**同一个口径**解释，一行都不改：
+/// 这个表达式给出还留在这条 `settle` 里的那一块 = `charged - reserved` 的正差，减去这个预留在这个账户上已经另记在 `late_settle` 里的，
+/// 再夹到预留在这个账户上剩下的净额以内（分录被改坏了也不会借此凭空多出一笔花费）。这一块的归属时刻是这条 `settle` 自己的 `at_ms`
+/// （结算时刻），提交序号是这条 `settle` 的分录号；预留本身那一笔相应减掉。
+///
+/// **所有按归属时刻切的求和和回放都用它**：额度窗口、分钟 / 小时速率窗口、补贴池的账期消耗（[`attributed_sum`]、
+/// [`pool_consumed_micros`]），和三本账的回放（[`load_spends`]）。它们各自的窗口边界（左闭 / 右开 / 滑动窗口）照旧，只是这一块
+/// 按结算时刻算，不按预留创建的时刻算——否则旧格式的库里，结算时担保人吸收过的额度（读的是结算那一刻生效的额度）会在记账时
+/// 记到预留创建的时刻，够不着结算时才生效的额度窗口、速率窗口、账期，同一块额度被吸收一次、又被下一个请求花一次。
+///
+/// 返回：
+/// * 不是 `settle` 的分录：0；
+/// * 预留正在这个事务里结算（状态 `open`）：0，这条 `settle` 是刚写的新格式，只有用户承担的那一块，没有要分出来的；
+/// * 已结算且没迟到的预留：上面的数；没有超出预留是 0；
+/// * 别的状态（放掉了、过期了、迟到结算了的）：`NULL`。`settle` 只写在没迟到的结算里，挂在它们上面的 `settle` 是库被改坏了：
+///   读花费的地方（[`load_spends`]）失败即关闭，只求和的地方（[`attributed_entries_sql`]）按 0 算。
+const LEGACY_OVERAGE_SQL: &str = "CASE WHEN e.kind <> 'settle' THEN 0 ELSE
+    (SELECT CASE h.state
+              WHEN 'open' THEN 0
+              WHEN 'settled' THEN
+                CASE WHEN h.late <> 0 THEN NULL
+                     WHEN h.charged_micros <= h.reserved_micros THEN 0
+                     ELSE MAX(0, MIN(
+                            h.charged_micros - h.reserved_micros
+                              - (SELECT COALESCE(SUM(l.spent_micros), 0) FROM ledger_entries l
+                                  WHERE l.hold_id = e.hold_id AND l.account_id = e.account_id AND l.kind = 'late_settle'),
+                            (SELECT COALESCE(SUM(r.held_micros + r.spent_micros), 0) FROM ledger_entries r
+                                  WHERE r.hold_id = e.hold_id AND r.account_id = e.account_id
+                                    AND r.kind IN ('reserve', 'settle', 'release', 'expire'))))
+                END
+            END
+       FROM ledger_holds h WHERE h.hold_id = e.hold_id)
+  END";
+
+/// 一个按归属时刻切的窗口：名字（内层查询里给 `moved_<名字>` 这一列起名用）和判断。判断里的 `{t}` 是归属时刻那一列，窗口自己的开闭边界
+/// 写在这里，[`attributed_sum`] 对预留之内的部分和对还留在 `settle` 里的超出部分各用一次，所以边界照旧。
+struct WindowSpec {
+    name: &'static str,
+    condition: &'static str,
+}
+
+/// 额度窗口：从最早生效的额度的起点（`?2`）算起，没有上界。
+const ALLOWANCE_WINDOW: WindowSpec = WindowSpec {
+    name: "window",
+    condition: "{t} >= ?2",
+};
+/// 分钟速率窗口：滑动窗口 `(now - 60 秒, now]`，`?3` 是 `now - 60 秒`。
+const MINUTE_WINDOW: WindowSpec = WindowSpec {
+    name: "minute",
+    condition: "{t} > ?3",
+};
+/// 小时速率窗口：滑动窗口 `(now - 3600 秒, now]`，`?4` 是 `now - 3600 秒`。
+const HOUR_WINDOW: WindowSpec = WindowSpec {
+    name: "hour",
+    condition: "{t} > ?4",
+};
+/// 补贴池的账期：`[?2, ?3)`。
+const POOL_PERIOD: WindowSpec = WindowSpec {
+    name: "pool",
+    condition: "{t} >= ?2 AND {t} < ?3",
+};
+
+/// 一个账户（`?1`）的全部分录，对每个窗口加一列 `moved_<名字>`：这条 `settle` 里**还留着、要按结算时刻算**的超出预留的部分
+/// （[`LEGACY_OVERAGE_SQL`]，取不到按 0）。按归属时刻求和的地方都从这里取数，见 [`attributed_sum`]。
+///
+/// **只在这条 `settle` 的两块落在窗口两边时才去查预留表**（预留之内的部分在 `window_at_ms`，超出的部分在 `at_ms`）：两块在窗口的
+/// 同一边（都在里面或都在外面）时，拆开求和和不拆求和结果一样，没有必要为每条 `settle` 去读一遍预留表——十万笔的历史里，需要读的只有
+/// 预留和结算跨过窗口边界的那几笔，不是十万笔。
+fn attributed_entries_sql(windows: &[&WindowSpec]) -> String {
+    let moved: String = windows
+        .iter()
+        .map(|window| {
+            let reservation = window.condition.replace("{t}", "e.window_at_ms");
+            let settlement = window.condition.replace("{t}", "e.at_ms");
+            format!(
+                ", CASE WHEN e.kind = 'settle' AND ({reservation}) <> ({settlement})
+                        THEN COALESCE({LEGACY_OVERAGE_SQL}, 0) ELSE 0 END AS moved_{name}",
+                name = window.name
+            )
+        })
+        .collect();
+    format!(
+        "SELECT e.kind AS kind, e.held_micros AS held_micros, e.spent_micros AS spent_micros, e.funds_micros AS funds_micros,
+                e.window_at_ms AS window_at_ms, e.at_ms AS at_ms{moved}
+           FROM ledger_entries e WHERE e.account_id = ?1"
+    )
+}
+
+/// [`attributed_entries_sql`] 上一个窗口里的 `Σ (held + spent)`：预留之内的部分按 `window_at_ms` 判，还留在 `settle` 里的超出部分
+/// （`moved_<名字>`）按这条 `settle` 的 `at_ms`（结算时刻）判，窗口的判断各用一次。
+fn attributed_sum(window: &WindowSpec) -> String {
+    let at_reservation = window.condition.replace("{t}", "window_at_ms");
+    let at_settlement = window.condition.replace("{t}", "at_ms");
+    let moved = format!("moved_{}", window.name);
+    format!(
+        "COALESCE(SUM(CASE WHEN {at_reservation} THEN held_micros + spent_micros - {moved} ELSE 0 END), 0)
+         + COALESCE(SUM(CASE WHEN {moved} <> 0 AND {at_settlement} THEN {moved} ELSE 0 END), 0)"
+    )
+}
+
+/// 补贴池账户在 `[start_ms, end_ms)` 这个账期里的消耗（已结算 + 在途），和额度窗口、速率窗口用同一条归属规则
+/// （[`LEGACY_OVERAGE_SQL`]）。准入的视图（[`project_chain_with_books`]）和报表（`subsidy.rs` 的 `pool_report_in`）共用。
+pub(super) fn pool_consumed_micros(
+    conn: &Connection,
+    pool: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<i64, LedgerError> {
+    let consumed = attributed_sum(&POOL_PERIOD);
+    let entries = attributed_entries_sql(&[&POOL_PERIOD]);
+    Ok(conn.query_row(
+        &format!("SELECT {consumed} FROM ({entries})"),
+        rusqlite::params![pool, start_ms, end_ms],
+        |row| row.get(0),
+    )?)
+}
+
 fn entry_sums(
     conn: &Connection,
     account: &str,
@@ -163,15 +291,19 @@ fn entry_sums(
 ) -> Result<EntrySums, LedgerError> {
     let minute_from = sub(now_ms, MINUTE_MS)?;
     let hour_from = sub(now_ms, HOUR_MS)?;
+    let window = attributed_sum(&ALLOWANCE_WINDOW);
+    let minute = attributed_sum(&MINUTE_WINDOW);
+    let hour = attributed_sum(&HOUR_WINDOW);
+    let entries = attributed_entries_sql(&[&ALLOWANCE_WINDOW, &MINUTE_WINDOW, &HOUR_WINDOW]);
     Ok(conn.query_row(
-        "SELECT COALESCE(SUM(held_micros), 0),
-                COALESCE(SUM(held_micros + spent_micros), 0),
-                COALESCE(SUM(funds_micros), 0),
-                COALESCE(SUM(CASE WHEN kind = 'fund' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN window_at_ms >= ?2 THEN held_micros + spent_micros ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN window_at_ms > ?3 THEN held_micros + spent_micros ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN window_at_ms > ?4 THEN held_micros + spent_micros ELSE 0 END), 0)
-           FROM ledger_entries WHERE account_id = ?1",
+        &format!(
+            "SELECT COALESCE(SUM(held_micros), 0),
+                    COALESCE(SUM(held_micros + spent_micros), 0),
+                    COALESCE(SUM(funds_micros), 0),
+                    COALESCE(SUM(CASE WHEN kind = 'fund' THEN 1 ELSE 0 END), 0),
+                    {window}, {minute}, {hour}
+               FROM ({entries})"
+        ),
         rusqlite::params![account, window_from_ms, minute_from, hour_from],
         |row| {
             Ok(EntrySums {
@@ -444,7 +576,7 @@ struct HoldRows {
     late_at: i64,
     late_amount: i64,
     late_seen: bool,
-    /// 没迟到的结算那一条 `settle`：它的分录号、`at_ms`（结算时刻），和预留自己的 `charged - reserved`。
+    /// 没迟到的结算那一条 `settle`：它的分录号、`at_ms`（结算时刻），和还留在里面的超出预留的部分（[`LEGACY_OVERAGE_SQL`]）。
     settle: Option<(i64, i64, i64)>,
 }
 
@@ -454,33 +586,28 @@ struct HoldRows {
 /// 是不是同一毫秒：预留和它的 overage 可以在同一毫秒（结算和预留取到了同一个毫秒），合成一笔就会让 overage 用上预留创建时的提交
 /// 序号，够不着结算之前才发的额度。
 ///
-/// **旧格式的分录要按同一个口径解释，但一行都不改**（Codex 复审 7c5a03fe High 1）。v0.5.0（和这个口径之前的 main）把没迟到的结算里
-/// 超出预留的部分和预留之内的部分一起记在预留创建时刻的一条 `settle` 里，没有 `late_settle`；现在的结算把超出的部分另记一条
-/// `late_settle`。所以一个没迟到、已结算的预留，`charged - reserved` 的正差（超出预留的部分）里**还留在 `settle` 里**的那一块
-/// （正差减去已经另记在 `late_settle` 里的）要从预留本身那笔花费里分出来，成为单独的一笔：归属时刻是这条 `settle` 自己的 `at_ms`
-/// （结算时刻），提交序号是这条 `settle` 自己的分录号，和新格式的 `late_settle` 一回事（同一个事务里，序号和别的花费、额度的创建 /
-/// 撤销序号比出来的先后一样）。没有这一步，旧库里超出预留的部分会一直被当成预留之内的、记在预留创建的时刻，够不着结算时才生效的
-/// 额度：担保人吸收过一次的额度又被下一个请求花一次。不迁移，不改写历史：只是读的时候多看一眼预留表里的 `charged - reserved`
-/// （只有 `settle` 那一行才查）。结算自己在同一个事务里读整条链的余量时，这个预留还是 `open`，它那条 `settle` 是刚写的新格式
-/// （只有用户承担的那一块），没有要分出来的，算 0；`settle` 挂在别的状态的预留上（放掉了、过期了、迟到的结算）是库被改坏了，
-/// 失败即关闭，不能把「取不到」当成「没有超出」。同一个预留的两条预留类分录（或两条 `late_settle`）归属时刻对不上，同样是库被改坏了。
+/// **旧格式的分录要按同一个口径解释，但一行都不改**（Codex 复审 7c5a03fe High 1；三复审 High 1：额度窗口、速率窗口、补贴池的账期用的是
+/// 同一条规则）。v0.5.0（和这个口径之前的 main）把没迟到的结算里超出预留的部分和预留之内的部分一起记在预留创建时刻的一条 `settle`
+/// 里，没有 `late_settle`；现在的结算把超出的部分另记一条 `late_settle`，也可能只搬了一半（中间形态）。所以一个没迟到、已结算的预留，
+/// `charged - reserved` 的正差（超出预留的部分）里**还留在 `settle` 里**的那一块（正差减去已经另记在 `late_settle` 里的，
+/// [`LEGACY_OVERAGE_SQL`]）要从预留本身那笔花费里分出来，成为单独的一笔：归属时刻是这条 `settle` 自己的 `at_ms`（结算时刻），
+/// 提交序号是这条 `settle` 自己的分录号，和新格式的 `late_settle` 一回事（同一个事务里，序号和别的花费、额度的创建 / 撤销序号比出来的
+/// 先后一样）。没有这一步，旧库里超出预留的部分会一直被当成预留之内的、记在预留创建的时刻，够不着结算时才生效的额度：担保人吸收过一次的
+/// 额度又被下一个请求花一次。不迁移，不改写历史：只是读的时候多看一眼预留表里的 `charged - reserved`（只有 `settle` 那一行才查）。
+/// 结算自己在同一个事务里读整条链的余量时，这个预留还是 `open`，它那条 `settle` 是刚写的新格式（只有用户承担的那一块），没有要分出来的，
+/// 算 0；`settle` 挂在别的状态的预留上（放掉了、过期了、迟到的结算）是库被改坏了，失败即关闭，不能把「取不到」当成「没有超出」。
+/// 同一个预留的两条预留类分录（或两条 `late_settle`）归属时刻对不上，一个预留（或结算时刻的那笔花费）的净额是负的，同样是库被改坏了。
 ///
 /// 一遍顺序扫描（走 `(account_id, window_at_ms)` 索引，不排序），在内存里按预留聚合：比让 SQLite 先按 (预留, 归属时刻, 种类)
 /// 分组、再按第一条分录的号排序（两次排序）快。
 fn load_spends(conn: &Connection, account: &str) -> Result<Vec<Spend>, LedgerError> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT e.entry_id, e.hold_id, e.kind, e.window_at_ms, e.at_ms, e.held_micros + e.spent_micros,
-                CASE WHEN e.kind = 'settle' THEN
-                     (SELECT CASE h.state
-                                  WHEN 'open' THEN 0
-                                  WHEN 'settled' THEN CASE WHEN h.late = 0 THEN h.charged_micros - h.reserved_micros END
-                             END
-                        FROM ledger_holds h WHERE h.hold_id = e.hold_id)
-                END
+                {LEGACY_OVERAGE_SQL}
            FROM ledger_entries e
           WHERE e.account_id = ?1 AND e.hold_id IS NOT NULL
-            AND e.kind IN ('reserve', 'settle', 'release', 'expire', 'late_settle')",
-    )?;
+            AND e.kind IN ('reserve', 'settle', 'release', 'expire', 'late_settle')"
+    ))?;
     let mut rows = stmt.query([account])?;
     let mut slots: HashMap<String, usize> = HashMap::new();
     let mut holds: Vec<HoldRows> = Vec::new();
@@ -541,34 +668,39 @@ fn load_spends(conn: &Connection, account: &str) -> Result<Vec<Spend>, LedgerErr
                 // `settle` 只写在没迟到的结算里，预留要么正在这个事务里结算（状态还是 `open`：这条 `settle` 是刚写的新格式，只有用户承担的
                 // 那一块，没有旧格式的超出部分，SQL 给 0），要么已经结算且没迟到。别的状态（放掉了、过期了、迟到的结算）下不会有 `settle`：
                 // 是库被改坏了，取不到数不能当成「没有超出」，失败即关闭。
-                let over: Option<i64> = row.get(6)?;
-                let over = over.ok_or_else(|| {
+                let inside: Option<i64> = row.get(6)?;
+                let inside = inside.ok_or_else(|| {
                     corrupt(
                         "have a settle entry, but the hold is neither being settled nor settled on time",
                         hold,
                     )
                 })?;
-                rows_of_hold.settle = Some((entry, at_ms, over));
+                rows_of_hold.settle = Some((entry, at_ms, inside));
             }
         }
     }
     let mut spends = Vec::with_capacity(holds.len() + holds.len() / 8);
-    for hold in holds {
+    for (index, hold) in holds.into_iter().enumerate() {
+        // 触发器和 CHECK 保证一个预留（和它结算时刻的那笔花费）的净额不为负；读到负的是库被改坏了，失败即关闭（不能按 0 算：
+        // 回放之外的求和里它会抵掉别的预留真实的债务，两条路要一致）
+        if hold.amount < 0 || hold.late_amount < 0 {
+            let id = slots
+                .iter()
+                .find(|(_, slot)| **slot == index)
+                .map_or("?", |(id, _)| id.as_str());
+            return Err(corrupt("have a negative net amount", id));
+        }
         let mut reservation = hold.amount;
-        if let Some((settle_entry, settle_at, over)) = hold.settle
-            && over > 0
+        if let Some((settle_entry, settle_at, inside)) = hold.settle
+            && inside > 0
         {
-            // 还留在 `settle` 里的超出部分：`charged - reserved` 减去已经另记在 `late_settle` 里的；不超过这条 `settle` 之后
-            // 预留本身剩下的净额（万一分录被改坏了，不会借此凭空多出一笔花费）
-            let inside = sub(over, hold.late_amount)?.clamp(0, reservation.max(0));
-            if inside > 0 {
-                reservation = sub(reservation, inside)?;
-                spends.push(Spend {
-                    at: settle_at,
-                    first_entry: settle_entry,
-                    amount: inside,
-                });
-            }
+            // 还留在 `settle` 里的超出部分（SQL 已经夹到预留剩下的净额以内，所以预留本身不会因此变负）
+            reservation = sub(reservation, inside)?;
+            spends.push(Spend {
+                at: settle_at,
+                first_entry: settle_entry,
+                amount: inside,
+            });
         }
         if reservation != 0 {
             spends.push(Spend {
@@ -604,18 +736,17 @@ fn load_spends(conn: &Connection, account: &str) -> Result<Vec<Spend>, LedgerErr
 ///
 /// **代价**（Codex 复审 7c5a03fe，Medium；设计稿 S3-24）：回放要读这个账户的**全部**历史分录，在调用方的写事务里，所以单次投影的耗时随账户
 /// 历史**线性**增长，没有压缩。找额度这一步用 [`WindowIndex`]（每笔花费只看窗口包含它的那一小撮额度），已经不是大头：10 万笔花费 × 120 笔
-/// 额度实测，找额度约 3%，其余是读分录本身（`ledger_projection_perf.rs`）。账户没有任何花费类额度时不回放，已花（含在途）就是额度之外的部分。
+/// 额度实测，找额度约 3%，其余是读分录本身（`ledger_projection_perf.rs`）。账户没有任何花费类额度时不回放，已花（含在途）就是额度之外的部分
+/// （[`uncovered_without_allowances`]：按预留分组求净额，**每个预留的净额都要不为负**，Codex 三复审 Medium）。
 fn separate_books(
     conn: &Connection,
     account: &str,
     now_ms: i64,
     funds: i64,
-    committed: i64,
 ) -> Result<Books, LedgerError> {
     let buckets = load_buckets(conn, account)?;
     let (uncovered, left) = if buckets.is_empty() {
-        // 没有任何额度能覆盖花费：已花（含在途）全部是额度之外的部分，不用读花费。每个预留的净额都不为负，所以和逐笔累加一样
-        (committed.max(0), Vec::new())
+        (uncovered_without_allowances(conn, account)?, Vec::new())
     } else {
         replay_spends(
             &buckets,
@@ -634,6 +765,30 @@ fn separate_books(
         funds_left: sub(funds, uncovered)?.max(0),
         credit_debt: sub(uncovered, funds)?.max(0),
     })
+}
+
+/// 没有任何花费类额度：没有额度能覆盖花费，已花（含在途）全部是额度之外的部分，不用逐笔回放，按预留分组求净额就够。
+///
+/// **每个预留的净额都要不为负**（Codex 三复审 Medium）：一个预留在这个账户上的净额 = `Σ (held + spent)`（预留、结算、释放、过期；
+/// 结算那一刻才发生的花费 `late_settle` 另算一笔），触发器和 CHECK 保证它不为负。读到负的是库被改坏了：失败即关闭。
+/// 不能直接用整个账户的 `Σ (held + spent)`——一个被改坏的负净额会抵掉别的预留真实的债务（90 和 -40 并存，只看到 50）。
+/// 有额度时的回放（[`load_spends`]）也是同一条规矩。
+fn uncovered_without_allowances(conn: &Connection, account: &str) -> Result<i64, LedgerError> {
+    let (lowest, total): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(MIN(net), 0), COALESCE(SUM(net), 0) FROM (
+             SELECT SUM(held_micros + spent_micros) AS net FROM ledger_entries
+              WHERE account_id = ?1 AND hold_id IS NOT NULL
+                AND kind IN ('reserve', 'settle', 'release', 'expire', 'late_settle')
+              GROUP BY hold_id, kind = 'late_settle')",
+        [account],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if lowest < 0 {
+        return Err(LedgerError::Corrupt(format!(
+            "a reservation on account {account} has a negative net amount ({lowest})"
+        )));
+    }
+    Ok(total)
 }
 
 /// 回放的核心（不碰数据库）：`spends`（已经按提交先后排好）一笔一笔找额度。返回（没被额度覆盖的部分之和，每笔额度回放之后的剩余）。
@@ -799,13 +954,7 @@ pub(super) fn project_chain_with_books(
             && (credit_limit > 0 || ever_had_credit_line(conn, id)?)
             && (!sums.has_funds || ever_had_allocation)
         {
-            Some(separate_books(
-                conn,
-                id,
-                now_ms,
-                sums.funds,
-                sums.committed,
-            )?)
+            Some(separate_books(conn, id, now_ms, sums.funds)?)
         } else {
             None
         };
@@ -838,12 +987,7 @@ pub(super) fn project_chain_with_books(
 
         let subsidy_pool_remaining = if account.kind == AccountKind::SubsidyPool {
             let cap = pool_cap_micros(conn, id, &period.to_string())?;
-            let consumed: i64 = conn.query_row(
-                "SELECT COALESCE(SUM(held_micros + spent_micros), 0) FROM ledger_entries
-                  WHERE account_id = ?1 AND window_at_ms >= ?2 AND window_at_ms < ?3",
-                rusqlite::params![id, period_start, period_end],
-                |row| row.get(0),
-            )?;
+            let consumed = pool_consumed_micros(conn, id, period_start, period_end)?;
             Some(money(sub(cap, consumed)?))
         } else {
             None

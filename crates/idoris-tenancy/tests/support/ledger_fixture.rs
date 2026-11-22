@@ -386,27 +386,60 @@ pub fn unfreeze_credential(db: &TempDb, credential: &str) {
 /// 把 `late_settle` 的已花并回同一账户上的 `settle`，删掉 `late_settle`。要拆掉只追加的触发器（这个库只给这个测试用，
 /// 之后账本的代码照常读它）。迟到的结算（预留过期之后才结算）旧版本本来就写 `late_settle`，没有 `settle` 的预留不动。
 pub fn rewrite_overage_as_v0_5_0(db: &TempDb, hold_id: &str) {
+    rewrite_overage_partially(db, hold_id, 0);
+}
+
+/// 把一个预留的分录改成**超出的部分只搬了一半的中间形态**（Codex 三复审 Low）：每个账户上，`late_settle` 里只留 `keep_in_late`，
+/// 其余的并回同一账户上的 `settle`。`keep_in_late = 0` 就是 v0.5.0 的旧写法（`late_settle` 整条删掉）；`keep_in_late` 等于原来的
+/// `late_settle` 就是现在的写法（什么都不改）。例：预留 100、实际 100 + 100 超出：`settle` 已花 100 + `late_settle` 100 →
+/// `keep_in_late = 40`：`settle` 已花 160 + `late_settle` 40。
+///
+/// 要拆掉只追加的触发器（这个库只给这个测试用）。没有 `late_settle` 的预留（比如 main 上本来就是旧写法）不动。
+pub fn rewrite_overage_partially(db: &TempDb, hold_id: &str, keep_in_late: i64) {
     let conn = rusqlite::Connection::open(db.path()).unwrap();
     conn.execute_batch(
         "DROP TRIGGER IF EXISTS ledger_entries_append_only_update;
          DROP TRIGGER IF EXISTS ledger_entries_append_only_delete;",
     )
     .unwrap();
-    conn.execute(
-        "UPDATE ledger_entries
-            SET spent_micros = spent_micros + (
-                SELECT COALESCE(SUM(l.spent_micros), 0) FROM ledger_entries l
-                 WHERE l.hold_id = ledger_entries.hold_id
-                   AND l.account_id = ledger_entries.account_id AND l.kind = 'late_settle')
-          WHERE hold_id = ?1 AND kind = 'settle'",
-        [hold_id],
-    )
-    .unwrap();
-    conn.execute(
-        "DELETE FROM ledger_entries
-          WHERE hold_id = ?1 AND kind = 'late_settle'
-            AND EXISTS (SELECT 1 FROM ledger_entries s WHERE s.hold_id = ?1 AND s.kind = 'settle')",
-        [hold_id],
-    )
-    .unwrap();
+    let late: Vec<(String, i64)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT account_id, spent_micros FROM ledger_entries
+                  WHERE hold_id = ?1 AND kind = 'late_settle'
+                    AND EXISTS (SELECT 1 FROM ledger_entries s
+                                 WHERE s.hold_id = ?1 AND s.account_id = ledger_entries.account_id AND s.kind = 'settle')",
+            )
+            .unwrap();
+        stmt.query_map([hold_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    for (account, spent) in late {
+        assert!(
+            spent >= keep_in_late,
+            "{hold_id} on {account}: only {spent} is booked as a settlement-time spend, cannot keep {keep_in_late}"
+        );
+        conn.execute(
+            "UPDATE ledger_entries SET spent_micros = spent_micros + ?3
+              WHERE hold_id = ?1 AND account_id = ?2 AND kind = 'settle'",
+            rusqlite::params![hold_id, account, spent - keep_in_late],
+        )
+        .unwrap();
+        if keep_in_late == 0 {
+            conn.execute(
+                "DELETE FROM ledger_entries WHERE hold_id = ?1 AND account_id = ?2 AND kind = 'late_settle'",
+                rusqlite::params![hold_id, account],
+            )
+            .unwrap();
+        } else {
+            conn.execute(
+                "UPDATE ledger_entries SET spent_micros = ?3
+                  WHERE hold_id = ?1 AND account_id = ?2 AND kind = 'late_settle'",
+                rusqlite::params![hold_id, account, keep_in_late],
+            )
+            .unwrap();
+        }
+    }
 }
