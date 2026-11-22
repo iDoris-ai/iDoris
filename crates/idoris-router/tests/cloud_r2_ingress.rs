@@ -264,6 +264,10 @@ async fn a_malformed_body_privacy_declaration_is_refused_over_http_not_treated_a
             json!({"local_only": true}),
             json!(["local_only"]),
             json!("Any"),
+            // Codex 预审 M4：`any` 只认首尾的 ASCII 空格和水平制表符，别的空白（不换行空格、转义的换行……）不是 `any`
+            json!("\u{00A0}any"),
+            json!("any\n"),
+            json!(" \t "),
         ] {
             let mut top = simple_body(100);
             top["privacy"] = bad.clone();
@@ -282,7 +286,7 @@ async fn a_malformed_body_privacy_declaration_is_refused_over_http_not_treated_a
             }
         }
     }
-    assert_eq!(refused, 3 * 6 * 3);
+    assert_eq!(refused, 3 * 9 * 3);
     // 一个字节都没出去：云上游没收到请求、安全检查器没被调用、谁都没被记账
     assert_eq!(w.upstream.request_count(), 0);
     assert_eq!(w.upstream.connection_count(), 0);
@@ -294,7 +298,7 @@ async fn a_malformed_body_privacy_declaration_is_refused_over_http_not_treated_a
     // 对照：合法取值（`any`、`null`、带空白的 ` any `）照常服务；它们和没写一样不说明任何事，
     // 而且这两个字段从来不转发给上游（`build_chat_body` 是白名单：`privacy`、`metadata` 都不在里面）
     let adult = Req::chat(w.cred("node_agent24"));
-    for (index, privacy) in [json!("any"), json!(null), json!(" any ")]
+    for (index, privacy) in [json!("any"), json!(null), json!(" any "), json!("\tany")]
         .into_iter()
         .enumerate()
     {
@@ -309,7 +313,7 @@ async fn a_malformed_body_privacy_declaration_is_refused_over_http_not_treated_a
             "the privacy label never reaches the upstream: {sent}"
         );
     }
-    assert_eq!(w.upstream.request_count(), 3);
+    assert_eq!(w.upstream.request_count(), 4);
 }
 
 // ---------------------------------------------------------------------------

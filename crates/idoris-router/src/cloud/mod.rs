@@ -134,8 +134,9 @@
 //! 27. **显式 `local_only` 在云入口一律拒绝**（403 `local_only_refused`，早于一切候选选择、准入、安全检查模型调用和上游请求；
 //!     入口只校验声明是否合法，拒绝 `local_only` 的是执行器 `CloudExecutor::execute` 的最开头，这是唯一的一道闸）。**没声明不等于 `local_only`**：本地路由器「没声明 = `local_only`」的保守默认在云入口不适用，
 //!     因为普通的 OpenAI 客户端不会发这个头，而它们调的就是云。头不合法（重复、空、不认识的值）、请求体里写了 `privacy` / `metadata.privacy` 却不是 `any` / `local_only` 都是 400 `invalid_privacy`，
-//!     不当作没声明。请求体里的等价声明（顶层 `privacy` 或 `metadata.privacy` 写了 `local_only`）同样拒绝，取最严的。请求头和请求体对
-//!     `any` 的宽严一致：去掉首尾空白之后精确匹配（` any ` 两处都认，`Any` 两处都不认）。
+//!     不当作没声明。请求体里的等价声明（顶层 `privacy` 或 `metadata.privacy` 写了 `local_only`）同样拒绝，取最严的。`any` 是允许发往云端的那个值，
+//!     识别要严：请求头和请求体都只去掉首尾的 ASCII 空格和水平制表符再精确匹配（不换行空格、换行等别的空白、`Any` 都不认）；
+//!     `local_only` 仍然宽松（任何首尾空白、不分大小写）。`metadata.privacy` 里的非法取值同样是 400：owner 2026-11-22 拍板保持。
 //! 28. **`billing: unbilled` 没有实现，加载配置时拒绝**（备选：完整实现「不收用户费用、单独记平台成本」，要改准入、预留、结算）。
 //!     契约（S0）里 `Billing::Unbilled` 对流式 usage 的豁免没有改动。
 //! 29. **`extra_body` 不能碰协议 / 计费 / 身份 / 留存字段**（`idoris_upstream::cloud::RESERVED_EXTRA_BODY_FIELDS`），加载时拒绝，
