@@ -958,15 +958,24 @@ impl Registration {
         }
     }
 
-    /// iDoris 开始停止（任何原因）时调用，立即返回：自愈立刻停止（之后不再重写发现文件）；原因是信号就让登记客户端在
-    /// 已建立的会话上尽力发 `bye`（至多 0.5 秒，与 HTTP 排空并行），其余原因不发（见 [`StopCause::says_bye`]）。
+    /// iDoris 开始停止（任何预期的原因）时调用，立即返回：自愈立刻停止（之后不再重写发现文件）；原因是信号或自有引擎失效就让
+    /// 登记客户端在已建立的会话上尽力发 `bye`（至多 0.5 秒，与 HTTP 排空并行），其余原因不发（见 [`StopCause::says_bye`]）。
     pub fn begin_stop(&self, cause: StopCause) {
-        self.inner.heal_cancel.cancel();
-        let mode = if cause.says_bye() {
+        self.begin(if cause.says_bye() {
             StopMode::Bye
         } else {
             StopMode::Silent
-        };
+        });
+    }
+
+    /// iDoris 因启动失败停止（不是任何一种预期的停止，没有 [`StopCause`]）时调用，立即返回：自愈立刻停止，登记客户端直接结束，
+    /// **不发 `bye`**。排空期间不能让一个已经在退出的进程继续往发现文件里写「我是活的」，也不能继续与 agent24d 保持登记会话。
+    pub fn begin_silent_stop(&self) {
+        self.begin(StopMode::Silent);
+    }
+
+    fn begin(&self, mode: StopMode) {
+        self.inner.heal_cancel.cancel();
         self.inner.stop.send_if_modified(|current| {
             let change = *current == StopMode::Run;
             if change {

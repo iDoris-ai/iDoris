@@ -154,13 +154,26 @@ impl ManagedRuntimeProcess {
     }
 
     #[cfg(unix)]
-    pub async fn shutdown(mut self, grace: Duration) -> Result<(), BackendError> {
+    pub async fn shutdown(self, grace: Duration) -> Result<(), BackendError> {
+        self.shutdown_bounded(grace, grace).await
+    }
+
+    /// [`Self::shutdown`] with the two waits told apart: `term_grace` is how long the group gets after SIGTERM to
+    /// leave on its own (`Duration::ZERO`: SIGKILL right after the SIGTERM), `confirm` is how long to wait, after
+    /// the SIGKILL, for the leader to be reaped and the group to be gone. A stop that has to finish by a deadline
+    /// (the launcher's SIGKILL of iDoris) shrinks `term_grace` and keeps a short `confirm`.
+    #[cfg(unix)]
+    pub async fn shutdown_bounded(
+        mut self,
+        term_grace: Duration,
+        confirm: Duration,
+    ) -> Result<(), BackendError> {
         // Keep the direct child unreaped while group signals are possible.
         // Its PID is also this group's PGID, so the zombie/live child is
         // the ownership anchor that prevents the numeric PGID from being
         // recycled for an unrelated process group.
         self.signal_terminate()?;
-        let leader_exited = wait_child_exit_without_reap(self.process_group, grace).await?;
+        let leader_exited = wait_child_exit_without_reap(self.process_group, term_grace).await?;
         if !leader_exited {
             self.signal_kill()?;
         } else if group_exists(self.process_group)? {
@@ -172,8 +185,8 @@ impl ManagedRuntimeProcess {
         // reaps them. Check for live group members while the unreaped leader
         // still prevents this PGID from being reused.
         #[cfg(target_os = "linux")]
-        let group_clean = wait_group_cleanup(self.process_group, grace).await;
-        tokio::time::timeout(grace, self.child.wait())
+        let group_clean = wait_group_cleanup(self.process_group, confirm).await;
+        tokio::time::timeout(confirm, self.child.wait())
             .await
             .map_err(|_| BackendError::internal("timed out reaping local runtime process"))?
             .map_err(|_| BackendError::internal("failed to reap local runtime process"))?;
@@ -183,13 +196,23 @@ impl ManagedRuntimeProcess {
         // On other Unix systems, observe group removal after the leader has
         // been reaped. This is read-only: never signal a numeric PGID here.
         #[cfg(not(target_os = "linux"))]
-        let group_clean = wait_group_cleanup(self.process_group, grace).await;
+        let group_clean = wait_group_cleanup(self.process_group, confirm).await;
         if !group_clean? {
             return Err(BackendError::internal(
                 "timed out waiting for local runtime process group cleanup",
             ));
         }
         Ok(())
+    }
+
+    /// Non-unix: there is no process group to sweep, so the two waits are the same wait.
+    #[cfg(not(unix))]
+    pub async fn shutdown_bounded(
+        self,
+        term_grace: Duration,
+        _confirm: Duration,
+    ) -> Result<(), BackendError> {
+        self.shutdown(term_grace).await
     }
 
     #[cfg(not(unix))]

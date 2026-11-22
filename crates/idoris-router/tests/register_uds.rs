@@ -3063,6 +3063,63 @@ async fn the_self_heal_stops_the_moment_a_stop_begins() {
     assert!(!path.exists(), "no rewrite after the stop began");
 }
 
+/// 启动失败的静默停止（`begin_silent_stop`，L2）与信号停止一样**立即**停下自愈：排空期间（`finish` 还没调）发现文件被删了也不再写回。
+/// 不调 `finish`：它自己也会停自愈，那样就分不出是不是开始停止的那一刻就停了。
+#[tokio::test]
+async fn the_self_heal_stops_the_moment_a_silent_stop_begins_without_waiting_for_finish() {
+    let rig = Rig::new();
+    let (target, record) = discovery_for(&rig);
+    target.publish(&record).unwrap();
+    let path = rig.dir_path.join("idoris.json");
+    let original = fs::read(&path).unwrap();
+    let registration = rig.start_with(StartOptions {
+        with_socket: false,
+        discovery: Some(SelfHeal {
+            target: target.clone(),
+            record: record.clone(),
+        }),
+        ..StartOptions::new(Timings {
+            self_heal_interval: ms(20),
+            ..fast()
+        })
+    });
+    // 对照：停止之前自愈在工作。
+    fs::remove_file(&path).unwrap();
+    wait_for_file(&path, &original).await;
+
+    registration.begin_silent_stop();
+    fs::remove_file(&path).unwrap();
+    // 二十轮自愈间隔：停下了就一直不回来。
+    tokio::time::sleep(ms(400)).await;
+    assert!(
+        !path.exists(),
+        "no rewrite after a silent stop began, even before finish"
+    );
+    registration.finish().await;
+}
+
+/// 启动失败的静默停止不发 `bye`，也不再重连：与孤儿超时一样直接结束登记客户端，已建立的会话被关掉。
+#[tokio::test]
+async fn a_silent_stop_sends_no_bye_closes_the_session_and_never_reconnects() {
+    let rig = Rig::new();
+    let server = rig.server();
+    let registration = rig.start(fast());
+    let mut peer = server.accept().await;
+    peer.handshake(&rig.nonce_hex, Some(20)).await;
+    rig.wait_registered(true).await;
+    registration.begin_silent_stop();
+    let frames = peer.drain_until_eof(secs(10)).await;
+    assert!(
+        frames
+            .iter()
+            .all(|frame| String::from_utf8_lossy(frame) != BYE_LINE),
+        "a startup failure is not an expected stop: no bye: {frames:?}"
+    );
+    registration.finish().await;
+    assert_eq!(rig.events.count(|e| matches!(e, Event::ByeSent)), 0);
+    assert!(server.try_accept(ms(300)).await.is_none());
+}
+
 /// 进行中的重写一定做完，`finish` 要等到它结束：删除发现文件在 `finish` 之后才做，否则自愈可能在删除之后又把文件写回来
 /// （规范 §2.7.3「何时删」：监听关闭之后、实例锁释放之前，仅当 `instance_id` 是自己）。做法：消费者持着旁路锁，
 /// 自愈的发布被挡在 `renameat` 之前（临时文件已经写好、出现在目录里）；这时开始停止并 `finish`，它必须还在等；

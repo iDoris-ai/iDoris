@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use fake_omlx::{Behavior, FakeOmlx, spawn_retrying};
+use fake_omlx::{Behavior, FakeOmlx, OnSigterm, spawn_retrying};
 use idoris_router::lifecycle::{
     CommandError, EngineBackend, EngineManager, GateOutcome, ManagedPlan, ManagerConfig,
     OmlxBackend, PlanError, PrepareFailure, Timings, plan_managed_with,
@@ -1367,6 +1367,68 @@ async fn an_engine_that_never_listens_is_stopped_after_the_startup_timeout_and_r
         "the engine that never listened is stopped before the next one is launched"
     );
     h.manager.shutdown(true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 总期限：停止必须在 iDoris 被 launcher SIGKILL 之前完成（M1）
+// ---------------------------------------------------------------------------------------------
+
+/// `shutdown_by` 带期限：对 SIGTERM 没有反应的引擎只得到期限里剩下的宽限，不是整整 `stop_grace`（这里 10 秒）。就绪的引擎，和启动
+/// 途中被打断的引擎（管理器正在等它就绪，停止命令打断了等待，先收拾半拉起的引擎）都一样：后者走的是「已经有一个带期限的停止在等」
+/// 那条路，宽限同样只拿剩下的。引擎被 SIGKILL、确认消失之后所有权记录才删。
+#[tokio::test]
+async fn a_stop_against_a_deadline_gives_a_sigterm_ignoring_engine_only_the_time_left() {
+    for starting in [false, true] {
+        let case = if starting {
+            "interrupted while starting"
+        } else {
+            "ready"
+        };
+        let rig = Rig::new(&Behavior {
+            on_sigterm: OnSigterm::Ignore,
+            never_listen: starting,
+            ..Behavior::default()
+        });
+        let mut timings = fast();
+        timings.stop_grace = Duration::from_secs(10);
+        let h = Harness::start(
+            &rig,
+            default_backend(&rig),
+            Scripted::claiming(rig.port),
+            timings,
+            StopOnExit::Owned,
+        );
+        if starting {
+            // 启动记录写下来的时候 SIGTERM 的处理已经就位（假引擎先装处理器、后写记录）。
+            wait_for("the engine to be launched", || rig.fake.launches() >= 1).await;
+        } else {
+            h.until_state(UpstreamState::Ready).await;
+        }
+        let pid = rig.pid(0);
+        let begun = Instant::now();
+        h.manager
+            .shutdown_by(
+                true,
+                Some(tokio::time::Instant::now() + Duration::from_secs(3)),
+            )
+            .await;
+        let took = begun.elapsed();
+        assert!(!pid_alive(pid), "{case}: the engine is gone");
+        assert_eq!(
+            rig.fake.sigterm_times().len(),
+            1,
+            "{case}: asked once, ignored it"
+        );
+        assert!(
+            took >= Duration::from_millis(2500),
+            "{case}: SIGTERM was ignored, so only the SIGKILL at the deadline ended it: {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(7),
+            "{case}: the grace is what is left of the deadline, not the full 10 s: {took:?}"
+        );
+        assert_eq!(rig.records(), 0, "{case}: no record left behind");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

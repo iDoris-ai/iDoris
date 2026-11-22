@@ -34,17 +34,40 @@
 //! 所以 `never` 的信号停止（[`EnginePlan::DecideAfterDrain`]）在排空期间**保留所有权句柄**，排空结束、退出结果出来之后才定：
 //! 以 0 退出就移交（引擎继续跑，所有权记录留给下一个 iDoris），否则停止并回收。其余情形（`owned`、退出码 3、4、5、启动失败）
 //! 原因一确定就与排空并行地停（[`EnginePlan::StopNow`]），总时长仍在 §2.7.5 的预算内。
+//!
+//! # 总期限（M1）
+//!
+//! 排空失败之后才停引擎的那条路（`never` + 信号 + 排空失败）是**串行**的：排空最多 10 秒，之后引擎 SIGTERM 加 8 秒宽限，共 18 秒，
+//! 而 launcher 在 SIGTERM 之后 17 秒 SIGKILL iDoris：引擎可能停到一半（收到了 SIGTERM、还在退出）iDoris 就被杀了。
+//! 所以整个收尾有一个**从停止原因锁存那一刻起算的期限**（[`STOP_DEADLINE`]，16 秒，给确认与退出留 1 秒）：[`finish_engines`] 的等待、
+//! 引擎管理器的等待与 `OwnedEngine::stop` 的宽限都只拿期限里剩下的（`min(8 秒, 剩下的)`，不到 2 秒就 SIGTERM 之后立刻 SIGKILL，
+//! [`crate::lifecycle::stop_windows`]）。仍然没能确认消失的引擎，所有权记录保留，下一个 iDoris 认回它（`Recovery::Exiting`：
+//! 身份吻合、只是端口上没有它在监听）再有界地收尾，不会悄悄丢掉记录。
+//!
+//! # 信号处理器启动时就装好（L6）
+//!
+//! [`TerminationSignals::install`] 在 `run` 一开始就注册 SIGINT/SIGTERM，不是等停止流程第一次被 poll：`select!` 在更靠前的来源
+//! 已经就绪时根本不 poll 信号那个分支，旧写法里处理器那时还没装，之后到的 SIGTERM 按默认动作直接杀死进程，不走优雅停止。
 
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::launcher_frame::StopOnExit;
 use crate::lifecycle::EngineManager;
-use crate::register::StopCause;
+use crate::register::{Registration, StopCause};
+
+/// 引擎收尾的总期限，从停止原因锁存那一刻起算。launcher 在 SIGTERM 之后 17 秒 SIGKILL iDoris；HTTP 排空最多 10 秒加引擎 8 秒宽限
+/// 放不下（M1），所以引擎的等待与宽限都从这个期限里扣。留 1 秒给 SIGKILL 之后的确认、登记收尾与删发现文件。
+pub const STOP_DEADLINE: Duration = Duration::from_secs(16);
+/// 没有期限时（服务自己倒了：没有信号在催）等引擎收尾的上限：SIGTERM 之后 8 秒宽限，加上 SIGKILL 与收尾。
+pub const OPEN_ENDED_STOP_WAIT: Duration = Duration::from_secs(14);
+/// 外面这层等待比里面的期限多留的余量：里面的停止（宽限加确认窗口）先自己结束并如实报告，外面这层只兜底。
+const WAIT_SLACK: Duration = Duration::from_millis(1500);
 
 /// 进程为什么停。只记一次（[`StopLatch`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,21 +78,38 @@ pub enum StopVerdict {
     StartupFailed(String),
 }
 
-/// 停止原因的一次性槽：先到先得，之后到的原因一概不改它。
+/// 停止原因的一次性槽：先到先得，之后到的原因一概不改它。同时记下锁存的时刻，收尾的期限（[`STOP_DEADLINE`]）从这一刻起算。
 #[derive(Debug, Default)]
 pub struct StopLatch {
-    slot: OnceLock<StopVerdict>,
+    slot: OnceLock<Latched>,
+}
+
+#[derive(Debug)]
+struct Latched {
+    verdict: StopVerdict,
+    at: Instant,
 }
 
 impl StopLatch {
     /// 锁存 `verdict`，返回**生效的**那一个：槽是空的就是 `verdict`，已经有了就是先到的那个（`verdict` 被丢掉）。
     pub fn latch(&self, verdict: StopVerdict) -> &StopVerdict {
-        self.slot.get_or_init(|| verdict)
+        &self
+            .slot
+            .get_or_init(|| Latched {
+                verdict,
+                at: Instant::now(),
+            })
+            .verdict
     }
 
     /// 已经锁存的停止原因；还没有时是 `None`（停止流程没有走到决定这一步：例如服务自己倒了）。
     pub fn get(&self) -> Option<&StopVerdict> {
-        self.slot.get()
+        self.slot.get().map(|latched| &latched.verdict)
+    }
+
+    /// 整个收尾必须完成的期限：锁存那一刻加 [`STOP_DEADLINE`]；还没有锁存时是 `None`（没有信号在催）。
+    pub fn deadline(&self) -> Option<Instant> {
+        self.slot.get().map(|latched| latched.at + STOP_DEADLINE)
     }
 }
 
@@ -125,11 +165,20 @@ pub enum EnginePlan {
     DecideAfterDrain,
 }
 
+/// 怎么通知登记客户端与发现文件自愈。**两种都立刻让自愈停下**（之后不再重写发现文件）；区别只在发不发 `bye`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationAction {
+    /// 预期的停止：[`StopCause::says_bye`] 决定发不发 `bye`。
+    Stop(StopCause),
+    /// 启动失败：不是预期的停止，不发 `bye`（没有通知登记客户端的原因），但登记与自愈也要在排空期间就停：
+    /// 否则一个已经在退出的进程还在往发现文件里写「我是活的」（L2）。
+    Silent,
+}
+
 /// 由**一个** [`StopVerdict`] 推出的收尾安排：通知登记客户端（决定发不发 `bye`）与引擎的处置都从这里来。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StopPlan {
-    /// 要告诉登记客户端的停止原因（[`StopCause::says_bye`] 决定发不发 `bye`）。启动失败不是预期的停止，没有。
-    pub registration: Option<StopCause>,
+    pub registration: RegistrationAction,
     pub engines: EnginePlan,
 }
 
@@ -137,7 +186,7 @@ impl StopPlan {
     pub fn new(verdict: &StopVerdict, stop_on_exit: StopOnExit) -> Self {
         match verdict {
             StopVerdict::Stop(cause) => Self {
-                registration: Some(*cause),
+                registration: RegistrationAction::Stop(*cause),
                 engines: if cause.stops_owned_engines(stop_on_exit) {
                     EnginePlan::StopNow
                 } else {
@@ -146,7 +195,7 @@ impl StopPlan {
             },
             // 启动失败：没有对外服务过，留着引擎没有意义，一律停。
             StopVerdict::StartupFailed(_) => Self {
-                registration: None,
+                registration: RegistrationAction::Silent,
                 engines: EnginePlan::StopNow,
             },
         }
@@ -165,7 +214,8 @@ pub trait EngineControl: Send + Sync + 'static {
     /// 自有引擎失效（门控完成之后进程退出）已经发布时立即返回；之前、或永远没有时不返回。
     async fn failed(&self);
     /// 收尾：`stop_engines` 为真就停掉自己拥有的引擎并回收所有权记录；为假就让它继续跑，所有权记录留给下一个 iDoris。
-    async fn shutdown(&self, stop_engines: bool);
+    /// `deadline` 是整个收尾必须完成的期限（[`STOP_DEADLINE`]）：宽限只拿期限里剩下的；`None` 是没有期限。
+    async fn shutdown(&self, stop_engines: bool, deadline: Option<Instant>);
 }
 
 #[async_trait]
@@ -174,58 +224,223 @@ impl EngineControl for EngineManager {
         let _ = self.engine_failed().await;
     }
 
-    async fn shutdown(&self, stop_engines: bool) {
-        EngineManager::shutdown(self, stop_engines).await;
+    async fn shutdown(&self, stop_engines: bool, deadline: Option<Instant>) {
+        EngineManager::shutdown_by(self, stop_engines, deadline).await;
+    }
+}
+
+/// 登记客户端（与发现文件自愈）对停止流程暴露的动作；测试里换成会记录调用的假货。
+#[async_trait]
+pub trait RegistrationControl: Send + Sync + 'static {
+    /// 登记客户端要求停止（孤儿超时、`instance_conflict`）时返回原因；没有时不返回。已经发布的原因第一次被 poll 就就绪。
+    async fn wants_stop(&self) -> StopCause;
+    /// 预期的停止：自愈立刻停；`cause.says_bye()` 决定发不发 `bye`。立即返回。
+    fn begin_stop(&self, cause: StopCause);
+    /// 启动失败：自愈与登记客户端立刻停，不发 `bye`。立即返回。
+    fn begin_silent_stop(&self);
+}
+
+#[async_trait]
+impl RegistrationControl for Registration {
+    async fn wants_stop(&self) -> StopCause {
+        Registration::wants_stop(self).await
+    }
+
+    fn begin_stop(&self, cause: StopCause) {
+        Registration::begin_stop(self, cause);
+    }
+
+    fn begin_silent_stop(&self) {
+        Registration::begin_silent_stop(self);
+    }
+}
+
+/// 停止流程的决定与开始：等到第一个来源成立（[`StopSources::first`]），**先锁存**，再从**锁存下来的那一个**推出收尾安排
+/// （L1：不用刚读到的局部值，免得先到的另一个结果与这里的安排各说各的），然后立刻开始：通知登记客户端（发不发 `bye`、自愈停下），
+/// 开始停引擎（[`begin_engines`]，句柄放进 `stopping` 交给 [`finish_engines`]）。`bin` 里的停止 future 就是这一个函数，
+/// 所以「哪个来源接哪个 future」「`bye` 与引擎处置从哪个结果推出」都能在这里用假的登记客户端与引擎管理器测（L5）。
+///
+/// `engines`、`registration` 为 `None` 的来源永不成立。
+pub async fn decide_and_begin<C, R, G, S>(
+    engines: Option<&Arc<C>>,
+    registration: Option<&R>,
+    gate_failed: G,
+    signal: S,
+    stop_on_exit: StopOnExit,
+    latch: &StopLatch,
+    stopping: &Mutex<Option<JoinHandle<()>>>,
+) where
+    C: EngineControl,
+    R: RegistrationControl,
+    G: Future<Output = String>,
+    S: Future<Output = ()>,
+{
+    // 引擎失效通常只在门控完成之后才会有（之前走重启与熔断；实例任务自己 panic 是例外，也报在这里）。没有引擎管理器时永不成立。
+    let engine_failed = async {
+        match engines {
+            Some(engines) => engines.failed().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let registration_stop = async {
+        match registration {
+            Some(registration) => registration.wants_stop().await,
+            None => std::future::pending::<StopCause>().await,
+        }
+    };
+    // 同一轮里几个来源同时成立：已经发布的 5、4、3 与启动失败排在信号前面，不随机挑（`StopSources::first` 是 `biased` 的）。
+    let verdict = StopSources {
+        engine_failed,
+        registration: registration_stop,
+        gate_failed,
+        signal,
+    }
+    .first()
+    .await;
+    // 先锁存，再从生效的那一个推出 `bye` 与引擎处置：同一个结果驱动一切。
+    let verdict = latch.latch(verdict).clone();
+    let plan = StopPlan::new(&verdict, stop_on_exit);
+    if let Some(registration) = registration {
+        match plan.registration {
+            RegistrationAction::Stop(cause) => registration.begin_stop(cause),
+            RegistrationAction::Silent => registration.begin_silent_stop(),
+        }
+    }
+    // 引擎的停止与 HTTP 排空并行：`stop_on_exit:"never"` 只对退出码 0 有效，退出码 4、5 与 3 一律停（接口规范 §2.7.5）；
+    // 启动失败当作要停（没有对外服务过，留着引擎没有意义）。`never` 的信号停止此刻不动，保留所有权句柄。
+    if let Some(engines) = engines {
+        *stopping.lock().unwrap_or_else(PoisonError::into_inner) =
+            begin_engines(engines, plan.engines, latch.deadline());
     }
 }
 
 /// 停止原因确定时调用：[`EnginePlan::StopNow`] 就在后台开始停（返回的句柄交给 [`finish_engines`]）；
-/// [`EnginePlan::DecideAfterDrain`] 什么也不做，所有权句柄保留。
+/// [`EnginePlan::DecideAfterDrain`] 什么也不做，所有权句柄保留。`deadline` 见 [`EngineControl::shutdown`]。
 pub fn begin_engines<E: EngineControl>(
     engines: &Arc<E>,
     plan: EnginePlan,
+    deadline: Option<Instant>,
 ) -> Option<JoinHandle<()>> {
     match plan {
         EnginePlan::StopNow => {
             let engines = engines.clone();
-            Some(tokio::spawn(async move { engines.shutdown(true).await }))
+            Some(tokio::spawn(async move {
+                engines.shutdown(true, deadline).await;
+            }))
         }
         EnginePlan::DecideAfterDrain => None,
     }
 }
 
-/// 排空结束、退出结果 `exit` 已经出来之后收尾引擎，至多等 `wait`。`started` 是 [`begin_engines`] 返回的句柄；`plan` 是
-/// 当时锁存的停止原因推出的安排（`None` = 没有锁存任何原因：服务自己倒了，没有走停止流程，现在才停）。
+/// 外面这层等待的上限：期限里剩下的加一点余量；没有期限就是 [`OPEN_ENDED_STOP_WAIT`]。
+fn wait_budget(deadline: Option<Instant>) -> Duration {
+    match deadline {
+        Some(deadline) => deadline.saturating_duration_since(Instant::now()) + WAIT_SLACK,
+        None => OPEN_ENDED_STOP_WAIT,
+    }
+}
+
+/// 排空结束、退出结果 `exit` 已经出来之后收尾引擎，至多等到 `deadline`（再加一点余量）。`started` 是 [`begin_engines`] 返回的句柄；
+/// `plan` 是当时锁存的停止原因推出的安排（`None` = 没有锁存任何原因：服务自己倒了，没有走停止流程，现在才停，没有期限）。
+///
+/// 等不到（超时）或后台的停止任务异常结束（panic）时各写一行 `log`（不含任何秘密），所有权记录保留，下一个 iDoris 认回并收尾
+/// （L7：不能悄悄吞掉）。
 pub async fn finish_engines<E: EngineControl>(
     engines: &E,
     started: Option<JoinHandle<()>>,
     plan: Option<EnginePlan>,
     exit: &Result<u8, String>,
-    wait: Duration,
+    deadline: Option<Instant>,
+    log: &dyn Fn(&str),
 ) {
+    let wait = wait_budget(deadline);
+    let timed_out = || {
+        log(&format!(
+            "[idoris] 停止自有引擎超过 {:.1} 秒仍未完成，不再等待（所有权记录保留，下一个 iDoris 会认回并收尾）",
+            wait.as_secs_f64()
+        ));
+    };
     match (started, plan) {
         // 已经在后台停了（与排空并行）：等它做完。
-        (Some(handle), _) => {
-            let _ = tokio::time::timeout(wait, handle).await;
-        }
+        (Some(handle), _) => match tokio::time::timeout(wait, handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => log(
+                "[idoris] 停止自有引擎的任务异常结束（panic）：所有权记录保留，下一个 iDoris 会认回并收尾",
+            ),
+            Err(_) => timed_out(),
+        },
         // `never` 的信号停止：现在退出结果出来了，以 0 退出才放手，否则停止并回收。
         (None, Some(EnginePlan::DecideAfterDrain)) => {
             let stop = engines_stop_after_drain(exit);
-            let _ = tokio::time::timeout(wait, engines.shutdown(stop)).await;
+            if tokio::time::timeout(wait, engines.shutdown(stop, deadline))
+                .await
+                .is_err()
+            {
+                timed_out();
+            }
         }
         // 没有锁存原因（服务自己倒了），或 `StopNow` 却没有句柄（不应该发生）：现在才停。
         (None, _) => {
-            let _ = tokio::time::timeout(wait, engines.shutdown(true)).await;
+            if tokio::time::timeout(wait, engines.shutdown(true, deadline))
+                .await
+                .is_err()
+            {
+                timed_out();
+            }
         }
+    }
+}
+
+/// SIGINT 与（unix）SIGTERM 的处理器，**启动一开始就注册**（[`Self::install`]）。
+///
+/// 旧写法是一个 `async fn`，处理器在第一次被 poll 时才注册；而 `select!` 在更靠前的来源已经就绪时不 poll 信号那个分支，
+/// 启动期间（注册之前）到的 SIGTERM 按默认动作直接杀死进程，来不及走优雅停止。注册之后到的信号被记下，第一次 [`Self::recv`]
+/// 就返回。
+pub struct TerminationSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl TerminationSignals {
+    /// 立刻注册 SIGINT 与 SIGTERM 的处理器（必须在 tokio 运行时里调用）。
+    #[cfg(unix)]
+    pub fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub fn install() -> std::io::Result<Self> {
+        Ok(Self {})
+    }
+
+    /// 等到 SIGINT 或 SIGTERM 之一（两者走同一条优雅停止的路）；注册之后已经到过的信号立即返回。
+    #[cfg(unix)]
+    pub async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub async fn recv(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::future::pending;
-    use std::sync::Mutex;
+
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -413,6 +628,13 @@ mod tests {
         }
     }
 
+    fn cause_of(plan: &StopPlan) -> StopCause {
+        match plan.registration {
+            RegistrationAction::Stop(cause) => cause,
+            RegistrationAction::Silent => panic!("no cause in a silent stop: {plan:?}"),
+        }
+    }
+
     /// `bye` 与引擎处置从同一个结果推出：同一轮里信号与别的原因同时成立，退出码、`bye`、引擎处置都是优先级最高的那个的。
     #[tokio::test]
     async fn bye_and_the_engine_plan_follow_the_one_verdict_even_when_the_signal_was_ready_too() {
@@ -423,12 +645,12 @@ mod tests {
         assert_eq!(
             plan,
             StopPlan {
-                registration: Some(StopCause::EngineFailed),
+                registration: RegistrationAction::Stop(StopCause::EngineFailed),
                 engines: EnginePlan::StopNow
             }
         );
-        assert!(plan.registration.unwrap().says_bye());
-        assert_eq!(plan.registration.unwrap().exit_code(), 5);
+        assert!(cause_of(&plan).says_bye());
+        assert_eq!(cause_of(&plan).exit_code(), 5);
 
         // `instance_conflict`（3）加信号，`never`：3 停引擎、不发 `bye`、退出码 3。
         let verdict = sources(false, Some(StopCause::InstanceConflict), false, true)
@@ -436,8 +658,8 @@ mod tests {
             .await;
         let plan = StopPlan::new(&verdict, StopOnExit::Never);
         assert_eq!(plan.engines, EnginePlan::StopNow);
-        assert!(!plan.registration.unwrap().says_bye());
-        assert_eq!(plan.registration.unwrap().exit_code(), 3);
+        assert!(!cause_of(&plan).says_bye());
+        assert_eq!(cause_of(&plan).exit_code(), 3);
 
         // 孤儿超时（4）加信号：同理，退出码 4，不发 `bye`。
         let verdict = sources(false, Some(StopCause::OrphanTimeout), false, true)
@@ -445,8 +667,8 @@ mod tests {
             .await;
         let plan = StopPlan::new(&verdict, StopOnExit::Never);
         assert_eq!(plan.engines, EnginePlan::StopNow);
-        assert!(!plan.registration.unwrap().says_bye());
-        assert_eq!(plan.registration.unwrap().exit_code(), 4);
+        assert!(!cause_of(&plan).says_bye());
+        assert_eq!(cause_of(&plan).exit_code(), 4);
 
         // 只有信号：`owned` 立刻停，`never` 保留到排空之后；都发 `bye`。
         let verdict = sources(false, None, false, true).first().await;
@@ -454,14 +676,14 @@ mod tests {
         assert_eq!(owned.engines, EnginePlan::StopNow);
         let never = StopPlan::new(&verdict, StopOnExit::Never);
         assert_eq!(never.engines, EnginePlan::DecideAfterDrain);
-        assert!(never.registration.unwrap().says_bye());
+        assert!(cause_of(&never).says_bye());
 
-        // 启动失败：不是预期的停止，不发 `bye`（没有通知登记客户端的原因），一律立刻停引擎，与 `stop_on_exit` 无关。
+        // 启动失败：不是预期的停止，不发 `bye`，但登记与自愈也立刻停下（静默停止，L2）；一律立刻停引擎，与 `stop_on_exit` 无关。
         for mode in [StopOnExit::Owned, StopOnExit::Never] {
             assert_eq!(
                 StopPlan::new(&StopVerdict::StartupFailed("x".into()), mode),
                 StopPlan {
-                    registration: None,
+                    registration: RegistrationAction::Silent,
                     engines: EnginePlan::StopNow
                 }
             );
@@ -480,13 +702,50 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------------------------
+    // 假的引擎管理器与登记客户端
+    // -----------------------------------------------------------------------------------------
+
+    /// 假引擎管理器的 `shutdown` 怎么表现。
+    #[derive(Clone, Copy, Default)]
+    enum ShutdownBehavior {
+        /// 立刻做完。
+        #[default]
+        Return,
+        /// 永远不返回（引擎卡住了）。
+        Hang,
+        /// panic（实例任务里的 bug）。
+        Panic,
+    }
+
     /// 记录调用的假引擎管理器。`log` 里除了 `shutdown(..)`，测试还往里放「排空」的标记，以便断言先后。
     #[derive(Default)]
     struct FakeEngines {
         log: Mutex<Vec<String>>,
+        /// 每次 `shutdown` 收到的期限。
+        deadlines: Mutex<Vec<Option<Instant>>>,
+        /// `shutdown` 一进来就通知：测试等的是这个事件（后台任务确实开始停了），不是让出几轮调度碰运气。
+        entered: Notify,
+        /// `failed()` 是否已经成立（自有引擎失效已经发布）。
+        failed: bool,
+        behavior: ShutdownBehavior,
     }
 
     impl FakeEngines {
+        fn failing() -> Self {
+            Self {
+                failed: true,
+                ..Self::default()
+            }
+        }
+
+        fn with(behavior: ShutdownBehavior) -> Self {
+            Self {
+                behavior,
+                ..Self::default()
+            }
+        }
+
         fn note(&self, line: &str) {
             self.log.lock().unwrap().push(line.to_string());
         }
@@ -494,18 +753,314 @@ mod tests {
         fn log(&self) -> Vec<String> {
             self.log.lock().unwrap().clone()
         }
+
+        fn deadlines(&self) -> Vec<Option<Instant>> {
+            self.deadlines.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
     impl EngineControl for FakeEngines {
         async fn failed(&self) {
-            pending::<()>().await;
+            if !self.failed {
+                pending::<()>().await;
+            }
         }
 
-        async fn shutdown(&self, stop_engines: bool) {
+        async fn shutdown(&self, stop_engines: bool, deadline: Option<Instant>) {
             self.note(&format!("shutdown({stop_engines})"));
+            self.deadlines.lock().unwrap().push(deadline);
+            self.entered.notify_one();
+            match self.behavior {
+                ShutdownBehavior::Return => {}
+                ShutdownBehavior::Hang => pending::<()>().await,
+                ShutdownBehavior::Panic => panic!("a bug in an instance task"),
+            }
         }
     }
+
+    /// 记录调用的假登记客户端：`wants` 是 `wants_stop()` 已经发布的原因。
+    #[derive(Default)]
+    struct FakeRegistration {
+        wants: Option<StopCause>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeRegistration {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl RegistrationControl for FakeRegistration {
+        async fn wants_stop(&self) -> StopCause {
+            match self.wants {
+                Some(cause) => cause,
+                None => pending::<StopCause>().await,
+            }
+        }
+
+        fn begin_stop(&self, cause: StopCause) {
+            self.calls.lock().unwrap().push(format!("stop({cause:?})"));
+        }
+
+        fn begin_silent_stop(&self) {
+            self.calls.lock().unwrap().push("silent".to_string());
+        }
+    }
+
+    fn quiet(_: &str) {}
+
+    /// 一轮决定的输入：哪几个来源已经成立，`stop_on_exit`。
+    struct Case {
+        name: &'static str,
+        engine_failed: bool,
+        registration: Option<StopCause>,
+        gate: bool,
+        signal: bool,
+        mode: StopOnExit,
+        /// 期望锁存下来的结果。
+        verdict: StopVerdict,
+        /// 期望对登记客户端做的那一个动作。
+        registration_call: &'static str,
+        /// 期望原因一确定就开始停引擎（`Some`：那一次 `shutdown(..)` 调用）；`None`：此刻不动（保留所有权句柄）。
+        engines_now: Option<&'static str>,
+    }
+
+    fn cases() -> Vec<Case> {
+        let stop = |cause| StopVerdict::Stop(cause);
+        vec![
+            Case {
+                name: "signal alone, owned",
+                engine_failed: false,
+                registration: None,
+                gate: false,
+                signal: true,
+                mode: StopOnExit::Owned,
+                verdict: stop(StopCause::Signal),
+                registration_call: "stop(Signal)",
+                engines_now: Some("shutdown(true)"),
+            },
+            Case {
+                name: "signal alone, never: the handle is kept through the drain",
+                engine_failed: false,
+                registration: None,
+                gate: false,
+                signal: true,
+                mode: StopOnExit::Never,
+                verdict: stop(StopCause::Signal),
+                registration_call: "stop(Signal)",
+                engines_now: None,
+            },
+            // 只有一个来源成立：错接线（引擎失效接成信号、信号接成引擎失效……）在这里就红，两者同时成立的行分不出来。
+            Case {
+                name: "engine failure alone, never: stopped anyway",
+                engine_failed: true,
+                registration: None,
+                gate: false,
+                signal: false,
+                mode: StopOnExit::Never,
+                verdict: stop(StopCause::EngineFailed),
+                registration_call: "stop(EngineFailed)",
+                engines_now: Some("shutdown(true)"),
+            },
+            Case {
+                name: "orphan timeout alone, never: stopped anyway",
+                engine_failed: false,
+                registration: Some(StopCause::OrphanTimeout),
+                gate: false,
+                signal: false,
+                mode: StopOnExit::Never,
+                verdict: stop(StopCause::OrphanTimeout),
+                registration_call: "stop(OrphanTimeout)",
+                engines_now: Some("shutdown(true)"),
+            },
+            Case {
+                name: "instance conflict alone, never: stopped anyway",
+                engine_failed: false,
+                registration: Some(StopCause::InstanceConflict),
+                gate: false,
+                signal: false,
+                mode: StopOnExit::Never,
+                verdict: stop(StopCause::InstanceConflict),
+                registration_call: "stop(InstanceConflict)",
+                engines_now: Some("shutdown(true)"),
+            },
+            Case {
+                name: "gate failure alone: silent registration stop, engines stopped",
+                engine_failed: false,
+                registration: None,
+                gate: true,
+                signal: false,
+                mode: StopOnExit::Never,
+                verdict: StopVerdict::StartupFailed("gate".to_string()),
+                registration_call: "silent",
+                engines_now: Some("shutdown(true)"),
+            },
+            // 同一轮里几个同时成立：优先级最高的赢，`bye` 与引擎处置都是它的。
+            Case {
+                name: "engine failure beats the signal that was ready too",
+                engine_failed: true,
+                registration: None,
+                gate: false,
+                signal: true,
+                mode: StopOnExit::Never,
+                verdict: stop(StopCause::EngineFailed),
+                registration_call: "stop(EngineFailed)",
+                engines_now: Some("shutdown(true)"),
+            },
+            Case {
+                name: "instance conflict beats the signal that was ready too",
+                engine_failed: false,
+                registration: Some(StopCause::InstanceConflict),
+                gate: false,
+                signal: true,
+                mode: StopOnExit::Never,
+                verdict: stop(StopCause::InstanceConflict),
+                registration_call: "stop(InstanceConflict)",
+                engines_now: Some("shutdown(true)"),
+            },
+            Case {
+                name: "gate failure beats the signal that was ready too",
+                engine_failed: false,
+                registration: None,
+                gate: true,
+                signal: true,
+                mode: StopOnExit::Never,
+                verdict: StopVerdict::StartupFailed("gate".to_string()),
+                registration_call: "silent",
+                engines_now: Some("shutdown(true)"),
+            },
+            Case {
+                name: "everything ready at once: 5 wins",
+                engine_failed: true,
+                registration: Some(StopCause::OrphanTimeout),
+                gate: true,
+                signal: true,
+                mode: StopOnExit::Owned,
+                verdict: stop(StopCause::EngineFailed),
+                registration_call: "stop(EngineFailed)",
+                engines_now: Some("shutdown(true)"),
+            },
+        ]
+    }
+
+    /// L5：从「哪个来源接哪个 future」到「`bye` 与引擎处置」的整条接线，用假的登记客户端与引擎管理器测。
+    #[tokio::test]
+    async fn the_decision_wiring_picks_the_verdict_and_starts_exactly_the_stop_that_verdict_calls_for()
+     {
+        for case in cases() {
+            for round in 0..16 {
+                let latch = StopLatch::default();
+                let registration = FakeRegistration {
+                    wants: case.registration,
+                    ..FakeRegistration::default()
+                };
+                let engines = Arc::new(if case.engine_failed {
+                    FakeEngines::failing()
+                } else {
+                    FakeEngines::default()
+                });
+                let stopping = Mutex::new(None);
+                decide_and_begin(
+                    Some(&engines),
+                    Some(&registration),
+                    async {
+                        if case.gate {
+                            "gate".to_string()
+                        } else {
+                            pending::<String>().await
+                        }
+                    },
+                    async {
+                        if !case.signal {
+                            pending::<()>().await;
+                        }
+                    },
+                    case.mode,
+                    &latch,
+                    &stopping,
+                )
+                .await;
+                let label = format!("{} (round {round})", case.name);
+                assert_eq!(latch.get(), Some(&case.verdict), "{label}");
+                assert_eq!(registration.calls(), [case.registration_call], "{label}");
+                let started = stopping.lock().unwrap().take();
+                match case.engines_now {
+                    Some(call) => {
+                        started
+                            .unwrap_or_else(|| panic!("{label}: the stop did not start"))
+                            .await
+                            .unwrap();
+                        assert_eq!(engines.log(), [call], "{label}");
+                        // 引擎拿到的就是锁存下来的那个期限。
+                        assert_eq!(engines.deadlines(), [latch.deadline()], "{label}");
+                    }
+                    None => {
+                        assert!(started.is_none(), "{label}: nothing runs during the drain");
+                        assert_eq!(engines.log(), Vec::<String>::new(), "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// L1：`bye` 与引擎处置从**锁存下来的**结果推出，不是这一次刚读到的局部值。先到的是孤儿超时（4）：这一次读到的信号输了，
+    /// 不发 `bye`、引擎立刻停（即使 `never`），用局部值会照信号（发 `bye`、`never` 保留引擎）走。
+    #[tokio::test]
+    async fn the_plan_follows_the_latched_verdict_not_the_one_this_call_happened_to_read() {
+        let latch = StopLatch::default();
+        latch.latch(StopVerdict::Stop(StopCause::OrphanTimeout));
+        let registration = FakeRegistration::default();
+        let engines = Arc::new(FakeEngines::default());
+        let stopping = Mutex::new(None);
+        decide_and_begin(
+            Some(&engines),
+            Some(&registration),
+            pending::<String>(),
+            async {},
+            StopOnExit::Never,
+            &latch,
+            &stopping,
+        )
+        .await;
+        assert_eq!(
+            latch.get(),
+            Some(&StopVerdict::Stop(StopCause::OrphanTimeout)),
+            "the first latched cause stands"
+        );
+        assert_eq!(registration.calls(), ["stop(OrphanTimeout)"]);
+        let started = stopping.lock().unwrap().take();
+        started
+            .expect("an orphan timeout stops the engines at once, whatever stop_on_exit says")
+            .await
+            .unwrap();
+        assert_eq!(engines.log(), ["shutdown(true)"]);
+    }
+
+    /// 没有引擎管理器、没有登记客户端（没有托管卡、没有发现文件）：信号照样决定，没有任何东西可通知。
+    #[tokio::test]
+    async fn without_engines_or_registration_the_signal_still_decides() {
+        let latch = StopLatch::default();
+        let stopping = Mutex::new(None);
+        decide_and_begin(
+            None::<&Arc<FakeEngines>>,
+            None::<&FakeRegistration>,
+            pending::<String>(),
+            async {},
+            StopOnExit::Owned,
+            &latch,
+            &stopping,
+        )
+        .await;
+        assert_eq!(latch.get(), Some(&StopVerdict::Stop(StopCause::Signal)));
+        assert!(stopping.lock().unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // 引擎的收尾（H5）
+    // -----------------------------------------------------------------------------------------
 
     const WAIT: Duration = Duration::from_secs(5);
 
@@ -514,17 +1069,25 @@ mod tests {
     async fn never_keeps_the_handle_during_the_drain_and_hands_over_only_after_a_clean_drain() {
         let engines = Arc::new(FakeEngines::default());
         let plan = StopPlan::new(&StopVerdict::Stop(StopCause::Signal), StopOnExit::Never);
-        let started = begin_engines(&engines, plan.engines);
+        let started = begin_engines(&engines, plan.engines, None);
         assert!(started.is_none(), "nothing runs in parallel with the drain");
         engines.note("drain");
-        tokio::task::yield_now().await;
+        // 没有后台任务，所以没有什么可等的：此刻引擎一个动作也没有，是结构上的，不是让出几轮调度碰运气。
         assert_eq!(
             engines.log(),
             ["drain"],
             "no stop before the drain result is known"
         );
         engines.note("drain-ok");
-        finish_engines(engines.as_ref(), started, Some(plan.engines), &Ok(0), WAIT).await;
+        finish_engines(
+            engines.as_ref(),
+            started,
+            Some(plan.engines),
+            &Ok(0),
+            None,
+            &quiet,
+        )
+        .await;
         assert_eq!(engines.log(), ["drain", "drain-ok", "shutdown(false)"]);
     }
 
@@ -533,7 +1096,7 @@ mod tests {
     async fn never_stops_and_reclaims_the_engine_when_the_drain_fails() {
         let engines = Arc::new(FakeEngines::default());
         let plan = StopPlan::new(&StopVerdict::Stop(StopCause::Signal), StopOnExit::Never);
-        let started = begin_engines(&engines, plan.engines);
+        let started = begin_engines(&engines, plan.engines, None);
         assert!(started.is_none());
         engines.note("drain-failed");
         finish_engines(
@@ -541,7 +1104,8 @@ mod tests {
             started,
             Some(plan.engines),
             &Err("优雅停机超过 10s，强制退出".to_string()),
-            WAIT,
+            None,
+            &quiet,
         )
         .await;
         assert_eq!(engines.log(), ["drain-failed", "shutdown(true)"]);
@@ -568,22 +1132,26 @@ mod tests {
         ] {
             let engines = Arc::new(FakeEngines::default());
             let plan = StopPlan::new(&verdict, mode);
-            let started = begin_engines(&engines, plan.engines);
+            let started = begin_engines(&engines, plan.engines, None);
             assert!(started.is_some(), "{verdict:?} {mode:?}: stops in parallel");
-            // 与排空并行：停止在「排空结束」之前就已经开始（后台任务在这里让出之后就跑起来，不等 `finish_engines`）。
-            for _ in 0..100 {
-                if !engines.log().is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+            // 与排空并行：停止在「排空结束」之前就已经开始。等的是事件（后台任务进了 `shutdown`），之后才记下「排空结束」，
+            // 所以日志里的先后是因果保证的；从不开始的实现会在这里超时，而不是靠让出几轮调度碰运气。
+            tokio::time::timeout(WAIT, engines.entered.notified())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{verdict:?} {mode:?}: the stop never began on its own")
+                });
             engines.note("drain-finished");
             finish_engines(
                 engines.as_ref(),
                 started,
                 Some(plan.engines),
-                &Ok(plan.registration.map_or(1, StopCause::exit_code)),
-                WAIT,
+                &Ok(match plan.registration {
+                    RegistrationAction::Stop(cause) => cause.exit_code(),
+                    RegistrationAction::Silent => 1,
+                }),
+                None,
+                &quiet,
             )
             .await;
             assert_eq!(
@@ -603,9 +1171,184 @@ mod tests {
             None,
             None,
             &Err("data server exited".to_string()),
-            WAIT,
+            None,
+            &quiet,
         )
         .await;
         assert_eq!(engines.log(), ["shutdown(true)"]);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // 总期限（M1）与收尾的日志（L7）：用暂停的时钟，不真等
+    // -----------------------------------------------------------------------------------------
+
+    /// 期限从**第一次**锁存起算（之后到的原因不挪它），常量是 launcher 的 17 秒减去 1 秒的余量。
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_counts_from_the_first_latch_and_the_engines_are_given_exactly_that_deadline()
+     {
+        assert_eq!(STOP_DEADLINE, Duration::from_secs(16));
+        assert_eq!(OPEN_ENDED_STOP_WAIT, Duration::from_secs(14));
+        let latch = StopLatch::default();
+        assert_eq!(latch.deadline(), None, "nothing latched, nothing urges");
+        let t0 = Instant::now();
+        let engines = Arc::new(FakeEngines::default());
+        let stopping = Mutex::new(None);
+        decide_and_begin(
+            Some(&engines),
+            None::<&FakeRegistration>,
+            pending::<String>(),
+            async {},
+            StopOnExit::Owned,
+            &latch,
+            &stopping,
+        )
+        .await;
+        assert_eq!(latch.deadline(), Some(t0 + STOP_DEADLINE));
+        let started = stopping.lock().unwrap().take();
+        started.unwrap().await.unwrap();
+        assert_eq!(engines.deadlines(), [Some(t0 + STOP_DEADLINE)]);
+        // 之后到的原因不挪期限。
+        tokio::time::advance(Duration::from_secs(5)).await;
+        latch.latch(StopVerdict::Stop(StopCause::EngineFailed));
+        assert_eq!(latch.deadline(), Some(t0 + STOP_DEADLINE));
+    }
+
+    /// 引擎卡住了：`finish_engines` 只等期限里剩下的加一点余量，不是固定的 14 秒；等不到就写一行日志（每条路径各一行）。
+    #[tokio::test(start_paused = true)]
+    async fn finish_waits_only_for_the_time_left_before_the_deadline_and_says_so_when_it_gives_up()
+    {
+        for branch in ["background stop", "decided after the drain", "no verdict"] {
+            let engines = Arc::new(FakeEngines::with(ShutdownBehavior::Hang));
+            let lines = Mutex::new(Vec::<String>::new());
+            let sink = |line: &str| lines.lock().unwrap().push(line.to_string());
+            let t0 = Instant::now();
+            // 排空占掉了 10 秒，期限里还剩 6 秒。
+            let deadline = t0 + Duration::from_secs(6);
+            let (started, plan) = match branch {
+                "background stop" => (
+                    begin_engines(&engines, EnginePlan::StopNow, Some(deadline)),
+                    Some(EnginePlan::StopNow),
+                ),
+                "decided after the drain" => (None, Some(EnginePlan::DecideAfterDrain)),
+                _ => (None, None),
+            };
+            finish_engines(
+                engines.as_ref(),
+                started,
+                plan,
+                &Err("drain failed".to_string()),
+                Some(deadline),
+                &sink,
+            )
+            .await;
+            assert_eq!(
+                t0.elapsed(),
+                Duration::from_millis(7500),
+                "{branch}: 6 s left plus the 1.5 s slack, not a fixed 14 s"
+            );
+            let lines = lines.lock().unwrap().clone();
+            assert_eq!(lines.len(), 1, "{branch}: exactly one line: {lines:?}");
+            assert!(
+                lines[0].starts_with("[idoris] 停止自有引擎超过 7.5 秒"),
+                "{lines:?}"
+            );
+            assert!(lines[0].contains("所有权记录保留"), "{lines:?}");
+            // 引擎拿到的就是这个期限（不是自己另算一个）。
+            assert_eq!(engines.deadlines(), [Some(deadline)], "{branch}");
+        }
+    }
+
+    /// 没有期限（服务自己倒了，没有信号在催）：照原来的 14 秒上限；期限已经过了：只剩余量。
+    #[tokio::test(start_paused = true)]
+    async fn without_a_deadline_the_wait_is_the_open_ended_bound_and_a_spent_deadline_leaves_only_the_slack()
+     {
+        let engines = FakeEngines::with(ShutdownBehavior::Hang);
+        let t0 = Instant::now();
+        finish_engines(&engines, None, None, &Err("died".to_string()), None, &quiet).await;
+        assert_eq!(t0.elapsed(), OPEN_ENDED_STOP_WAIT);
+        let t1 = Instant::now();
+        let spent = t1 - Duration::from_secs(3);
+        finish_engines(
+            &engines,
+            None,
+            None,
+            &Err("died".to_string()),
+            Some(spent),
+            &quiet,
+        )
+        .await;
+        assert_eq!(t1.elapsed(), WAIT_SLACK);
+    }
+
+    /// L7：后台的停止任务 panic（实例任务里的 bug）也要写一行，不能悄悄吞掉；一切正常时一行也不写。
+    #[tokio::test]
+    async fn a_panicking_background_stop_is_logged_and_a_clean_finish_logs_nothing() {
+        let engines = Arc::new(FakeEngines::with(ShutdownBehavior::Panic));
+        let started = begin_engines(&engines, EnginePlan::StopNow, None);
+        let lines = Mutex::new(Vec::<String>::new());
+        let sink = |line: &str| lines.lock().unwrap().push(line.to_string());
+        finish_engines(
+            engines.as_ref(),
+            started,
+            Some(EnginePlan::StopNow),
+            &Ok(0),
+            None,
+            &sink,
+        )
+        .await;
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("panic"), "{lines:?}");
+        assert!(lines[0].contains("所有权记录保留"), "{lines:?}");
+
+        // 正常收尾：一行也不写（三条路径）。
+        for plan in [
+            Some(EnginePlan::StopNow),
+            Some(EnginePlan::DecideAfterDrain),
+            None,
+        ] {
+            let engines = Arc::new(FakeEngines::default());
+            let started = match plan {
+                Some(EnginePlan::StopNow) => begin_engines(&engines, EnginePlan::StopNow, None),
+                _ => None,
+            };
+            let lines = Mutex::new(Vec::<String>::new());
+            let sink = |line: &str| lines.lock().unwrap().push(line.to_string());
+            finish_engines(engines.as_ref(), started, plan, &Ok(0), None, &sink).await;
+            assert_eq!(
+                lines.lock().unwrap().clone(),
+                Vec::<String>::new(),
+                "{plan:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // 信号处理器启动时就装好（L6）
+    // -----------------------------------------------------------------------------------------
+
+    /// 信号在**第一次 `recv` 之前**就到了：处理器是 `install` 时注册的，所以信号被记下、`recv` 立即返回；处理器若是等第一次 poll 才注册
+    /// （旧写法），这两次 `raise` 按默认动作直接杀死整个进程（这个测试进程），根本走不到断言。SIGINT 与 SIGTERM 各来一次。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signals_that_arrive_before_the_first_recv_are_recorded_because_the_handlers_are_installed_up_front()
+     {
+        use nix::sys::signal::{Signal, raise};
+
+        let mut signals = TerminationSignals::install().unwrap();
+        raise(Signal::SIGTERM).unwrap();
+        tokio::time::timeout(WAIT, signals.recv())
+            .await
+            .expect("SIGTERM raised before the first recv is recorded");
+        raise(Signal::SIGINT).unwrap();
+        tokio::time::timeout(WAIT, signals.recv())
+            .await
+            .expect("SIGINT raised before the next recv is recorded too");
+        // 没有新信号时不返回（不是一个一直就绪的 future）。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), signals.recv())
+                .await
+                .is_err()
+        );
     }
 }

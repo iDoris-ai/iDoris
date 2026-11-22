@@ -44,7 +44,7 @@ use idoris_router::{
     runtime::RuntimeRegistry,
     runtime_launch_config,
     startup_form::StartupForm,
-    stop::{self, EngineControl, StopLatch, StopPlan, StopSources, StopVerdict},
+    stop::{self, StopLatch, StopPlan, StopVerdict, TerminationSignals},
     storage,
     subscription::{
         config::SubscriptionConfig,
@@ -69,22 +69,6 @@ const EXIT_ALREADY_RUNNING: i32 = 3;
 /// Upper bound for graceful shutdown after SIGTERM/SIGINT; if in-flight
 /// requests or subscriptions do not finish in time a signal stop exits with code 1 (`stop_report` for the other causes).
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Resolves on SIGINT or (unix) SIGTERM; both take the same graceful path.
-async fn termination_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        if let Ok(mut term) = signal(SignalKind::terminate()) {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-            }
-            return;
-        }
-    }
-    let _ = tokio::signal::ctrl_c().await;
-}
 
 const BIND_HOST_ENV: &str = "IDORIS_BIND_HOST";
 
@@ -185,7 +169,7 @@ fn stop_report(
 /// 退出结果：锁存的停止原因 `verdict`（`None` = 停止流程没有走到决定这一步，服务自己倒了）加上排空的结果 `served`。
 /// 引擎的收尾（[`stop::engines_stop_after_drain`]）、退出码与日志行都从这**一个**结果来。
 ///
-/// - 启动失败（门控创建完整服务体失败）：`Err`，退出码 1，排空的结果不重要，也没有原因行。
+/// - 启动失败（门控创建完整服务体失败）：`Err`，退出码 1，没有原因行；排空也失败时，它的错误并进同一条退出信息。
 /// - 预期的停止：[`stop_report`]（排空失败不能盖掉已经确定的 3、4、5）。
 fn exit_report(
     verdict: Option<&StopVerdict>,
@@ -193,9 +177,13 @@ fn exit_report(
     orphan_timeout_s: u32,
 ) -> StopReport {
     match verdict {
+        // 排空也失败了就把它的错误并进同一条退出信息，不丢（L2）：启动失败仍是退出码 1，没有原因行。
         Some(StopVerdict::StartupFailed(message)) => StopReport {
             lines: Vec::new(),
-            result: Err(message.clone()),
+            result: Err(match served {
+                Ok(()) => message.clone(),
+                Err(drain) => format!("{message}（排空也失败了：{drain}）"),
+            }),
         },
         Some(StopVerdict::Stop(cause)) => stop_report(Some(*cause), served, orphan_timeout_s),
         None => stop_report(None, served, orphan_timeout_s),
@@ -487,6 +475,11 @@ fn validate_bind_authority(
 
 /// 返回优雅停止的退出码（接口规范 §2.7.5）：信号 0，`instance_conflict` 3，孤儿超时 4；启动或停止失败是 `Err`（退出码 1）。
 async fn run(options: cli::ServeOptions) -> Result<u8, String> {
+    // SIGINT 与 SIGTERM 的处理器启动一开始就注册（勘误十二，L6），不是等停止流程第一次被 poll：`select!` 在更靠前的来源已经就绪时不 poll
+    // 信号那个分支，处理器那时还没装的话，之后到的 SIGTERM 按默认动作直接杀死进程，不走优雅停止，自己拉起的引擎也来不及收尾。
+    // 注册之后到的信号被记下，停止流程第一次读它就读到。
+    let termination = TerminationSignals::install()
+        .map_err(|error| format!("无法注册 SIGINT/SIGTERM 处理器：{error}"))?;
     // 接口规范 §2.7.3：`started_at_ms` 是 iDoris 开始 `run()` 时的 Unix 毫秒（墙钟），发现文件与 `/health` 用同一个值。
     let started_at_ms = readiness::unix_millis_now();
     // 接口规范 §2.1：`instance_nonce` 每次启动一个，CSPRNG 取 256 位。秘密：只在这个进程的内存和发现文件里，
@@ -992,7 +985,7 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     let prober_slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
     // 停止的原因（接口规范 §2.7.5，勘误十二）：SIGTERM、SIGINT，登记客户端要求停止（`instance_conflict`、孤儿超时），自己拉起的引擎失效
     // （退出码 5），或门控创建完整服务体失败（启动失败）。它们走同一条停止路径，原因只在这里**锁存一次**（先到先得）；同一轮里几个同时
-    // 成立时按 5 > 4 > 3 > 启动失败 > 信号取一个（`stop::StopSources`）。退出码、是否发 `bye`、对自有引擎的处置都从这一个结果推出。
+    // 成立时按 5 > 4 > 3 > 启动失败 > 信号取一个（`stop::StopSources`）。退出码、是否发 `bye`、对自有引擎的处置都从这一个结果推出；收尾的期限（`stop::STOP_DEADLINE`）从锁存那一刻起算。
     let stop_latch: Arc<StopLatch> = Arc::new(StopLatch::default());
     // 引擎的停止与 HTTP 排空并行（接口规范 §2.7.5 第 1 到 3 步）：停止原因一确定就在后台开始，之后等它做完。`stop_on_exit:"never"` 的
     // 信号停止是例外：排空期间保留所有权句柄，这里一直是空的，排空结束、退出结果出来之后才定（`stop::finish_engines`）。
@@ -1021,7 +1014,8 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
                 Box::new(move |outcome: &lifecycle::GateOutcome| {
                     // 降级放行（有托管引擎终局失败，接口规范 §2.7.6 勘误六）：没就绪的托管卡不建 Supervisor——它会去采样一个没起来、
                     // 或者没通过属主校验的端点；路由到这些卡的请求由 `managed_failures` 直接 503（带原因），别的卡照常服务。
-                    // 卡集与本地 runtime 配置表一起投影（被拿掉的卡的配置随它走），适配器参数用启动时按原始卡集解析好的（勘误十二（3））。
+                    // 本地 runtime 配置从不绑托管卡（启动时 `validate_local_configs` 已拒绝，勘误十二（3））：配置表原样交给它，不需要投影；
+                    // 适配器参数用启动时按原始卡集解析好的，建表走启动时干跑过的同一条路径（勘误十二（3））。
                     let runtimes = RuntimeRegistry::spawn_after_gate(
                         &state.cards,
                         &local_runtime_configs,
@@ -1101,45 +1095,20 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
         let stop_latch = stop_latch.clone();
         let engines = engines.clone();
         let engines_stopping = engines_stopping.clone();
+        let mut termination = termination;
         async move {
-            // 引擎失效通常只在门控完成之后才会有（之前走重启与熔断；实例任务自己 panic 是例外，也报在这里）。
-            // 没有引擎管理器时永不返回。
-            let engine_failed = async {
-                match &engines {
-                    Some(engines) => engines.failed().await,
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            let registration_stop = async {
-                match &registration {
-                    Some(registration) => registration.wants_stop().await,
-                    None => std::future::pending().await,
-                }
-            };
-            // 同一轮里几个来源同时成立：已经发布的 5、4、3 与启动失败排在信号前面，不随机挑（`select!` 在这里是 `biased` 的）。
-            let verdict = StopSources {
-                engine_failed,
-                registration: registration_stop,
+            // 决定、锁存、开始收尾（通知登记客户端、开始停引擎）都在 `stop::decide_and_begin` 里：优先级、`bye` 与引擎处置从锁存下来的
+            // 那一个结果推出、各来源接哪个 future，都在那里用假的登记客户端与引擎管理器测过。
+            stop::decide_and_begin(
+                engines.as_ref(),
+                registration.as_ref(),
                 gate_failed,
-                signal: termination_signal(),
-            }
-            .first()
+                termination.recv(),
+                launcher_stop_on_exit,
+                &stop_latch,
+                &engines_stopping,
+            )
             .await;
-            // `bye` 与引擎处置都从这**一个**结果推出。
-            let plan = StopPlan::new(&verdict, launcher_stop_on_exit);
-            if let (Some(registration), Some(cause)) = (&registration, plan.registration) {
-                // 立即返回：自愈马上停止；信号与引擎失效时 `bye`（至多 0.5 秒）与下面的 HTTP 排空并行。启动失败不是预期的停止，不发 `bye`。
-                registration.begin_stop(cause);
-            }
-            // 引擎的停止与 HTTP 排空并行：`stop_on_exit:"never"` 只对退出码 0 有效，退出码 4、5 与 3 一律停（接口规范 §2.7.5）；
-            // 启动失败当作要停（没有对外服务过，留着引擎没有意义）。`never` 的信号停止此刻不动，保留所有权句柄。
-            if let Some(engines) = &engines {
-                *engines_stopping
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) =
-                    stop::begin_engines(engines, plan.engines);
-            }
-            stop_latch.latch(verdict);
         }
     };
     let served = match bodies {
@@ -1198,7 +1167,8 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
             started,
             plan,
             &report.result,
-            ENGINE_STOP_WAIT,
+            stop_latch.deadline(),
+            &|line| say(std::io::stderr(), line),
         )
         .await;
     }
@@ -1219,9 +1189,6 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     }
     report.result
 }
-
-/// 等引擎停止的上限：SIGTERM 之后 8 秒宽限，加上 SIGKILL 与收尾（`EngineManager::shutdown` 自己也有上限，这里是外面的兜底）。
-const ENGINE_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(14);
 
 /// 退出时删发现文件：只在文件属于自己时删；删不掉（旁路锁不可用或等锁超时、IO 失败）只留一行日志，文件成为崩溃残留，
 /// 由下一个拿到实例锁的实例覆盖。日志不含路径与文件内容（`launcher_discovery.rs` 里两条进程级测试逐字断言了这两行）。
@@ -1822,8 +1789,14 @@ mod tests {
     #[test]
     fn the_exit_report_and_the_engine_fate_both_come_from_the_one_latched_verdict() {
         let drain_failed = || Err(shutdown_timeout_message());
-        // 启动失败：`Err`（退出码 1），没有原因行，排空是否成功都一样；引擎一律停。
-        for served in [Ok(()), drain_failed()] {
+        // 启动失败：`Err`（退出码 1），没有原因行；排空也失败时，它的错误并进同一条退出信息（不丢）；引擎一律停。
+        for (served, message) in [
+            (Ok(()), "门控失败".to_string()),
+            (
+                drain_failed(),
+                format!("门控失败（排空也失败了：{}）", shutdown_timeout_message()),
+            ),
+        ] {
             let report = exit_report(
                 Some(&StopVerdict::StartupFailed("门控失败".to_string())),
                 served,
@@ -1833,7 +1806,7 @@ mod tests {
                 report,
                 StopReport {
                     lines: Vec::new(),
-                    result: Err("门控失败".to_string()),
+                    result: Err(message),
                 }
             );
             assert!(stop::engines_stop_after_drain(&report.result));
@@ -1874,9 +1847,7 @@ mod tests {
     fn the_components_dir_is_resolved_to_one_canonical_path_that_loading_and_publishing_share() {
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("first");
-        let second = root.path().join("second");
         std::fs::create_dir(&first).unwrap();
-        std::fs::create_dir(&second).unwrap();
         let link = root.path().join("link");
         std::os::unix::fs::symlink(&first, &link).unwrap();
 
@@ -1885,9 +1856,7 @@ mod tests {
         assert_eq!(resolved, std::fs::canonicalize(&first).unwrap());
         assert_ne!(resolved, link);
 
-        // 解析之后、发布之前，符号链接被换成指向另一个目录：发布的仍是加载用的那一个，不是再解析一次的结果。
-        std::fs::remove_file(&link).unwrap();
-        std::os::unix::fs::symlink(&second, &link).unwrap();
+        // 发布的是加载用的那个 canonical 路径，数据库路径与额度原样带上。
         let snapshot = launch_snapshot(
             std::path::Path::new("/db/idoris.sqlite3"),
             &resolved,
@@ -1895,15 +1864,10 @@ mod tests {
             &[],
         );
         assert_eq!(snapshot.components_dir, resolved.to_string_lossy());
-        assert_ne!(
-            snapshot.components_dir,
-            std::fs::canonicalize(&second).unwrap().to_string_lossy(),
-            "the swapped link must not leak into the published snapshot"
-        );
         assert_eq!(snapshot.db_path, "/db/idoris.sqlite3");
         assert_eq!(snapshot.allocated_budget_bytes, Some(7));
         // `launch_snapshot` 自己从不解析路径：给它符号链接本身，发布的就是这个字符串（解析是 `canonical_components_dir` 的事，
-        // 而且只在启动时做一次）。
+        // 而且只在启动时做一次）。再解析一次的实现会在这里把链接换成真实目录，这条断言就红。
         assert_eq!(
             launch_snapshot(std::path::Path::new("/db"), &link, None, &[]).components_dir,
             link.to_string_lossy()

@@ -169,12 +169,14 @@ impl RuntimeRegistry {
     /// Build the Supervisor table when the start-up gate opens (interface spec §2.7.6, erratum 12 (3)).
     ///
     /// Managed cards the gate gave up on (`degraded`: no Supervisor is created for an engine that did not come up)
-    /// are projected out of **both** the card set and the local-runtime table: a local runtime configuration that
-    /// belongs to a removed card goes with it. The full validation of the configuration against the *original* card
-    /// set happens at start-up ([`Self::validate_local_configs`], before anything starts); the projected pair passes
-    /// the same check again here because the projection is joint. Projecting only the cards (the old finalize) left a
-    /// configuration without its card, and that second check turned a legal configuration into "没有对应的组件卡"
-    /// and took the whole process down on a degraded open.
+    /// are left out of the card set. The local-runtime table needs no matching projection: a local runtime
+    /// configuration can never be bound to a managed card ([`Self::validate_local_configs`] refuses that at
+    /// start-up, before anything starts), so every configuration's card is still in the set whatever the gate gave
+    /// up on, and the second validation inside [`Self::spawn_with_local_factory`] passes by construction. (The
+    /// earlier finalize removed only the cards, which made that second validation turn a legal-looking
+    /// configuration into "没有对应的组件卡" and took the whole process down on a degraded open; the first fix
+    /// projected the table too, silently dropping a configuration the operator had written. Refusing the
+    /// combination up front is the honest version.)
     /// `params` were resolved at start-up ([`Self::resolve_adapter_params`]): nothing reads the environment here.
     pub fn spawn_after_gate(
         cards: &[ComponentCard],
@@ -184,10 +186,14 @@ impl RuntimeRegistry {
         remote_kill_switch: bool,
         params: &AdapterParams,
     ) -> Result<Self, String> {
-        let (cards, local) = project_without(cards, local, degraded);
+        let cards: Vec<ComponentCard> = cards
+            .iter()
+            .filter(|card| !degraded(&card.provider.id))
+            .cloned()
+            .collect();
         Self::spawn_with_local_factory(
             &cards,
-            &local,
+            local,
             allocated_budget_bytes,
             remote_kill_switch,
             |card| create_adapter_with(card, params),
@@ -199,18 +205,36 @@ impl RuntimeRegistry {
     /// managed engine later turns out to be ready. Only a card that will actually be built by the adapter factory
     /// (Supervisor-managed, not a subscription relay, not a resident direct-proxy card, no local-runtime
     /// configuration of its own) needs the environment; with none, nothing is read (unchanged behaviour).
+    ///
+    /// Then **every** card that gets a Supervisor is dry-run through the very constructor path the gate-open build
+    /// uses ([`adapter_for`]) and the adapter dropped: a card whose adapter cannot be built (`no adapter for
+    /// provider X`, a form with `no runtime constructor`) is a start-up failure here, not an error at gate-open
+    /// (after the engines already started and the discovery file was published) that a degraded projection could
+    /// even have hidden. Constructing an adapter does no I/O; it only reads the environment and settings for the
+    /// oMLX API key, so the dry-run neither depends on nor disturbs the engine's state.
     pub fn resolve_adapter_params(
         cards: &[ComponentCard],
         local: &BTreeMap<String, LocalHttpRuntimeConfig>,
     ) -> Result<AdapterParams, String> {
-        let needs_factory = cards.iter().find(|card| {
-            matches!(uses_supervisor(card), Ok(true)) && !local.contains_key(&card.provider.id)
-        });
-        match needs_factory {
-            Some(card) => AdapterParams::from_env()
-                .map_err(|error| format!("provider {}: {error}", card.provider.id)),
-            None => Ok(AdapterParams::default()),
+        let mut supervised = Vec::new();
+        for card in cards {
+            if uses_supervisor(card)? {
+                supervised.push(card);
+            }
         }
+        let params = match supervised
+            .iter()
+            .find(|card| !local.contains_key(&card.provider.id))
+        {
+            Some(card) => AdapterParams::from_env()
+                .map_err(|error| format!("provider {}: {error}", card.provider.id))?,
+            None => AdapterParams::default(),
+        };
+        for card in supervised {
+            adapter_for(card, local, |card| create_adapter_with(card, &params))
+                .map_err(|error| format!("provider {}: {error}", card.provider.id))?;
+        }
+        Ok(params)
     }
 
     /// One validation of the local-runtime table against `cards`, then one Supervisor per lifecycle card; `make`
@@ -230,14 +254,7 @@ impl RuntimeRegistry {
             cards,
             allocated_budget_bytes,
             remote_kill_switch,
-            |card| {
-                if let Some(config) = local.get(&card.provider.id) {
-                    return LocalHttpRuntimeAdapter::new(config.clone()).map(|adapter| {
-                        std::sync::Arc::new(adapter) as std::sync::Arc<dyn RuntimeAdapter>
-                    });
-                }
-                make(card)
-            },
+            |card| adapter_for(card, local, &make),
         )?;
         for (provider_id, config) in local {
             if let Some(bound) = registry.supervisors.get_mut(provider_id) {
@@ -249,9 +266,14 @@ impl RuntimeRegistry {
         Ok(registry)
     }
 
-    /// 本地 runtime 配置与组件卡对得上：每个配置都有对应的卡、不绑 Resident 直连卡、form/locality/endpoint 一致。
-    /// 不启动任何任务。启动门控期间（接口规范 §2.7.6）Supervisor 要等引擎落定才创建，但这些配置错误仍要在启动的
-    /// 一开头报出来（先于绑定端口），所以单独拿出来，[`Self::spawn_with_local_configs_budget_and_kill_switch`] 也先调它。
+    /// 本地 runtime 配置与组件卡对得上：每个配置都有对应的卡、不绑托管卡（`extensions.idoris_managed`）、不绑 Resident
+    /// 直连卡、form/locality/endpoint 一致。不启动任何任务。启动门控期间（接口规范 §2.7.6）Supervisor 要等引擎落定才创建，
+    /// 但这些配置错误仍要在启动的一开头报出来（先于绑定端口），所以单独拿出来，
+    /// [`Self::spawn_with_local_configs_budget_and_kill_switch`] 也先调它。
+    ///
+    /// 本地 runtime 配置绑托管卡是矛盾的（勘误十二（3））：托管卡的引擎由引擎管理器拉起、停止、回收（所有权记录、`stop_on_exit`、
+    /// 退出码 5），本地 runtime 配置是另一条拉起路径（`LocalHttpRuntimeAdapter` 自己起 `mlx_lm_server`），两条路都想管同一个
+    /// 端口。降级放行时配置只能随卡一起默默消失，那是在替操作员丢掉他写下的配置；所以启动时就拒绝。
     pub fn validate_local_configs(
         cards: &[ComponentCard],
         local: &BTreeMap<String, LocalHttpRuntimeConfig>,
@@ -263,6 +285,12 @@ impl RuntimeRegistry {
                 .ok_or_else(|| {
                     format!("本地 runtime {provider_id:?} 没有对应的组件卡，拒绝启动")
                 })?;
+            if is_managed_card(card) {
+                return Err(format!(
+                    "本地 runtime {provider_id:?} 不能绑定由引擎管理器托管的组件卡（extensions.{}）：托管卡的引擎由 iDoris 的引擎管理器拉起与停止，本地 runtime 配置是另一条拉起路径，两者只能留一个，拒绝启动",
+                    crate::engine_kind::MANAGED_EXTENSION
+                ));
+            }
             if crate::dispatch::is_resident_http_service(card) {
                 return Err(format!(
                     "本地 runtime {provider_id:?} 不能绑定 Resident 直连组件卡"
@@ -433,24 +461,31 @@ fn uses_supervisor(card: &ComponentCard) -> Result<bool, String> {
     Ok(true)
 }
 
-/// The card set and the local-runtime table without the cards `excluded` names: a configuration belongs to its
-/// card, so it leaves with it (see [`RuntimeRegistry::spawn_after_gate`]).
-fn project_without(
-    cards: &[ComponentCard],
+/// Whether the card declares an engine the engine manager owns (`extensions.idoris_managed`; the same predicate the
+/// card validation uses to set `EngineIdentity::managed`).
+fn is_managed_card(card: &ComponentCard) -> bool {
+    card.extensions
+        .as_ref()
+        .is_some_and(|extensions| extensions.contains_key(crate::engine_kind::MANAGED_EXTENSION))
+}
+
+/// The one way a Supervisor card's adapter is built: from its own local-runtime configuration when it has one,
+/// otherwise by `make` (the adapter factory). The gate-open build and the start-up dry-run
+/// ([`RuntimeRegistry::resolve_adapter_params`]) both go through here, so the dry-run checks exactly what the build
+/// will do.
+fn adapter_for<F>(
+    card: &ComponentCard,
     local: &BTreeMap<String, LocalHttpRuntimeConfig>,
-    excluded: impl Fn(&str) -> bool,
-) -> (Vec<ComponentCard>, BTreeMap<String, LocalHttpRuntimeConfig>) {
-    let cards = cards
-        .iter()
-        .filter(|card| !excluded(&card.provider.id))
-        .cloned()
-        .collect();
-    let local = local
-        .iter()
-        .filter(|(provider_id, _)| !excluded(provider_id))
-        .map(|(provider_id, config)| (provider_id.clone(), config.clone()))
-        .collect();
-    (cards, local)
+    make: F,
+) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>
+where
+    F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
+{
+    if let Some(config) = local.get(&card.provider.id) {
+        return LocalHttpRuntimeAdapter::new(config.clone())
+            .map(|adapter| std::sync::Arc::new(adapter) as std::sync::Arc<dyn RuntimeAdapter>);
+    }
+    make(card)
 }
 
 fn is_trusted_local_card(card: &ComponentCard) -> bool {
@@ -1176,51 +1211,76 @@ mod tests {
         .unwrap()
     }
 
-    /// 规范勘误十二（3）(b)（M5）：降级放行时没就绪的托管卡不建 Supervisor，它对应的本地 runtime 配置随它一起从投影里拿掉：
-    /// 别的卡照常建 Supervisor，进程不会因为「没有对应的组件卡」退出。校验只对**原始卡集**做一次（启动时）。
+    fn managed_named_card(id: &str, port: u16) -> ComponentCard {
+        let mut card = named_card(id);
+        card.endpoint = format!("http://127.0.0.1:{port}");
+        card.extensions = Some(
+            serde_json::json!({"idoris_managed": {"engine": "omlx", "mode": "auto"}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        card
+    }
+
+    /// 规范勘误十二（3）（L4）：本地 runtime 配置绑在托管卡（`extensions.idoris_managed`）上，启动时就拒绝：托管卡的引擎由引擎管理器
+    /// 拉起与停止，本地 runtime 配置是另一条拉起路径，不能等降级放行时默默把配置丢掉。两个入口（有托管卡的启动校验、没有托管卡的
+    /// 直接建表）都拒绝；同一份配置绑在不托管的卡上是合法的（对照）。
     #[tokio::test]
-    async fn a_degraded_gate_projects_the_removed_cards_local_config_out_with_the_card() {
-        let mut managed = named_card("managed-local");
-        managed.endpoint = "http://127.0.0.1:18121".into();
+    async fn a_local_runtime_config_bound_to_a_managed_card_is_refused_at_start_up() {
+        let managed = managed_named_card("managed-local", 18121);
+        let dir = tempfile::tempdir().unwrap();
+        let configs = BTreeMap::from([(
+            "managed-local".to_string(),
+            local_runtime_config("managed-local", 18121, dir.path()),
+        )]);
+        let error =
+            RuntimeRegistry::validate_local_configs(std::slice::from_ref(&managed), &configs)
+                .unwrap_err();
+        assert!(error.contains("managed-local"), "{error}");
+        assert!(error.contains("托管"), "{error}");
+        assert!(error.contains("idoris_managed"), "{error}");
+        let error =
+            RuntimeRegistry::spawn_with_local_configs(std::slice::from_ref(&managed), &configs)
+                .unwrap_err();
+        assert!(error.contains("托管"), "{error}");
+
+        // 对照：同一份配置，卡不声明托管：合法。
+        let mut plain = managed.clone();
+        plain.extensions = None;
+        RuntimeRegistry::validate_local_configs(std::slice::from_ref(&plain), &configs).unwrap();
+        assert!(
+            RuntimeRegistry::spawn_with_local_configs(std::slice::from_ref(&plain), &configs)
+                .is_ok()
+        );
+    }
+
+    /// 降级放行（勘误十二（3））：没就绪的托管卡不建 Supervisor，别的卡照常建；本地 runtime 配置表原样不动（它从不绑托管卡，
+    /// 所以第二次校验必然通过，不会再把合法的配置变成启动失败）。
+    #[tokio::test]
+    async fn a_degraded_gate_leaves_the_managed_card_out_and_builds_every_other_card() {
+        let managed = managed_named_card("omlx", 18121);
         let mut healthy = named_card("healthy-local");
         healthy.endpoint = "http://127.0.0.1:18122".into();
         let fences = tempfile::tempdir().unwrap();
-        let configs = BTreeMap::from([
-            (
-                "managed-local".to_string(),
-                local_runtime_config("managed-local", 18121, fences.path()),
-            ),
-            (
-                "healthy-local".to_string(),
-                local_runtime_config("healthy-local", 18122, fences.path()),
-            ),
-        ]);
-        let original = [managed.clone(), healthy.clone()];
-        // 原始卡集上的一次完整校验：合法。
+        let configs = BTreeMap::from([(
+            "healthy-local".to_string(),
+            local_runtime_config("healthy-local", 18122, fences.path()),
+        )]);
+        let original = [managed, healthy];
         RuntimeRegistry::validate_local_configs(&original, &configs).unwrap();
-        // 只拿掉卡、不拿配置（此前的写法）：`validate_local_configs` 再对半个投影校验一次，合法的配置就成了启动失败。
-        let error = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
-            std::slice::from_ref(&healthy),
-            &configs,
-            None,
-            false,
-        )
-        .unwrap_err();
-        assert!(error.contains("managed-local"), "{error}");
-        assert!(error.contains("没有对应的组件卡"), "{error}");
 
-        // 门控放行（降级）：卡集与配置表一起投影。
         let registry = RuntimeRegistry::spawn_after_gate(
             &original,
             &configs,
-            |provider_id| provider_id == "managed-local",
+            |provider_id| provider_id == "omlx",
             None,
             false,
             &AdapterParams::default(),
         )
         .unwrap();
         assert!(
-            registry.get("managed-local").is_none(),
+            registry.get("omlx").is_none(),
             "the degraded managed card gets no Supervisor"
         );
         let healthy_runtime = registry
@@ -1230,8 +1290,9 @@ mod tests {
             healthy_runtime.status().await.is_ok(),
             "its Supervisor is alive"
         );
+        assert_eq!(configs.len(), 1, "the table is not touched");
 
-        // 都没降级：两张卡都建。全降级：什么也不建，也不报错。
+        // 都没降级：两张卡都建。全降级：只剩带本地配置的那张（它不是托管卡，门控降级与它无关）。
         let all = RuntimeRegistry::spawn_after_gate(
             &original,
             &configs,
@@ -1242,50 +1303,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(all.len(), 2);
-        let none = RuntimeRegistry::spawn_after_gate(
+        let managed_degraded_only = RuntimeRegistry::spawn_after_gate(
             &original,
             &configs,
-            |_| true,
+            |provider_id| provider_id == "omlx",
             None,
             false,
             &AdapterParams::default(),
         )
         .unwrap();
-        assert!(none.is_empty());
+        assert_eq!(managed_degraded_only.len(), 1);
     }
 
+    /// L3：启动时对**每一张**要 Supervisor 的卡干跑一遍适配器的构造（和门控放行时建表走同一条路 `adapter_for`），建不出适配器的卡
+    /// （`no adapter for provider`、`no runtime constructor`）是启动失败，不是门控放行之后才发现的错误（降级投影甚至能把它藏起来）。
+    /// 不要 Supervisor 的卡（订阅中转、resident 直连）不被干跑；带自己本地配置的卡由那份配置建，不看工厂。
     #[test]
-    fn projecting_a_degraded_set_removes_exactly_the_named_cards_and_their_configs() {
-        let mut a = named_card("a");
-        a.endpoint = "http://127.0.0.1:18131".into();
-        let mut b = named_card("b");
-        b.endpoint = "http://127.0.0.1:18132".into();
-        let dir = tempfile::tempdir().unwrap();
-        let configs = BTreeMap::from([
-            (
-                "a".to_string(),
-                local_runtime_config("a", 18131, dir.path()),
-            ),
-            (
-                "b".to_string(),
-                local_runtime_config("b", 18132, dir.path()),
-            ),
-        ]);
-        let (cards, local) = project_without(&[a, b], &configs, |id| id == "a");
+    fn resolving_the_adapter_params_dry_runs_the_adapter_construction_of_every_supervisor_card() {
+        let good = named_card("omlx");
+        let no_adapter = named_card("vllm-lifecycle");
+        // 好卡在前、坏卡在后：错误不被前面的好卡遮住；换个顺序也一样。
+        for cards in [
+            [good.clone(), no_adapter.clone()],
+            [no_adapter.clone(), good.clone()],
+        ] {
+            let error =
+                RuntimeRegistry::resolve_adapter_params(&cards, &BTreeMap::new()).unwrap_err();
+            assert!(error.contains("vllm-lifecycle"), "{error}");
+            assert!(error.contains("no adapter for provider"), "{error}");
+        }
+        // 没有 runtime 构造器的形态：同样是启动失败（以前这里不报错，等门控放行时才报）。
+        let mut cli = named_card("cli-thing");
+        cli.form = Form::SpawnCli;
+        let error = RuntimeRegistry::resolve_adapter_params(&[good.clone(), cli], &BTreeMap::new())
+            .unwrap_err();
+        assert!(error.contains("cli-thing"), "{error}");
+        assert!(error.contains("has no runtime constructor"), "{error}");
+        // 全是好卡：通过，参数是环境解析出来的（这里没设：默认值）。
         assert_eq!(
-            cards
-                .iter()
-                .map(|c| c.provider.id.as_str())
-                .collect::<Vec<_>>(),
-            ["b"]
+            RuntimeRegistry::resolve_adapter_params(std::slice::from_ref(&good), &BTreeMap::new())
+                .unwrap(),
+            AdapterParams::default()
         );
-        assert_eq!(local.keys().map(String::as_str).collect::<Vec<_>>(), ["b"]);
-        // 原表不动。
-        assert_eq!(configs.len(), 2);
+        // 不要 Supervisor 的卡不被干跑：resident 直连与订阅中转，哪怕它们的 provider id 没有适配器。
+        let mut resident = named_card("resident-thing");
+        resident.load_policy.as_mut().unwrap().mode = LoadMode::Resident;
+        let mut subscription = named_card(idoris_policy::SUBSCRIPTION_PROVIDER_ID);
+        subscription.load_policy = None;
+        RuntimeRegistry::resolve_adapter_params(&[resident, subscription], &BTreeMap::new())
+            .unwrap();
+        // 带自己本地配置的卡由那份配置建，不走工厂：provider id 没有适配器也不是错误。
+        let mut custom = named_card("local-http");
+        custom.endpoint = "http://127.0.0.1:18111".into();
+        let dir = tempfile::tempdir().unwrap();
+        let configs = BTreeMap::from([(
+            "local-http".to_string(),
+            local_runtime_config("local-http", 18111, dir.path()),
+        )]);
+        RuntimeRegistry::resolve_adapter_params(&[custom], &configs).unwrap();
     }
 
     /// 哪些卡要 Supervisor（`uses_supervisor`，`spawn_runtime_with_factory` 与启动时的参数解析共用这一个判据）：订阅中转与 resident
-    /// 直连卡不要；其余必须是 `http_service`，别的形态没有 runtime 构造器，是启动失败。启动时的参数解析不因此报错、也不读环境。
+    /// 直连卡不要；其余必须是 `http_service`，别的形态没有 runtime 构造器，是启动失败（建表与启动时的参数解析都报）。
     #[test]
     fn only_http_service_lifecycle_cards_get_a_supervisor_and_other_forms_have_no_constructor() {
         assert_eq!(uses_supervisor(&named_card("lifecycle")), Ok(true));
@@ -1301,17 +1380,16 @@ mod tests {
         let error = uses_supervisor(&cli).unwrap_err();
         assert!(error.contains("cli-thing"), "{error}");
         assert!(error.contains("has no runtime constructor"), "{error}");
-        // 建运行时登记报同一个错误（启动失败）；启动时的参数解析对这张卡既不报错也不读环境。
+        // 建运行时登记报同一个错误（启动失败）；启动时的参数解析（L3）对这张卡也报同一个错误，不读环境、不等门控放行。
         let error = RuntimeRegistry::spawn_with_factory(std::slice::from_ref(&cli), |_| {
             Err(BackendError::internal("factory must not run"))
         })
         .unwrap_err();
         assert!(error.contains("has no runtime constructor"), "{error}");
-        assert_eq!(
+        let error =
             RuntimeRegistry::resolve_adapter_params(std::slice::from_ref(&cli), &BTreeMap::new())
-                .unwrap(),
-            AdapterParams::default()
-        );
+                .unwrap_err();
+        assert!(error.contains("has no runtime constructor"), "{error}");
     }
 
     #[tokio::test]

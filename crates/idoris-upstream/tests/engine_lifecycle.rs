@@ -359,12 +359,12 @@ fn lsof_available() -> bool {
     Path::new("/usr/sbin/lsof").is_file() || Path::new("/usr/bin/lsof").is_file()
 }
 
-/// 没有 `lsof` 的机器上跳过用到它的测试（说明原因，不静默）。
+/// 没有 `lsof` 的机器上跳过用到它的测试：明确写一行 `SKIPPED`（测试输出里能搜到），不静默。
 fn require_lsof(test: &str) -> bool {
     if lsof_available() {
         return true;
     }
-    eprintln!("skipping {test}: lsof is not installed on this machine");
+    eprintln!("SKIPPED {test}: lsof is not installed on this machine (the test did not run)");
     false
 }
 
@@ -1046,17 +1046,8 @@ async fn a_record_naming_an_unrelated_live_process_never_signals_it_and_is_dropp
             forged(&|r| r.command = Some("fake-server --serve".into())),
             MismatchReason::Command,
         ),
-        (
-            "not listening on the recorded port",
-            forged(&|_| {}),
-            MismatchReason::Port,
-        ),
     ];
     for (name, record, reason) in cases {
-        if reason == MismatchReason::Port && !lsof_available() {
-            eprintln!("skipping the port forgery: lsof is not installed");
-            continue;
-        }
         store.write(&record).unwrap();
         let recovery = OwnedEngine::recover(&instance, &dyn_inspector(&inspector))
             .await
@@ -1083,6 +1074,90 @@ async fn a_record_naming_an_unrelated_live_process_never_signals_it_and_is_dropp
         matches!(recovery, Recovery::Stale(MismatchReason::ProcessGone)),
         "{recovery:?}"
     );
+}
+
+/// pid, start time, process group and command all match, only the recorded port has no listener: the previous
+/// generation of our engine, still exiting (it closed its listener on SIGTERM and lingers while it finishes in-flight
+/// work; the iDoris that signalled it was SIGKILLed by the launcher). It is ours, so `recover` must neither drop the
+/// record (that left an engine nobody manages) nor signal anything: it hands the engine back as `Exiting`, and the
+/// caller's bounded stop (SIGTERM, grace, SIGKILL) removes the record once the process is confirmed gone.
+#[tokio::test]
+async fn a_record_that_only_misses_its_port_is_an_exiting_generation_stopped_not_dropped() {
+    if !require_lsof(
+        "a_record_that_only_misses_its_port_is_an_exiting_generation_stopped_not_dropped",
+    ) {
+        return;
+    }
+    let rig = Rig::new();
+    let port = free_port();
+    let instance = rig.fake_instance(port);
+    let store = instance.store();
+    let inspector = TestInspector::new(None);
+
+    // A stand-in for the lingering engine: its own process group (a group of one, like an engine's), and it
+    // ignores SIGTERM so only the SIGKILL after the grace can end it. It touches a file once the trap is in place,
+    // so nothing is signalled before it can ignore SIGTERM.
+    let ready = rig.work.path().join("lingering.ready");
+    let mut lingering = std::process::Command::new("/bin/sh");
+    lingering.args([
+        "-c",
+        &format!(
+            "trap '' TERM; : > '{}'; while :; do sleep 1; done",
+            ready.display()
+        ),
+    ]);
+    std::os::unix::process::CommandExt::process_group(&mut lingering, 0);
+    let mut lingering = lingering.spawn().unwrap();
+    let pid = lingering.id();
+    rig.reapers.borrow_mut().push(Reaper::new(pid as i32));
+    // In production a recovered engine is an orphan that init reaps; here it is the test's child, so a thread
+    // reaps it the moment it dies (an unreaped zombie would still count as a live member of its group).
+    let reaper = std::thread::spawn(move || lingering.wait());
+    wait_until("the stand-in has installed its trap", || ready.exists());
+    let record = OwnershipRecord {
+        engine_kind: kind(FAKE_KIND),
+        pid,
+        port,
+        started_at: ps_lstart(pid),
+        command: Some(ps_command(pid)),
+        executable: "/opt/engines/fake/bin/fake-server".into(),
+        api_key: Some(EngineKey::generate().unwrap()),
+        launched_by_instance: LAUNCHED_BY.into(),
+    };
+    store.write(&record).unwrap();
+
+    let recovery = OwnedEngine::recover(&instance, &dyn_inspector(&inspector))
+        .await
+        .unwrap();
+    let Recovery::Exiting(engine) = recovery else {
+        panic!("expected Exiting, got {recovery:?}");
+    };
+    assert!(pid_alive(pid as i32), "recover itself signals nothing");
+    assert_eq!(
+        store.read().unwrap().as_ref(),
+        Some(&record),
+        "the record is kept until the engine is confirmed gone"
+    );
+
+    // The bounded stop: SIGTERM is ignored, so the engine only goes with the SIGKILL after the 300 ms grace; the 5 s window is
+    // the time allowed for confirming it is gone after the SIGKILL, not a second grace.
+    let begun = Instant::now();
+    engine
+        .stop_bounded(Duration::from_millis(300), Duration::from_secs(5))
+        .await
+        .unwrap();
+    let took = begun.elapsed();
+    assert!(
+        took >= Duration::from_millis(250),
+        "it was given the SIGTERM grace first: {took:?}"
+    );
+    assert!(
+        took < Duration::from_secs(3),
+        "the grace is 300 ms, not the 5 s confirmation window: {took:?}"
+    );
+    assert!(!pid_alive(pid as i32), "the lingering engine is gone");
+    assert_eq!(store.read().unwrap(), None, "and its record with it");
+    reaper.join().unwrap().unwrap();
 }
 
 #[tokio::test]

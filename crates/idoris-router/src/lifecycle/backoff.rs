@@ -61,6 +61,33 @@ impl Default for Timings {
     }
 }
 
+/// 在期限之前必须收尾的停止里，SIGTERM 之后的宽限不到这么多就不给了：SIGTERM 之后立刻 SIGKILL（宽限本来就比它短的配置，
+/// 即测试里缩短过的，按自己的宽限算）。
+pub const MIN_TERM_GRACE: Duration = Duration::from_secs(2);
+/// SIGKILL 之后等进程被回收、整组消失的最短时间，期限已经到了也给这么多（SIGKILL 之后几毫秒就够，这是给卡在内核里的进程的余量）。
+pub const MIN_CONFIRM: Duration = Duration::from_millis(500);
+
+/// 距期限还有 `remaining` 时开始的停止怎么分配时间，返回 `(term, confirm)`：
+///
+/// - `term`：SIGTERM 之后等整组自己消失多久，`min(grace, remaining)`；不到 `min(MIN_TERM_GRACE, grace)` 就是零，
+///   SIGTERM 之后立刻 SIGKILL，剩下的时间留给确认。
+/// - `confirm`：SIGKILL 之后等进程被回收、整组消失多久：期限里剩下的，至少 [`MIN_CONFIRM`]，至多 `grace`。
+///
+/// iDoris 收到信号之后，launcher 在 17 秒时 SIGKILL 它；`stop_on_exit:"never"` 的信号停止先排空 HTTP（最多 10 秒）再停引擎，
+/// 引擎照 8 秒宽限就是 18 秒，放不下。总期限从信号起算（`crate::stop::STOP_DEADLINE`），宽限只拿剩下的那一段。
+pub fn stop_windows(grace: Duration, remaining: Duration) -> (Duration, Duration) {
+    let term = grace.min(remaining);
+    let term = if term < MIN_TERM_GRACE.min(grace) {
+        Duration::ZERO
+    } else {
+        term
+    };
+    let confirm = remaining
+        .saturating_sub(term)
+        .clamp(MIN_CONFIRM, grace.max(MIN_CONFIRM));
+    (term, confirm)
+}
+
 /// 第 `failures`（从 1 起）次失败之后、重启之前的等待：`base × 2^(failures-1)`，封顶 `cap`，再抖动。
 /// 规范：1、2、4 秒起翻倍，封顶 30 秒，±20%。`failures` 为 0 时不等。
 pub fn restart_delay(failures: usize, timings: &Timings) -> Duration {
@@ -153,6 +180,43 @@ mod tests {
         assert_eq!(timings.crash_limit, 5);
         assert_eq!(timings.half_open_interval, Duration::from_secs(60));
         assert_eq!(timings.stop_grace, Duration::from_secs(8));
+    }
+
+    /// 期限内的停止怎么分配时间：宽限只拿期限里剩下的，不到 2 秒就不给（SIGTERM 之后立刻 SIGKILL），确认窗口至少 0.5 秒。
+    #[test]
+    fn a_stop_against_a_deadline_gets_the_time_left_and_kills_at_once_when_under_two_seconds_remain()
+     {
+        let secs = Duration::from_secs;
+        let ms = Duration::from_millis;
+        let grace = secs(8);
+        for (remaining, term, confirm) in [
+            // 期限还很远：与没有期限一样（8 秒宽限，SIGKILL 之后至多再等 8 秒）。
+            (secs(16), secs(8), secs(8)),
+            (secs(100), secs(8), secs(8)),
+            // 排空占掉了 10 秒：宽限缩到剩下的 6 秒，确认窗口取下限。
+            (secs(6), secs(6), ms(500)),
+            (secs(2), secs(2), ms(500)),
+            // 不到 2 秒：不给宽限，SIGTERM 之后立刻 SIGKILL，剩下的时间都给确认。
+            (ms(1999), Duration::ZERO, ms(1999)),
+            (ms(1500), Duration::ZERO, ms(1500)),
+            (ms(100), Duration::ZERO, ms(500)),
+            // 期限已经过了：照样 SIGKILL，确认窗口取下限（不是零：零会把「没来得及回收」当成失败）。
+            (Duration::ZERO, Duration::ZERO, ms(500)),
+        ] {
+            assert_eq!(
+                stop_windows(grace, remaining),
+                (term, confirm),
+                "{remaining:?}"
+            );
+        }
+        // 缩短过的宽限（测试）：按自己的宽限算，不被 2 秒的下限一刀切成零。
+        assert_eq!(stop_windows(ms(300), secs(10)), (ms(300), ms(500)));
+        assert_eq!(stop_windows(ms(300), ms(200)), (Duration::ZERO, ms(500)));
+        // 宽限永远不超过原来的宽限，也不超过剩下的时间。
+        for remaining in 0..40 {
+            let (term, _) = stop_windows(grace, ms(remaining * 500));
+            assert!(term <= grace && term <= ms(remaining * 500), "{remaining}");
+        }
     }
 
     #[test]

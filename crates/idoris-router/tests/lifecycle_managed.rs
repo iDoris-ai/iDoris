@@ -21,16 +21,20 @@ mod fake_omlx;
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
+    net::Shutdown,
     os::unix::fs::PermissionsExt,
-    os::unix::net::UnixListener,
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use child_guard::ChildGuard;
-use fake_omlx::{Behavior, FakeOmlx, spawn_retrying};
+use fake_omlx::{Behavior, FakeOmlx, OnSigterm, spawn_retrying};
 use serde_json::{Value, json};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -56,13 +60,48 @@ fn lsof_available() -> bool {
     Path::new("/usr/sbin/lsof").is_file() || Path::new("/usr/bin/lsof").is_file()
 }
 
-/// 没有 `lsof` 的机器上跳过用到它的测试（说明原因，不静默）。
+/// 没有 `lsof` 的机器上跳过用到它的测试：明确写一行 `SKIPPED`（测试输出里能搜到），不静默。
 fn require_lsof(test: &str) -> bool {
     if lsof_available() {
         return true;
     }
-    eprintln!("skipping {test}: lsof is not installed on this machine");
+    eprintln!("SKIPPED {test}: lsof is not installed on this machine (the test did not run)");
     false
+}
+
+/// 等一个条件成立（轮询，至多 [`PATIENT`]）。等的是事件，不是一段固定的时间。
+fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + PATIENT;
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 端口上有没有东西在监听（连得上就是有）。
+fn port_listens(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+}
+
+/// 一个排空等不完的请求：请求头发完、声明了 1 MB 正文而一个字节不发（连接一直挂着）。`Expect: 100-continue` 让服务端在处理函数
+/// 开始读正文的那一刻回 `100 Continue`：收到它就确知请求已经在途，不靠固定的等待时间。返回连接，丢弃它才放行。
+fn hold_a_request_open(data_port: u64) -> std::net::TcpStream {
+    let mut stuck =
+        std::net::TcpStream::connect(("127.0.0.1", u16::try_from(data_port).unwrap())).unwrap();
+    stuck.set_read_timeout(Some(PATIENT)).unwrap();
+    stuck
+        .write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: idoris\r\nContent-Type: application/json\r\nExpect: 100-continue\r\nContent-Length: 1000000\r\n\r\n",
+        )
+        .unwrap();
+    let mut answer = [0_u8; 64];
+    let read = stuck.read(&mut answer).unwrap();
+    assert!(
+        String::from_utf8_lossy(&answer[..read]).starts_with("HTTP/1.1 100 Continue"),
+        "the server must be waiting for this request's body: {:?}",
+        String::from_utf8_lossy(&answer[..read])
+    );
+    stuck
 }
 
 fn managed_card(port: u16) -> String {
@@ -1179,16 +1218,28 @@ async fn stop_on_exit_never_keeps_the_engine_on_a_clean_exit_for_the_next_idoris
 /// 并记下收到的每个 `op`（尤其是 `bye`）。证明用发现文件里的 `instance_nonce` 计算（只有读得到发现文件的才算得出来）。
 struct FakeAgent24d {
     ops: Arc<Mutex<Vec<String>>>,
+    /// 已接受的连接；[`Self::hang_up`] 把它们都关掉。
+    streams: Arc<Mutex<Vec<UnixStream>>>,
+    hung_up: Arc<AtomicBool>,
 }
 
 impl FakeAgent24d {
     fn start(socket: &Path, discovery: PathBuf) -> Self {
         let listener = UnixListener::bind(socket).unwrap();
         let ops: Arc<Mutex<Vec<String>>> = Arc::default();
+        let streams: Arc<Mutex<Vec<UnixStream>>> = Arc::default();
+        let hung_up = Arc::new(AtomicBool::new(false));
         let recorded = ops.clone();
+        let (accepted, refusing) = (streams.clone(), hung_up.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
+                if refusing.load(Ordering::SeqCst) {
+                    // 挂断之后来的连接：接上就关，握手永远完不成。
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                accepted.lock().unwrap().push(stream.try_clone().unwrap());
                 let (recorded, discovery) = (recorded.clone(), discovery.clone());
                 std::thread::spawn(move || {
                     let conn_id = "0123456789abcdef";
@@ -1237,11 +1288,23 @@ impl FakeAgent24d {
                 });
             }
         });
-        Self { ops }
+        Self {
+            ops,
+            streams,
+            hung_up,
+        }
     }
 
     fn ops(&self) -> Vec<String> {
         self.ops.lock().unwrap().clone()
+    }
+
+    /// agent24d 走了：关掉所有已建立的会话，之后来的连接一律接上就关。iDoris 从这一刻起没有已 ack 的登记会话（孤儿计时从这里开始）。
+    fn hang_up(&self) {
+        self.hung_up.store(true, Ordering::SeqCst);
+        for stream in self.streams.lock().unwrap().iter() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
     }
 }
 
@@ -1326,21 +1389,7 @@ async fn stop_on_exit_never_stops_and_reclaims_the_engine_when_the_drain_fails_a
     let record_dir = env.state_dir().join("engines-owned/omlx");
     assert_eq!(fs::read_dir(&record_dir).unwrap().count(), 1);
 
-    let mut stuck =
-        std::net::TcpStream::connect(("127.0.0.1", u16::try_from(data_port).unwrap())).unwrap();
-    stuck.set_read_timeout(Some(PATIENT)).unwrap();
-    stuck
-        .write_all(
-            b"POST /v1/chat/completions HTTP/1.1\r\nHost: idoris\r\nContent-Type: application/json\r\nExpect: 100-continue\r\nContent-Length: 1000000\r\n\r\n",
-        )
-        .unwrap();
-    let mut answer = [0_u8; 64];
-    let read = stuck.read(&mut answer).unwrap();
-    assert!(
-        String::from_utf8_lossy(&answer[..read]).starts_with("HTTP/1.1 100 Continue"),
-        "the server must be waiting for this request's body: {:?}",
-        String::from_utf8_lossy(&answer[..read])
-    );
+    let stuck = hold_a_request_open(data_port);
 
     send("-TERM", child.id());
     let status = wait_exit(&mut child, Duration::from_secs(60));
@@ -1361,21 +1410,30 @@ async fn stop_on_exit_never_stops_and_reclaims_the_engine_when_the_drain_fails_a
     );
 }
 
-/// H4（引擎处置）：`stop_on_exit:"never"` 只对退出码 0 有效。孤儿超时（退出码 4）照样停掉自己拥有的引擎、清理所有权记录；
-/// 这个结果与同一轮里是否还有信号无关，都从锁存的那一个停止原因来（`stop::StopPlan`）。
-/// 孤儿计时从启动算起：登记 socket 没有人监听，所以永远登记不上，到点以退出码 4 停止（引擎在这之前早已就绪）。
+/// M1（a）：`stop_on_exit:"never"` + 信号 + 排空失败，而引擎对 SIGTERM 没有反应。这条路是串行的：排空最多 10 秒，之后才轮到停引擎，
+/// 引擎照原来的 8 秒宽限就是 18 秒以上，超过 launcher 在 SIGTERM 之后 17 秒的 SIGKILL：引擎停到一半 iDoris 就被杀了，
+/// 所有权记录还在而引擎已经半死。收尾有一个从信号起算的总期限（`stop::STOP_DEADLINE`，16 秒）：SIGTERM 之后的宽限只拿剩下的，
+/// 无视 SIGTERM 的引擎在期限之前被 SIGKILL，iDoris 在 launcher 动手之前自己退出，引擎确认消失之后才删记录。
 #[tokio::test]
-async fn an_orphan_timeout_stops_the_owned_engine_even_with_stop_on_exit_never() {
-    if !require_lsof("an_orphan_timeout_stops_the_owned_engine_even_with_stop_on_exit_never") {
+async fn a_sigterm_ignoring_engine_after_a_failed_drain_is_killed_inside_the_launchers_seventeen_seconds()
+ {
+    if !require_lsof(
+        "a_sigterm_ignoring_engine_after_a_failed_drain_is_killed_inside_the_launchers_seventeen_seconds",
+    ) {
         return;
     }
     let env = Env::new();
-    let fake = env.fake("engine", &Behavior::default());
-    let socket = env.run_dir.join("register.sock");
+    let fake = env.fake(
+        "engine",
+        &Behavior {
+            on_sigterm: OnSigterm::Ignore,
+            ..Behavior::default()
+        },
+    );
     let frame = env.frame(
         &fake.executable,
         json!({"stop_on_exit": "never"}),
-        json!({"register_socket": socket, "orphan_timeout_s": 12}),
+        json!({}),
     );
     let client = http();
     let (mut child, data_port, _) = env.start(&frame);
@@ -1385,12 +1443,172 @@ async fn an_orphan_timeout_stops_the_owned_engine_even_with_stop_on_exit_never()
     let record_dir = env.state_dir().join("engines-owned/omlx");
     assert_eq!(fs::read_dir(&record_dir).unwrap().count(), 1);
 
+    let stuck = hold_a_request_open(data_port);
+    let signalled = Instant::now();
+    send("-TERM", child.id());
+    let status = wait_exit(&mut child, Duration::from_secs(60));
+    let took = signalled.elapsed();
+    eprintln!("iDoris exited {took:?} after the SIGTERM (launcher SIGKILL: 17 s)");
+    drop(stuck);
+    let stderr = stderr_of(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a drain that cannot finish is a stop failure: {stderr}"
+    );
+    assert!(stderr.contains("停止失败"), "{stderr}");
+    // 总期限：launcher 17 秒时 SIGKILL iDoris。此前 10 秒排空加 8 秒宽限是 18 秒以上。
+    assert!(
+        took < Duration::from_secs(17),
+        "iDoris must be done before the launcher's 17 s SIGKILL: took {took:?}"
+    );
+    assert!(
+        took >= Duration::from_secs(10),
+        "the drain really did run its 10 s: took {took:?}"
+    );
+    // 引擎收到过一次 SIGTERM（无视了），之后被 SIGKILL：iDoris 退出时它已经确认消失，记录随之清理，没有留下半停的引擎。
+    assert_eq!(fake.sigterm_times().len(), 1, "asked once, ignored it");
+    assert!(
+        !pid_alive(engine_pid),
+        "the engine is gone by the time iDoris exits"
+    );
+    assert_eq!(
+        fs::read_dir(&record_dir).map(|d| d.count()).unwrap_or(0),
+        0,
+        "the ownership record is reclaimed together with the engine"
+    );
+}
+
+/// M1（b）：上一个 iDoris 在引擎「正在退出」的当口被 launcher SIGKILL 了：它已经给引擎发了 SIGTERM，引擎关了监听、还在收尾（赖着不走）。
+/// 下一个 iDoris 读到的记录，pid、启动时间、进程组、命令都吻合，只是端口上没有它在监听。这不是别人的进程，也不能当作作废悄悄丢掉记录
+/// （那样留下一个没人管的引擎，既占着内存、又再没有任何记录能认回它）：有界地停掉它（再发 SIGTERM，宽限，SIGKILL），确认消失之后才
+/// 删记录，再拉起新的引擎。
+#[tokio::test]
+async fn an_idoris_killed_while_its_engine_was_exiting_leaves_a_record_the_next_idoris_finishes_off_before_starting_a_new_engine()
+ {
+    if !require_lsof(
+        "an_idoris_killed_while_its_engine_was_exiting_leaves_a_record_the_next_idoris_finishes_off_before_starting_a_new_engine",
+    ) {
+        return;
+    }
+    let env = Env::new();
+    let fake = env.fake(
+        "engine",
+        &Behavior {
+            on_sigterm: OnSigterm::CloseListenerAndLinger,
+            ..Behavior::default()
+        },
+    );
+    let frame = env.frame(
+        &fake.executable,
+        json!({"stop_on_exit": "never"}),
+        json!({}),
+    );
+    let client = http();
+    let (mut first, data_port, _) = env.start(&frame);
+    health_until(&client, data_port, |body| body["phase"] == "ready").await;
+    let old_pid = fake.launch(0)["pid"].as_u64().unwrap();
+    env.reaper.track(old_pid);
+    let record_dir = env.state_dir().join("engines-owned/omlx");
+    assert_eq!(fs::read_dir(&record_dir).unwrap().count(), 1);
+
+    // launcher 的 SIGKILL 落在 iDoris 停止的中途：iDoris 没了，而它刚发给引擎的 SIGTERM 到了。
+    send("-KILL", first.id());
+    wait_exit(&mut first, Duration::from_secs(30));
+    send("-TERM", u32::try_from(old_pid).unwrap());
+    let engine_port = env.port;
+    wait_for("the engine to have received the SIGTERM", || {
+        fake.sigterm_times().len() == 1
+    });
+    wait_for("the engine to have closed its listener", || {
+        !port_listens(engine_port)
+    });
+    assert!(
+        pid_alive(old_pid),
+        "the engine lingers: it is exiting, not gone"
+    );
+    assert_eq!(
+        fs::read_dir(&record_dir).unwrap().count(),
+        1,
+        "its record is still there"
+    );
+
+    // 新拉起的引擎照常（收到 SIGTERM 就退出），免得测试结束时再等一轮宽限。
+    fake.set_behavior(&Behavior::default());
+    let (mut second, data_port, _) = env.start(&frame);
+    health_until(&client, data_port, |body| body["phase"] == "ready").await;
+    // 旧引擎被收尾了（它无视 SIGTERM，所以是宽限之后的 SIGKILL）：再收到一次 SIGTERM，之后消失。
+    assert!(!pid_alive(old_pid), "the exiting engine was finished off");
+    assert_eq!(
+        fake.sigterm_times().len(),
+        2,
+        "the next iDoris signalled it again before killing it"
+    );
+    // 然后才拉起新的：两次启动，新的 pid 不同，记录只有一份、记的是新引擎。
+    assert_eq!(fake.launches(), 2);
+    let new_pid = fake.launch(1)["pid"].as_u64().unwrap();
+    env.reaper.track(new_pid);
+    assert_ne!(new_pid, old_pid);
+    let records: Vec<_> = fs::read_dir(&record_dir).unwrap().collect();
+    assert_eq!(records.len(), 1, "exactly one record, the new engine's");
+    let record: Value =
+        serde_json::from_slice(&fs::read(records[0].as_ref().unwrap().path()).unwrap()).unwrap();
+    assert_eq!(record["pid"].as_u64(), Some(new_pid));
+
+    send("-TERM", second.id());
+    assert_eq!(
+        wait_exit(&mut second, Duration::from_secs(30)).code(),
+        Some(0)
+    );
+    let stderr = stderr_of(&mut second);
+    assert!(stderr.contains("遗留的引擎正在退出"), "{stderr}");
+}
+
+/// H4（引擎处置）：`stop_on_exit:"never"` 只对退出码 0 有效。孤儿超时（退出码 4）照样停掉自己拥有的引擎、清理所有权记录；
+/// 这个结果与同一轮里是否还有信号无关，都从锁存的那一个停止原因来（`stop::StopPlan`）。
+///
+/// 孤儿计时从「没有已 ack 的登记会话」那一刻算起（会话结束时重新开始）：先让假 agent24d 把会话 ack 下来、引擎就绪、记录封印，
+/// 之后它挂断，计时才开始。所以引擎「早已就绪」是事件的先后保证的，不是靠超时设得够长去赌启动够快（此前超时从进程启动算，
+/// 慢机器上引擎没就绪超时就先到了）。
+#[tokio::test]
+async fn an_orphan_timeout_stops_the_owned_engine_even_with_stop_on_exit_never() {
+    if !require_lsof("an_orphan_timeout_stops_the_owned_engine_even_with_stop_on_exit_never") {
+        return;
+    }
+    let env = Env::new();
+    let fake = env.fake("engine", &Behavior::default());
+    let socket = env.run_dir.join("register.sock");
+    let agent = FakeAgent24d::start(&socket, env.discovery_path());
+    let frame = env.frame(
+        &fake.executable,
+        json!({"stop_on_exit": "never"}),
+        json!({"register_socket": socket, "orphan_timeout_s": 12}),
+    );
+    let client = http();
+    let (mut child, data_port, _) = env.start(&frame);
+    health_until(&client, data_port, |body| {
+        body["phase"] == "ready" && body["registered"] == true
+    })
+    .await;
+    let engine_pid = fake.launch(0)["pid"].as_u64().unwrap();
+    env.reaper.track(engine_pid);
+    let record_dir = env.state_dir().join("engines-owned/omlx");
+    assert_eq!(fs::read_dir(&record_dir).unwrap().count(), 1);
+
+    // agent24d 走了：从这一刻起没有已 ack 的会话，孤儿计时开始。
+    agent.hang_up();
+    let hung_up = Instant::now();
     let status = wait_exit(&mut child, Duration::from_secs(60));
     let stderr = stderr_of(&mut child);
     assert_eq!(status.code(), Some(4), "{stderr}");
     assert!(
         stderr.contains("无启动器登记超过 12 秒，已停止"),
         "{stderr}"
+    );
+    assert!(
+        hung_up.elapsed() >= Duration::from_secs(11),
+        "the clock runs from the lost session, not from the process start: {:?}",
+        hung_up.elapsed()
     );
     wait_dead(engine_pid);
     assert_eq!(
@@ -1436,181 +1654,155 @@ async fn an_invalid_load_timeout_fails_startup_before_anything_starts_whether_or
     }
 }
 
-/// M5：一条合法的本地 runtime 配置（`IDORIS_LOCAL_RUNTIME_CONFIG`）绑在托管的非 resident 卡上，该卡降级（没装 oMLX）：
-/// 没就绪的托管卡不建 Supervisor，它的配置随它一起拿掉，进程继续服务健康的上游。（此前降级放行时只拿掉卡、留着配置，
-/// 再校验一次得到「没有对应的组件卡」，门控放行失败，整个进程以退出码 1 退出。）
+/// L4（勘误十二（3））：本地 runtime 配置（`IDORIS_LOCAL_RUNTIME_CONFIG`）绑在托管卡上：启动时就拒绝，不等门控降级再默默把配置丢掉。
+/// 退出码 1，错误点名卡与原因；什么都没启动：发现文件没发布、没登记、引擎没拉起。引擎可用与否结果相同。
+/// （托管卡的引擎由引擎管理器拉起与停止，本地 runtime 配置是另一条拉起路径，两条路都想管同一个端口。）
 #[tokio::test]
-async fn a_legal_local_runtime_config_on_a_degraded_managed_card_does_not_take_the_process_down() {
-    let lm_studio = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(url_path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            json!({"object": "list", "data": [{"id": "up-model", "object": "model"}]}),
-        ))
-        .mount(&lm_studio)
-        .await;
-    Mock::given(method("POST"))
-        .and(url_path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "model": "up-model",
-            "choices": [{"message": {"content": "hello from the upstream"}}]
-        })))
-        .mount(&lm_studio)
-        .await;
-    let mut env = Env::new();
-    env.write_card(&managed_card_with_a_role(env.port));
-    fs::write(
-        env.components.path().join("lmstudio.yaml"),
-        upstream_card(&lm_studio.uri()),
-    )
-    .unwrap();
-    // 配置的 provider_id 与端口都对得上托管卡 `omlx`（端点一致、不是 resident）：对原始卡集是合法的。
-    let config = env.work.path().join("local-runtimes.yaml");
-    fs::write(
-        &config,
-        format!(
-            "version: 1\nruntimes:\n  - provider_id: omlx\n    kind: mlx_lm_server\n    executable: /usr/bin/python3\n    model_path: {}\n    port: {}\n    model_id: managed-model\n    memory_gb: 1.0\n    load_fence_path: {}\n",
-            env.work.path().join("model").display(),
-            env.port,
-            env.work.path().join("local.pending").display()
-        ),
-    )
-    .unwrap();
-    env.extra_env.push((
-        "IDORIS_LOCAL_RUNTIME_CONFIG".to_owned(),
-        config.to_str().unwrap().to_owned(),
-    ));
-    let (mut child, data_port, _) =
-        env.start(&env.frame(&env.missing_executable(), json!({}), json!({})));
-    let client = http();
-    // 门控放行之后非托管卡的探测器才起：上游卡 `ready` 说明数据面已经是完整的 Router，进程没有因为配置退出。
-    let body = health_until(&client, data_port, |body| {
-        upstream(body, "lmstudio")["state"] == "ready"
-    })
-    .await;
-    assert_eq!(body["phase"], "degraded", "{body}");
-    assert_eq!(upstream(&body, "omlx")["reason"], "engine_not_found");
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "the process keeps running"
-    );
-    let response = client
-        .post(format!("http://127.0.0.1:{data_port}/v1/chat/completions"))
-        .header("X-iDoris-Privacy", "local_only")
-        .json(&json!({"model": "idoris/daily", "messages": [{"role": "user", "content": "hi"}]}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let answer: Value = response.json().await.unwrap();
-    assert!(
-        answer.to_string().contains("hello from the upstream"),
-        "{answer}"
-    );
-    send("-TERM", child.id());
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(30)).code(),
-        Some(0),
-        "stderr: {}",
-        stderr_of(&mut child)
-    );
-}
-
-/// 一个 `/v1/models` 答得很慢（5 秒，探测的期限是 2 秒）的 resident 上游卡：它在探测超时之前一直没有第一次观测（`starting`）。
-async fn slow_upstream() -> MockServer {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(url_path("/v1/models"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"object": "list", "data": [{"id": "up-model"}]}))
-                .set_delay(Duration::from_secs(5)),
+async fn a_local_runtime_config_bound_to_a_managed_card_is_refused_before_anything_starts() {
+    for engine_available in [true, false] {
+        let case = format!("engine_available={engine_available}");
+        let mut env = Env::new();
+        let fake = env.fake("engine", &Behavior::default());
+        let executable = if engine_available {
+            fake.executable.clone()
+        } else {
+            env.missing_executable()
+        };
+        // 配置的 provider_id 与端口都对得上托管卡 `omlx`（端点一致、不是 resident）：只有「绑托管卡」这一条是错的。
+        let config = env.work.path().join("local-runtimes.yaml");
+        fs::write(
+            &config,
+            format!(
+                "version: 1\nruntimes:\n  - provider_id: omlx\n    kind: mlx_lm_server\n    executable: /usr/bin/python3\n    model_path: {}\n    port: {}\n    model_id: managed-model\n    memory_gb: 1.0\n    load_fence_path: {}\n",
+                env.work.path().join("model").display(),
+                env.port,
+                env.work.path().join("local.pending").display()
+            ),
         )
-        .mount(&server)
-        .await;
-    server
-}
-
-/// 数据面是不是已经在服务：一个无效 JSON 的聊天请求，启动门控未开时是 503 `idoris_starting`，开了之后是 400。
-async fn data_plane_status(client: &reqwest::Client, data_port: u64) -> u16 {
-    client
-        .post(format!("http://127.0.0.1:{data_port}/v1/chat/completions"))
-        .header("content-type", "application/json")
-        .header("X-iDoris-Privacy", "local_only")
-        .body("not json")
-        .send()
-        .await
-        .unwrap()
-        .status()
-        .as_u16()
-}
-
-/// M6 (a)：门控已开之后，托管引擎的终局失败不被「别的上游还没有第一次观测」遮住：`phase` 是 `degraded`，不是 `starting`。
-/// 门控放行的那一刻探测器才起，健康卡此刻还没有观测（它的 `/v1/models` 答得很慢）；此前这个 `starting` 一直遮到探测超时。
-#[tokio::test]
-async fn a_managed_terminal_failure_is_degraded_even_while_another_upstream_has_no_first_observation()
- {
-    let slow = slow_upstream().await;
-    let env = Env::new();
-    env.write_card(&managed_card_with_a_role(env.port));
-    fs::write(
-        env.components.path().join("lmstudio.yaml"),
-        upstream_card(&slow.uri()),
-    )
-    .unwrap();
-    let (mut child, data_port, _) =
-        env.start(&env.frame(&env.missing_executable(), json!({}), json!({})));
-    let client = http();
-    // 等门控放行（数据面不再是 503 `idoris_starting`），然后马上读 `/health`：探测器刚起，慢上游还没有第一次观测。
-    let deadline = Instant::now() + PATIENT;
-    while data_plane_status(&client, data_port).await == 503 {
-        assert!(Instant::now() < deadline, "the gate never opened");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        .unwrap();
+        env.extra_env.push((
+            "IDORIS_LOCAL_RUNTIME_CONFIG".to_owned(),
+            config.to_str().unwrap().to_owned(),
+        ));
+        let socket = env.run_dir.join("register.sock");
+        let agent = FakeAgent24d::start(&socket, env.discovery_path());
+        let frame = env.frame(&executable, json!({}), json!({"register_socket": socket}));
+        let mut child = env.spawn(&frame);
+        let status = wait_exit(&mut child, Duration::from_secs(30));
+        let stderr = stderr_of(&mut child);
+        assert_eq!(status.code(), Some(1), "{case}: {stderr}");
+        assert!(stderr.contains("启动失败"), "{case}: {stderr}");
+        assert!(stderr.contains("\"omlx\""), "{case}: {stderr}");
+        assert!(stderr.contains("托管"), "{case}: {stderr}");
+        assert!(
+            !env.discovery_path().exists(),
+            "{case}: the discovery file was never published"
+        );
+        assert!(
+            agent.ops().is_empty(),
+            "{case}: never registered: {:?}",
+            agent.ops()
+        );
+        assert_eq!(fake.launches(), 0, "{case}: the engine was never spawned");
     }
-    let body = health(&client, data_port).await;
-    assert_eq!(
-        upstream(&body, "lmstudio")["state"],
-        "starting",
-        "the slow upstream has no first observation yet: {body}"
-    );
-    assert_eq!(
-        upstream(&body, "omlx")["state"],
-        "absent",
-        "the managed engine is in a terminal failure: {body}"
-    );
-    assert_eq!(body["phase"], "degraded", "{body}");
-    assert_eq!(body["ready"], false);
-    send("-TERM", child.id());
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(30)).code(),
-        Some(0)
-    );
 }
 
-/// M6 (b)：没有托管卡（没有启动门控）、一张还没有第一次观测的 resident 卡：`phase` 是 `starting`，**而数据面此刻已经在服务**
-/// （不是 503 `idoris_starting`）。规范 §2.11.1：`starting` 只在全局门控未开时意味着数据面 503。
+/// 一张要 Supervisor 的卡（非 resident 的 `http_service`），provider 是 `vllm`：没有这种引擎的适配器。
+fn card_whose_provider_has_no_adapter(port: u16) -> String {
+    format!(
+        r#"provider:
+  id: vllm
+  family: local
+  tier: local
+  capabilities: [chat]
+  privacy_class: local_only
+  cost: {{ input_per_m: 0, output_per_m: 0 }}
+  locality: loopback
+form: http_service
+endpoint: "http://127.0.0.1:{port}"
+version_pin: "vllm@0.1"
+privacy_class: local_only
+allowed_egress: [loopback]
+fallback_policy: fail_closed
+fail_closed: true
+load_policy: {{ mode: on_demand, keepalive: {{ idle_ttl_s: 300 }}, admission: requires_eviction }}
+"#
+    )
+}
+
+/// L3：启动时对每一张要 Supervisor 的卡干跑一遍适配器的构造：这张卡的 provider 没有适配器，是启动失败（退出码 1，点名这张卡），
+/// 不是门控放行之后才发现的错误（那时引擎早已拉起、发现文件已经发布）。托管卡本身没问题、引擎可用与否结果相同。
 #[tokio::test]
-async fn phase_starting_without_a_gate_means_only_that_an_upstream_has_no_first_observation_the_data_plane_serves()
+async fn a_lifecycle_card_whose_provider_has_no_adapter_fails_startup_before_anything_starts() {
+    for engine_available in [true, false] {
+        let case = format!("engine_available={engine_available}");
+        let env = Env::new();
+        fs::write(
+            env.components.path().join("vllm.yaml"),
+            card_whose_provider_has_no_adapter(free_port()),
+        )
+        .unwrap();
+        let fake = env.fake("engine", &Behavior::default());
+        let executable = if engine_available {
+            fake.executable.clone()
+        } else {
+            env.missing_executable()
+        };
+        let socket = env.run_dir.join("register.sock");
+        let agent = FakeAgent24d::start(&socket, env.discovery_path());
+        let frame = env.frame(&executable, json!({}), json!({"register_socket": socket}));
+        let mut child = env.spawn(&frame);
+        let status = wait_exit(&mut child, Duration::from_secs(30));
+        let stderr = stderr_of(&mut child);
+        assert_eq!(status.code(), Some(1), "{case}: {stderr}");
+        assert!(stderr.contains("启动失败"), "{case}: {stderr}");
+        assert!(
+            stderr.contains("no adapter for provider vllm"),
+            "{case}: {stderr}"
+        );
+        assert!(
+            !env.discovery_path().exists(),
+            "{case}: the discovery file was never published"
+        );
+        assert!(
+            agent.ops().is_empty(),
+            "{case}: never registered: {:?}",
+            agent.ops()
+        );
+        assert_eq!(fake.launches(), 0, "{case}: the engine was never spawned");
+    }
+}
+
+/// L6：SIGTERM 在 iDoris 还在启动的时候就到了（它停在读 launcher 的启动帧上，帧还没写给它）：信号处理器是 `run` 一开始就注册的，
+/// 信号被记下，帧到了、开始服务之后停止流程第一次读它就读到，走优雅停止，退出码 0。（此前处理器在停止流程第一次被 poll 时才注册，
+/// 启动期间到的 SIGTERM 按默认动作直接杀死进程：没有退出码，自己拉起的引擎也来不及收尾。）
+///
+/// 怎么知道 iDoris 已经走过 `run` 的开头：实例锁文件（`<db>.lock`）在 `run` 里、处理器注册**之后**才创建，它出现就说明处理器已经装好，
+/// 而帧此刻还没给它，所以它一定还在启动里。
+#[tokio::test]
+async fn a_sigterm_that_arrives_while_idoris_is_still_starting_up_is_held_and_ends_in_a_graceful_exit()
  {
-    let slow = slow_upstream().await;
     let env = Env::new();
-    // 没有托管卡：只有这一张 resident 卡。
-    env.write_card(&upstream_card(&slow.uri()));
-    let (mut child, data_port, _) =
-        env.start(&env.frame(&env.missing_executable(), json!({}), json!({})));
-    let client = http();
-    let body = health(&client, data_port).await;
-    assert_eq!(body["phase"], "starting", "{body}");
-    assert_eq!(body["ready"], false);
-    assert_eq!(upstream(&body, "lmstudio")["state"], "starting", "{body}");
-    assert_eq!(
-        data_plane_status(&client, data_port).await,
-        400,
-        "the data plane is serving (an invalid body is a 400, not the gate's 503 idoris_starting)"
+    let fake = env.fake("engine", &Behavior::default());
+    let frame = env.frame(&fake.executable, json!({}), json!({}));
+    let mut command = env.command();
+    command.args(["serve", "--launcher-stdin"]);
+    let mut child = spawn_retrying(&mut command).unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let lock = env.state.path().join("state.sqlite3.lock");
+    wait_for(
+        "iDoris to take its instance lock (it is past the start of run, waiting for the launcher frame)",
+        || lock.exists(),
     );
     send("-TERM", child.id());
+    // 信号已经到过了；现在才把启动帧给它。
+    let _ = stdin.write_all(format!("{frame}\n").as_bytes());
+    drop(stdin);
+    let status = wait_exit(&mut child, Duration::from_secs(60));
+    let stderr = stderr_of(&mut child);
     assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(30)).code(),
-        Some(0)
+        status.code(),
+        Some(0),
+        "a SIGTERM during start-up is held, not fatal (killed by signal = no exit code): {status:?} {stderr}"
     );
 }

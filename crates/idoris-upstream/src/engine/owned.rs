@@ -20,7 +20,11 @@
 //! 照 Agent24 `omlx-kept.ts`：pid、启动时间、命令、监听端口四项**全部**吻合才算同一个进程；再加进程组：
 //! 引擎是自己那个组的组长（拉起时 `process_group(0)`，组 id 就是 pid，记录里不另存），整组信号只发给这个
 //! pid 的组，所以要确认它此刻仍领着这个组。这些判据与引擎种类无关。
-//! - 任何一项**不一致**（进程没了、pid 被复用、命令或端口不同）：记录作废，**不发任何信号**。
+//! - 任何一项**不一致**（进程没了、pid 被复用、启动时间、进程组或命令不同）：记录作废，**不发任何信号**。
+//! - **只有监听端口不一致**（pid、启动时间、进程组、命令都吻合，进程在，端口上却没有它）：这是**上一代引擎正在退出**
+//!   （收到 SIGTERM 后关了监听、还在等在途的生成结束，而上一个 iDoris 在这期间被 launcher SIGKILL 了）：它是我们的，
+//!   不是别人的进程。**不能**当作作废丢掉记录（那会留下一个没人管的引擎，既占着内存又没有记录能认回它），而是
+//!   [`Recovery::Exiting`]：由调用方 [`OwnedEngine::stop`] 有界地收尾（SIGTERM、宽限、SIGKILL），确认消失之后才删记录。
 //! - 任何一项**读不出来**（`ps` / `lsof` 超时、失败）：**不是**不一致：不发信号，记录保留，等下一次。
 //!
 //! 记录按「引擎种类 → endpoint」存放（规范 §2.7.6，见 [`super::EngineInstance`]）：一个种类的 `recover`
@@ -29,7 +33,9 @@
 //!
 //! # 停止
 //!
-//! SIGTERM 整组，宽限期内等整组消失，仍在就 SIGKILL 整组，再等到消失才算完成；完成后删记录。
+//! SIGTERM 整组，宽限期内等整组消失，仍在就 SIGKILL 整组，再等到消失才算完成；完成后删记录。必须在期限之前完成的停止
+//! （iDoris 收到信号之后，launcher 在 17 秒后 SIGKILL 它）用 [`OwnedEngine::stop_bounded`]：SIGTERM 之后的宽限与 SIGKILL
+//! 之后的确认窗口分开给，宽限随剩余时间缩短，剩得太少就不给宽限，SIGTERM 之后立刻 SIGKILL。
 //! 对自己 spawn 的引擎走 [`ManagedRuntimeProcess::shutdown`]（未回收的直接子进程占着 PGID，发信号时这个组 id 不会已被
 //! 复用）；对认回的孤儿，发 SIGTERM 前先过身份闸（pid 存活、启动时间吻合、仍是自己进程组的组长），闸与第一次信号之间有
 //! 微秒级的非原子窗口（没有 pidfd），误伤要求这个 pid 恰在窗口内被复用并成为另一个进程组的组长。之后组里还有活成员时，
@@ -80,7 +86,8 @@ pub enum MismatchReason {
     ProcessGroup,
     /// 命令行不同。
     Command,
-    /// 这个 pid 没有在记录里的端口上监听。
+    /// 这个 pid 没有在记录里的端口上监听。pid、启动时间、进程组、命令都吻合时，[`OwnedEngine::recover`] 不把它当作作废：
+    /// 那是上一代引擎正在退出（[`Recovery::Exiting`]）。
     Port,
     /// 记录本身不可用（内容坏、种类或端口与所在位置对不上）。
     InvalidRecord,
@@ -227,6 +234,10 @@ pub enum Recovery {
     Adopted(OwnedEngine),
     /// 记录没封印：上一个 iDoris 在引擎启动途中被杀。它还在，但没有就绪过：只能 [`OwnedEngine::stop`] 后重拉。
     Starting(OwnedEngine),
+    /// 记录已封印，pid、启动时间、进程组、命令都吻合，**只是端口上没有它在监听**：上一代引擎正在退出（关了监听，等在途的
+    /// 生成结束），上一个 iDoris 在这期间被 SIGKILL 了。它是我们的，记录**保留**：调用方有界地 [`OwnedEngine::stop`]
+    /// （SIGTERM、宽限、SIGKILL），确认消失之后记录才删，再重拉。不能丢掉记录：那会留下一个没人管的引擎。
+    Exiting(OwnedEngine),
     /// 记录作废（进程没了、pid 被复用、记录坏了）：**没有发任何信号**，记录已删。
     Stale(MismatchReason),
     /// 有一项身份读不出来：**没有发任何信号**，记录保留。
@@ -287,7 +298,9 @@ impl OwnedEngine {
         let endpoint = launch.endpoint();
         match classify(&store, inspector.as_ref()).await? {
             Classified::NoRecord | Classified::Stale(_) => {}
-            Classified::Verified { .. } | Classified::Unverifiable(_) => {
+            Classified::Verified { .. }
+            | Classified::Exiting { .. }
+            | Classified::Unverifiable(_) => {
                 return Err(EngineError::AlreadyOwned);
             }
         }
@@ -371,21 +384,34 @@ impl OwnedEngine {
             Classified::Stale(reason) => Recovery::Stale(reason),
             Classified::Unverifiable(reason) => Recovery::Unverifiable(reason),
             Classified::Verified { record, sealed } => {
-                let engine = Self {
-                    backing: Backing::Recovered,
-                    instance: instance.clone(),
-                    endpoint: instance.endpoint(),
-                    record,
-                    store,
-                    inspector: Arc::clone(inspector),
-                };
+                let engine = Self::recovered(instance, record, store, inspector);
                 if sealed {
                     Recovery::Adopted(engine)
                 } else {
                     Recovery::Starting(engine)
                 }
             }
+            Classified::Exiting { record } => {
+                Recovery::Exiting(Self::recovered(instance, record, store, inspector))
+            }
         })
+    }
+
+    /// 认回的孤儿（不是我们的子进程）。
+    fn recovered(
+        instance: &EngineInstance,
+        record: OwnershipRecord,
+        store: OwnershipStore,
+        inspector: &Arc<dyn ProcessInspector>,
+    ) -> Self {
+        Self {
+            backing: Backing::Recovered,
+            instance: instance.clone(),
+            endpoint: instance.endpoint(),
+            record,
+            store,
+            inspector: Arc::clone(inspector),
+        }
     }
 
     pub fn instance(&self) -> &EngineInstance {
@@ -512,6 +538,19 @@ impl OwnedEngine {
     /// 认回的孤儿身份对不上（进程已经没了、pid 被复用）时什么信号都不发，直接 `Ok`：没有我们的东西在跑。
     /// 身份读不出来 → [`EngineError::IdentityUnreadable`]，同样不发信号。
     pub async fn stop(self, grace: Duration) -> Result<(), EngineError> {
+        self.stop_bounded(grace, grace).await
+    }
+
+    /// [`Self::stop`] with the two waits told apart, for a stop that has to be over by a deadline (the launcher's
+    /// SIGKILL of iDoris, 17 s after the signal): `term_grace` is how long the group gets after SIGTERM to leave on its
+    /// own (`Duration::ZERO`: SIGKILL right after the SIGTERM), `confirm` how long to wait after the SIGKILL for the
+    /// group to be gone. Same rules otherwise: identity gate for a recovered orphan, record removed only once the
+    /// process is confirmed gone.
+    pub async fn stop_bounded(
+        self,
+        term_grace: Duration,
+        confirm: Duration,
+    ) -> Result<(), EngineError> {
         let Self {
             backing,
             record,
@@ -521,17 +560,19 @@ impl OwnedEngine {
         } = self;
         match backing {
             Backing::Spawned(process) => {
-                if process.shutdown(grace).await.is_err() {
+                if process.shutdown_bounded(term_grace, confirm).await.is_err() {
                     // `shutdown` sweeps the group with SIGKILL once; a child forked in the instant
                     // of that sweep is not on its list. Sweep again until nothing is left.
                     let group = i32::try_from(record.process_group())
                         .map_err(|_| EngineError::StopFailed)?;
-                    if !sweep_until_gone(group, grace).await? {
+                    if !sweep_until_gone(group, confirm).await? {
                         return Err(EngineError::StopFailed);
                     }
                 }
             }
-            Backing::Recovered => stop_recovered(inspector.as_ref(), &record, grace).await?,
+            Backing::Recovered => {
+                stop_recovered(inspector.as_ref(), &record, term_grace, confirm).await?;
+            }
         }
         // 进程已确认消失。记录删不掉也无妨：下一个 iDoris 读到它会因进程不在而作废。
         let _ = store.remove_if_same(&record);
@@ -610,6 +651,10 @@ enum Classified {
         record: OwnershipRecord,
         sealed: bool,
     },
+    /// 除监听端口外都吻合：上一代引擎正在退出。记录保留。
+    Exiting {
+        record: OwnershipRecord,
+    },
     Unverifiable(UnreadableReason),
 }
 
@@ -636,6 +681,9 @@ async fn classify(
             record,
             sealed: false,
         },
+        // pid、启动时间、进程组、命令都吻合，只是端口上没有它：上一代引擎正在退出，它是我们的。记录不删：
+        // 删了就再没有任何东西认得回它，它会成为一个没人管的引擎（上一个 iDoris 在它收尾期间被 SIGKILL）。
+        IdentityVerdict::Mismatch(MismatchReason::Port) => Classified::Exiting { record },
         IdentityVerdict::Mismatch(reason) => {
             store.remove_if_same(&record)?;
             Classified::Stale(reason)
@@ -644,11 +692,12 @@ async fn classify(
     })
 }
 
-/// 停认回的孤儿：身份闸 → SIGTERM 整组 → 等整组消失 → SIGKILL 整组 → 等整组消失。
+/// 停认回的孤儿：身份闸 → SIGTERM 整组 → 等整组消失（`term_grace`）→ SIGKILL 整组 → 等整组消失（`confirm`）。
 async fn stop_recovered(
     inspector: &dyn ProcessInspector,
     record: &OwnershipRecord,
-    grace: Duration,
+    term_grace: Duration,
+    confirm: Duration,
 ) -> Result<(), EngineError> {
     match gate(inspector, record).await {
         // 没有我们的东西在跑（或 pid 已经给了别人）：什么都不发。
@@ -658,11 +707,11 @@ async fn stop_recovered(
     }
     let group = signal_target(record)?;
     signal_group(group, Signal::SIGTERM).map_err(|_| EngineError::Signal)?;
-    if wait_group_gone(group, grace).await? {
+    if wait_group_gone(group, term_grace).await? {
         return Ok(());
     }
     // 组里仍有活成员：组 id 此刻没有被重新分配（成员检查与 SIGKILL 之间有微秒级的非原子窗口），整组 SIGKILL。
-    if sweep_until_gone(group, grace).await? {
+    if sweep_until_gone(group, confirm).await? {
         Ok(())
     } else {
         Err(EngineError::StopFailed)
@@ -998,6 +1047,55 @@ mod tests {
         assert!(present());
     }
 
+    /// pid, start time, process group and command all match but the port is not listening: the previous generation,
+    /// still exiting (it closed its listener on SIGTERM and is waiting for in-flight work). It is ours: the record
+    /// is **kept** (dropping it would leave an engine nobody manages), never classified Stale.
+    #[tokio::test]
+    async fn a_record_whose_only_mismatch_is_the_port_is_an_exiting_generation_and_is_kept() {
+        let (_state, _inst, store) = fixture();
+        store.write(&record()).unwrap();
+        let mut not_listening = Fake::matching();
+        not_listening.listens = Ok(false);
+        assert!(matches!(
+            classify(&store, &not_listening).await.unwrap(),
+            Classified::Exiting { .. }
+        ));
+        assert!(
+            store.read().unwrap().is_some(),
+            "the record of an exiting engine is kept until the engine is confirmed gone"
+        );
+        // Every other single mismatch is still Stale (and the record dropped): that is not our process.
+        for (tweak, reason) in [
+            (
+                (|f: &mut Fake| f.start = Ok("other".into())) as fn(&mut Fake),
+                MismatchReason::StartTime,
+            ),
+            (|f| f.group = Ok(2), MismatchReason::ProcessGroup),
+            (|f| f.command = Ok("other".into()), MismatchReason::Command),
+            (|f| f.state = PidState::Gone, MismatchReason::ProcessGone),
+        ] {
+            store.write(&record()).unwrap();
+            let mut fake = Fake::matching();
+            fake.listens = Ok(false);
+            tweak(&mut fake);
+            assert!(
+                matches!(classify(&store, &fake).await.unwrap(), Classified::Stale(r) if r == reason),
+                "{reason:?}"
+            );
+            assert!(store.read().unwrap().is_none(), "{reason:?}");
+        }
+        // An unsealed record (no command to compare) is `Starting`, never `Exiting`, whatever the port says.
+        let mut unsealed = record();
+        unsealed.command = None;
+        store.write(&unsealed).unwrap();
+        let mut fake = Fake::matching();
+        fake.listens = Ok(false);
+        assert!(matches!(
+            classify(&store, &fake).await.unwrap(),
+            Classified::Verified { sealed: false, .. }
+        ));
+    }
+
     #[tokio::test]
     async fn classify_refuses_records_that_are_not_ours_to_trust() {
         use std::os::unix::fs::PermissionsExt;
@@ -1186,12 +1284,12 @@ mod tests {
         ] {
             let mut fake = Fake::matching();
             tweak(&mut fake);
-            stop_recovered(&fake, &mine, grace).await.unwrap();
+            stop_recovered(&fake, &mine, grace, grace).await.unwrap();
         }
         let mut blind = Fake::matching();
         blind.start = Err(InspectError::TimedOut);
         assert!(matches!(
-            stop_recovered(&blind, &mine, grace).await,
+            stop_recovered(&blind, &mine, grace, grace).await,
             Err(EngineError::IdentityUnreadable(UnreadableReason::StartTime))
         ));
     }

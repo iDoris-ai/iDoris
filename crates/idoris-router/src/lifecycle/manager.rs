@@ -529,12 +529,20 @@ impl EngineManager {
     /// 删记录）；为假（`stop_on_exit:"never"` 的正常退出）就让引擎继续跑，所有权记录留给下一个 iDoris。
     /// 等各实例完成，至多 `stop_grace` 加一点余量；超时的实例任务被中止（`OwnedEngine` 的 `Drop` 仍会兜底）。
     pub async fn shutdown(&self, stop_engines: bool) {
+        self.shutdown_by(stop_engines, None).await;
+    }
+
+    /// [`Self::shutdown`]，带整个停止必须完成的期限（iDoris 收到信号之后，launcher 在 17 秒时 SIGKILL 它）：停引擎的宽限只拿
+    /// 期限里剩下的（[`super::backoff::stop_windows`]：不到 2 秒就 SIGTERM 之后立刻 SIGKILL），等各实例的上限也跟着缩到期限
+    /// 之后一点余量。`None` 与 [`Self::shutdown`] 相同。
+    pub async fn shutdown_by(&self, stop_engines: bool, deadline: Option<tokio::time::Instant>) {
         let mut waits = Vec::new();
         for sender in self.senders.values() {
             let (reply, answer) = oneshot::channel();
             let request = Request {
                 command: Command::Shutdown {
                     stop_engine: stop_engines,
+                    deadline,
                 },
                 reply: Some(reply),
             };
@@ -542,7 +550,15 @@ impl EngineManager {
                 waits.push(answer);
             }
         }
-        let budget = self.shared.config.timings.stop_grace + Duration::from_secs(3);
+        let budget = match deadline {
+            // 实例自己在期限里收尾（宽限加确认窗口），这是外面的兜底：比实例多一秒。
+            Some(deadline) => {
+                deadline.saturating_duration_since(tokio::time::Instant::now())
+                    + super::backoff::MIN_CONFIRM
+                    + Duration::from_millis(500)
+            }
+            None => self.shared.config.timings.stop_grace + Duration::from_secs(3),
+        };
         let finished = tokio::time::timeout(budget, async {
             for answer in waits {
                 let _ = answer.await;
