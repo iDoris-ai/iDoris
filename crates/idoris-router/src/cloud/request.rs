@@ -33,13 +33,13 @@ fn header_privacy(headers: &HeaderMap) -> Result<CallPrivacy, InvalidPrivacy> {
     }
 }
 
-/// 请求体里的一处声明（顶层 `privacy` 或 `metadata.privacy`）：没写 / `null` / `any` 不说明任何事（这个字段从来不转发给
-/// 上游）；`local_only`（不分大小写、可带空白）= 显式本地；**写了别的任何东西**（`"local-only"`、`true`、对象……）= 不合法，
-/// 与请求头同样失败即关闭，不当作「没声明」放行。
+/// 请求体里的一处声明（顶层 `privacy` 或 `metadata.privacy`）：没写 / `null` / `any`（去掉首尾空白，和请求头一样）不说明任何事
+/// （这个字段从来不转发给上游）；`local_only`（不分大小写、可带空白）= 显式本地；**写了别的任何东西**（`"localonly"`、`true`、
+/// 对象……）= 不合法，与请求头同样失败即关闭，不当作「没声明」放行。
 fn body_field_privacy(value: Option<&Value>) -> Result<bool, InvalidPrivacy> {
     match value {
         None | Some(Value::Null) => Ok(false),
-        Some(Value::String(text)) if text == "any" => Ok(false),
+        Some(Value::String(text)) if text.trim() == "any" => Ok(false),
         Some(Value::String(text)) if text.trim().eq_ignore_ascii_case("local_only") => Ok(true),
         Some(_) => Err(InvalidPrivacy),
     }
@@ -488,6 +488,60 @@ mod tests {
             declared_privacy(&headers(&[]), &ok),
             Ok(CallPrivacy::LocalOnly)
         );
+    }
+
+    /// PR-Daemon 在 #608 评审里指出：头里带空白的 ` any ` 被接受，请求体里的 ` any ` 却是 400。N5 的要求是「像请求头一样」，
+    /// 两处对 `any` 的宽严要一致：都是去掉首尾空白之后精确匹配 `any`；`Any` / `ANY` 仍然不认（失败即关闭，头和请求体一样）。
+    /// 请求体里的 `any` 和没写一样，不说明任何事（没有变成 `CallPrivacy::Any`）。
+    #[test]
+    fn a_padded_any_is_read_the_same_way_in_the_header_and_in_the_body() {
+        let plain = object(base());
+        for padded in [" any ", "  any", "any  "] {
+            assert_eq!(
+                declared_privacy(&headers(&[padded]), &plain),
+                Ok(CallPrivacy::Any),
+                "header {padded:?}"
+            );
+            let mut top = plain.clone();
+            top.insert("privacy".into(), json!(padded));
+            assert_eq!(
+                declared_privacy(&headers(&[]), &top),
+                Ok(CallPrivacy::Undeclared),
+                "body privacy {padded:?}"
+            );
+            let mut nested = plain.clone();
+            nested.insert("metadata".into(), json!({"privacy": padded}));
+            assert_eq!(
+                declared_privacy(&headers(&[]), &nested),
+                Ok(CallPrivacy::Undeclared),
+                "body metadata.privacy {padded:?}"
+            );
+        }
+        // 大小写不对：头和请求体一样不认
+        for wrong in ["Any", "ANY", " Any "] {
+            assert_eq!(
+                declared_privacy(&headers(&[wrong]), &plain),
+                Err(InvalidPrivacy),
+                "header {wrong:?}"
+            );
+            let mut top = plain.clone();
+            top.insert("privacy".into(), json!(wrong));
+            assert_eq!(
+                declared_privacy(&headers(&[]), &top),
+                Err(InvalidPrivacy),
+                "body privacy {wrong:?}"
+            );
+        }
+        // 空白本身仍然不是取值（头和请求体一样）
+        for blank in ["", " ", "   "] {
+            let mut top = plain.clone();
+            top.insert("privacy".into(), json!(blank));
+            assert_eq!(
+                declared_privacy(&headers(&[]), &top),
+                Err(InvalidPrivacy),
+                "body privacy {blank:?}"
+            );
+        }
     }
 
     #[test]

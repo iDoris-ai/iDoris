@@ -238,6 +238,80 @@ async fn a_malformed_privacy_declaration_is_refused_not_treated_as_undeclared() 
     assert_eq!(w.spent("agent24"), 0);
 }
 
+/// issue #603 N5：请求体里写了 `privacy` / `metadata.privacy` 却不是 `any` / `local_only`（`"local-only"`、`true`、对象……），
+/// 与请求头同样是 400 `invalid_privacy`，不当作「没声明」放行上云。PR-Daemon 在 #608 评审里指出：之前只有函数层的测试，
+/// 这里经真实的 HTTP 路径，对每一类调用方（儿童租户的服务凭证、成人节点凭证、孩子自己的成员凭证）各验一遍。
+#[tokio::test]
+async fn a_malformed_body_privacy_declaration_is_refused_over_http_not_treated_as_undeclared() {
+    let counting = Counting::new();
+    let w = World::new(WorldOptions {
+        script: ok_script(10),
+        safety_gate: Some(counting_gate(counting.clone())),
+        ..WorldOptions::default()
+    })
+    .await;
+    let bases = [
+        Req::chat(w.cred("svc_eduai")).member("kid-1"),
+        Req::chat(w.cred("node_agent24")),
+        Req::chat(w.cred("mem_kid1")),
+    ];
+    let mut refused = 0;
+    for base in &bases {
+        for bad in [
+            json!("local-only"),
+            json!(true),
+            json!(5),
+            json!({"local_only": true}),
+            json!(["local_only"]),
+            json!("Any"),
+        ] {
+            let mut top = simple_body(100);
+            top["privacy"] = bad.clone();
+            let mut nested = simple_body(100);
+            nested["metadata"] = json!({"privacy": bad.clone()});
+            for req in [
+                base.clone().body(top.clone()),
+                // 头写 any 也不能掩盖请求体里的错写
+                base.clone().header("x-idoris-privacy", "any").body(top),
+                base.clone().body(nested),
+            ] {
+                let reply = w.send(&req).await;
+                assert_eq!(reply.status, 400, "{bad}: {}", reply.text());
+                assert_eq!(reply.code(), "invalid_privacy", "{bad}");
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!(refused, 3 * 6 * 3);
+    // 一个字节都没出去：云上游没收到请求、安全检查器没被调用、谁都没被记账
+    assert_eq!(w.upstream.request_count(), 0);
+    assert_eq!(w.upstream.connection_count(), 0);
+    assert_eq!(counting.calls(), (0, 0));
+    for account in ALL_PAYERS {
+        assert_eq!(w.spent(account), 0, "{account}");
+    }
+
+    // 对照：合法取值（`any`、`null`、带空白的 ` any `）照常服务；它们和没写一样不说明任何事，
+    // 而且这两个字段从来不转发给上游（`build_chat_body` 是白名单：`privacy`、`metadata` 都不在里面）
+    let adult = Req::chat(w.cred("node_agent24"));
+    for (index, privacy) in [json!("any"), json!(null), json!(" any ")]
+        .into_iter()
+        .enumerate()
+    {
+        let mut body = simple_body(100);
+        body["privacy"] = privacy.clone();
+        body["metadata"] = json!({"privacy": privacy, "tag": "x"});
+        let reply = w.send(&adult.clone().body(body)).await;
+        assert_eq!(reply.status, 200, "{index}: {}", reply.text());
+        let sent = w.upstream.requests()[index].json();
+        assert!(
+            sent.get("privacy").is_none() && sent.get("metadata").is_none(),
+            "the privacy label never reaches the upstream: {sent}"
+        );
+    }
+    assert_eq!(w.upstream.request_count(), 3);
+}
+
 // ---------------------------------------------------------------------------
 // R2 High#4：认证之前的有界工作
 // ---------------------------------------------------------------------------
