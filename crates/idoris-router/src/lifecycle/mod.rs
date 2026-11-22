@@ -128,5 +128,6 @@ pub use backend::{EngineBackend, OmlxBackend, PrepareFailure};
 pub use backoff::{CrashWindow, Timings, restart_delay};
 pub use manager::{
     CommandError, EngineFailure, EngineManager, GateOutcome, ManagedPlan, ManagedView,
-    ManagerConfig, PlanError, plan_managed, plan_managed_with,
+    ManagerConfig, PlanError, managed_backend_kind, plan_managed, plan_managed_with,
+    validate_managed_plan,
 };
