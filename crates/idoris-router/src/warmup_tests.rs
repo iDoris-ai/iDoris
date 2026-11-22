@@ -847,3 +847,208 @@ async fn a_429_for_the_per_key_limit_carries_retry_after_too() {
     wait_for_all_permits(&proxy, total, Duration::from_secs(10)).await;
     wait_for_idle(&proxy).await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// 合并的键里有准入时的引擎代际（IDORIS-CORE S6 合并之后）
+// ---------------------------------------------------------------------------------------------
+
+/// 一张 resident 的托管 oMLX 卡（loopback，会按引擎管理器登记的口径带 key）：形状同 S6 的 `tests/warmup_generation.rs`。
+fn managed_resident(endpoint: &str) -> ComponentCard {
+    serde_yaml::from_str(&format!(
+        r#"provider:
+  id: omlx
+  family: local
+  tier: local
+  capabilities: [chat]
+  privacy_class: local_only
+  cost: {{ input_per_m: 0, output_per_m: 0 }}
+  locality: loopback
+form: http_service
+endpoint: "{endpoint}"
+version_pin: "omlx@0.6.4"
+privacy_class: local_only
+allowed_egress: [loopback]
+fallback_policy: fail_closed
+fail_closed: true
+load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexist }}
+extensions:
+  _degradation: "Removing these bindings disables aliases."
+  idoris_role_models: {{ daily: "qwen" }}
+  idoris_managed: {{ engine: omlx, mode: auto }}
+"#
+    ))
+    .unwrap()
+}
+
+/// 数据面此刻认为这个托管上游在服务（所以预热能走到发送那一步）。
+fn serving() -> readiness::HealthState {
+    readiness::HealthState::with_upstreams(
+        0,
+        vec![readiness::UpstreamStatus {
+            id: "omlx".to_owned(),
+            engine_kind: "omlx".to_owned(),
+            state: readiness::UpstreamState::Ready,
+            reason: None,
+            managed: true,
+            owned: true,
+        }],
+    )
+}
+
+/// 引擎登记表是进程全局的：每个用例结束时撤销自己端点的登记（端口各不相同）。
+struct Governed(String);
+
+impl Drop for Governed {
+    fn drop(&mut self) {
+        idoris_upstream::omlx::key::release_endpoint(&self.0);
+    }
+}
+
+fn authorization(request: &wiremock::Request) -> Option<String> {
+    request
+        .headers
+        .get("authorization")
+        .map(|value| value.to_str().unwrap().to_owned())
+}
+
+/// 托管卡 + 带门的代理：领头任务停在发请求之前，测试在这时「重启引擎」。
+async fn managed_app_with_run_hook(
+    endpoint: &str,
+    hook: Arc<warmup::RunHook>,
+) -> (Router, Arc<proxy::ChatProxy>) {
+    let mut proxy = proxy::ChatProxy::new(idoris_upstream::http_client().unwrap());
+    proxy.warmup_run_hook = Some(hook);
+    let proxy = Arc::new(proxy);
+    let app = build_app(AppState {
+        cards: vec![managed_resident(endpoint)],
+        health_state: serving(),
+        proxy: proxy.clone(),
+        ..AppState::default()
+    });
+    (app, proxy)
+}
+
+async fn engine() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "x"}}]
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn a_caller_that_arrives_after_an_engine_restart_leads_its_own_request_and_is_not_given_the_old_generations_result()
+ {
+    use idoris_upstream::omlx::key::{EndpointKey, block_endpoint, govern_endpoint};
+    let server = engine().await;
+    let uri = server.uri();
+    let _governed = Governed(uri.clone());
+    govern_endpoint(&uri, EndpointKey::Private("key-of-the-old-engine".into()));
+    let hook = warmup::RunHook::closed(false);
+    let (app, proxy) = managed_app_with_run_hook(&uri, hook.clone()).await;
+    let warm = |app: Router| async move {
+        post(&app, warmup::WARMUP_PATH, json!({"model": "idoris/daily"})).await
+    };
+
+    // 旧一代的领头：已经登记、停在发请求之前（准入时读到的是旧的代际）。
+    let old = tokio::spawn(warm(app.clone()));
+    wait_for_requests_in_flight(&proxy, 1).await;
+    // 引擎被换掉：先封上、再登记新进程的 key，代际变了。
+    block_endpoint(&uri);
+    govern_endpoint(&uri, EndpointKey::Private("key-of-the-new-engine".into()));
+    // 重启之后才到的调用方：不并入那个绑在旧一代上的任务，自己领头。
+    let new = tokio::spawn(warm(app.clone()));
+    wait_for_requests_in_flight(&proxy, 2).await;
+    assert_eq!(
+        proxy.warmup_followers_waiting(),
+        0,
+        "it did not join the task bound to the old generation"
+    );
+    hook.gate.add_permits(2);
+    let (old_status, _) = old.await.unwrap();
+    let (new_status, new_body) = new.await.unwrap();
+    // 旧一代的任务在发送时被代理拒绝：一个字节也没发，503。
+    assert_eq!(old_status, StatusCode::SERVICE_UNAVAILABLE);
+    // 新来的拿到的是它自己那个请求的结果，不是旧任务被拒的那个 503，也没有被标成并入。
+    assert_eq!(new_status, StatusCode::OK, "{new_body}");
+    assert!(new_body.get("coalesced").is_none(), "{new_body}");
+    let seen = server.received_requests().await.unwrap();
+    assert_eq!(
+        seen.len(),
+        1,
+        "only the new generation's request reached the engine"
+    );
+    assert_eq!(
+        authorization(&seen[0]).as_deref(),
+        Some("Bearer key-of-the-new-engine")
+    );
+    wait_for_idle(&proxy).await;
+}
+
+#[tokio::test]
+async fn without_a_restart_a_second_caller_still_joins_the_managed_cards_request() {
+    // 对照：代际没变，合并照常——代际只是键的一部分，不是不让合并。
+    use idoris_upstream::omlx::key::{EndpointKey, govern_endpoint};
+    let server = engine().await;
+    let uri = server.uri();
+    let _governed = Governed(uri.clone());
+    govern_endpoint(&uri, EndpointKey::Private("key-of-the-engine".into()));
+    let hook = warmup::RunHook::closed(false);
+    let (app, proxy) = managed_app_with_run_hook(&uri, hook.clone()).await;
+    let warm = |app: Router| async move {
+        post(&app, warmup::WARMUP_PATH, json!({"model": "idoris/daily"})).await
+    };
+    let leader = tokio::spawn(warm(app.clone()));
+    wait_for_requests_in_flight(&proxy, 1).await;
+    let follower = tokio::spawn(warm(app.clone()));
+    wait_for_followers(&proxy, 1).await;
+    hook.gate.add_permits(1);
+    let (leader_status, leader_body) = leader.await.unwrap();
+    let (follower_status, follower_body) = follower.await.unwrap();
+    assert_eq!(leader_status, StatusCode::OK, "{leader_body}");
+    assert_eq!(follower_status, StatusCode::OK, "{follower_body}");
+    assert_eq!(follower_body["coalesced"], json!(true));
+    let seen = server.received_requests().await.unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        authorization(&seen[0]).as_deref(),
+        Some("Bearer key-of-the-engine")
+    );
+}
+
+#[tokio::test]
+async fn on_a_governed_card_the_limit_precheck_finds_the_request_the_caller_is_about_to_join() {
+    // 并发上限的预检（预算之前）要在和登记同一个键下找在途的请求，键里有引擎代际：这里这个调用方的两个领头名额满了，
+    // 要领头一个新模型的被 429，并入在途请求的不该被预检当成「要领头」而误拒。
+    use idoris_upstream::omlx::key::{EndpointKey, govern_endpoint};
+    let server = engine().await;
+    let uri = server.uri();
+    let _governed = Governed(uri.clone());
+    govern_endpoint(&uri, EndpointKey::Private("key-of-the-engine".into()));
+    let hook = warmup::RunHook::closed(false);
+    let (app, proxy) = managed_app_with_run_hook(&uri, hook.clone()).await;
+    let warm = |app: Router, model: &'static str| async move {
+        post(&app, warmup::WARMUP_PATH, json!({"model": model})).await
+    };
+    let one = tokio::spawn(warm(app.clone(), "model-one"));
+    let two = tokio::spawn(warm(app.clone(), "model-two"));
+    wait_for_requests_in_flight(&proxy, 2).await;
+    // 对照：要领头第三个模型，名额满了，429。
+    let (status, body) = warm(app.clone(), "model-three").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["type"], "warmup_in_flight_limited");
+    // 同一个模型的第二个调用方是并入，不是领头，不占名额：不被拒。
+    let joiner = tokio::spawn(warm(app.clone(), "model-one"));
+    wait_for_followers(&proxy, 1).await;
+    hook.gate.add_permits(2);
+    for (name, handle) in [("model-one", one), ("model-two", two), ("joiner", joiner)] {
+        let (status, body) = handle.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+    }
+    let seen = server.received_requests().await.unwrap();
+    assert_eq!(seen.len(), 2, "one request per model, the joiner sent none");
+    wait_for_idle(&proxy).await;
+}

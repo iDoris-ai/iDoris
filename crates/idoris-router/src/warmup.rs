@@ -342,7 +342,7 @@ enum Limit {
     Followers,
 }
 
-/// 一个 resident 最小请求在合并表里的身份：同一张卡（id 与端点）、同一种最小请求、同一个模型。
+/// 一个 resident 最小请求在合并表里的身份：同一张卡（id 与端点）、同一种最小请求、同一个模型、**准入时的引擎代际**。
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct RequestKey {
     provider_id: String,
@@ -350,15 +350,20 @@ struct RequestKey {
     /// `"chat"` 或 `"embedding"`：同一个模型的两种最小请求是两个请求。
     kind: &'static str,
     model: String,
+    /// 准入时这张卡的端点所在的引擎代际（[`Job::generation`]，IDORIS-CORE S6）。领头的任务绑在它被准入的那一代上：引擎换了代
+    /// （停止、重启、换了进程），代理在发送时拒绝它，一个字节也不发（503）。要是键里没有代际，重启之后才到的调用方会并入这个绑在
+    /// 旧一代上的任务，拿到它被拒的那个 503，而不是自己为新一代发的请求的结果。没有被引擎管理器接管的端点，代际恒为 0，合并照旧。
+    generation: u64,
 }
 
 impl RequestKey {
-    fn of(card: &ComponentCard, kind: &'static str, model: &str) -> Self {
+    fn of(card: &ComponentCard, kind: &'static str, model: &str, generation: u64) -> Self {
         Self {
             provider_id: card.provider.id.clone(),
             endpoint: card.endpoint.clone(),
             kind,
             model: model.to_string(),
+            generation,
         }
     }
 }
@@ -437,7 +442,9 @@ struct InFlight {
 /// 为什么需要（PR-Daemon 对 #634 的预审 W-1，及其后的本地预审 L-3、L-4）：resident 预热的请求在自己的任务里占着代理的一个并发
 /// 许可，最长 180 秒加正文，调用方却早就拿到了 504；一把数据 key 凑满 32 个并发预热就占满全部许可，别的租户的聊天得 503。四道限制：
 ///
-/// 1. **合并**：同一（卡、端点、最小请求、模型）已经有请求在途时，后来的预热并入它——不再发请求、不占许可，等同一个结果。
+/// 1. **合并**：同一（卡、端点、最小请求、模型、准入时的引擎代际）已经有请求在途时，后来的预热并入它——不再发请求、不占许可，
+///    等同一个结果。代际在键里，是因为领头的请求绑在它被准入的那一代上、引擎换了代就在发送时被拒绝（见 [`RequestKey`]）：重启之后
+///    才到的预热不能并入它去拿那个被拒的 503，要自己领头。
 /// 2. **并入者上限**：一个在途请求上同时等着的并入者最多 [`MAX_FOLLOWERS_PER_REQUEST`] 个，再多的 429 [`LIMITED`]。并入者不占许可，
 ///    但每个都是一个等着的任务，还要先过自己的预算检查（拿账本的锁），所以不能无限多。
 /// 3. **每 key 上限**：一把 key 自己发起（领头）的在途请求最多 [`MAX_IN_FLIGHT_PER_KEY`] 个，再多的 429。并入别人的请求不算
@@ -715,6 +722,7 @@ impl ResidentRequest {
     /// 180 秒）。引擎在这期间被停止、重启、换了进程，代理在每一次发送（连接失败的重试也算）时按这个代际核对：端点被封上、或者
     /// 代际已经不是准入时的，一个字节都不发——不带新一代的 key，请求体也不会发给新进程。已经发给旧引擎、在等回答的那一次随旧进程
     /// 一起结束（连接被重置）。resident 的托管卡没有 Supervisor，没有关门与排空可言：这个绑定加上代理的封上检查就是它的「封住」。
+    /// 合并表的键里也带这个代际（[`RequestKey`]）：重启之后才到的调用方不会并入一个绑在旧一代上的任务，去拿它被拒的那个 503。
     async fn run(self) -> ForwardOutcome {
         #[cfg(test)]
         if let Some(hook) = self.proxy.warmup_run_hook.as_ref() {
@@ -768,8 +776,8 @@ impl ResidentRequest {
 /// 请求在**自己的任务**里跑，有自己的响应头期限（[`crate::proxy::WARMUP_HEADER_TIMEOUT`]，与调用方的 `timeout_ms` 无关）：
 /// 这个函数的 future 被丢掉——`timeout_ms` 到点、客户端断开——只是不再等结果，**不取消**发给上游的请求（上游那一侧的冷加载
 /// 不被我们的放弃打断），代理照常在请求结束时结算熔断的准入：成功，或 504 按既有规则计入提供方熔断。任务占着代理的一个
-/// 并发许可直到请求结束，所以同时在途的预热请求要有界：同一（卡、模型）的并发预热合并成一个请求，每把数据 key 自己发起的在途
-/// 请求有上限（见 [`Registry`]）。
+/// 并发许可直到请求结束，所以同时在途的预热请求要有界：同一（卡、模型）、同一代引擎的并发预热合并成一个请求，每把数据 key 自己
+/// 发起的在途请求有上限（见 [`Registry`]）。
 ///
 /// 上游的回答按预热的错误矩阵翻译：404 是 `model_not_found`，504（响应头或正文超时）是 `warmup_timeout`，其余非 2xx 与聊天的
 /// resident 路径一样原样透传（含代理自己的 502 `upstream_auth_failed` 与熔断的 503）。不带幂等键：预热每次都是真请求，不重放缓存。
@@ -810,7 +818,7 @@ async fn warm_resident(
     if !is_local_endpoint(&selected.card) {
         return Err(not_local_response(selected));
     }
-    let key = RequestKey::of(&selected.card, kind, target);
+    let key = RequestKey::of(&selected.card, kind, target, job.generation);
     let waiting = match state.proxy.warmups.join_or_lead(key, job.caller) {
         Join::Refused(limit) => return Err(limited_response(selected, limit)),
         // 同样的请求已经在途：并入它，不发请求、不占并发许可。
@@ -1069,10 +1077,10 @@ async fn handle(
     // 候选与预算，并入不是绕开它们的后门；而一个会被拒的，也不必为它付账本的锁。
     if dispatch::is_resident_http_service(&selected.card)
         && let Some(kind) = request_kind(capability)
-        && let Some(limit) = state
-            .proxy
-            .warmups
-            .refusal(&RequestKey::of(&selected.card, kind, &target), caller)
+        && let Some(limit) = state.proxy.warmups.refusal(
+            &RequestKey::of(&selected.card, kind, &target, generation),
+            caller,
+        )
     {
         return limited_response(&selected, limit);
     }
@@ -1280,6 +1288,7 @@ mod tests {
             endpoint: "http://127.0.0.1:9".to_string(),
             kind: "chat",
             model: model.to_string(),
+            generation: 0,
         }
     }
 
@@ -1845,5 +1854,56 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
             state.proxy.cache.lock().unwrap().is_empty(),
             "nothing of a warmup request is remembered for replay"
         );
+    }
+
+    // ---- 合并的键里有准入时的引擎代际（S6 合并之后） ----
+
+    /// 同一个请求，在某一代引擎下准入。
+    fn request_at(model: &str, generation: u64) -> RequestKey {
+        RequestKey {
+            generation,
+            ..request(model)
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_admitted_under_different_engine_generations_are_different_requests() {
+        let registry = new_registry();
+        let old = match registry.join_or_lead(request_at("m", 1), Some("key-a")) {
+            Join::Lead(lead, waiting) => (lead, waiting),
+            _ => panic!("the first caller leads"),
+        };
+        // 同一代：并入，等同一个结果。
+        let joined_same_generation = match registry.join_or_lead(request_at("m", 1), Some("key-b"))
+        {
+            Join::Follow(waiting) => waiting,
+            _ => panic!("the same model under the same generation is joined"),
+        };
+        // 引擎换了代之后才到的：不并入绑在旧一代上的任务，自己领头。
+        let new = match registry.join_or_lead(request_at("m", 3), Some("key-b")) {
+            Join::Lead(lead, waiting) => (lead, waiting),
+            _ => panic!("a caller admitted under a newer generation leads its own request"),
+        };
+        assert_eq!(registry.requests_in_flight(), 2);
+        assert_eq!(
+            registry.followers_waiting(),
+            1,
+            "only the same-generation caller joined"
+        );
+        // 旧一代的任务被代理拒绝（503）：结果只交给并入它的那一个，新一代的领头与它无关。
+        old.0.finish(answer(503));
+        assert_eq!(joined_same_generation.answer().await.unwrap().status, 503);
+        assert_eq!(
+            registry.requests_in_flight(),
+            1,
+            "the new generation's request is still in flight"
+        );
+        new.0.finish(answer(200));
+        assert_eq!(
+            new.1.answer().await.unwrap().status,
+            200,
+            "its own result, not the old one's"
+        );
+        assert!(registry.is_idle());
     }
 }
