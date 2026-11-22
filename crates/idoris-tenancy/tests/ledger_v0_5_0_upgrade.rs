@@ -1,7 +1,8 @@
 //! 从 v0.5.0 的库升级（issue #601：充过值的账户也按方案 C 记账）。
 //!
-//! 记账口径是账本分录、额度、额度序号上的**投影**（`ledger/project.rs`），没有新的列、表、触发器，所以不需要迁移：
-//! v0.5.0 写下的库用新代码打开，版本表、表结构、已写的每一行都不变，变的只是同一批分录怎么读。
+//! 记账口径是账本分录、额度、额度序号上的**投影**（`ledger/project.rs`），没有新的列、表、触发器，所以记账口径本身不需要迁移：
+//! v0.5.0 写下的库用新代码打开，已写的每一行都不变，变的只是同一批分录怎么读。唯一的结构变化是迁移 0005（Codex 四复审 Low）：
+//! 一条只加索引的迁移（`settle` 按结算时刻，补贴池一个账期的消耗不用把池账户的全部历史读一遍），不改任何列、表、触发器。
 //!
 //! 夹具 `fixtures/ledger_v0_5_0_funded_books.sql` 是 v0.5.0 的账户 / 账本代码真实跑出来的库（头注释写了来历和旧代码读到的数，
 //! 那些数是旧代码当时打印的，不是被测代码算的）。组织 `paid` 下五个成员：
@@ -168,7 +169,7 @@ fn alerts(store: &AccountStore) -> Vec<(String, i64)> {
 }
 
 #[test]
-fn opening_a_v0_5_0_ledger_changes_no_schema_and_rewrites_no_row() {
+fn opening_a_v0_5_0_ledger_adds_one_index_and_rewrites_no_row() {
     let db = load("v050-open");
     assert_eq!(
         versions(db.path(), "ledger_schema_migrations"),
@@ -189,14 +190,17 @@ fn opening_a_v0_5_0_ledger_changes_no_schema_and_rewrites_no_row() {
 
     assert_eq!(
         versions(db.path(), "ledger_schema_migrations"),
-        [1, 2, 3, 4],
-        "the funded books are a projection: no new migration"
+        [1, 2, 3, 4, 5],
+        "the funded books are a projection; the one new migration is the settlement-time index"
     );
     assert_eq!(versions(db.path(), "account_schema_migrations"), [1, 2]);
+    let mut expected_objects = objects_before;
+    expected_objects.push("index ledger_entries_settled_by_account_at".to_string());
+    expected_objects.sort();
     assert_eq!(
         objects(db.path()),
-        objects_before,
-        "no table, index or trigger was added or dropped"
+        expected_objects,
+        "the only schema change is that one index: no table, column or trigger was added or dropped"
     );
     let rows_after: Vec<String> = DATA_TABLES
         .iter()
