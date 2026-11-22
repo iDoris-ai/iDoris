@@ -444,7 +444,10 @@ pub fn spawn_runtime(card: &ComponentCard) -> Result<Option<SupervisorHandle>, S
 }
 
 /// Whether `card` gets a lifecycle Supervisor built by the adapter factory. Subscription relays and resident
-/// direct-proxy cards do not (`Ok(false)`); anything else must be an `http_service`.
+/// direct-proxy cards do not (`Ok(false)`); anything else must be an `http_service`: the one rejection of every other
+/// form is [`check_runtime_form`], which `setup`'s pre-commit validation shares, so there is no second copy of the
+/// rule here. `spawn_runtime_with_factory` (serve start-up and the gate-open build) and the start-up dry run
+/// ([`RuntimeRegistry::resolve_adapter_params`]) both decide through this function.
 fn uses_supervisor(card: &ComponentCard) -> Result<bool, String> {
     if is_subscription_provider_id(&card.provider.id) {
         return Ok(false);
@@ -452,12 +455,7 @@ fn uses_supervisor(card: &ComponentCard) -> Result<bool, String> {
     if crate::dispatch::is_resident_http_service(card) {
         return Ok(false);
     }
-    if card.form != Form::HttpService {
-        return Err(format!(
-            "provider {} with form {:?} has no runtime constructor",
-            card.provider.id, card.form
-        ));
-    }
+    check_runtime_form(card)?;
     Ok(true)
 }
 
@@ -497,6 +495,23 @@ fn is_trusted_local_card(card: &ComponentCard) -> bool {
         estimated_cost_minor: None,
         admission_status: idoris_policy::AdmissionStatus::Ready,
     })
+}
+
+/// 运行时能不能为这张卡构造运行时（纯函数）：订阅卡与 resident 的 HTTP 卡不走运行时（Ok）；其余的卡只有 `http_service`
+/// 形态有运行时构造器，别的形态是确定的拒绝。`uses_supervisor`（serve 启动与门控放行建表的 `spawn_runtime_with_factory`、
+/// 启动时的适配器干跑都经它）与 `setup` 的落盘前校验（[`crate::preflight`]）共用它，所以 `setup` 放行的目录不会再因为卡的
+/// `form` 让 serve 起不来。
+pub fn check_runtime_form(card: &ComponentCard) -> Result<(), String> {
+    if is_subscription_provider_id(&card.provider.id)
+        || crate::dispatch::is_resident_http_service(card)
+        || card.form == Form::HttpService
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "provider {} with form {:?} has no runtime constructor",
+        card.provider.id, card.form
+    ))
 }
 
 fn spawn_runtime_with_factory<F>(

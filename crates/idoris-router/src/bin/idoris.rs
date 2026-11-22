@@ -527,17 +527,16 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
         parse_bind_host(bind_host_raw.as_deref())?
     };
 
-    // 接口规范 §2.7.3（勘误十二（5））：canonical 路径在加载之前确定，加载与发布 `launch.components_dir` 用的是同一个结果。
-    let components_dir = canonical_components_dir(&config::resolve_env(
-        "IDORIS_COMPONENTS_DIR",
-        components::DEFAULT_COMPONENTS_DIR,
-    )?)?;
-    let allow_mock = env_flag("IDORIS_ALLOW_MOCK");
-    let cards = components::load_components(&components_dir, allow_mock).map_err(|err| {
-        format!(
-            "无法加载组件目录 \"{}\"（IDORIS_COMPONENTS_DIR）：{err}",
-            components_dir.display()
-        )
+    let components_dir_raw =
+        config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
+    // 与 `idoris setup` 的校验共用同一个取值与同一个 `dev-mock` 条件。
+    let allow_mock = components::allow_mock_from_env();
+    let lock_wait = components_lock_wait()?;
+    // 接口规范 §2.7.3、§2.7.8（勘误十二（5））：组件目录的 canonical 路径在这里**只确定一次**（`components::canonical_components_dir`），
+    // 对它加共享锁（与 `idoris setup` 的独占锁同一把：不会读到 setup 落盘到一半的卡集合）、相对锁住的目录读卡、发布给 launcher 的
+    // `launch.components_dir` 用的都是这同一个结果。
+    let (components_dir, cards) = load_serve_components(&components_dir_raw, |canonical| {
+        components::load_components_locked_canonical(canonical, allow_mock, lock_wait)
     })?;
     let subscription_config = SubscriptionConfig::snapshot(
         std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref(),
@@ -1266,23 +1265,45 @@ impl ManagedEngines {
     }
 }
 
-/// `IDORIS_COMPONENTS_DIR` 的 canonical 路径（接口规范 §2.7.3，勘误十二（5））。启动时**在加载组件卡之前**确定一次：加载与发布
-/// `launch.components_dir` 用同一个结果。此前加载用原路径、发布时再 `canonicalize` 一次（失败退回绝对路径），两次之间目录
-/// 被换掉时发布的不是加载的那一个，`canonicalize` 失败时发布的还不是 canonical。失败就是启动失败，不退回绝对路径；
-/// 说明沿用加载失败的那一句（点名 `IDORIS_COMPONENTS_DIR`）。
-fn canonical_components_dir(
-    components_dir: &std::path::Path,
-) -> Result<std::path::PathBuf, String> {
-    std::fs::canonicalize(components_dir).map_err(|error| {
+/// serve 等 `idoris setup` 放开组件目录锁的上限：默认 [`components::DIR_LOCK_WAIT`]；
+/// `IDORIS_COMPONENTS_LOCK_WAIT_MS`（毫秒，诊断与测试用）可以缩短或延长。
+/// 取值不是毫秒数是启动错误（不悄悄退回默认），过大的值按上限截断（[`components::parse_lock_wait_ms`]）。
+fn components_lock_wait() -> Result<std::time::Duration, String> {
+    components::parse_lock_wait_ms(
+        std::env::var("IDORIS_COMPONENTS_LOCK_WAIT_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// 加载 serve 的组件卡（接口规范 §2.7.3、§2.7.8，勘误十二（5））。`raw_dir` 是 `IDORIS_COMPONENTS_DIR` 的取值；它的 canonical 路径
+/// 由 `components::canonical_components_dir` **只确定一次**（那是全仓唯一的一份），`load` 收到的就是这个路径（生产里是
+/// `components::load_components_locked_canonical`：对它加共享锁、相对锁住的目录读卡），返回值的第一项也是它，调用方原样交给
+/// [`launch_snapshot`]：**加锁、读卡、发布给 launcher 的 `launch.components_dir` 是同一个路径**，目录或符号链接中途被换掉也不会各指各的。
+/// 路径解析或加载失败都是启动失败，说明沿用「无法加载组件目录」那一句（点名 `IDORIS_COMPONENTS_DIR`）。
+fn load_serve_components<L>(
+    raw_dir: &std::path::Path,
+    load: L,
+) -> Result<(std::path::PathBuf, Vec<idoris_contracts::ComponentCard>), String>
+where
+    L: FnOnce(
+        &std::path::Path,
+    ) -> Result<Vec<idoris_contracts::ComponentCard>, components::LoadError>,
+{
+    let failed = |error: &dyn std::fmt::Display| {
         format!(
-            "无法加载组件目录 \"{}\"（IDORIS_COMPONENTS_DIR）：无法解析 canonical 路径：{error}",
-            components_dir.display()
+            "无法加载组件目录 \"{}\"（IDORIS_COMPONENTS_DIR）：{error}",
+            raw_dir.display()
         )
-    })
+    };
+    let canonical =
+        components::canonical_components_dir(raw_dir).map_err(|error| failed(&error))?;
+    let cards = load(&canonical).map_err(|error| failed(&error))?;
+    Ok((canonical, cards))
 }
 
 /// 发现文件的 `launch`：启动输入快照（接口规范 §2.7.3）。`db_path` 是与实例锁用的同一个 canonical 基路径；`components_dir` 必须是
-/// [`canonical_components_dir`] 的结果（加载组件卡用的那一个）：这里**不再**解析路径，原样发布。
+/// [`load_serve_components`] 返回的那个 canonical 路径（加锁与读卡用的那一个）：这里**不再**解析路径，原样发布。
 fn launch_snapshot(
     db_path: &std::path::Path,
     components_dir: &std::path::Path,
@@ -1841,20 +1862,17 @@ mod tests {
         );
     }
 
-    /// 勘误十二（5）：`IDORIS_COMPONENTS_DIR` 在加载之前确定 canonical 路径，加载与发布用同一个结果；失败是启动失败，不退回绝对路径。
+    /// 勘误十二（5）：发布的 `launch.components_dir` 就是加载用的那个 canonical 路径，`launch_snapshot` 自己从不解析路径。
     #[cfg(unix)]
     #[test]
-    fn the_components_dir_is_resolved_to_one_canonical_path_that_loading_and_publishing_share() {
+    fn the_snapshot_publishes_the_path_it_is_given_without_resolving_it_again() {
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("first");
         std::fs::create_dir(&first).unwrap();
         let link = root.path().join("link");
         std::os::unix::fs::symlink(&first, &link).unwrap();
-
-        // 经符号链接给的路径，解析成真实目录的 canonical 路径（macOS 的 `/var` 实为 `/private/var`：临时目录自己也不是 canonical）。
-        let resolved = canonical_components_dir(&link).unwrap();
+        let resolved = components::canonical_components_dir(&link).unwrap();
         assert_eq!(resolved, std::fs::canonicalize(&first).unwrap());
-        assert_ne!(resolved, link);
 
         // 发布的是加载用的那个 canonical 路径，数据库路径与额度原样带上。
         let snapshot = launch_snapshot(
@@ -1866,13 +1884,12 @@ mod tests {
         assert_eq!(snapshot.components_dir, resolved.to_string_lossy());
         assert_eq!(snapshot.db_path, "/db/idoris.sqlite3");
         assert_eq!(snapshot.allocated_budget_bytes, Some(7));
-        // `launch_snapshot` 自己从不解析路径：给它符号链接本身，发布的就是这个字符串（解析是 `canonical_components_dir` 的事，
-        // 而且只在启动时做一次）。再解析一次的实现会在这里把链接换成真实目录，这条断言就红。
+        // 给它符号链接本身，发布的就是这个字符串（解析是 `components::canonical_components_dir` 的事，而且只在启动时做一次）。
+        // 再解析一次的实现会在这里把链接换成真实目录，这条断言就红。
         assert_eq!(
             launch_snapshot(std::path::Path::new("/db"), &link, None, &[]).components_dir,
             link.to_string_lossy()
         );
-
         // 发布时**不再**做 I/O：一个根本不存在的路径也原样发布（调用方负责给 canonical 的）。
         let ghost = std::path::Path::new("/definitely/not/there");
         assert_eq!(
@@ -1881,18 +1898,113 @@ mod tests {
         );
     }
 
+    /// 勘误十二（5）、§2.7.8：**加锁、读卡、发布给 launcher 的 `launch.components_dir` 是同一个路径**。加载进行到一半（目录已经打开、锁还没拿）
+    /// 时部署把 `current` 这个符号链接切到另一个目录：
+    /// - 锁：挂钩在「已打开」与「已加锁」两个阶段看到的目录都是 canonical 的那一个，不是符号链接，也不是切过去的那个；
+    /// - 读卡：读到的是原来那个目录里的卡，不是链接此刻指向的目录里的；
+    /// - 发布：快照里的 `components_dir` 就是这个 canonical 路径（再解析一次的实现会拿到切过去的那个）。
+    #[cfg(unix)]
     #[test]
-    fn a_components_dir_that_cannot_be_canonicalized_is_a_startup_failure_not_an_absolute_path() {
+    fn the_lock_the_card_reads_and_the_published_components_dir_are_one_and_the_same_path() {
+        use std::cell::RefCell;
+
+        let root = tempfile::tempdir().unwrap();
+        let card = |id: &str| {
+            include_str!("../../../../config/components/omlx.yaml").replacen(
+                "id: omlx",
+                &format!("id: {id}"),
+                1,
+            )
+        };
+        let dir_a = root.path().join("a");
+        let dir_b = root.path().join("b");
+        for (dir, id) in [(&dir_a, "card-a"), (&dir_b, "card-b")] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("card.yaml"), card(id)).unwrap();
+        }
+        let link = root.path().join("current");
+        std::os::unix::fs::symlink(&dir_a, &link).unwrap();
+        let canonical_a = std::fs::canonicalize(&dir_a).unwrap();
+        let canonical_b = std::fs::canonicalize(&dir_b).unwrap();
+
+        let seen = RefCell::new(Vec::new());
+        let hook = |phase: components::LoadPhase, dir: &std::path::Path| {
+            seen.borrow_mut().push((phase, dir.to_path_buf()));
+            if phase == components::LoadPhase::Opened {
+                // 部署此刻把 `current` 切到另一个目录。
+                std::fs::remove_file(&link).unwrap();
+                std::os::unix::fs::symlink(&dir_b, &link).unwrap();
+            }
+        };
+        let (components_dir, cards) = load_serve_components(&link, |canonical| {
+            components::load_components_locked_with_hook(
+                canonical,
+                false,
+                std::time::Duration::from_secs(5),
+                Some(&hook),
+            )
+        })
+        .unwrap();
+
+        // 链接此刻确实指向另一个目录：这个测试里「各指各的」是真的会发生的。
+        assert_eq!(std::fs::canonicalize(&link).unwrap(), canonical_b);
+        // 锁：打开与加锁用的都是 canonical 路径。
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                (components::LoadPhase::Opened, canonical_a.clone()),
+                (components::LoadPhase::Locked, canonical_a.clone()),
+            ]
+        );
+        // 读卡：读到的是原来那个目录里的卡。
+        assert_eq!(
+            cards
+                .iter()
+                .map(|card| card.provider.id.as_str())
+                .collect::<Vec<_>>(),
+            ["card-a"]
+        );
+        // 发布：交给快照的路径就是它，快照原样发布。
+        assert_eq!(components_dir, canonical_a);
+        assert_ne!(components_dir, canonical_b);
+        let snapshot = launch_snapshot(
+            std::path::Path::new("/db/idoris.sqlite3"),
+            &components_dir,
+            None,
+            &[],
+        );
+        assert_eq!(snapshot.components_dir, canonical_a.to_string_lossy());
+    }
+
+    /// 路径解析失败是启动失败（点名 `IDORIS_COMPONENTS_DIR` 与路径，不退回绝对路径），而且不会去加载；相对路径解析成绝对的 canonical 路径。
+    #[test]
+    fn a_components_dir_that_cannot_be_resolved_is_a_startup_failure_and_nothing_is_loaded() {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("missing");
-        let error = canonical_components_dir(&missing).unwrap_err();
+        let error = load_serve_components(&missing, |_| {
+            panic!("nothing may be loaded when the directory cannot be resolved")
+        })
+        .unwrap_err();
         assert!(error.starts_with("无法加载组件目录"), "{error}");
         assert!(error.contains("IDORIS_COMPONENTS_DIR"), "{error}");
         assert!(error.contains(&missing.display().to_string()), "{error}");
-        // 一个相对路径：解析成绝对的 canonical 路径（相对 cwd），不是原样保留。
-        let relative = canonical_components_dir(std::path::Path::new(".")).unwrap();
+        // 一个相对路径：解析成绝对的 canonical 路径（相对 cwd），不是原样保留；加载收到的也是它。
+        let (relative, _) = load_serve_components(std::path::Path::new("."), |canonical| {
+            assert_eq!(canonical, std::fs::canonicalize(".").unwrap());
+            Ok(Vec::new())
+        })
+        .unwrap();
         assert!(relative.is_absolute());
         assert_eq!(relative, std::fs::canonicalize(".").unwrap());
+        // 加载失败也是启动失败，说明里带着原始路径。
+        let error = load_serve_components(std::path::Path::new("."), |_| {
+            Err(components::LoadError::DirLocked {
+                dir: "x".to_string(),
+                waited_ms: 7,
+            })
+        })
+        .unwrap_err();
+        assert!(error.starts_with("无法加载组件目录"), "{error}");
     }
 
     #[cfg(unix)]
