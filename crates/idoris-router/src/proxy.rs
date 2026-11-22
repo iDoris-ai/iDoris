@@ -553,19 +553,29 @@ fn wall_clock_ms() -> u64 {
         })
 }
 
-/// `localhost` or a loopback IP literal. Anything else — other names
-/// included, since they may resolve off-host — counts as egress.
+/// Whether a connection to `url` lands on this machine, judged from the host the URL parser extracts (the
+/// host a client would actually connect to): `localhost` (also spelled `localhost.`), a loopback address
+/// (an IPv4-mapped IPv6 loopback such as `[::ffff:127.0.0.1]` included: that connection lands on
+/// `127.0.0.1`), or an unspecified address (`0.0.0.0`, `::`), which as a destination means "this host".
+/// The parser also normalizes the numeric spellings (`127.1`, `2130706433`, `0x7f.1`), and a user-info part
+/// (`127.0.0.1@evil.com`) is not the host. Anything else — other names included, since they may resolve
+/// off-host — counts as egress, and so does anything that does not parse to a host.
 pub(crate) fn is_loopback_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
     parsed.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
+        host.strip_suffix('.')
+            .unwrap_or(host)
+            .eq_ignore_ascii_case("localhost")
             || host
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
+                .is_ok_and(|ip| {
+                    let ip = ip.to_canonical();
+                    ip.is_loopback() || ip.is_unspecified()
+                })
     })
 }
 
@@ -594,6 +604,9 @@ pub struct ChatProxy {
     /// 在途的 resident 预热请求：同一模型的并发预热合并成一个请求、每把数据 key 自己发起的在途请求有上限
     /// （[`crate::warmup::Registry`]）。它保护的就是下面这 32 个并发许可，所以放在这个代理上：每个路由器各有各的。
     pub(crate) warmups: Arc<crate::warmup::Registry>,
+    /// 测试注入点（[`crate::warmup::RunHook`]）：让 resident 预热的领头任务停在发请求之前、放行之后可选地 panic。
+    #[cfg(test)]
+    pub(crate) warmup_run_hook: Option<Arc<crate::warmup::RunHook>>,
     body_timeout: Duration,
     max_body_bytes: usize,
     max_cache_bytes: usize,
@@ -820,6 +833,18 @@ impl ChatProxy {
         self.egress.snapshot()
     }
 
+    /// Observability of `POST /v1/models/warmup` on a resident card: how many warmup requests are in
+    /// flight through this proxy right now (the callers that led them, all keys together).
+    pub fn warmup_requests_in_flight(&self) -> usize {
+        self.warmups.requests_in_flight()
+    }
+
+    /// Observability of `POST /v1/models/warmup` on a resident card: how many callers are waiting on a
+    /// warmup request another caller started (they send nothing of their own).
+    pub fn warmup_followers_waiting(&self) -> usize {
+        self.warmups.followers_waiting()
+    }
+
     /// The POST exactly as it goes on the wire, recorded in the egress
     /// counter first when the host is not loopback.
     ///
@@ -881,6 +906,8 @@ impl ChatProxy {
             embeddings_header_timeout: EMBEDDINGS_HEADER_TIMEOUT,
             warmup_header_timeout: WARMUP_HEADER_TIMEOUT,
             warmups: Arc::default(),
+            #[cfg(test)]
+            warmup_run_hook: None,
             body_timeout: Duration::from_secs(60),
             max_body_bytes: 8 * 1024 * 1024,
             max_cache_bytes: 32 * 1024 * 1024,
@@ -2448,6 +2475,11 @@ mod tests {
             "http://127.9.9.9",
             "http://LOCALHOST:1",
             "http://[::1]:2/x",
+            // Spellings whose connection lands on this machine too (see `is_loopback_url`).
+            "http://localhost.:1",
+            "http://[::ffff:127.0.0.1]:1",
+            "http://0.0.0.0:1",
+            "http://[::]:1",
         ] {
             assert!(is_loopback_url(url), "{url}");
         }
@@ -2456,6 +2488,7 @@ mod tests {
             "https://api.openai.com/v1",
             "http://127.0.0.1.nip.io",
             "http://[::ffff:8.8.8.8]",
+            "http://[::ffff:10.0.0.5]",
             "not a url",
         ] {
             assert!(!is_loopback_url(url), "{url}");

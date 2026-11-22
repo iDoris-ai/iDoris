@@ -8,27 +8,31 @@
 //!   也不放宽它，那只对聊天开放远程卡）；请求的能力由角色定（`embed` 是 embedding，`rerank` 是 rerank，其余是 chat）；
 //!   单价非零的卡拒绝（预热只服务本地免费卡）。
 //! - **生命周期卡（oMLX 等）**：走 [`dispatch::ensure_loaded`]——和聊天的按需加载是同一段代码（读 catalog、拒未知模型、
-//!   Supervisor 的幂等 load：余量确认与驱逐都在里面）；加载完成即返回，**不生成任何 token**。三种角色（chat、embedding、
-//!   rerank）都一样，因为「就绪」就是「已加载」。同一模型的并发预热与并发的首个聊天请求由 Supervisor 合并成一次加载。
+//!   Supervisor 的幂等 load：余量确认与驱逐都在里面）；加载完成即返回，**不生成任何 token**。加载之前同样按 [`is_local_endpoint`]
+//!   复核选中的卡。三种角色（chat、embedding、rerank）都一样，因为「就绪」就是「已加载」。同一模型的并发预热与并发的首个聊天请求由
+//!   Supervisor 合并成一次加载。
 //! - **resident 卡**：没有生命周期可管，按能力发一个最小的真实请求（chat：`max_tokens: 1`；embedding：输入 `"warmup"`），
 //!   发出之前对选中的卡按 [`is_local_endpoint`] 复核一次（看的是真要发往的地址），不过就什么也不发。
 //!   请求在自己的任务里跑、有自己的响应头期限（[`crate::proxy::WARMUP_HEADER_TIMEOUT`]，不是聊天的 10 秒，也不是 `timeout_ms`）。
 //!   规范没有定义 rerank 的最小请求，rerank 的 resident 卡明确拒绝（400 `unsupported_field` / `unsupported_model`），什么也不发。
-//!   请求占着代理的一个并发许可（共 32 个，和聊天共用）直到结束，所以有两道限制（[`Registry`]）：同一模型的并发预热合并成一个请求，
-//!   每把数据 key 自己发起的在途请求有上限（429 `warmup_in_flight_limited`）。
+//!   请求占着代理的一个并发许可（共 32 个，和聊天共用）直到结束，所以有四道限制（[`Registry`]）：同一模型的并发预热合并成一个请求；
+//!   每个在途请求上并入者的个数有上限；每把数据 key 自己发起的在途请求有上限；全部 key 合计的在途请求也有上限。后三道超了是 429
+//!   `warmup_in_flight_limited`，带 `Retry-After`。一个预热并入别人的请求之前，先过它自己的鉴权、本机候选与预算（顺序：鉴权、本机候选、
+//!   并发上限的预检、预算，最后才登记），所以并入不是绕开这些检查的后门；并入的那个 200 里多一个 `"coalesced": true`。
+//!   最小请求本身不带幂等键（`ForwardOpts.request_id` 恒为 `None`，见 [`ResidentRequest::run`]）。
 //! - **`timeout_ms` 到点只是放弃等待**：返回 504 `warmup_timeout`，**不取消、不缩短**任何东西。生命周期卡：Supervisor 的加载任务
 //!   与请求的 future 无关，照常跑完并清掉 `load.pending`，之后的预热或聊天直接看到「已就绪」。resident 卡：最小请求在它自己的
 //!   任务里，不被打断，直到上游答了或它自己的期限到点，代理照常结算熔断的准入（504 按既有规则计入提供方熔断）。客户端断开同理。
 //!   预热自己的 `timeout_ms` 与客户端断开不留围栏；引擎侧的超时（`RuntimeAdapter::load_timeout`，生产缺省 180 秒）或 panic 保持
 //!   既有的「结果未知」保护，围栏保留（行为同聊天，没有变）。
-//! - **预算**：接了账本的部署里，`SpendGate::All` 下余额不足的租户聊天是 402，预热也一样（一次只读的 `check_admission`，不预留、
-//!   不结算），免费调用在默认的 `PaidOnly` 下放行。
+//! - **预算**：接了账本的部署里，`SpendGate::All` 下余额不足的租户聊天是 402，预热也一样（一次不插入预留行的 `check_admission`，
+//!   不结算；它要拿账本的锁，所以排在并发上限的预检之后），免费调用在默认的 `PaidOnly` 下放行。
 //! - 不进用量记录、不占用预算（本地免费；付费卡直接拒绝），写一条 `intent: warmup` 的审计事件（见 `record_id_middleware`）。请求被取消
 //!   （客户端断开）时中间件走不到那里，由 [`CancelAudit`] 补上：完成、`timeout_ms` 到点、取消各写恰好一条。
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -255,6 +259,11 @@ async fn warm_lifecycle(
     target: &str,
     headroom_confirmed: bool,
 ) -> Result<bool, Response> {
+    // 复核（同 [`warm_resident`]）：选卡已经把不在本机的卡排除了，这是加载请求发给引擎之前的最后一道。在查 Supervisor 之前，
+    // 所以过不去的卡不碰任何运行时。
+    if !is_local_endpoint(&selected.card) {
+        return Err(not_local_response(selected));
+    }
     let provider_id = selected.card.provider.id.as_str();
     // 没有这张卡的 Supervisor（或绑定的不是这张卡）：和聊天一样，失败即关闭。
     let Some(bound) = state
@@ -291,18 +300,43 @@ struct Job<'a> {
     capability: Capability,
     target: &'a str,
     started: Instant,
+    /// 这个预热并入了别人发起的在途请求（[`Join::Follow`]）：自己没有向上游发请求。200 的回答里标出来（`"coalesced": true`）。
+    coalesced: &'a AtomicBool,
 }
 
 // ---------------------------------------------------------------------------------------------
-// 同一模型的并发预热合并，与每把数据 key 的在途上限
+// 同一模型的并发预热合并，与在途请求的几道上限
 // ---------------------------------------------------------------------------------------------
 
 /// 每把数据 key 此刻自己发起的 resident 预热请求数的上限（见 [`Registry`]）。2 个够 Agent24 同时预热一个 chat 模型与一个
 /// embedding 模型；再多的不同模型要等一个结束。
-const MAX_IN_FLIGHT_PER_KEY: usize = 2;
+pub(crate) const MAX_IN_FLIGHT_PER_KEY: usize = 2;
 
-/// 超过 [`MAX_IN_FLIGHT_PER_KEY`] 时的错误类型与原因码（429）。
+/// 全部 key 合计的在途领头请求数的上限。每个领头请求占代理 32 个并发许可里的一个，8 个把聊天剩下至少 24 个：每把 key 的上限再
+/// 高，凑够许多把 key 也不能占满它们。
+pub(crate) const MAX_LEADERS_IN_FLIGHT: usize = 8;
+
+/// 一个在途请求上同时等着的并入者（不含领头的调用方）的上限。并入不占并发许可，但每个并入者都是一个等着的任务，还要先过自己的
+/// 预算检查（拿账本的锁）；64 个远多于 Agent24 会有的并发预热。
+pub(crate) const MAX_FOLLOWERS_PER_REQUEST: usize = 64;
+
+/// 429 的 `Retry-After`（秒）：只是提示。请求可能跑到 180 秒，没有哪个数是对的；10 秒够领头的请求答完或并入者走掉一批，又不至于
+/// 让调用方干等。
+pub(crate) const RETRY_AFTER_SECS: u64 = 10;
+
+/// 超过上面几个上限时的错误类型与原因码（429）。
 const LIMITED: &str = "warmup_in_flight_limited";
+
+/// 429 是因为哪一道上限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Limit {
+    /// 这把 key 自己发起的在途请求已经有 [`MAX_IN_FLIGHT_PER_KEY`] 个。
+    Key,
+    /// 全部 key 合计的在途领头请求已经有 [`MAX_LEADERS_IN_FLIGHT`] 个。
+    Global,
+    /// 要并入的那个在途请求上已经等着 [`MAX_FOLLOWERS_PER_REQUEST`] 个并入者。
+    Followers,
+}
 
 /// 一个 resident 最小请求在合并表里的身份：同一张卡（id 与端点）、同一种最小请求、同一个模型。
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -312,6 +346,26 @@ struct RequestKey {
     /// `"chat"` 或 `"embedding"`：同一个模型的两种最小请求是两个请求。
     kind: &'static str,
     model: String,
+}
+
+impl RequestKey {
+    fn of(card: &ComponentCard, kind: &'static str, model: &str) -> Self {
+        Self {
+            provider_id: card.provider.id.clone(),
+            endpoint: card.endpoint.clone(),
+            kind,
+            model: model.to_string(),
+        }
+    }
+}
+
+/// 预热哪种最小请求：chat 与 embedding 才有（规范只定义了这两种），别的能力（rerank）没有。
+fn request_kind(capability: Capability) -> Option<&'static str> {
+    match capability {
+        Capability::Chat => Some("chat"),
+        Capability::Embedding => Some("embedding"),
+        _ => None,
+    }
 }
 
 /// 一个 resident 最小请求的结果，摘出预热需要的部分：状态码，以及非 2xx 时要原样透传的类型与正文。
@@ -343,25 +397,50 @@ impl Answer {
 type Shared = watch::Receiver<Option<Arc<Answer>>>;
 
 /// 等一个在途请求的结果。
-struct Waiting(Shared);
+struct Waiting {
+    answer: Shared,
+    /// 并入者持有：它不再等（拿到了结果、`timeout_ms` 到点、客户端断开）时丢掉，把并入者的名额还回去。领头的调用方没有。
+    _follower: Option<FollowerGuard>,
+}
 
 impl Waiting {
     /// `None`：请求的任务没有留下结果就没了（panic，或运行时在关闭）。
     async fn answer(mut self) -> Option<Arc<Answer>> {
-        let answered = self.0.wait_for(Option::is_some).await.ok()?;
+        let answered = self.answer.wait_for(Option::is_some).await.ok()?;
         answered.clone()
     }
 }
 
-/// 一个代理上在途的 resident 预热请求，与每把数据 key 此刻自己发起了几个。
+/// 一个并入者在它所并入的在途请求上占的名额：丢掉就还。计数放在表项与并入者共享的原子数里，请求先结束、表项先没了也无妨。
+struct FollowerGuard(Arc<AtomicUsize>);
+
+impl Drop for FollowerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// 表里一个在途的请求。
+struct InFlight {
+    answer: Shared,
+    /// 此刻等着它的并入者数（不含领头的调用方）。加在持表的锁里，减在并入者丢掉 [`FollowerGuard`] 时、不持锁：所以持锁时读到的
+    /// 数可能比实际多一点点（刚走的那个还没减），只会让上限在边界上早一步拒绝，不会放多。
+    followers: Arc<AtomicUsize>,
+}
+
+/// 一个代理上在途的 resident 预热请求，与它们的几道上限。
 ///
-/// 为什么需要（PR-Daemon 对 #634 的预审 W-1）：resident 预热的请求在自己的任务里占着代理的一个并发许可，最长 180 秒加正文，
-/// 调用方却早就拿到了 504；一把数据 key 凑满 32 个并发预热就占满全部许可，别的租户的聊天得 503。两道限制：
+/// 为什么需要（PR-Daemon 对 #634 的预审 W-1，及其后的本地预审 L-3、L-4）：resident 预热的请求在自己的任务里占着代理的一个并发
+/// 许可，最长 180 秒加正文，调用方却早就拿到了 504；一把数据 key 凑满 32 个并发预热就占满全部许可，别的租户的聊天得 503。四道限制：
 ///
 /// 1. **合并**：同一（卡、端点、最小请求、模型）已经有请求在途时，后来的预热并入它——不再发请求、不占许可，等同一个结果。
-/// 2. **每 key 上限**：一把 key 自己发起（领头）的在途请求最多 [`MAX_IN_FLIGHT_PER_KEY`] 个，再多的 429 [`LIMITED`]。并入别人的
-///    请求不算（它不占许可）。名额由请求的任务持有，**请求真正结束才还**：调用方的 `timeout_ms` 到点、客户端断开都不还，所以
-///    一把 key 不论超时多少次，最多只占 N 个许可。
+/// 2. **并入者上限**：一个在途请求上同时等着的并入者最多 [`MAX_FOLLOWERS_PER_REQUEST`] 个，再多的 429 [`LIMITED`]。并入者不占许可，
+///    但每个都是一个等着的任务，还要先过自己的预算检查（拿账本的锁），所以不能无限多。
+/// 3. **每 key 上限**：一把 key 自己发起（领头）的在途请求最多 [`MAX_IN_FLIGHT_PER_KEY`] 个，再多的 429。并入别人的请求不算
+///    （它不占许可）。名额由请求的任务持有，**请求真正结束才还**：调用方的 `timeout_ms` 到点、客户端断开都不还，所以一把 key 不论
+///    超时多少次，最多只占 N 个许可。
+/// 4. **全局上限**：全部 key 合计的在途领头请求最多 [`MAX_LEADERS_IN_FLIGHT`] 个，再多的 429。每把 key 的上限再低，凑够许多把 key
+///    也能占满 32 个许可；这一道把聊天剩下的许可留出来。每个在途请求恰有一个领头的，所以在途请求数就是领头请求数。
 ///
 /// 只管 resident 卡：生命周期卡的预热不走代理的许可（加载在 Supervisor 里，同一模型本来就合并，别的模型 `supervisor_busy`）。
 /// 没有认证的调用方（开发的无 key 模式，只在本机回环）算一个整体。每个代理各有一份，所以每个路由器各管各的。
@@ -372,7 +451,7 @@ pub(crate) struct Registry {
 
 #[derive(Default)]
 struct Table {
-    requests: HashMap<RequestKey, Shared>,
+    requests: HashMap<RequestKey, InFlight>,
     leading: HashMap<Option<String>, usize>,
 }
 
@@ -382,8 +461,35 @@ enum Join {
     Lead(Lead, Waiting),
     /// 同样的请求已经在途：并入它，等它的结果。
     Follow(Waiting),
-    /// 要领头，但这把 key 已经领着 [`MAX_IN_FLIGHT_PER_KEY`] 个了。
-    Refused,
+    /// 超了一道上限：429。
+    Refused(Limit),
+}
+
+/// [`decide`] 的结论：只是判断，还没有登记任何东西。
+enum Decision<'t> {
+    Follow(&'t InFlight),
+    Lead,
+    Refused(Limit),
+}
+
+/// 一个预热此刻在表里的去向，不改任何东西。**登记**（[`Registry::join_or_lead`]）与**预检**（[`Registry::refusal`]）用的是这同一个
+/// 判断，所以预检说放行的，登记时只会因为中间有别人先到才可能被拒。先看有没有同样的请求在途（并入不占许可，所以先于领头的几道
+/// 上限），再依次看这把 key 的名额、全局的名额。
+fn decide<'t>(table: &'t Table, key: &RequestKey, caller: &Option<String>) -> Decision<'t> {
+    if let Some(in_flight) = table.requests.get(key) {
+        return if in_flight.followers.load(Ordering::SeqCst) >= MAX_FOLLOWERS_PER_REQUEST {
+            Decision::Refused(Limit::Followers)
+        } else {
+            Decision::Follow(in_flight)
+        };
+    }
+    if table.leading.get(caller).copied().unwrap_or(0) >= MAX_IN_FLIGHT_PER_KEY {
+        return Decision::Refused(Limit::Key);
+    }
+    if table.requests.len() >= MAX_LEADERS_IN_FLIGHT {
+        return Decision::Refused(Limit::Global);
+    }
+    Decision::Lead
 }
 
 impl Registry {
@@ -392,30 +498,55 @@ impl Registry {
         self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// 先看有没有同样的请求在途（并入不占名额，所以先于上限检查），没有才看这把 key 的名额。
+    /// 登记：并入同样的请求、领头，或者被拒。判断与登记在同一个临界区里。
     fn join_or_lead(self: &Arc<Self>, key: RequestKey, caller: Option<&str>) -> Join {
-        let mut table = self.lock();
-        if let Some(shared) = table.requests.get(&key) {
-            return Join::Follow(Waiting(shared.clone()));
-        }
         let caller = caller.map(str::to_string);
-        let leading = table.leading.get(&caller).copied().unwrap_or(0);
-        if leading >= MAX_IN_FLIGHT_PER_KEY {
-            return Join::Refused;
+        let mut table = self.lock();
+        match decide(&table, &key, &caller) {
+            Decision::Refused(limit) => Join::Refused(limit),
+            Decision::Follow(in_flight) => {
+                in_flight.followers.fetch_add(1, Ordering::SeqCst);
+                Join::Follow(Waiting {
+                    answer: in_flight.answer.clone(),
+                    _follower: Some(FollowerGuard(Arc::clone(&in_flight.followers))),
+                })
+            }
+            Decision::Lead => {
+                *table.leading.entry(caller.clone()).or_insert(0) += 1;
+                let (sender, receiver) = watch::channel(None);
+                table.requests.insert(
+                    key.clone(),
+                    InFlight {
+                        answer: receiver.clone(),
+                        followers: Arc::default(),
+                    },
+                );
+                Join::Lead(
+                    Lead {
+                        registry: Arc::clone(self),
+                        key,
+                        caller,
+                        sender,
+                        released: false,
+                    },
+                    Waiting {
+                        answer: receiver,
+                        _follower: None,
+                    },
+                )
+            }
         }
-        table.leading.insert(caller.clone(), leading + 1);
-        let (sender, receiver) = watch::channel(None);
-        table.requests.insert(key.clone(), receiver.clone());
-        Join::Lead(
-            Lead {
-                registry: Arc::clone(self),
-                key,
-                caller,
-                sender,
-                released: false,
-            },
-            Waiting(receiver),
-        )
+    }
+
+    /// 预检：此刻这样一个预热会不会因为哪一道上限被 429。什么也不登记。放在预算检查之前（它要拿账本的锁），免得一堆注定被拒的
+    /// 预热每个都去拿；真正的判断仍在登记时再做一次，两次之间别人先到的话以登记为准。
+    fn refusal(&self, key: &RequestKey, caller: Option<&str>) -> Option<Limit> {
+        let caller = caller.map(str::to_string);
+        let table = self.lock();
+        match decide(&table, key, &caller) {
+            Decision::Refused(limit) => Some(limit),
+            Decision::Follow(_) | Decision::Lead => None,
+        }
     }
 
     /// 请求结束：表项与这把 key 的名额都还回去。
@@ -432,6 +563,20 @@ impl Registry {
         if now_idle {
             table.leading.remove(caller);
         }
+    }
+
+    /// 观测：此刻在途的请求数（领头的，全部 key 合计）。
+    pub(crate) fn requests_in_flight(&self) -> usize {
+        self.lock().requests.len()
+    }
+
+    /// 观测：此刻等着别人发起的在途请求的并入者数（全部在途请求合计）。
+    pub(crate) fn followers_waiting(&self) -> usize {
+        self.lock()
+            .requests
+            .values()
+            .map(|in_flight| in_flight.followers.load(Ordering::SeqCst))
+            .sum()
     }
 
     /// 测试用：没有任何在途请求，也没有任何 key 占着名额。
@@ -481,20 +626,33 @@ impl Drop for Lead {
     }
 }
 
-/// 这把 key 自己发起的在途预热请求已经到了上限：429。
-fn limited_response(selected: &Selected) -> Response {
-    with_headers(
-        error_envelope(
-            StatusCode::TOO_MANY_REQUESTS,
-            LIMITED,
-            format!(
-                "this key already has {MAX_IN_FLIGHT_PER_KEY} resident warmup requests in flight (the limit): \
-                 wait for one to finish and retry, or warm a model that is already being warmed, \
-                 because concurrent warmups of the same model share one request"
-            ),
+/// 超了一道在途上限：429，带 `Retry-After`。三道上限共用一个错误类型与原因码，只有说明文字不同。
+fn limited_response(selected: &Selected, limit: Limit) -> Response {
+    let message = match limit {
+        Limit::Key => format!(
+            "this key already has {MAX_IN_FLIGHT_PER_KEY} resident warmup requests in flight (the limit): \
+             wait for one to finish and retry, or warm a model that is already being warmed, \
+             because concurrent warmups of the same model share one request"
         ),
+        Limit::Global => format!(
+            "{MAX_LEADERS_IN_FLIGHT} resident warmup requests are already in flight across all keys (the limit): \
+             retry shortly, or warm a model that is already being warmed, \
+             because concurrent warmups of the same model share one request"
+        ),
+        Limit::Followers => format!(
+            "{MAX_FOLLOWERS_PER_REQUEST} callers are already waiting on the warmup of this model (the limit): \
+             retry shortly, by when this warmup has most likely finished"
+        ),
+    };
+    let mut response = with_headers(
+        error_envelope(StatusCode::TOO_MANY_REQUESTS, LIMITED, message),
         selected,
-    )
+    );
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from(RETRY_AFTER_SECS),
+    );
+    response
 }
 
 /// 一个 resident 预热的最小请求，连同它跑起来需要的一切。它在自己的任务里跑，所以拥有全部数据，不借用请求的任何东西。
@@ -513,11 +671,50 @@ struct ResidentRequest {
     header_timeout: Duration,
 }
 
+/// 测试注入点（[`ResidentRequest::run`]）：让一个 resident 预热的领头任务停在发请求之前，等测试放行；放行之后可以让它 panic，
+/// 而不是发请求。用来让「并入者一定在领头的结束之前到」、以及领头任务 panic 的路径都不靠时间碰运气。
+#[cfg(test)]
+pub(crate) struct RunHook {
+    /// 领头任务在这里等：测试往里放许可才继续（`add_permits`）。
+    pub(crate) gate: tokio::sync::Semaphore,
+    /// 放行之后 panic，而不是发请求。
+    pub(crate) panic_after_gate: bool,
+    /// 到过门口的领头任务数。
+    pub(crate) arrived: AtomicUsize,
+}
+
+#[cfg(test)]
+impl RunHook {
+    /// 关着的门；`panic_after_gate` 为真时放行之后 panic。
+    pub(crate) fn closed(panic_after_gate: bool) -> Arc<Self> {
+        Arc::new(Self {
+            gate: tokio::sync::Semaphore::new(0),
+            panic_after_gate,
+            arrived: AtomicUsize::new(0),
+        })
+    }
+}
+
 impl ResidentRequest {
     /// 经聊天用的同一个代理发出去，一直等到它收尾（成功、上游的错误，或响应头期限到点的 504）。并发许可由代理在发送之前拿，随
     /// 返回的结果一起带着，结果被丢掉时才还（等结果的 handler 用完了丢，handler 已经走了则在任务结束时丢）；熔断的准入由代理在
-    /// 结果产生之前按既有规则结算（`claim.finish`）。不带幂等键。
+    /// 结果产生之前按既有规则结算（`claim.finish`）。
+    ///
+    /// **不变式：最小请求不带幂等键，`request_id` 恒为 `None`。** 代理的幂等缓存与在途表（重放）都按它建键：带了，这个最小请求的结果
+    /// 就会按领头调用方的 `X-iDoris-Request-Id` 登记下来，之后同一张卡上用同一个 id 的聊天会撞上它（409 `request_id_conflict`，或者
+    /// 重放预热的结果）。预热的合并由 [`Registry`] 做，不靠幂等键；`X-iDoris-Request-Id` 在预热里只用于审计关联，属于每个调用方
+    /// 自己（领头的与并入的各记各的），不属于那个被共享的请求。
     async fn run(self) -> ForwardOutcome {
+        #[cfg(test)]
+        if let Some(hook) = self.proxy.warmup_run_hook.as_ref() {
+            hook.arrived.fetch_add(1, Ordering::SeqCst);
+            if let Ok(permit) = hook.gate.acquire().await {
+                permit.forget();
+            }
+            if hook.panic_after_gate {
+                panic!("injected panic in the warmup leader task");
+            }
+        }
         let opts = ForwardOpts {
             request_id: None,
             tenant_id: self.tenant_id.as_deref(),
@@ -566,48 +763,45 @@ async fn warm_resident(
     job: &Job<'_>,
 ) -> Result<(), Response> {
     let target = job.target;
-    let (path, body, kind) = match job.capability {
+    // 规范只定义了 chat 与 embedding 的最小请求：别的能力（rerank）的 resident 卡不发一个种类不对的请求，明确拒绝，什么也不发。
+    let Some(kind) = request_kind(job.capability) else {
+        return Err(with_headers(
+            BadField::new(
+                "unsupported_model",
+                "warmup has a minimal request for chat and embedding only: a resident card for this capability cannot be warmed",
+            )
+            .into_response(),
+            selected,
+        ));
+    };
+    let (path, body) = match job.capability {
         Capability::Embedding => (
             BufferedUpstreamPath::EMBEDDINGS,
             json!({"model": target, "input": MINIMAL_INPUT}),
-            "embedding",
         ),
-        Capability::Chat => (
+        // 到这里只剩 chat：`request_kind` 已经把 chat 与 embedding 之外的能力挡在上面。
+        _ => (
             BufferedUpstreamPath::CHAT_COMPLETIONS,
             json!({
                 "model": target,
                 "messages": [{"role": "user", "content": MINIMAL_INPUT}],
                 "max_tokens": 1,
             }),
-            "chat",
         ),
-        // 规范只定义了 chat 与 embedding 的最小请求：别的能力（rerank）的 resident 卡不发一个种类不对的请求，明确拒绝，什么也不发。
-        _ => {
-            return Err(with_headers(
-                BadField::new(
-                    "unsupported_model",
-                    "warmup has a minimal request for chat and embedding only: a resident card for this capability cannot be warmed",
-                )
-                .into_response(),
-                selected,
-            ));
-        }
     };
     // 复核：选卡已经把不在本机的卡排除了，这是请求真正发出去之前的最后一道，看的是 `ResidentRequest` 里要发往的那个地址。
     // 在登记合并表之前，所以过不去的卡不占名额、不留表项。
     if !is_local_endpoint(&selected.card) {
         return Err(not_local_response(selected));
     }
-    let key = RequestKey {
-        provider_id: selected.card.provider.id.clone(),
-        endpoint: selected.card.endpoint.clone(),
-        kind,
-        model: target.to_string(),
-    };
+    let key = RequestKey::of(&selected.card, kind, target);
     let waiting = match state.proxy.warmups.join_or_lead(key, job.caller) {
-        Join::Refused => return Err(limited_response(selected)),
+        Join::Refused(limit) => return Err(limited_response(selected, limit)),
         // 同样的请求已经在途：并入它，不发请求、不占并发许可。
-        Join::Follow(waiting) => waiting,
+        Join::Follow(waiting) => {
+            job.coalesced.store(true, Ordering::SeqCst);
+            waiting
+        }
         Join::Lead(lead, waiting) => {
             let request = ResidentRequest {
                 proxy: Arc::clone(&state.proxy),
@@ -750,7 +944,9 @@ pub(crate) async fn warmup(
 ) -> Response {
     let identity = remote_identity.as_ref().map(|identity| &identity.0);
     let mut cancel_audit = CancelAudit::arm(&state, &headers, identity, &record_id);
-    let response = handle(&state, &headers, identity, &record_id, &body).await;
+    // 并入了别人发起的请求时置位，只用来在 200 的回答里标一个 `"coalesced": true`。
+    let coalesced = AtomicBool::new(false);
+    let response = handle(&state, &headers, identity, &record_id, &body, &coalesced).await;
     cancel_audit.defuse();
     response
 }
@@ -761,6 +957,7 @@ async fn handle(
     identity: Option<&AuthenticatedVirtualKey>,
     record_id: &str,
     body: &Bytes,
+    coalesced: &AtomicBool,
 ) -> Response {
     let value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
@@ -847,13 +1044,27 @@ async fn handle(
         Ok(target) => target,
         Err(error) => return crate::model_resolution_error(error),
     };
+    let caller = identity.map(|identity| identity.key_id.as_str());
+    // 并发上限的预检（本地预审 L-3）：resident 预热要是已经注定被 429，就别再去拿账本的锁。顺序是 鉴权、本机候选、并发上限的预检、
+    // 预算、最后才登记（`warm_resident` 里的 `join_or_lead`，那里再判断一次，以登记为准）：并入别人请求的预热同样先过自己的鉴权、
+    // 候选与预算，并入不是绕开它们的后门；而一个会被拒的，也不必为它付账本的锁。
+    if dispatch::is_resident_http_service(&selected.card)
+        && let Some(kind) = request_kind(capability)
+        && let Some(limit) = state
+            .proxy
+            .warmups
+            .refusal(&RequestKey::of(&selected.card, kind, &target), caller)
+    {
+        return limited_response(&selected, limit);
+    }
     // 预算（PR-Daemon 对 #634 的预审 W-2）：聊天对免费的本地模型也会过一遍账本（`SpendGate::All` 下余额为 0 是 402），预热不能是
-    // 绕开它的后门——加载或驱逐一个模型、对 resident 卡发一个 token，都是这个租户在用本机。这里只做一次**只读**的准入检查
-    // （`check_admission`，不预留、不结算、不写任何行）：预热本身不花钱，不占用预算，也不进用量记录。没有账本就不查（同聊天：
-    // 没接账本的部署里免费调用照常可用）；默认的 `PaidOnly` 对免费调用放行。余额不足的错误与聊天是同一个函数映射出来的。
+    // 绕开它的后门——加载或驱逐一个模型、对 resident 卡发一个 token，都是这个租户在用本机。这里做一次不插入预留行的准入检查
+    // （`check_admission`：不预留、不结算，但它要拿账本的锁、开一个写事务，所以不是零成本，才排在并发上限的预检之后）：预热本身不花钱，
+    // 不占用预算，也不进用量记录。没有账本就不查（同聊天：没接账本的部署里免费调用照常可用）；默认的 `PaidOnly` 对免费调用放行。
+    // 余额不足的错误与聊天是同一个函数映射出来的。
     if let Some(ledger) = state.budget_ledger.as_deref() {
         let budget_identity = budget::BudgetIdentity::resolve(
-            identity.map(|identity| identity.key_id.as_str()),
+            caller,
             Some(&target),
             selected.card.provider.id.as_str(),
         );
@@ -880,11 +1091,12 @@ async fn handle(
     let job = Job {
         privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         tenant_id: parsed.tenant_id.as_deref(),
-        caller: identity.map(|identity| identity.key_id.as_str()),
+        caller,
         record_id,
         capability,
         target: &target,
         started,
+        coalesced,
     };
     let work = async {
         if dispatch::is_resident_http_service(&selected.card) {
@@ -907,17 +1119,18 @@ async fn handle(
         // 任务）都与它无关，照常跑完。
         Err(_elapsed) => return timeout_response(&selected, request.timeout),
     };
-    with_headers(
-        Json(json!({
-            "model": target,
-            "provider_id": selected.card.provider.id,
-            "state": "ready",
-            "already_loaded": already_loaded,
-            "load_ms": crate::elapsed_ms(started),
-        }))
-        .into_response(),
-        &selected,
-    )
+    let mut answer = json!({
+        "model": target,
+        "provider_id": selected.card.provider.id,
+        "state": "ready",
+        "already_loaded": already_loaded,
+        "load_ms": crate::elapsed_ms(started),
+    });
+    // 并入了别人发起的请求：说一声，这个 `load_ms` 是它自己等了多久，不是一个它发出去的请求的耗时（L-1，只增）。
+    if coalesced.load(Ordering::SeqCst) {
+        answer["coalesced"] = json!(true);
+    }
+    with_headers(Json(answer).into_response(), &selected)
 }
 
 #[cfg(test)]
@@ -1059,7 +1272,7 @@ mod tests {
         match registry.join_or_lead(request(model), caller) {
             Join::Lead(lead, waiting) => (lead, waiting),
             Join::Follow(_) => panic!("{model}: expected to lead, but joined an in-flight request"),
-            Join::Refused => panic!("{model}: expected to lead, but the key is at its limit"),
+            Join::Refused(limit) => panic!("{model}: expected to lead, but refused: {limit:?}"),
         }
     }
 
@@ -1067,12 +1280,24 @@ mod tests {
         match registry.join_or_lead(request(model), caller) {
             Join::Follow(waiting) => waiting,
             Join::Lead(..) => panic!("{model}: expected to join an in-flight request, but led"),
-            Join::Refused => panic!("{model}: expected to join, but was refused"),
+            Join::Refused(limit) => panic!("{model}: expected to join, but refused: {limit:?}"),
+        }
+    }
+
+    /// 被拒就返回是哪一道上限；没被拒（领头或并入了）就让用例失败。被拒时什么也没登记。
+    fn refused_by(registry: &Arc<Registry>, model: &str, caller: Option<&str>) -> Limit {
+        match registry.join_or_lead(request(model), caller) {
+            Join::Refused(limit) => limit,
+            Join::Lead(..) => panic!("{model}: expected a refusal, but led"),
+            Join::Follow(_) => panic!("{model}: expected a refusal, but joined"),
         }
     }
 
     fn is_refused(registry: &Arc<Registry>, model: &str, caller: Option<&str>) -> bool {
-        matches!(registry.join_or_lead(request(model), caller), Join::Refused)
+        matches!(
+            registry.join_or_lead(request(model), caller),
+            Join::Refused(_)
+        )
     }
 
     fn answer(status: u16) -> Answer {
@@ -1231,6 +1456,7 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
         ] {
             let state = AppState::default();
             let selected = selected_as_is(card);
+            let coalesced = AtomicBool::new(false);
             let job = Job {
                 privacy: PrivacyClass::Any,
                 tenant_id: None,
@@ -1239,6 +1465,7 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
                 capability: Capability::Chat,
                 target: "model",
                 started: Instant::now(),
+                coalesced: &coalesced,
             };
             let refused = warm_resident(&state, &selected, &job).await.unwrap_err();
             assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE, "{what}");
@@ -1274,6 +1501,7 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
             .await;
         let state = AppState::default();
         let selected = selected_as_is(local_chat_card(&upstream.uri()));
+        let coalesced = AtomicBool::new(false);
         let job = Job {
             privacy: PrivacyClass::LocalOnly,
             tenant_id: None,
@@ -1282,8 +1510,317 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
             capability: Capability::Chat,
             target: "model",
             started: Instant::now(),
+            coalesced: &coalesced,
         };
         warm_resident(&state, &selected, &job).await.unwrap();
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        assert!(
+            !coalesced.load(Ordering::SeqCst),
+            "the one that sent the request did not join anyone's"
+        );
+    }
+
+    // ---- 全局上限、并入者上限、预检（本地预审 L-3、L-4） ----
+
+    /// 四把 key 各领头两个，正好是全局上限；返回它们的守卫（丢掉就还）。
+    fn fill_the_global_limit(registry: &Arc<Registry>) -> Vec<(Lead, Waiting)> {
+        let mut held = Vec::new();
+        for key in ["key-a", "key-b", "key-c", "key-d"] {
+            for index in 0..MAX_IN_FLIGHT_PER_KEY {
+                held.push(leads(registry, &format!("{key}-{index}"), Some(key)));
+            }
+        }
+        assert_eq!(held.len(), MAX_LEADERS_IN_FLIGHT);
+        held
+    }
+
+    #[test]
+    fn the_global_limit_counts_the_leaders_of_all_keys_and_followers_do_not_count() {
+        let registry = new_registry();
+        let mut held = fill_the_global_limit(&registry);
+        assert_eq!(registry.requests_in_flight(), MAX_LEADERS_IN_FLIGHT);
+        // 第五把 key 自己一个也没有，领头被全局上限拒绝；并入已经在途的请求不算领头，照样放行。
+        assert_eq!(
+            refused_by(&registry, "key-e-0", Some("key-e")),
+            Limit::Global
+        );
+        let _joined = follows(&registry, "key-a-0", Some("key-e"));
+        assert_eq!(registry.leading_for(Some("key-e")), 0);
+        // 一个结束了，全局的名额回来，第五把 key 可以领头。
+        let (finished, _) = held.remove(0);
+        finished.finish(answer(200));
+        let _fifth = leads(&registry, "key-e-0", Some("key-e"));
+        assert_eq!(registry.requests_in_flight(), MAX_LEADERS_IN_FLIGHT);
+    }
+
+    #[test]
+    fn the_per_key_limit_is_reported_before_the_global_one() {
+        let registry = new_registry();
+        let _held = fill_the_global_limit(&registry);
+        // key-a 已经领着自己的两个，表也满了：报的是更具体的那一道。
+        assert_eq!(refused_by(&registry, "more", Some("key-a")), Limit::Key);
+        assert_eq!(refused_by(&registry, "more", Some("key-e")), Limit::Global);
+    }
+
+    #[test]
+    fn a_request_takes_at_most_the_follower_limit_and_a_follower_that_stops_waiting_gives_its_place_back()
+     {
+        let registry = new_registry();
+        let (_lead, _) = leads(&registry, "m", Some("key"));
+        let mut followers: Vec<Waiting> = (0..MAX_FOLLOWERS_PER_REQUEST)
+            .map(|index| follows(&registry, "m", Some(&format!("follower-{index}"))))
+            .collect();
+        assert_eq!(registry.followers_waiting(), MAX_FOLLOWERS_PER_REQUEST);
+        // 再来一个并入者：被并入者上限拒绝，什么也没登记。
+        assert_eq!(
+            refused_by(&registry, "m", Some("one-more")),
+            Limit::Followers
+        );
+        assert_eq!(registry.followers_waiting(), MAX_FOLLOWERS_PER_REQUEST);
+        // 别的请求不受影响（它自己领头，不是这个请求的并入者）。
+        let _other = leads(&registry, "other", Some("one-more"));
+        // 一个并入者不再等了（丢掉 `Waiting`，等同于 `timeout_ms` 到点或客户端断开）：它的名额回来。
+        drop(followers.pop());
+        assert_eq!(registry.followers_waiting(), MAX_FOLLOWERS_PER_REQUEST - 1);
+        let _again = follows(&registry, "m", Some("late"));
+        assert_eq!(registry.followers_waiting(), MAX_FOLLOWERS_PER_REQUEST);
+    }
+
+    #[test]
+    fn the_follower_count_belongs_to_the_request_it_was_counted_on() {
+        let registry = new_registry();
+        let (first, _) = leads(&registry, "m", Some("key"));
+        // 它还占着旧请求上的名额（还没丢掉 `Waiting`），旧请求就结束了。
+        let straggler = follows(&registry, "m", Some("late"));
+        first.finish(answer(200));
+        // 同一个模型的新请求从零个并入者开始，不管旧请求上落在后面的那个怎么样；它之后走掉也不动新请求的计数。
+        let (_second, _) = leads(&registry, "m", Some("key"));
+        assert_eq!(registry.followers_waiting(), 0);
+        let _followers: Vec<Waiting> = (0..MAX_FOLLOWERS_PER_REQUEST)
+            .map(|index| follows(&registry, "m", Some(&format!("follower-{index}"))))
+            .collect();
+        drop(straggler);
+        assert_eq!(registry.followers_waiting(), MAX_FOLLOWERS_PER_REQUEST);
+        assert!(is_refused(&registry, "m", Some("one-more")));
+    }
+
+    #[test]
+    fn the_precheck_judges_like_registration_and_registers_nothing() {
+        let registry = new_registry();
+        assert_eq!(registry.refusal(&request("m"), Some("key")), None);
+        assert!(registry.is_idle(), "asking registered nothing");
+        let held = [
+            leads(&registry, "m", Some("key")),
+            leads(&registry, "n", Some("key")),
+        ];
+        // 这把 key 到了自己的上限：第三个模型会被拒，在途的两个模型仍然可以并入；问一问不会并入任何东西。
+        assert_eq!(
+            registry.refusal(&request("o"), Some("key")),
+            Some(Limit::Key)
+        );
+        assert_eq!(registry.refusal(&request("m"), Some("key")), None);
+        assert_eq!(registry.followers_waiting(), 0, "asking never joins");
+        assert_eq!(registry.leading_for(Some("key")), MAX_IN_FLIGHT_PER_KEY);
+        // 并入者上限：问一问同样说「会被拒」。
+        let _followers: Vec<Waiting> = (0..MAX_FOLLOWERS_PER_REQUEST)
+            .map(|index| follows(&registry, "m", Some(&format!("follower-{index}"))))
+            .collect();
+        assert_eq!(
+            registry.refusal(&request("m"), Some("late")),
+            Some(Limit::Followers)
+        );
+        drop(held);
+    }
+
+    // ---- 「本机」的判据（本地预审 L-6）与生命周期卡的复核（L-7） ----
+
+    /// 把端点换成测试给的字符串（不经 YAML：反斜杠、`@`、`#` 在 YAML 的双引号里有自己的意思）。
+    fn local_card_at(endpoint: &str) -> ComponentCard {
+        let mut card = local_chat_card("http://127.0.0.1:8088");
+        card.endpoint = endpoint.to_string();
+        card
+    }
+
+    /// 判据随**真要连接的目标**走，不随字符串的样子走：端点交给 URL 解析器，连接落在解析出来的主机上。
+    ///
+    /// - 落在本机的各种写法：`localhost`（含全限定的 `localhost.`）、各种 loopback 地址（含 IPv4 映射的 IPv6 loopback，那条连接落在
+    ///   `127.0.0.1`）、未指定的地址（`0.0.0.0`、`::` 作为目的地就是「本机」；在 macOS 上实测落在 `127.0.0.1` 与 `::1`），以及解析器
+    ///   规范成 `127.0.0.1` 的数字写法；用户信息（`@` 之前）不是主机；`?` 与 `#` 之后的一切不是主机（代理把路径接在端点后面，
+    ///   连接仍然落在端点的主机上）。
+    /// - 不是本机，或者从 URL 看不出落在哪：主机是别处的（含 `127.0.0.1@evil.com` 这种主机其实是 `evil.com` 的）；除 `localhost`
+    ///   以外的名字，由跑解析器的人说了算，不是 URL 自己的事实（`127.0.0.1.nip.io`、`localtest.me` 今天碰巧解析到 `127.0.0.1`，
+    ///   `*.localhost` 按 RFC 6761 该是 loopback，可不是每个解析器都这样做）；没有协议头的写法解析不出主机，连不出去。
+    #[test]
+    fn is_local_endpoint_follows_where_the_connection_would_actually_land() {
+        let lands_here = [
+            "http://127.0.0.1:8088",
+            "http://127.0.0.1:8088/v1/",
+            "https://localhost:8088",
+            "http://LOCALHOST:8088",
+            "http://localhost.:8088",
+            "http://[::1]:8088",
+            "http://[0:0:0:0:0:0:0:1]:8088",
+            "http://[::ffff:127.0.0.1]:8088",
+            "http://[::ffff:7f00:1]:8088",
+            "http://0.0.0.0:8088",
+            "http://0:8088",
+            "http://[::]:8088",
+            "http://127.1:8088",
+            "http://2130706433:8088",
+            "http://0x7f.1:8088",
+            "http://0177.0.0.1:8088",
+            "http://%6c%6f%63%61%6c%68%6f%73%74:8088",
+            "http://evil.com@127.0.0.1:8088",
+            "http://127.0.0.1:8088?@evil.com",
+            "http://127.0.0.1:8088#@evil.com",
+        ];
+        for endpoint in lands_here {
+            assert!(
+                is_local_endpoint(&local_card_at(endpoint)),
+                "{endpoint} lands on this machine"
+            );
+        }
+        let lands_elsewhere_or_nowhere_we_can_tell = [
+            "http://127.0.0.1@evil.com:8088",
+            "http://127.0.0.1:80@evil.com",
+            "http://localhost@evil.com:8088",
+            "http://evil.com\\@127.0.0.1",
+            "http://127.0.0.1%2f@evil.com",
+            "http://127.0.0.1.nip.io:8088",
+            "http://localtest.me:8088",
+            "http://foo.localhost:8088",
+            "http://localhost.localdomain:8088",
+            "http://10.0.0.5:8088",
+            "http://192.168.1.2:8088",
+            "http://8.8.8.8:8088",
+            "http://[::ffff:8.8.8.8]:8088",
+            "http://[::ffff:10.0.0.5]:8088",
+            "https://api.openai.com/v1",
+            "127.0.0.1:8088",
+            "localhost:8088",
+            "//127.0.0.1:8088",
+            "",
+            "not a url",
+        ];
+        for endpoint in lands_elsewhere_or_nowhere_we_can_tell {
+            assert!(
+                !is_local_endpoint(&local_card_at(endpoint)),
+                "{endpoint} does not land on this machine, or nothing says it does"
+            );
+        }
+    }
+
+    /// 判据的另一半：卡自己也得声明是本机的（可信本地三条件），端点在 loopback 上也不够。
+    #[test]
+    fn is_local_endpoint_also_needs_the_card_to_claim_to_be_local() {
+        assert!(is_local_endpoint(&local_card_at("http://127.0.0.1:8088")));
+        type Change = fn(&mut ComponentCard);
+        let claims: [(&str, Change); 7] = [
+            ("declared remote", |card| {
+                card.provider.locality = Locality::Remote;
+            }),
+            ("declared on the LAN", |card| {
+                card.provider.locality = Locality::Lan;
+            }),
+            ("privacy class any", |card| {
+                card.privacy_class = PrivacyClass::Any;
+            }),
+            ("may egress to the internet", |card| {
+                card.allowed_egress = vec![idoris_contracts::component_card::Egress::Internet];
+            }),
+            ("may egress to the LAN", |card| {
+                card.allowed_egress = vec![idoris_contracts::component_card::Egress::Lan];
+            }),
+            ("a spawned CLI", |card| {
+                card.form = idoris_contracts::component_card::Form::SpawnCli;
+            }),
+            ("the subscription relay", |card| {
+                card.provider.id = idoris_policy::SUBSCRIPTION_PROVIDER_ID.to_string();
+            }),
+        ];
+        for (what, change) in claims {
+            let mut card = local_card_at("http://127.0.0.1:8088");
+            change(&mut card);
+            assert!(
+                !is_local_endpoint(&card),
+                "{what}: the endpoint is on this machine, but the card does not claim to be"
+            );
+        }
+    }
+
+    /// 生命周期卡在加载之前也复核（本地预审 L-7）：选卡阶段被绕过时，一张端点指向别处的生命周期卡不碰任何运行时。
+    /// 对照：同一张卡、端点在本机，走到了查 Supervisor 那一步（这里没有注册运行时，所以是 `supervisor_unavailable`）——所以前一个
+    /// 回答是复核给的，不是别的什么给的。
+    #[tokio::test]
+    async fn a_lifecycle_card_whose_endpoint_is_not_on_this_machine_is_refused_before_the_runtime_is_asked()
+     {
+        let card: ComponentCard =
+            serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
+        let state = AppState::default();
+        let error_type = |response: Response| async move {
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            (status, body["error"]["type"].as_str().unwrap().to_string())
+        };
+
+        let mut elsewhere = card.clone();
+        elsewhere.endpoint = "http://warmup-lifecycle.invalid:8000".to_string();
+        let refused = warm_lifecycle(&state, &selected_as_is(elsewhere), "model", false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error_type(refused).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_eligible_candidate".to_string()
+            )
+        );
+
+        let on_this_machine = warm_lifecycle(&state, &selected_as_is(card), "model", false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error_type(on_this_machine).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "local_only_unavailable".to_string()
+            ),
+            "no runtime is registered for it: the lookup was reached"
+        );
+    }
+
+    // ---- 最小请求不带幂等键（本地预审 L-1） ----
+
+    /// 最小请求的 `request_id` 恒为 `None`（[`ResidentRequest::run`] 的不变式）：若带了，代理会把这个请求的结果按它登记进幂等缓存。
+    #[tokio::test]
+    async fn the_minimal_request_carries_no_idempotency_key_so_the_proxy_keeps_nothing_of_it() {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({"choices": [{"message": {"content": "x"}}]})),
+            )
+            .mount(&upstream)
+            .await;
+        let state = AppState::default();
+        let selected = selected_as_is(local_chat_card(&upstream.uri()));
+        let coalesced = AtomicBool::new(false);
+        let job = Job {
+            privacy: PrivacyClass::LocalOnly,
+            tenant_id: None,
+            caller: None,
+            record_id: "the-callers-record-id",
+            capability: Capability::Chat,
+            target: "model",
+            started: Instant::now(),
+            coalesced: &coalesced,
+        };
+        warm_resident(&state, &selected, &job).await.unwrap();
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        assert!(
+            state.proxy.cache.lock().unwrap().is_empty(),
+            "nothing of a warmup request is remembered for replay"
+        );
     }
 }

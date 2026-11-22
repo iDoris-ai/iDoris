@@ -72,6 +72,16 @@ fn app_with_short_header_timeouts(cards: Vec<ComponentCard>) -> Router {
 }
 
 async fn post(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    let (status, _headers, body) = post_full(app, uri, body).await;
+    (status, body)
+}
+
+/// [`post`]，连响应头一起交回来。
+async fn post_full(
+    app: &Router,
+    uri: &str,
+    body: Value,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
     let request = Request::builder()
         .method("POST")
         .uri(uri)
@@ -80,9 +90,11 @@ async fn post(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
         .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     (
         status,
+        headers,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
 }
@@ -194,10 +206,13 @@ async fn wait_for_idle(proxy: &proxy::ChatProxy) {
 }
 
 #[tokio::test]
-async fn a_resident_warmup_may_wait_longer_than_any_ordinary_call_through_the_proxy() {
-    // 它有自己的期限，正是因为冷加载比普通调用慢：比聊天（缺省 10 秒）与 embeddings（缺省 30 秒）的响应头超时都长。具体取多少是
-    // 个取舍（规范里写的是 180 秒）；这里只守住「比普通调用长」这个关系，不把实现里的那个数再抄一遍。
+async fn a_resident_warmup_has_the_180_second_deadline_the_spec_gives_it_and_waits_longer_than_any_ordinary_call()
+ {
+    // 勘误八（4）：resident 预热的最小请求有它自己的 180 秒响应头期限，「不是聊天的 10 秒，不是 embeddings 的 30 秒，也不是调用方的
+    // `timeout_ms`」。180 秒是规范写下的数（对外可见的行为），不是这里从实现里抄来的：实现把它改了，规范也得跟着改。
     let proxy = proxy::ChatProxy::new(idoris_upstream::http_client().unwrap());
+    assert_eq!(proxy.warmup_header_timeout, Duration::from_secs(180));
+    // 它有自己的期限，正是因为冷加载比普通调用慢：比聊天与 embeddings 的响应头超时都长。
     assert!(proxy.warmup_header_timeout > proxy.header_timeout);
     assert!(proxy.warmup_header_timeout > proxy.embeddings_header_timeout);
 }
@@ -246,6 +261,49 @@ async fn a_timed_out_resident_warmup_keeps_its_request_and_its_permit_until_the_
     );
 }
 
+/// 带注入点的代理（[`warmup::RunHook`]）：resident 预热的领头任务停在发请求之前，等测试放行；放行之后可以让它 panic。交出代理，
+/// 测试要看合并表与并发许可。
+fn app_with_run_hook(
+    cards: Vec<ComponentCard>,
+    hook: Arc<warmup::RunHook>,
+) -> (Router, Arc<proxy::ChatProxy>) {
+    let mut proxy = proxy::ChatProxy::new(idoris_upstream::http_client().unwrap());
+    proxy.warmup_run_hook = Some(hook);
+    let proxy = Arc::new(proxy);
+    let app = build_app(AppState {
+        cards,
+        proxy: proxy.clone(),
+        ..AppState::default()
+    });
+    (app, proxy)
+}
+
+/// 等到恰好 `count` 个并入者在等在途的预热请求：并入者登记之后才会在这里被数到，所以「放行」之前并入者一定已经到了，不靠时间碰运气。
+async fn wait_for_followers(proxy: &proxy::ChatProxy, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while proxy.warmup_followers_waiting() != count {
+        assert!(
+            Instant::now() < deadline,
+            "expected {count} follower(s), have {}",
+            proxy.warmup_followers_waiting()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// 等到恰好 `count` 个领头的预热请求在途。
+async fn wait_for_requests_in_flight(proxy: &proxy::ChatProxy, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while proxy.warmup_requests_in_flight() != count {
+        assert!(
+            Instant::now() < deadline,
+            "expected {count} request(s) in flight, have {}",
+            proxy.warmup_requests_in_flight()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// 等到上游收到了 `count` 个请求（请求是在任务里异步发出去的）。
 async fn wait_for_requests(server: &MockServer, count: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -264,15 +322,18 @@ async fn wait_for_requests(server: &MockServer, count: usize) {
 
 #[tokio::test]
 async fn thirty_two_concurrent_warmups_of_one_resident_model_share_one_request_and_one_permit() {
-    let upstream = slow_upstream(Duration::from_millis(1_500)).await;
-    let (app, proxy) = app_with_warmup_deadline(
+    // 三十一个并入者「一定在领头的结束之前到」靠注入点，不靠上游的延迟：领头的任务停在发请求之前，三十一个并入者都登记了才放行。
+    // 上游答得慢一点（1 秒）只是为了放行之后看得到那一个并发许可还占着。
+    let upstream = slow_upstream(Duration::from_millis(1_000)).await;
+    let hook = warmup::RunHook::closed(false);
+    let (app, proxy) = app_with_run_hook(
         vec![resident(
             "lmstudio",
             &upstream.uri(),
             "chat",
             "daily: \"up-model\"",
         )],
-        Duration::from_secs(30),
+        hook.clone(),
     );
     let total = proxy.available_permits_for_test();
     let mut warmups = tokio::task::JoinSet::new();
@@ -282,18 +343,32 @@ async fn thirty_two_concurrent_warmups_of_one_resident_model_share_one_request_a
             post(&app, warmup::WARMUP_PATH, json!({"model": "idoris/daily"})).await
         });
     }
-    // 三十二个都在途：只有领头的那一个请求到了上游，只占一个并发许可，其余三十一个在等它的结果。
+    // 一个领头、三十一个并入，领头的还没发出任何东西。
+    wait_for_followers(&proxy, 31).await;
+    assert_eq!(hook.arrived.load(Ordering::SeqCst), 1, "one leader");
+    assert_eq!(proxy.warmup_requests_in_flight(), 1);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 0);
+    hook.gate.add_permits(1);
+    // 只有领头的那一个请求到了上游，只占一个并发许可，其余三十一个在等它的结果。
     wait_for_requests(&upstream, 1).await;
     assert_eq!(proxy.available_permits_for_test(), total - 1);
-    let mut answered = 0;
+    let (mut answered, mut coalesced) = (0, 0);
     while let Some(done) = warmups.join_next().await {
         let (status, body) = done.unwrap();
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["state"], "ready");
         assert_eq!(body["already_loaded"], false);
+        if let Some(marker) = body.get("coalesced") {
+            assert_eq!(marker, &json!(true), "{body}");
+            coalesced += 1;
+        }
         answered += 1;
     }
     assert_eq!(answered, 32);
+    assert_eq!(
+        coalesced, 31,
+        "the 31 that joined say so, the one that led does not"
+    );
     assert_eq!(
         upstream.received_requests().await.unwrap().len(),
         1,
@@ -616,4 +691,159 @@ async fn the_explicit_header_deadline_replaces_the_path_default_and_none_keeps_i
             .unwrap_or_else(|never| match never {});
         assert_eq!(explicit.status, 200, "Some 取代该路径的缺省超时");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 本地预审（#634 的后续）：并入者上限与 `Retry-After`（L-2、L-3），领头任务 panic（M-1 d）
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn over_the_follower_limit_a_warmup_gets_429_with_retry_after_and_the_leader_is_unaffected() {
+    let upstream = slow_upstream(Duration::ZERO).await;
+    let hook = warmup::RunHook::closed(false);
+    let (app, proxy) = app_with_run_hook(
+        vec![resident(
+            "lmstudio",
+            &upstream.uri(),
+            "chat",
+            "daily: \"up-model\"",
+        )],
+        hook.clone(),
+    );
+    let total = proxy.available_permits_for_test();
+    let warm = |app: Router| async move {
+        post_full(&app, warmup::WARMUP_PATH, json!({"model": "idoris/daily"})).await
+    };
+    let leader = tokio::spawn(warm(app.clone()));
+    wait_for_requests_in_flight(&proxy, 1).await;
+    // 并入者上限个并入者，都在等同一个在途请求。
+    let mut followers = Vec::new();
+    for _ in 0..warmup::MAX_FOLLOWERS_PER_REQUEST {
+        followers.push(tokio::spawn(warm(app.clone())));
+    }
+    wait_for_followers(&proxy, warmup::MAX_FOLLOWERS_PER_REQUEST).await;
+    // 再来一个：429，同一个错误类型与原因码，带 `Retry-After` 与 served-locality；它什么也没登记。
+    let (status, headers, body) = warm(app.clone()).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["type"], "warmup_in_flight_limited");
+    assert_eq!(body["error"]["reason_code"], "warmup_in_flight_limited");
+    assert_eq!(
+        headers.get("retry-after").and_then(|v| v.to_str().ok()),
+        Some("10")
+    );
+    assert_eq!(
+        headers
+            .get("x-idoris-served-locality")
+            .and_then(|v| v.to_str().ok()),
+        Some("loopback")
+    );
+    assert_eq!(
+        proxy.warmup_followers_waiting(),
+        warmup::MAX_FOLLOWERS_PER_REQUEST
+    );
+    // 放行：领头的与六十四个并入者都拿到 200，被拒的那个不影响它们；上游只收到领头的那一个请求。
+    hook.gate.add_permits(1);
+    let (status, _headers, body) = leader.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("coalesced").is_none(), "the leader did not join");
+    for follower in followers {
+        let (status, _headers, body) = follower.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["coalesced"], json!(true));
+    }
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    wait_for_all_permits(&proxy, total, Duration::from_secs(10)).await;
+    wait_for_idle(&proxy).await;
+    assert_eq!(proxy.warmup_followers_waiting(), 0);
+}
+
+#[tokio::test]
+async fn when_the_leader_task_panics_the_follower_gets_a_500_and_the_slot_and_the_permit_come_back()
+{
+    let upstream = slow_upstream(Duration::ZERO).await;
+    let hook = warmup::RunHook::closed(true);
+    let (app, proxy) = app_with_run_hook(
+        vec![resident(
+            "lmstudio",
+            &upstream.uri(),
+            "chat",
+            "daily: \"up-model\"",
+        )],
+        hook.clone(),
+    );
+    let total = proxy.available_permits_for_test();
+    let warm = |app: Router, model: &'static str| async move {
+        post(&app, warmup::WARMUP_PATH, json!({"model": model})).await
+    };
+    let leader = tokio::spawn(warm(app.clone(), "model-one"));
+    wait_for_requests_in_flight(&proxy, 1).await;
+    let follower = tokio::spawn(warm(app.clone(), "model-one"));
+    wait_for_followers(&proxy, 1).await;
+    // 放行：领头的任务 panic，什么也没发给上游。
+    hook.gate.add_permits(1);
+    for (who, handle) in [("leader", leader), ("follower", follower)] {
+        let (status, body) = handle.await.unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{who}: {body}");
+        assert_eq!(body["error"]["type"], "internal_error", "{who}");
+        assert_eq!(
+            body["error"]["remediation"], "the warmup request did not complete",
+            "{who}: a fixed sentence, nothing of the panic"
+        );
+    }
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 0);
+    // 表项、名额、并入者的位置都还回来了，并发许可也没有泄漏。
+    wait_for_idle(&proxy).await;
+    assert_eq!(proxy.warmups.leading_for(None), 0);
+    assert_eq!(proxy.warmup_followers_waiting(), 0);
+    assert_eq!(proxy.available_permits_for_test(), total);
+    // 名额真的还了：这个 key（没有认证，算一个整体）又能领头满额的两个，不是一个也不是 429。
+    let again_one = tokio::spawn(warm(app.clone(), "model-two"));
+    let again_two = tokio::spawn(warm(app.clone(), "model-three"));
+    wait_for_requests_in_flight(&proxy, 2).await;
+    hook.gate.add_permits(2);
+    for handle in [again_one, again_two] {
+        assert_eq!(
+            handle.await.unwrap().0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "they panic in their turn too"
+        );
+    }
+    wait_for_idle(&proxy).await;
+}
+
+#[tokio::test]
+async fn a_429_for_the_per_key_limit_carries_retry_after_too() {
+    let upstream = slow_upstream(Duration::ZERO).await;
+    let hook = warmup::RunHook::closed(false);
+    let (app, proxy) = app_with_run_hook(
+        vec![resident(
+            "lmstudio",
+            &upstream.uri(),
+            "chat",
+            "daily: \"up-model\"",
+        )],
+        hook.clone(),
+    );
+    let total = proxy.available_permits_for_test();
+    let start = |model: &'static str| {
+        let app = app.clone();
+        tokio::spawn(async move { post(&app, warmup::WARMUP_PATH, json!({"model": model})).await })
+    };
+    let one = start("model-one");
+    let two = start("model-two");
+    wait_for_requests_in_flight(&proxy, 2).await;
+    let (status, headers, body) =
+        post_full(&app, warmup::WARMUP_PATH, json!({"model": "model-three"})).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["type"], "warmup_in_flight_limited");
+    assert_eq!(
+        headers.get("retry-after").and_then(|v| v.to_str().ok()),
+        Some("10")
+    );
+    hook.gate.add_permits(2);
+    for handle in [one, two] {
+        assert_eq!(handle.await.unwrap().0, StatusCode::OK);
+    }
+    wait_for_all_permits(&proxy, total, Duration::from_secs(10)).await;
+    wait_for_idle(&proxy).await;
 }
