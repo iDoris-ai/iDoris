@@ -4,12 +4,14 @@
 //! - **鉴权与 key 范围同聊天**：聊天在该模型上会被拒的 key，预热也被拒（`auth::enforce_scope`，与 embeddings 同一个入口
 //!   `enforce_protocol_key_scope`）。
 //! - **选卡同聊天**（同一套 `policy_cards` + `select_with_gate_fallback`，含角色绑定、隐私、熔断的就绪快照），另有三条：
-//!   订阅中转卡不参与（没有「加载」可言）；请求的能力由角色定（`embed` 是 embedding，`rerank` 是 rerank，其余是 chat）；
+//!   不在本机的卡不参与（[`is_local_endpoint`]：订阅中转卡、远程与局域网的卡、声明在本机而端点指向别处的卡；`X-iDoris-Privacy: any`
+//!   也不放宽它，那只对聊天开放远程卡）；请求的能力由角色定（`embed` 是 embedding，`rerank` 是 rerank，其余是 chat）；
 //!   单价非零的卡拒绝（预热只服务本地免费卡）。
 //! - **生命周期卡（oMLX 等）**：走 [`dispatch::ensure_loaded`]——和聊天的按需加载是同一段代码（读 catalog、拒未知模型、
 //!   Supervisor 的幂等 load：余量确认与驱逐都在里面）；加载完成即返回，**不生成任何 token**。三种角色（chat、embedding、
 //!   rerank）都一样，因为「就绪」就是「已加载」。同一模型的并发预热与并发的首个聊天请求由 Supervisor 合并成一次加载。
 //! - **resident 卡**：没有生命周期可管，按能力发一个最小的真实请求（chat：`max_tokens: 1`；embedding：输入 `"warmup"`），
+//!   发出之前对选中的卡按 [`is_local_endpoint`] 复核一次（看的是真要发往的地址），不过就什么也不发。
 //!   请求在自己的任务里跑、有自己的响应头期限（[`crate::proxy::WARMUP_HEADER_TIMEOUT`]，不是聊天的 10 秒，也不是 `timeout_ms`）。
 //!   规范没有定义 rerank 的最小请求，rerank 的 resident 卡明确拒绝（400 `unsupported_field` / `unsupported_model`），什么也不发。
 //!   请求占着代理的一个并发许可（共 32 个，和聊天共用）直到结束，所以有两道限制（[`Registry`]）：同一模型的并发预热合并成一个请求，
@@ -36,6 +38,7 @@ use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use idoris_backend::BackendError;
+use idoris_contracts::ComponentCard;
 use idoris_contracts::common::{Capability, PrivacyClass};
 use idoris_contracts::provider::Locality;
 use idoris_policy::Role;
@@ -47,7 +50,7 @@ use crate::dispatch::{
     self, ChatOutcome, DispatchError, DispatchFailure, EnsureLoadedError, Selected,
 };
 use crate::profile::parse_profile;
-use crate::proxy::{BufferedUpstreamPath, ChatProxy, ForwardOpts, ForwardOutcome};
+use crate::proxy::{BufferedUpstreamPath, ChatProxy, ForwardOpts, ForwardOutcome, is_loopback_url};
 use crate::{
     AppState, BufferedAuditMeta, RequestRecordId, apply_selected_headers, backend_error_response,
     budget, budget_error_response, error_envelope, error_envelope_with_reason,
@@ -176,6 +179,32 @@ fn warm_capability(role: Option<Role>) -> Capability {
 fn with_headers(mut response: Response, selected: &Selected) -> Response {
     apply_selected_headers(&mut response, selected.served_locality, &selected.decision);
     response
+}
+
+/// 预热只服务**本机**的卡：它发出的请求（resident 的最小请求，或生命周期卡的加载）不会离开这台机器。判据是两个已有的判断合在一起，
+/// 没有另写一套：
+///
+/// - [`models::is_trusted_local`]：路由给 `local_only` 请求用的可信本地三条件（实际 loopback、卡只承载 `local_only`、出站只有 none
+///   或 loopback），`/v1/models` 与 `/health` 探活的熔断口径用的也是它；订阅中转与 `spawn_cli` 卡在里面一律算远程。
+/// - [`is_loopback_url`]：代理自己判断「这个请求算不算非本机出口」的那个函数（出口计数、凭据类别、去标识都用它），按**真要发往的 URL
+///   的主机**判，不信卡自己声明的 locality：声明 loopback 而端点指向别处的卡（注册校验没拦住，或根本没走注册）在这里过不去。
+///
+/// 只看「单价为零」不够：免费的远程卡同样会被选中（`X-iDoris-Privacy: any` 下聊天本来就可以选它），预热却会向它的真实地址发一个请求。
+fn is_local_endpoint(card: &ComponentCard) -> bool {
+    models::is_trusted_local(card) && is_loopback_url(&card.endpoint)
+}
+
+/// 选中的卡不在本机：503 `no_eligible_candidate`（既有的错误类型，意思是「它不是预热的候选」），什么也不发。选卡阶段已经把这样的卡
+/// 排除在候选之外，这是请求发出之前的复核（[`warm_resident`]）没过时的回答。
+fn not_local_response(selected: &Selected) -> Response {
+    with_headers(
+        error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_eligible_candidate",
+            "warmup is only available for free local models; the selected card's endpoint is not on this machine, so nothing was sent",
+        ),
+        selected,
+    )
 }
 
 /// 一个后端错误，沿用聊天的信封与代码（`backend_error_response`：`headroom_confirmation_required`、`local_only_unavailable`
@@ -564,6 +593,11 @@ async fn warm_resident(
             ));
         }
     };
+    // 复核：选卡已经把不在本机的卡排除了，这是请求真正发出去之前的最后一道，看的是 `ResidentRequest` 里要发往的那个地址。
+    // 在登记合并表之前，所以过不去的卡不占名额、不留表项。
+    if !is_local_endpoint(&selected.card) {
+        return Err(not_local_response(selected));
+    }
     let key = RequestKey {
         provider_id: selected.card.provider.id.clone(),
         endpoint: selected.card.endpoint.clone(),
@@ -773,11 +807,10 @@ async fn handle(
     parsed.task.privacy = Some(inspection.effective);
 
     let policy = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
-    let cards: Vec<_> = policy
-        .cards
-        .into_iter()
-        .filter(|card| !idoris_policy::is_subscription_provider_id(&card.provider.id))
-        .collect();
+    // 候选只有本机的卡：订阅中转卡、远程与局域网的卡、端点指向别处的卡都不参与，隐私头是 `any` 也一样（它只对聊天开放远程卡）。
+    // 在选卡之前排除，而不是选完再拒绝：排在前面的远程卡不会把同一角色下的本机卡挡住，没有本机候选时得到的是选卡管线自己的 503
+    // （缺省的 `local_only` 是 `local_only_unavailable`，`any` 是 `no_eligible_candidate`），什么也不发。
+    let cards: Vec<_> = policy.cards.into_iter().filter(is_local_endpoint).collect();
     let blocked = state.proxy.blocked_cards(&cards);
     let selected = match dispatch::select_with_gate_fallback(
         &cards,
@@ -1136,5 +1169,121 @@ mod tests {
         drop(lead); // 任务 panic 了。
         assert!(registry.is_idle());
         assert!(follower.answer().await.is_none());
+    }
+
+    // ---- 只服务本机的卡（M1）：发请求之前的复核 ----
+
+    /// 一张 resident 的 chat 卡，声明的一切都是本机的（loopback、`local_only`、出站 loopback）；端点由测试定。
+    fn local_chat_card(endpoint: &str) -> ComponentCard {
+        serde_yaml::from_str(&format!(
+            r#"provider:
+  id: recheck
+  family: local
+  tier: local
+  capabilities: [chat]
+  privacy_class: local_only
+  cost: {{ input_per_m: 0, output_per_m: 0 }}
+  locality: loopback
+form: http_service
+endpoint: "{endpoint}"
+version_pin: "openai_compat@unknown"
+privacy_class: local_only
+allowed_egress: [loopback]
+fallback_policy: fail_closed
+fail_closed: true
+load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexist }}
+"#
+        ))
+        .unwrap()
+    }
+
+    /// 绕过选卡阶段：直接把一张卡当作「已选中的候选」。
+    fn selected_as_is(card: ComponentCard) -> Selected {
+        Selected {
+            decision: idoris_policy::Decision {
+                chosen_id: card.provider.id.clone(),
+                reason_codes: Vec::new(),
+                degradations: Vec::new(),
+            },
+            served_locality: card.provider.locality,
+            load_policy: card.load_policy.unwrap(),
+            card,
+            estimated_cost_minor: 0,
+        }
+    }
+
+    /// 选卡阶段已经把不在本机的卡排除了，所以从 HTTP 入口看不到复核起作用；这里把选卡绕过去，直接交给 `warm_resident`：请求照样发不
+    /// 出去，合并表里也不留名额与表项。两种卡各只有判据的一半拦得住：声明在远程的（端点碰巧在本机，所以只有「声明」拦得住它），
+    /// 和声明在本机而端点指向别处的（只有「地址」拦得住它）。
+    #[tokio::test]
+    async fn the_recheck_refuses_a_card_that_is_not_on_this_machine_before_anything_is_sent() {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&upstream)
+            .await;
+        let mut declared_remote = local_chat_card(&upstream.uri());
+        declared_remote.provider.locality = Locality::Remote;
+        let off_host = local_chat_card("http://warmup-recheck.invalid:9");
+        for (what, card) in [
+            ("declared remote, endpoint on this machine", declared_remote),
+            ("declared local, endpoint elsewhere", off_host),
+        ] {
+            let state = AppState::default();
+            let selected = selected_as_is(card);
+            let job = Job {
+                privacy: PrivacyClass::Any,
+                tenant_id: None,
+                caller: Some("key"),
+                record_id: "rec",
+                capability: Capability::Chat,
+                target: "model",
+                started: Instant::now(),
+            };
+            let refused = warm_resident(&state, &selected, &job).await.unwrap_err();
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE, "{what}");
+            let body = refused.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body["error"]["type"], "no_eligible_candidate",
+                "{what}: {body}"
+            );
+            assert!(
+                state.proxy.warmups.is_idle(),
+                "{what}: a refused card takes no slot and leaves no entry"
+            );
+            assert_eq!(
+                state.proxy.egress().requests,
+                0,
+                "{what}: no attempt towards an address off this machine"
+            );
+        }
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "nothing reached the endpoint that is on this machine either"
+        );
+    }
+
+    /// 对照：同一条路径上，一张声明与端点都在本机的卡不会被复核拦住（复核不是「一律拒绝」）。
+    #[tokio::test]
+    async fn the_recheck_lets_a_card_that_is_on_this_machine_through() {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&upstream)
+            .await;
+        let state = AppState::default();
+        let selected = selected_as_is(local_chat_card(&upstream.uri()));
+        let job = Job {
+            privacy: PrivacyClass::LocalOnly,
+            tenant_id: None,
+            caller: None,
+            record_id: "rec",
+            capability: Capability::Chat,
+            target: "model",
+            started: Instant::now(),
+        };
+        warm_resident(&state, &selected, &job).await.unwrap();
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     }
 }

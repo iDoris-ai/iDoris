@@ -2508,12 +2508,9 @@ async fn a_cooling_resident_card_is_skipped_when_another_card_can_warm() {
     assert_eq!(reply.body["provider_id"], "b-good");
 }
 
-#[tokio::test]
-async fn a_subscription_card_is_never_a_warmup_candidate() {
-    let subscription: ComponentCard =
-        serde_yaml::from_str(include_str!("../../../config/components/subscription.yaml")).unwrap();
-    // Remote-tier cards are eligible for `any` here, so only the warmup's own exclusion keeps it out.
-    let routing_policy = idoris_contracts::RoutingPolicy {
+/// 路由策略放行本机与远程两个层级（缺省只放行本机）：远程层级的卡在聊天里是可选的，所以拦住它们的只能是预热自己的规则。
+fn local_and_remote_tiers() -> idoris_contracts::RoutingPolicy {
+    idoris_contracts::RoutingPolicy {
         routing_policy: idoris_contracts::routing_policy::RoutingPolicyInner {
             version: 1,
             rules: Vec::new(),
@@ -2526,10 +2523,17 @@ async fn a_subscription_card_is_never_a_warmup_candidate() {
                 ..Default::default()
             },
         },
-    };
+    }
+}
+
+#[tokio::test]
+async fn a_subscription_card_is_never_a_warmup_candidate() {
+    let subscription: ComponentCard =
+        serde_yaml::from_str(include_str!("../../../config/components/subscription.yaml")).unwrap();
+    // Remote-tier cards are eligible for `any` here, so only the warmup's own exclusion keeps it out.
     let app = build_app(AppState {
         cards: vec![subscription],
-        routing_policy,
+        routing_policy: local_and_remote_tiers(),
         ..AppState::default()
     });
     let reply = warm_with(
@@ -2571,10 +2575,10 @@ async fn content_that_tightens_privacy_is_reported_in_the_reason_header() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 隐私：远程熔断开关与 `X-iDoris-Privacy`
+// 隐私与「只服务本机的卡」：远程熔断开关、`X-iDoris-Privacy`、不在本机的卡（M1）
 // ---------------------------------------------------------------------------------------------
 
-/// 一张「本机之外」的免费卡（局域网，隐私等级 any）：只有 `X-iDoris-Privacy: any` 才有资格被选。
+/// 一张「本机之外」的免费卡（局域网，隐私等级 any）：聊天里只有 `X-iDoris-Privacy: any` 才有资格选它；预热里它任何时候都不是候选。
 fn lan_card(endpoint: &str) -> ComponentCard {
     let mut card = resident_card("lan-box", endpoint, "chat", "daily: \"lan-model\"", false);
     card.provider.locality = idoris_contracts::provider::Locality::Lan;
@@ -2584,11 +2588,26 @@ fn lan_card(endpoint: &str) -> ComponentCard {
     card
 }
 
+/// 一张远程的免费卡（别人的云端点：层级 remote、隐私等级 any、出站 internet、单价为零）。端点由测试定：测试里指向本机的假上游，
+/// 所以只有卡的**声明**能把它挡在预热之外（单价为零、层级被路由策略放行、隐私等级允许远程，聊天里它是可选的）。
+fn remote_card(id: &str, endpoint: &str, capabilities: &str, roles: &str) -> ComponentCard {
+    let mut card = resident_card(id, endpoint, capabilities, roles, false);
+    card.provider.family = idoris_contracts::provider::Family::Openai;
+    card.provider.tier = idoris_contracts::common::Tier::Remote;
+    card.provider.locality = idoris_contracts::provider::Locality::Remote;
+    card.provider.privacy_class = PrivacyClass::Any;
+    card.privacy_class = PrivacyClass::Any;
+    card.allowed_egress = vec![idoris_contracts::component_card::Egress::Internet];
+    card
+}
+
+const ANY: [(&str, &str); 1] = [("X-iDoris-Privacy", "any")];
+
 #[tokio::test]
 async fn privacy_defaults_to_local_only_and_the_kill_switch_pins_any_back_to_local() {
     let server = upstream().await;
     let app = resident_app(vec![lan_card(&server.uri())]);
-    // 缺省 local_only：局域网卡没有资格。
+    // 缺省 local_only：局域网卡没有资格，选卡管线答 `local_only_unavailable`。
     let reply = warm(&app, json!({"model": "idoris/daily"})).await;
     assert_eq!(
         reply.status,
@@ -2596,18 +2615,28 @@ async fn privacy_defaults_to_local_only_and_the_kill_switch_pins_any_back_to_loc
         "{}",
         reply.raw
     );
+    assert_eq!(
+        reply.error_type(),
+        "local_only_unavailable",
+        "{}",
+        reply.raw
+    );
+    // 声明 any：选卡管线放行局域网卡，预热不放行（另见 `a_zero_priced_remote_resident_card_…`），答的是 `no_eligible_candidate`。
+    let reply = warm_with(&app, json!({"model": "idoris/daily"}), &ANY).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.raw
+    );
+    assert_eq!(reply.error_type(), "no_eligible_candidate", "{}", reply.raw);
     assert_eq!(requests_of(&server).await.len(), 0);
-    // 声明 any：有资格，served-locality 如实报 lan。
-    let reply = warm_with(
-        &app,
-        json!({"model": "idoris/daily"}),
-        &[("X-iDoris-Privacy", "any")],
-    )
-    .await;
+    // 对照：同一张卡、同一个 `any`，聊天确实能到它，served-locality 如实报 lan（所以上面不是夹具坏了）。这是上游收到的唯一一个请求。
+    let reply = chat(&app, "idoris/daily", &ANY).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
     assert_eq!(reply.header("x-idoris-served-locality"), Some("lan"));
     assert_eq!(requests_of(&server).await.len(), 1);
-    // 远程熔断开关合上：any 被钉回 local_only，同一个请求不再能到局域网卡。
+    // 远程熔断开关合上：any 被钉回 local_only，答的从 `no_eligible_candidate` 变回 `local_only_unavailable`，同一个请求不再有资格。
     let state = AppState {
         cards: vec![lan_card(&server.uri())],
         ..AppState::default()
@@ -2616,12 +2645,7 @@ async fn privacy_defaults_to_local_only_and_the_kill_switch_pins_any_back_to_loc
         .remote_kill_switch
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let app = build_app(state);
-    let reply = warm_with(
-        &app,
-        json!({"model": "idoris/daily"}),
-        &[("X-iDoris-Privacy", "any")],
-    )
-    .await;
+    let reply = warm_with(&app, json!({"model": "idoris/daily"}), &ANY).await;
     assert_eq!(
         reply.status,
         StatusCode::SERVICE_UNAVAILABLE,
@@ -2629,9 +2653,139 @@ async fn privacy_defaults_to_local_only_and_the_kill_switch_pins_any_back_to_loc
         reply.raw
     );
     assert_eq!(
+        reply.error_type(),
+        "local_only_unavailable",
+        "{}",
+        reply.raw
+    );
+    assert_eq!(
         requests_of(&server).await.len(),
         1,
-        "开关合上之后一个字节也没出去"
+        "开关合上之后一个字节也没出去（那一个是上面聊天的）"
+    );
+}
+
+/// M1 的场景：层级被路由策略放行、隐私等级允许远程、单价为零的远程 resident 卡。聊天选得到它，预热不能向它的真实地址发请求。
+#[tokio::test]
+async fn a_zero_priced_remote_resident_card_is_not_warmed_up_and_receives_no_request() {
+    let server = upstream().await;
+    let app = resident_app_with(
+        vec![
+            remote_card(
+                "cloud-chat",
+                &server.uri(),
+                "chat",
+                "daily: \"cloud-model\"",
+            ),
+            remote_card(
+                "cloud-embed",
+                &server.uri(),
+                "embedding",
+                "embed: \"cloud-embed\"",
+            ),
+        ],
+        |state| state.routing_policy = local_and_remote_tiers(),
+    );
+    // 对照：聊天在同样的条件下选的就是这张卡、也发了请求（场景成立）；这是上游收到的唯一一个请求。
+    let reply = chat(&app, "idoris/daily", &ANY).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
+    assert_eq!(reply.header("x-idoris-served-locality"), Some("remote"));
+    assert_eq!(requests_of(&server).await.len(), 1);
+    for model in ["idoris/daily", "idoris/embed"] {
+        let reply = warm_with(&app, json!({"model": model}), &ANY).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{model}: {}",
+            reply.raw
+        );
+        assert_eq!(
+            reply.error_type(),
+            "no_eligible_candidate",
+            "{model}: {}",
+            reply.raw
+        );
+        // 选卡阶段就排除了它，回答里没有任何一张卡的信息；它也没有被选中过。
+        assert_eq!(reply.header("x-idoris-served-locality"), None, "{model}");
+    }
+    assert_eq!(
+        requests_of(&server).await.len(),
+        1,
+        "预热没有向远程卡发任何请求"
+    );
+}
+
+/// 候选在选卡之前排除，不是选完再拒绝：同价、同准入状态时按 id 字典序选，排在前面的远程卡不能把同一角色下的本机卡挡住。
+#[tokio::test]
+async fn a_local_card_is_still_warmed_when_a_remote_card_ranks_ahead_of_it_for_the_same_role() {
+    let remote = upstream().await;
+    let local = upstream().await;
+    let app = resident_app_with(
+        vec![
+            remote_card("a-cloud", &remote.uri(), "chat", "daily: \"cloud-model\""),
+            resident_card(
+                "z-local",
+                &local.uri(),
+                "chat",
+                "daily: \"local-model\"",
+                false,
+            ),
+        ],
+        |state| state.routing_policy = local_and_remote_tiers(),
+    );
+    // 对照：聊天（`any`）选的是排在前面的远程卡，所以不排除它的话预热也会选它。
+    let reply = chat(&app, "idoris/daily", &ANY).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
+    assert_eq!(reply.header("x-idoris-served-locality"), Some("remote"));
+    assert_eq!(requests_of(&remote).await.len(), 1);
+    let reply = warm_with(&app, json!({"model": "idoris/daily"}), &ANY).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
+    assert_eq!(reply.body["provider_id"], "z-local");
+    assert_eq!(reply.body["model"], "local-model");
+    assert_eq!(reply.header("x-idoris-served-locality"), Some("loopback"));
+    assert_eq!(requests_of(&local).await.len(), 1);
+    assert_eq!(
+        requests_of(&remote).await.len(),
+        1,
+        "远程卡只收到聊天的那一个请求"
+    );
+}
+
+/// 声明的一切都是本机的，端点却是个外部的主机名：注册校验会拒绝这样的卡，但预热不能指望卡一定走过注册，所以按真要发往的地址判。
+/// 代理在每次发送之前记出口计数（连不上也算一次），所以计数为零就是没有任何向非本机地址发送的尝试。
+#[tokio::test]
+async fn a_card_that_declares_itself_local_but_whose_endpoint_is_elsewhere_is_not_sent_to() {
+    let liar = resident_card(
+        "liar",
+        "http://warmup-m1.invalid:9",
+        "chat",
+        "daily: \"liar-model\"",
+        false,
+    );
+    let state = AppState {
+        cards: vec![liar],
+        ..AppState::default()
+    };
+    let proxy = Arc::clone(&state.proxy);
+    let app = build_app(state);
+    let expected = [
+        (&[][..], "local_only_unavailable"),
+        (&ANY[..], "no_eligible_candidate"),
+    ];
+    for (headers, error_type) in expected {
+        let reply = warm_with(&app, json!({"model": "idoris/daily"}), headers).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{headers:?}: {}",
+            reply.raw
+        );
+        assert_eq!(reply.error_type(), error_type, "{headers:?}: {}", reply.raw);
+    }
+    assert_eq!(
+        proxy.egress().requests,
+        0,
+        "没有向非本机的地址发过任何请求（连不上也记一次）"
     );
 }
 

@@ -555,7 +555,7 @@ fn wall_clock_ms() -> u64 {
 
 /// `localhost` or a loopback IP literal. Anything else — other names
 /// included, since they may resolve off-host — counts as egress.
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
