@@ -318,6 +318,65 @@ fn a_late_settlement_of_a_grace_hold_counts_the_platform_share_once_and_freezes_
 }
 
 #[test]
+fn a_late_settlement_that_the_platform_absorbs_whole_still_records_its_zero_late_settle_entry() {
+    // v0.5.0 / main 的迟到结算总是记一条 `late_settle`，哪怕记到链上的金额是 0；重排结算顺序（再复审 High 2）的时候不能让它悄悄消失，
+    // 审计看分录：预留、过期、迟到结算各一条。
+    //
+    // 余额 20 的账户先花掉 20（预留 10 + 2 * 5 = 20，按 20 结算），余额 0；T0 + 1 000 宽限预留 210（余额 0，缺口 210 不超过一次预留，
+    // 下限 0，平台承担缺口 210），TTL 之后才按 100 结算：宽限承担 G = min(100, 210) - 0 = 100，记到链上 100 - 100 = 0，
+    // 没有超出预留的部分：用户承担 0、担保人 0、平台损失 0。`emp` 名下这个预留的分录：reserve +210、expire -210（都在预留创建的
+    // 时刻 T0 + 1 000），late_settle 0 / 0（在结算的时刻）。
+    let db = TempDb::new("conserve-late-grace-zero");
+    let store = paid_chain(&db, 20);
+    let first = Req::new(&store, "r-0", 0, "cred-e", 5).at(T0);
+    let decision = store.admit_attempt(&first.input()).unwrap();
+    assert!(decision.is_admitted(), "{decision:?}");
+    store
+        .settle_attempt(&attempt("r-0", 0), &price(20), ts(T0 + 100))
+        .unwrap();
+    assert_eq!(balance(&store, "emp", T0 + 500), 0);
+
+    let decision = admit_with_ladder(&store, "r-1", "cred-e", 100, T0 + 1_000);
+    assert!(
+        matches!(decision, AdmissionDecision::Grace { .. }),
+        "{decision:?}"
+    );
+    let late_at = T0 + 1_000 + ttl(&store) + 1_000;
+    let outcome = store
+        .settle_attempt(&attempt("r-1", 0), &price(100), ts(late_at))
+        .unwrap();
+    assert!(outcome.late, "{outcome:?}");
+    assert_eq!(outcome.grace_absorbed, thb(100), "{outcome:?}");
+    assert_eq!(outcome.user_borne, thb(0), "{outcome:?}");
+    assert_eq!(outcome.overage, thb(0), "{outcome:?}");
+    assert_eq!(outcome.sponsor_covered, thb(0), "{outcome:?}");
+    assert_eq!(outcome.platform_loss, thb(0), "{outcome:?}");
+    assert!(!outcome.credential_frozen, "{outcome:?}");
+    assert_conserved(&db, "r-1#0", "emp", 100, &outcome);
+    assert_eq!(
+        store
+            .entries_of_hold(&attempt("r-1", 0), "model")
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.account == "emp")
+            .map(|entry| (
+                entry.kind,
+                entry.held,
+                entry.spent,
+                entry.window_at.millis()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("reserve".to_string(), 210, 0, T0 + 1_000),
+            ("expire".to_string(), -210, 0, T0 + 1_000),
+            ("late_settle".to_string(), 0, 0, late_at),
+        ],
+        "the late settlement is on the books even though it cost the chain nothing"
+    );
+    assert_clean(&store);
+}
+
+#[test]
 fn a_late_settlement_of_a_grace_hold_that_overshoots_the_reservation_is_split_without_overlap() {
     // 迟到、宽限、而且实际消费超出预留：宽限承担 min(A, R) - 下限；剩下的（含超出预留的部分）才按迟到 overage 分
     let db = TempDb::new("conserve-late-grace-over");
