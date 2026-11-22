@@ -34,7 +34,8 @@ use std::time::Duration;
 use admin::AdminRequestError;
 
 use idoris_backend::{
-    BackendError, BackendStatus, ChatRequest, ChatResponse, ModelInfo, RuntimeAdapter,
+    BackendError, BackendStatus, ChatRequest, ChatResponse, LOAD_CONFIRMATION_FLOOR, ModelInfo,
+    RuntimeAdapter,
 };
 use idoris_contracts::LoadPolicy;
 use idoris_contracts::load_policy::LoadMode;
@@ -71,7 +72,8 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default deadline of one whole load (IDORIS-CORE S8, interface spec §2.11.2): the `POST /v1/models/{id}/load`
 /// **and** the pin and state verification that follow it, which must all finish inside it (PR-Daemon's #634
-/// review, W-3). Loading a model is not a management call: Qwen3-8B takes about 4 s cold
+/// review, W-3; the confirmation is always given at least [`LOAD_CONFIRMATION_FLOOR`], so a load accepted
+/// at the very end of the budget can still be confirmed). Loading a model is not a management call: Qwen3-8B takes about 4 s cold
 /// (`spike/u0/U0-LOG.md`) and the 27B the 48 GiB+ tier recommends is expected to take much longer, but under
 /// [`DEFAULT_CALL_TIMEOUT`] such a load would be reported as an unknown outcome and leave the durable
 /// fence behind — exactly what a first-start warmup of a big model must not do. The adapter only uses
@@ -90,6 +92,30 @@ pub const MIN_LOAD_TIMEOUT_SECS: u64 = 1;
 /// Upper bound of [`LOAD_TIMEOUT_ENV`]: one load holds the Supervisor's single load/evict mutex for as
 /// long as it runs, so a typo must not be able to hold it for days.
 pub const MAX_LOAD_TIMEOUT_SECS: u64 = 3600;
+
+/// What the confirmation after an accepted load (pin and state verification) may still spend, given the
+/// load `budget`, how long the `POST` has `spent`, and the confirmation `floor` (the adapter's
+/// [`LOAD_CONFIRMATION_FLOOR`], or its `call_timeout` if that is shorter) — local review of #634, L-5:
+///
+/// - `None` when the request itself used the whole budget: nothing is sent after that, the outcome is
+///   already unknown;
+/// - otherwise what the budget has left, but never less than `floor`: a load the engine accepted with
+///   100 ms to spare must still get a fair chance to be confirmed, instead of being reported unknown —
+///   fence retained — although the model is loaded.
+///
+/// The whole `load` therefore takes at most `budget + floor`, and the floor is never above
+/// [`LOAD_CONFIRMATION_FLOOR`], which the Supervisor's backstop accounts for.
+pub(crate) fn confirmation_allowance(
+    budget: Duration,
+    spent: Duration,
+    floor: Duration,
+) -> Option<Duration> {
+    let remaining = budget.saturating_sub(spent);
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(remaining.max(floor))
+}
 
 /// Parses the raw value of [`LOAD_TIMEOUT_ENV`] (`None` = not set).
 pub fn load_timeout_from_env(raw: Option<&std::ffi::OsStr>) -> Result<Duration, BackendError> {
@@ -204,6 +230,9 @@ pub struct OmlxAdapter {
     /// use `call_timeout` for the POST and, as before, `call_timeout` for each later call (see
     /// [`DEFAULT_LOAD_TIMEOUT`]).
     load_timeout: Option<Duration>,
+    /// How long the confirmation after an accepted load is given at least, however little of the load budget
+    /// the POST left (never above [`LOAD_CONFIRMATION_FLOOR`], and never above `call_timeout`).
+    confirmation_floor: Duration,
     chat_timeout: Duration,
     client: reqwest::Client,
     admin_session: tokio::sync::Mutex<Option<reqwest::header::HeaderValue>>,
@@ -219,6 +248,7 @@ impl OmlxAdapter {
             api_key: config.api_key,
             call_timeout: config.call_timeout,
             load_timeout: None,
+            confirmation_floor: LOAD_CONFIRMATION_FLOOR,
             chat_timeout: DEFAULT_CHAT_TIMEOUT,
             client,
             admin_session: tokio::sync::Mutex::new(None),
@@ -238,13 +268,24 @@ impl OmlxAdapter {
     /// The deadline covers the **whole** load: the `POST /v1/models/{id}/load` and then the pin and state
     /// verification (login, `PUT` settings, `GET` status) that confirm it. Each of those calls still has
     /// its own `call_timeout`, but together with the POST they must fit in this one budget; the follow-up
-    /// gets what the POST left over. That is what lets the Supervisor's backstop (this budget plus a margin)
-    /// stay a backstop: the adapter's own answer comes first, so a load whose outcome is unknown is reported
-    /// as [`BackendError::LoadUnconfirmed`] and not as the Supervisor's `adapter_timed_out`. `status`,
-    /// `unload`, `probe_ready` and `list` stay under `call_timeout`. A load that outlasts the budget is an
-    /// unknown outcome ([`BackendError::LoadUnconfirmed`]) and keeps the durable fence.
+    /// gets what the POST left over, and at least [`LOAD_CONFIRMATION_FLOOR`] (or `call_timeout`, if that is
+    /// shorter) so that a load accepted at the end of the budget can still be confirmed; when the POST used
+    /// the whole budget nothing is sent after it. The whole call therefore returns within this budget plus
+    /// at most the floor, which the Supervisor's backstop accounts for: the adapter's own answer comes
+    /// first, so a load whose outcome is unknown is reported as [`BackendError::LoadUnconfirmed`] and not
+    /// as the Supervisor's `adapter_timed_out`. `status`, `unload`, `probe_ready` and `list` stay under
+    /// `call_timeout`. A load that outlasts the budget is an unknown outcome
+    /// ([`BackendError::LoadUnconfirmed`]) and keeps the durable fence.
     pub fn with_load_timeout(mut self, load_timeout: Duration) -> Self {
         self.load_timeout = Some(load_timeout);
+        self
+    }
+
+    /// Shorten the confirmation floor (default [`LOAD_CONFIRMATION_FLOOR`], which is also the most it can be:
+    /// the Supervisor's backstop adds exactly that). Zero makes the load budget exact. Production keeps the
+    /// default; tests use this to keep their timings short.
+    pub fn with_confirmation_floor(mut self, floor: Duration) -> Self {
+        self.confirmation_floor = floor.min(LOAD_CONFIRMATION_FLOOR);
         self
     }
 
@@ -337,7 +378,8 @@ impl OmlxAdapter {
     /// deterministic policy failures use `LoadPostconditionFailed`.
     ///
     /// With a load budget ([`Self::with_load_timeout`]) the whole call — the POST and the confirmation
-    /// after it — returns within that budget, and running out of it is `LoadUnconfirmed` too.
+    /// after it — returns within that budget (plus at most [`LOAD_CONFIRMATION_FLOOR`] when the POST left
+    /// less than that for the confirmation), and running out of it is `LoadUnconfirmed` too.
     pub async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
         let budget = self.load_timeout.unwrap_or(self.call_timeout);
         let started = tokio::time::Instant::now();
@@ -358,17 +400,32 @@ impl OmlxAdapter {
             }
         };
         let confirmed = if self.load_timeout.is_some() {
-            // The follow-up gets what the POST left of the budget. Dropping it at the deadline is safe: the
-            // outcome is already "unknown", which is what we report (a half-sent admin PUT is exactly the
-            // `AdminRequestError::Unknown` case `pin` already treats this way).
-            match tokio::time::timeout(budget.saturating_sub(started.elapsed()), confirm).await {
+            let floor = self.confirmation_floor.min(self.call_timeout);
+            let Some(allowance) = confirmation_allowance(budget, started.elapsed(), floor) else {
+                // The POST itself used the whole budget. Pinning and verifying now would send requests after
+                // the outcome is already "unknown", so none is sent (the `confirm` future above is never
+                // polled).
+                return Err(BackendError::load_unconfirmed(
+                    id,
+                    format!(
+                        "oMLX accepted the load of {id}, but the request itself used the whole load budget \
+                         of {budget:?}: pinning and verification were not attempted"
+                    ),
+                ));
+            };
+            // The follow-up gets what the POST left of the budget, and at least the confirmation floor.
+            // Dropping it at the deadline is safe: the outcome is already "unknown", which is what we
+            // report (a half-sent admin PUT is exactly the `AdminRequestError::Unknown` case `pin` already
+            // treats this way).
+            match tokio::time::timeout(allowance, confirm).await {
                 Ok(confirmed) => confirmed,
                 Err(_) => {
                     return Err(BackendError::load_unconfirmed(
                         id,
                         format!(
                             "oMLX accepted the load of {id}, but pinning and verifying it did not finish \
-                             within the load budget of {budget:?}"
+                             within {allowance:?} (what the request left of the load budget of {budget:?}, \
+                             and at least the confirmation floor)"
                         ),
                     ));
                 }
@@ -1483,5 +1540,52 @@ mod tests {
             .expect("list via trait object must succeed");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "qwen3-8b");
+    }
+
+    /// 确认还能花多少时间（本地预审 L-5）：POST 用掉了整个预算就不发了；否则是预算剩下的，但不少于下限。
+    #[test]
+    fn the_confirmation_gets_what_the_budget_left_but_never_less_than_the_floor_and_nothing_when_nothing_is_left()
+     {
+        let s = Duration::from_secs;
+        let ms = Duration::from_millis;
+        let floor = s(5);
+        // 剩得多：就是剩下的。
+        assert_eq!(confirmation_allowance(s(180), s(4), floor), Some(s(176)));
+        // 剩得比下限少：下限。预算快用完才接受的加载，核对仍有下限那么久。
+        assert_eq!(
+            confirmation_allowance(s(180), ms(179_900), floor),
+            Some(floor)
+        );
+        assert_eq!(confirmation_allowance(s(3), s(1), floor), Some(floor));
+        // 刚好一点也不剩（或已经超了）：没有，什么也不发。
+        assert_eq!(confirmation_allowance(s(180), s(180), floor), None);
+        assert_eq!(confirmation_allowance(s(180), s(181), floor), None);
+        assert_eq!(
+            confirmation_allowance(Duration::ZERO, Duration::ZERO, floor),
+            None
+        );
+        // 下限为零：预算本身，一点不多。
+        assert_eq!(
+            confirmation_allowance(s(3), s(1), Duration::ZERO),
+            Some(s(2))
+        );
+        assert_eq!(confirmation_allowance(s(3), s(3), Duration::ZERO), None);
+        // 剩下的刚好一毫秒也还是有，并且拿到下限。
+        assert_eq!(confirmation_allowance(s(3), ms(2_999), floor), Some(floor));
+    }
+
+    #[test]
+    fn the_adapters_floor_is_never_above_the_one_the_supervisors_backstop_accounts_for() {
+        let adapter = OmlxAdapter::new(OmlxAdapterConfig {
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: None,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+        })
+        .unwrap();
+        assert_eq!(adapter.confirmation_floor, LOAD_CONFIRMATION_FLOOR);
+        let shorter = adapter.with_confirmation_floor(Duration::from_millis(300));
+        assert_eq!(shorter.confirmation_floor, Duration::from_millis(300));
+        let capped = shorter.with_confirmation_floor(Duration::from_secs(600));
+        assert_eq!(capped.confirmation_floor, LOAD_CONFIRMATION_FLOOR);
     }
 }

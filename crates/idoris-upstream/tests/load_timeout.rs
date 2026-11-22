@@ -181,7 +181,8 @@ fn resident() -> LoadPolicy {
     }
 }
 
-/// 像生产那样：通用的管理调用超时是 10 秒，比下面用例里的加载预算长得多；带 key，resident 的钉住要登录管理会话。
+/// 像生产那样：通用的管理调用超时是 10 秒，比下面用例里的加载预算长得多；带 key，resident 的钉住要登录管理会话。确认下限设成 0：
+/// 这一组用例看的是预算本身（后续步骤只拿到 POST 剩下的部分），下限另有用例（见下面「确认下限」一节）。
 fn adapter_with_call_timeout(server: &MockServer, call_timeout: Duration) -> OmlxAdapter {
     OmlxAdapter::new(OmlxAdapterConfig {
         base_url: server.uri(),
@@ -190,6 +191,7 @@ fn adapter_with_call_timeout(server: &MockServer, call_timeout: Duration) -> Oml
     })
     .unwrap()
     .with_load_fence_path(idoris_backend::mock::temporary_load_fence_path())
+    .with_confirmation_floor(Duration::ZERO)
 }
 
 /// 假 oMLX，resident 路径的全套：`load`、管理会话登录、`PUT .../settings`（钉住）、核对用的 `GET /v1/models/status`（已钉住）。
@@ -344,6 +346,63 @@ async fn a_stalled_confirmation_is_reported_as_load_unconfirmed_not_as_the_super
     let error = handle.load("m", 1.0, resident()).await.unwrap_err();
     assert_eq!(error.reason_code(), "load_unconfirmed", "{error}");
     assert!(fence.exists(), "an unknown outcome keeps the durable fence");
+}
+
+// ---------------------------------------------------------------------------------------------
+// 确认下限（本地预审 L-5）：引擎在预算快用完时才接受了加载，确认仍然有一个下限的时间
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_load_accepted_at_the_end_of_the_budget_still_gets_the_confirmation_floor() {
+    // 预算 3 秒，POST 用 1.5 秒，只剩 1.5 秒；核对要 2.5 秒：比剩下的长，比 4 秒的下限短。有下限，它成功（总共约 4 秒，超出预算
+    // 约 1 秒）；没有下限，1.5 秒处就是「结果未知」，围栏保留，可模型其实已经加载好了。
+    let server = engine(Duration::from_millis(1_500), Duration::from_millis(2_500)).await;
+    let adapter = adapter_with_call_timeout(&server, Duration::from_secs(10))
+        .with_load_timeout(Duration::from_secs(3))
+        .with_confirmation_floor(Duration::from_secs(4));
+    let started = Instant::now();
+    adapter.load("m", Some(&on_demand())).await.unwrap();
+    let took = started.elapsed();
+    assert!(
+        took > Duration::from_secs(3),
+        "the confirmation ran past the budget, on the floor: {took:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_floor_is_the_most_the_confirmation_may_run_past_the_budget() {
+    // 对照：下限不是白送的时间。预算 1 秒，POST 用 0.2 秒，下限 1 秒，核对要 4 秒（单次调用的 10 秒之内）：拿到的是
+    // max(剩下的 0.8 秒, 下限 1 秒) = 1 秒，所以约 1.2 秒就放弃，不是等到 4 秒。
+    let server = engine(Duration::from_millis(200), Duration::from_secs(4)).await;
+    let adapter = adapter_with_call_timeout(&server, Duration::from_secs(10))
+        .with_load_timeout(Duration::from_secs(1))
+        .with_confirmation_floor(Duration::from_secs(1));
+    let started = Instant::now();
+    let error = adapter.load("m", Some(&on_demand())).await.unwrap_err();
+    assert_eq!(error.reason_code(), "load_unconfirmed", "{error}");
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(1_100) && waited < Duration::from_millis(2_800),
+        "cut at about budget + 0.2 s, not at the 4 s the check needs: {waited:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_floor_never_exceeds_the_one_the_supervisors_backstop_accounts_for() {
+    // 下限最多是 `LOAD_CONFIRMATION_FLOOR`（Supervisor 的兜底按它算）：要一个 10 分钟的下限，得到的还是它。核对要 7 秒：
+    // 比预算剩下的长，也比 5 秒的下限长，所以 5 秒处放弃，不是 10 分钟。
+    let server = engine(Duration::from_millis(200), Duration::from_secs(7)).await;
+    let adapter = adapter_with_call_timeout(&server, Duration::from_secs(30))
+        .with_load_timeout(Duration::from_secs(1))
+        .with_confirmation_floor(Duration::from_secs(600));
+    let started = Instant::now();
+    let error = adapter.load("m", Some(&on_demand())).await.unwrap_err();
+    assert_eq!(error.reason_code(), "load_unconfirmed", "{error}");
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(4_800) && waited < Duration::from_millis(6_800),
+        "cut at about 5 s (the floor, errata eight (6)), not at 10 minutes or at the 7 s the check needs: {waited:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

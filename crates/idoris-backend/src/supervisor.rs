@@ -25,7 +25,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::GlobalCapacityLedger;
-use crate::adapter::RuntimeAdapter;
+use crate::adapter::{LOAD_CONFIRMATION_FLOOR, RuntimeAdapter};
 use crate::error::BackendError;
 use crate::eviction::{
     CAPACITY_EPSILON_GB, EvictionPlan, ModelEntry, ModelReq, ModelState, PlanEvictionError,
@@ -633,7 +633,8 @@ const ADAPTER_LOAD_BACKSTOP_MARGIN: std::time::Duration = std::time::Duration::f
 
 /// The outer deadline for one `adapter.load` call (IDORIS-CORE S8). An adapter without a separate load
 /// budget is bounded by [`SupervisorConfig::adapter_call_timeout`] like every other management call, so
-/// nothing changes for it. One that declares [`RuntimeAdapter::load_timeout`] gets that plus
+/// nothing changes for it. One that declares [`RuntimeAdapter::load_timeout`] gets that, plus the
+/// [`LOAD_CONFIRMATION_FLOOR`] it may run past it to confirm a load accepted at the end of its budget, plus
 /// [`ADAPTER_LOAD_BACKSTOP_MARGIN`], never less than `adapter_call_timeout`. Only the `load` call itself
 /// uses this: `unload`, `status`, `probe_ready` and `list` stay under `adapter_call_timeout`.
 fn load_call_deadline(
@@ -643,7 +644,8 @@ fn load_call_deadline(
     adapter
         .load_timeout()
         .map_or(config.adapter_call_timeout, |own| {
-            own.saturating_add(ADAPTER_LOAD_BACKSTOP_MARGIN)
+            own.saturating_add(LOAD_CONFIRMATION_FLOOR)
+                .saturating_add(ADAPTER_LOAD_BACKSTOP_MARGIN)
                 .max(config.adapter_call_timeout)
         })
 }
@@ -5040,7 +5042,8 @@ mod tests {
     }
 
     #[test]
-    fn the_load_deadline_is_the_declared_budget_plus_the_margin_and_never_below_the_generic_one() {
+    fn the_load_deadline_is_the_declared_budget_plus_the_floor_and_the_margin_and_never_below_the_generic_one()
+     {
         use std::time::Duration;
         let declares = |budget| DeclaresLoadBudget {
             inner: MockAdapter::new(Vec::new()),
@@ -5055,15 +5058,16 @@ mod tests {
             load_call_deadline(&declares(None), &config(Duration::from_millis(200))),
             Duration::from_millis(200)
         );
-        // Declared: the budget plus the fixed 30 s margin, strictly above the budget so the adapter's own
-        // timeout error is the one reported. The margin is pinned through the computed value (180 + 30):
-        // asserting the constant against its own literal would add nothing.
+        // Declared: the budget, plus the confirmation floor the adapter may run past it by, plus the fixed
+        // 30 s margin: strictly above the longest the adapter itself may take (budget + floor), so the
+        // adapter's own timeout error is the one reported. Pinned through the computed value
+        // (180 + 5 + 30): asserting the constants against their own literals would add nothing.
         let deadline = load_call_deadline(
             &declares(Some(Duration::from_secs(180))),
             &config(Duration::from_secs(30)),
         );
-        assert_eq!(deadline, Duration::from_secs(210));
-        assert!(deadline > Duration::from_secs(180));
+        assert_eq!(deadline, Duration::from_secs(215));
+        assert!(deadline > Duration::from_secs(180) + LOAD_CONFIRMATION_FLOOR);
         // A small budget does not shrink the deadline below the generic one.
         assert_eq!(
             load_call_deadline(
