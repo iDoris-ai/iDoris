@@ -3,9 +3,8 @@
 //! # 版本号：按字段是否存在判断，不要看 `contract_version`
 //!
 //! 新字段（`phase`、`ready`、`started_at_ms`、`registered`、`upstreams[]`）**从 IDORIS-CORE 切片 S1 起就出现**，
-//! 但 `/health.contract_version` 到 v0.6.0 发版才升到 1.3.0（规范 §2.11：发版前仍是 1.2.0；切片 S11 统一升）。
-//! 原因是 warmup、embeddings 伴生卡、Admin `upstreams` 等 1.3.0 的其他功能还没做齐，调用方不能从版本号推断它们
-//! 已经有了。所以调用方按字段是否存在判断，不要看版本号。
+//! 当时 `/health.contract_version` 仍是 1.2.0；v0.6.0 起升到 1.3.0（规范 §2.11）。
+//! 调用方仍按字段是否存在判断，不要看版本号，这样对预发布构建也成立。
 //!
 //! # 快照，不是探测
 //!

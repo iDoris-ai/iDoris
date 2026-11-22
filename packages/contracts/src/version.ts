@@ -15,7 +15,7 @@
  * - v1.2.0：加法新增 —— 只读端点 `GET /v1/recommendation?role=chat` 与
  *   `GET /v1/models/local`（接口规范 §2.9，由 Rust 实现承载；TS 参考实现不含这两个端点，
  *   版本号只为三处常量保持一致）。1.1.x 的字段和行为不变。
- * - v1.3.0（iDoris v0.6.0 的目标，**尚未生效**）：加法新增 —— `GET /health` 的 `phase`、`ready`、
+ * - v1.3.0（iDoris v0.6.0 起生效）：加法新增 —— `GET /health` 的 `phase`、`ready`、
  *   `started_at_ms`、`registered`、`upstreams[]`（含 `engine_kind`；接口规范修订 1.6 §2.11.1，
  *   IDORIS-CORE，由 Rust 实现承载；TS 参考实现不含这些字段，同 v1.2.0 的先例）。`status` 仍恒为
  *   `"ok"`，1.2.x 的字段和行为不变。另有端点 `POST /v1/models/warmup`（接口规范 §2.11.2，IDORIS-CORE
@@ -23,10 +23,9 @@
  *   `timeout_ms`，让模型进入可用状态而不生成 token；200 应答 `{model, provider_id, state,
  *   already_loaded, load_ms}`，错误沿用聊天的信封，另有 504 `warmup_timeout`。它没有 JSON Schema
  *   （规范 §2.11.5），状态码矩阵由 Rust 集成测试 `crates/idoris-router/tests/warmup.rs` 锁定。
- *   **这些新字段从 IDORIS-CORE 切片 S1 起就出现在 Rust 实现的 `/health` 里，但本常量（以及
- *   `/health.contract_version`）要到 v0.6.0 发版才升到 1.3.0（切片 S11 统一升）：** 规范 §2.11
- *   写明发版前仍是 1.2.0，免得 warmup、embeddings 伴生卡、Admin `upstreams` 等 1.3.0 的功能还没
- *   做齐，调用方就从版本号误以为齐了。调用方按字段是否存在判断，不要看版本号。
+ *   这些新字段在 IDORIS-CORE 开发期间（切片 S1 起）就出现在 Rust 实现的 `/health` 里，当时本常量
+ *   仍是 1.2.0；v0.6.0 起本常量（以及 `/health.contract_version`）是 1.3.0（规范 §2.11）。
+ *   调用方仍应按字段是否存在判断，不要看版本号，这样对同一修订的预发布构建也成立。
  *
  * 后续演进按同文档 G-5「加法优先、零回归」处理：
  * - 加法新增字段/端点/枚举值 → 升 minor；
@@ -35,4 +34,4 @@
  * `pnpm check:contract-drift` 会把本常量、Rust 常量与 conformance 的 health
  * 期望机械比对；任何一侧单独修改都会失败（B1 task39 / FU-21 的常量漂移部分）。
  */
-export const CONTRACT_VERSION = "1.2.0";
+export const CONTRACT_VERSION = "1.3.0";

@@ -81,7 +81,7 @@ pub mod recommendation;
 pub mod startup_form;
 
 /// IDORIS-CORE S1（接口规范 §2.7.1–§2.7.3、§2.11.1、§2.12.1，修订 1.6；wire 契约 1.3.0 的一部分，
-/// `contract_version` 到 v0.6.0 发版才升）：`--launcher-stdin` 帧、`instance_nonce`、发现文件、
+/// `contract_version` 自 v0.6.0 起为 1.3.0）：`--launcher-stdin` 帧、`instance_nonce`、发现文件、
 /// 引擎种类与 `/health` 的就绪快照。
 pub mod discovery;
 pub mod engine_kind;
@@ -242,9 +242,8 @@ pub fn parse_port(raw: Option<&str>) -> Result<u16, PortError> {
 /// **不是**「模型可用」）；后五个是 wire 契约 1.3.0 的新增（接口规范 §2.11.1）：模型可用看 `ready`（等于
 /// `phase == "ready"`）。`instance_id` 是公开的实例标识；`instance_nonce` 永远不出现在这里或任何响应里。
 ///
-/// **新字段从 IDORIS-CORE 切片 S1 起就出现，但 `contract_version` 到 v0.6.0 发版才升到 1.3.0**（规范 §2.11：
-/// 发版前 `/health.contract_version` 仍是 1.2.0；warmup、embeddings 伴生卡等 1.3.0 的其他功能还没做齐，
-/// 调用方不能从版本号推断它们已经有了）。调用方按字段是否存在判断，不要看版本号。
+/// 新字段在 IDORIS-CORE 开发期间（切片 S1 起）就出现，当时 `contract_version` 仍是 1.2.0；v0.6.0 起是 1.3.0
+/// （规范 §2.11）。调用方仍按字段是否存在判断，不要看版本号，这样对预发布构建也成立。
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
@@ -4460,8 +4459,8 @@ mod tests {
     }
 
     /// 接口规范 §2.11.1：七个既有字段不变，新增 `phase`、`ready`、`started_at_ms`、`registered`、`upstreams`；
-    /// `status` 恒为 `"ok"`，和 `phase` 无关。新字段从 S1 起出现，`contract_version` 仍是 1.2.0（到 v0.6.0
-    /// 发版才升 1.3.0），所以调用方按字段是否存在判断：这里在新字段全部出现的同时，也断言版本号还没有升。
+    /// `status` 恒为 `"ok"`，和 `phase` 无关。新字段从 S1 起出现；v0.6.0 起 `contract_version` 是 1.3.0，
+    /// 这里在新字段全部出现的同时，也断言版本号等于发布值。
     #[tokio::test]
     async fn health_has_the_s1_fields_and_status_stays_ok_in_every_phase() {
         use readiness::{UpstreamReason, UpstreamState, UpstreamStatus};
@@ -4513,9 +4512,9 @@ mod tests {
             assert_eq!(json["status"], "ok", "{phase}");
             assert_eq!(json["service"], "idoris");
             assert_eq!(json["contract_version"], idoris_contracts::CONTRACT_VERSION);
-            // 故意写死字面量（同 TS 的 health-identity 测试）：新字段已经出现，版本号仍是 1.2.0，
-            // 到 v0.6.0 发版（切片 S11）才升 1.3.0；谁提前把常量改了，这里会失败。
-            assert_eq!(json["contract_version"], "1.2.0");
+            // 故意写死字面量（同 TS 的 health-identity 测试）：v0.6.0 起版本号是 1.3.0；
+            // 谁改了常量，这里会失败。
+            assert_eq!(json["contract_version"], "1.3.0");
             assert!(json["version"].is_string());
             assert!(json["instance_id"].is_string());
             assert_eq!(json["components"], 0);
