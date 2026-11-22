@@ -359,7 +359,7 @@ enum Join {
 
 impl Registry {
     fn lock(&self) -> MutexGuard<'_, Table> {
-        // 表里只有计数与句柄，没有跨语句的不变量：别的线程 panic 留下的毒不必当真。
+        // 持锁的临界区里只对两张哈希表做插入、删除与读取（不调用外部代码、不 await），不会半途 panic；别的线程留下的毒不必当真。
         self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

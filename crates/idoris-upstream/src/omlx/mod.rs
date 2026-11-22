@@ -239,10 +239,10 @@ impl OmlxAdapter {
     /// verification (login, `PUT` settings, `GET` status) that confirm it. Each of those calls still has
     /// its own `call_timeout`, but together with the POST they must fit in this one budget; the follow-up
     /// gets what the POST left over. That is what lets the Supervisor's backstop (this budget plus a margin)
-    /// stay a backstop: the adapter's own answer always comes first, so a load whose outcome is unknown is
-    /// always reported as [`BackendError::LoadUnconfirmed`], never as the Supervisor's `adapter_timed_out`.
-    /// `status`, `unload`, `probe_ready` and `list` stay under `call_timeout`. A load that outlasts the
-    /// budget is an unknown outcome ([`BackendError::LoadUnconfirmed`]) and keeps the durable fence.
+    /// stay a backstop: the adapter's own answer comes first, so a load whose outcome is unknown is reported
+    /// as [`BackendError::LoadUnconfirmed`] and not as the Supervisor's `adapter_timed_out`. `status`,
+    /// `unload`, `probe_ready` and `list` stay under `call_timeout`. A load that outlasts the budget is an
+    /// unknown outcome ([`BackendError::LoadUnconfirmed`]) and keeps the durable fence.
     pub fn with_load_timeout(mut self, load_timeout: Duration) -> Self {
         self.load_timeout = Some(load_timeout);
         self
