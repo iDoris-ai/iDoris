@@ -3099,9 +3099,18 @@ async fn a_subscription_card_is_never_a_warmup_candidate() {
         "{}",
         reply.raw
     );
-    // With the subscription card excluded there is no candidate at all. (Were it a candidate, it would
-    // be selected and fail as `supervisor_unavailable`: it has no lifecycle runtime.)
+    // With the subscription card excluded there is no candidate at all. Were it a candidate it would be
+    // selected, and the recheck in `warm_lifecycle` (the card is not on this machine) would refuse it with
+    // this same 503 `no_eligible_candidate`: status and type cannot tell the two apart. What can is that a
+    // refusal after selection carries the selected card's served locality, while "no candidate" has no
+    // card behind it and carries none.
     assert_eq!(reply.error_type(), "no_eligible_candidate", "{}", reply.raw);
+    assert_eq!(
+        reply.header("x-idoris-served-locality"),
+        None,
+        "no card was selected, so none is reported: {:?}",
+        reply.headers
+    );
 }
 
 #[tokio::test]
