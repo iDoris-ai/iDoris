@@ -1346,10 +1346,11 @@ fn reserve_extra(store: &AccountStore, request: &str, micros: i64, at: i64) -> C
         .unwrap()
 }
 
-/// `emp` 名下 `credit_used` 告警的完整内容：（金额，担保人，凭证，预留，说明）。
-fn credit_used_alerts(
-    store: &AccountStore,
-) -> Vec<(i64, Option<String>, Option<String>, Option<String>, String)> {
+/// 一条 `credit_used` 告警的完整内容：（金额，担保人，凭证，预留，说明）。
+type AlertContent = (i64, Option<String>, Option<String>, Option<String>, String);
+
+/// `emp` 名下 `credit_used` 告警的完整内容，按写入顺序。
+fn credit_used_alerts(store: &AccountStore) -> Vec<AlertContent> {
     store
         .alerts(Some(AlertKind::CreditUsed))
         .unwrap()
