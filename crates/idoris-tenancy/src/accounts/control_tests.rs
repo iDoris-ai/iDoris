@@ -19,6 +19,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use idoris_compute_contracts::account::{
     Account, AccountKind, AccountStatus, Membership, MembershipRole, MembershipStatus,
@@ -34,6 +35,7 @@ use idoris_compute_contracts::ids::{
 use idoris_compute_contracts::money::{Money, Unit};
 use idoris_contracts::common::PrivacyClass;
 use rusqlite::Connection;
+use rusqlite::trace::{TraceEvent, TraceEventCodes};
 
 use super::{
     AccountStore, CreateAccount, CreateMembership, CreatePrincipal, Failure, GrantAllocation,
@@ -4266,5 +4268,260 @@ fn replaying_the_creation_of_an_own_membership_stays_idempotent_after_its_princi
         }
         .run(&env, &other.who(), T0 + 4),
         Err(ControlReason::AlreadyExists)
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// Codex 对 fix/603-compute-followups（25a30d59）的预审：H1（付款账户已被占用）、M2（审计里目标派生的字段）、
+// M3（失败路径上的数据库工作量）。HTTP 层的 H1 在 `idoris-router` 的 `control/tests.rs`，配对码的审计在 `pairing_tests.rs`。
+// ------------------------------------------------------------------------------------------------
+
+/// 库里全部成员关系的 id（升序）。
+pub(super) fn membership_ids(env: &Env) -> Vec<String> {
+    let conn = env.raw();
+    let mut stmt = conn
+        .prepare("SELECT membership_id FROM memberships ORDER BY membership_id")
+        .unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// 夹具：school-b 登记了主体 bee（随后撤销）、cat、dan（活跃）；付款账户 acct-b 已经属于 cat 的成员关系 m-cat，acct-c 空闲。
+/// 返回 school-b 的管理凭证。
+fn school_b_with_a_bound_payment_account(env: &Env) -> Minted {
+    let (_edu, other) = principal_world(env);
+    for principal in ["bee", "cat", "dan"] {
+        assert_eq!(
+            Action::CreatePrincipal {
+                principal,
+                org: "school-b"
+            }
+            .run(env, &other.who(), T0 + 2),
+            Ok(WriteResult::Created)
+        );
+    }
+    assert_eq!(
+        Action::RevokePrincipal {
+            principal: "bee",
+            org: "school-b"
+        }
+        .run(env, &other.who(), T0 + 3),
+        Ok(WriteResult::Updated)
+    );
+    env.account("acct-b", AccountKind::Member, Some("school-b"));
+    env.account("acct-c", AccountKind::Member, Some("school-b"));
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-cat",
+            principal: "cat",
+            org: "school-b",
+            account: "acct-b"
+        }
+        .run(env, &other.who(), T0 + 4),
+        Ok(WriteResult::Created)
+    );
+    other
+}
+
+/// H1：付款账户已经属于别的成员关系时，对调用者管不到的已有 id（m-kid1 是 eduai 的）和不存在的 id，建成员关系得到同一个失败。
+/// 旧代码：管不到的 id 直接 `out_of_scope`，不存在的 id 走到 `AccountAlreadyBound`，得到 `invalid_membership`，
+/// 调用者借一个已被占用的付款账户就能区分「别的组织有没有这个成员关系 id」。
+#[test]
+fn a_bound_payment_account_gives_a_hidden_and_a_missing_membership_id_the_same_failure() {
+    let env = Env::new();
+    let other = school_b_with_a_bound_payment_account(&env);
+    let before = membership_ids(&env);
+    let hidden = attach_failure(
+        &env,
+        &other.who(),
+        T0 + 5,
+        member_membership("m-kid1", "dan", "school-b", "acct-b"),
+    );
+    let missing = attach_failure(
+        &env,
+        &other.who(),
+        T0 + 5,
+        member_membership("m-probe-missing", "dan", "school-b", "acct-b"),
+    );
+    assert_eq!(
+        hidden.reason,
+        ControlReason::InvalidMembership,
+        "{hidden:?}"
+    );
+    assert_eq!(hidden.reason, missing.reason, "{hidden:?} vs {missing:?}");
+    // 详情里只有调用者自己提交的那个 id 不同；占着账户的是调用者自己管的 m-cat
+    assert_eq!(
+        hidden.detail.replace("m-kid1", "<id>"),
+        missing.detail.replace("m-probe-missing", "<id>")
+    );
+    assert!(
+        hidden.detail.contains("acct-b") && hidden.detail.contains("m-cat"),
+        "{hidden:?}"
+    );
+    // 两次都没有建出任何东西
+    assert_eq!(membership_ids(&env), before);
+}
+
+/// 在 `body` 执行期间记下这个存储的连接上执行的全部 SQL 语句。用的是 `sqlite3_sql`（原文，参数没有展开），所以语句文本里没有调用者
+/// 提交的 id，序列可以直接比较。
+fn traced<T>(env: &Env, body: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&log);
+    env.store
+        .lock()
+        .trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(move |event: TraceEvent<'_>| {
+                if let TraceEvent::Stmt(statement, _) = event {
+                    sink.lock().unwrap().push(statement.sql().into_owned());
+                }
+            }),
+        )
+        .unwrap();
+    let out = body();
+    env.store
+        .lock()
+        .trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            None::<fn(TraceEvent<'_>)>,
+        )
+        .unwrap();
+    let statements = log.lock().unwrap().clone();
+    (out, statements)
+}
+
+/// M3：失败发生在「主体已撤销」或「付款账户已被占用」时，调用者管不到的已有 id 和不存在的 id 让数据库执行完全一样的语句序列。
+/// 旧代码先读出那一行再去做授权（多出一串查询），响应时间和数据库工作量都能把两种 id 区分开。这里比语句序列，不比毫秒。
+#[test]
+fn hidden_and_missing_membership_ids_run_the_same_statements_when_attaching_fails() {
+    let env = Env::new();
+    let other = school_b_with_a_bound_payment_account(&env);
+    for (label, principal, account) in [
+        ("revoked principal", "bee", "acct-c"),
+        ("occupied payment account", "dan", "acct-b"),
+    ] {
+        let (hidden, hidden_sql) = traced(&env, || {
+            attach_failure(
+                &env,
+                &other.who(),
+                T0 + 5,
+                member_membership("m-kid1", principal, "school-b", account),
+            )
+        });
+        let (missing, missing_sql) = traced(&env, || {
+            attach_failure(
+                &env,
+                &other.who(),
+                T0 + 5,
+                member_membership("m-probe-missing", principal, "school-b", account),
+            )
+        });
+        assert_eq!(
+            hidden.reason, missing.reason,
+            "{label}: {hidden:?} vs {missing:?}"
+        );
+        assert!(
+            hidden_sql.len() > 5,
+            "{label}: the trace must actually see the statements: {hidden_sql:?}"
+        );
+        assert_eq!(
+            hidden_sql, missing_sql,
+            "{label}: a membership id the caller cannot manage must cost the database what a missing one costs"
+        );
+    }
+}
+
+/// 范围限定的读（`rows::load_membership_within`，一条 SQL 里按子树过滤）和授权判定（契约的 `authorize`）用两套写法表达同一个
+/// 「调用者管得到哪些成员关系」。这条把两者的一致钉住：只管 teacher 子树的凭证，对子树里的成员关系（付款账户在 teacher 下）
+/// 照旧能重放、能得到冲突；管理员关系没有付款账户，范围看所属组织，管着 eduai 的凭证对它也照旧能重放；子树之外的
+/// （s2 在 eduai 下、teacher 之外）对它是「不存在」。
+#[test]
+fn a_manager_with_a_narrow_scope_replays_and_conflicts_inside_it_and_is_blind_outside_it() {
+    let env = Env::new();
+    env.tree();
+    // teacher 子树里再加一个空闲的成员账户 s3
+    env.account("s3", AccountKind::Member, Some("teacher"));
+    let narrow = env.issue_as_operator(Issue::service(
+        "eduai",
+        vec![sc(ControlOp::ManageMembership, "teacher", None)],
+    ));
+    let edu = env.issue_as_operator(Issue::service("eduai", all_ops("eduai", 1)));
+    // 子树里已有的 m-kid1（kid1 -> s1，org eduai）：同样的定义是 replayed，不同的定义是 already_exists
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-kid1",
+            principal: "kid1",
+            org: "eduai",
+            account: "s1"
+        }
+        .run(&env, &narrow.who(), T0 + 1),
+        Ok(WriteResult::Replayed)
+    );
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-kid1",
+            principal: "kid2",
+            org: "eduai",
+            account: "s1"
+        }
+        .run(&env, &narrow.who(), T0 + 2),
+        Err(ControlReason::AlreadyExists)
+    );
+    // 管理员关系：没有付款账户，范围看所属组织。管着 eduai 的凭证建出来之后，同样的请求是 replayed
+    assert_eq!(
+        Action::CreatePrincipal {
+            principal: "boss",
+            org: "eduai"
+        }
+        .run(&env, &edu.who(), T0 + 3),
+        Ok(WriteResult::Created)
+    );
+    let admin = |id: &str| CreateMembership {
+        membership: admin_membership(id, "boss", "eduai"),
+    };
+    let attach_admin = |who: &Who<'_>, id: &str, now: i64| {
+        let rid = env.rid();
+        env.store
+            .control_create_membership(who, &env.meta(now, &rid), &admin(id))
+            .map(|written| written.result)
+            .map_err(|failure| failure.reason)
+    };
+    assert_eq!(
+        attach_admin(&edu.who(), "m-boss", T0 + 4),
+        Ok(WriteResult::Created)
+    );
+    assert_eq!(
+        attach_admin(&edu.who(), "m-boss", T0 + 5),
+        Ok(WriteResult::Replayed)
+    );
+    // 子树之外：m-kid2（s2 在 eduai 下、teacher 之外）和管理员关系 m-boss（组织 eduai 不在 teacher 之下）对窄凭证都是「不存在」，
+    // 用它们的 id 建一个自己子树里的成员关系（s3 空闲）：先过结构校验，最后才是 out_of_scope
+    let before = membership_ids(&env);
+    for hidden in ["m-kid2", "m-boss"] {
+        assert_eq!(
+            Action::CreateMembership {
+                id: hidden,
+                principal: "kid1",
+                org: "eduai",
+                account: "s3"
+            }
+            .run(&env, &narrow.who(), T0 + 6),
+            Err(ControlReason::OutOfScope),
+            "{hidden}"
+        );
+    }
+    assert_eq!(membership_ids(&env), before, "nothing was created");
+    // 残余（无法消除，只钉住）：不存在的 id 同样的请求创建成功
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-fresh",
+            principal: "kid1",
+            org: "eduai",
+            account: "s3"
+        }
+        .run(&env, &narrow.who(), T0 + 7),
+        Ok(WriteResult::Created)
     );
 }

@@ -58,12 +58,13 @@ use super::pairing::{
 };
 use super::rows::{
     AllocationRecord, load_account, load_allocation_record, load_ancestors, load_credential,
-    load_membership, load_memberships_of, load_platform_roots, load_principal, merge_chains,
+    load_membership, load_membership_within, load_memberships_of, load_platform_roots,
+    load_principal, merge_chains,
 };
 use super::store::{
-    AccountStore, AllocationOutcome, create_account_in, create_allocation_in, create_credential_in,
-    create_membership_in, ensure_principal_in, revoke_membership_in, revoke_principal_in,
-    set_account_status_in, set_credential_status_in,
+    AccountStore, AllocationOutcome, check_new_membership_in, create_account_in,
+    create_allocation_in, create_credential_in, create_membership_in, ensure_principal_in,
+    revoke_membership_in, revoke_principal_in, set_account_status_in, set_credential_status_in,
 };
 use crate::virtual_key::VirtualKeyHash;
 
@@ -1203,6 +1204,30 @@ pub(super) fn authority_is_visible<T>(result: Result<T, Failure>) -> Result<bool
     }
 }
 
+/// 成员关系 `id`，读的时候限定在调用者对 `manage_membership` 管得到的范围里：管不到的和不存在的一样返回 `None`
+/// （一条语句，见 [`load_membership_within`]）。本机运维管得到全部；凭证管得到的范围是它身上 `manage_membership` 权限的子树
+/// （带额度上限的权限不算：契约的 `scope_covers` 对没有额度的请求不认带上限的授权）；配对码身份没有任何授权。
+///
+/// 管得到的成员关系，行为和以前的「读出来再授权」完全一样；管不到的不再被读出来，所以后面没有已有 id 独有的授权查询
+/// （issue #603 N7 残余，Codex 预审 H1 / M3）。
+fn load_manageable_membership(
+    conn: &Connection,
+    caller: &Caller,
+    id: &MembershipId,
+) -> Result<Option<Membership>, Failure> {
+    let roots: Vec<AccountId> = match &caller.identity {
+        Identity::Operator => return Ok(load_membership(conn, id)?),
+        Identity::Credential { credential, .. } => credential
+            .admin_scopes()
+            .iter()
+            .filter(|scope| scope.op == ControlOp::ManageMembership && scope.max_amount.is_none())
+            .map(|scope| scope.subtree.clone())
+            .collect(),
+        Identity::PairingCode(_) => Vec::new(),
+    };
+    Ok(load_membership_within(conn, id, &roots)?)
+}
+
 /// 调用者有没有资格知道这个主体现在是什么状态。
 ///
 /// 没有资格时，活跃、已撤销、不存在必须是同一个 `out_of_scope`（细节为空）。状态如果在归属方授权之前就返回，
@@ -1347,26 +1372,10 @@ impl AccountStore {
             )? {
                 return Err(Failure::new(ControlReason::OutOfScope));
             }
-            // 已有的成员关系属于调用者管不到的付款账户（对它所属的账户没有 `manage_membership`）时，这个 id 对调用者按「不存在」走：
-            // 先过主体状态，最后才以同样的 `out_of_scope` 拒绝；replayed / already_exists 留给管得到它的人。顺序反了的话，调用者拿
-            // 自己名下已撤销的主体建成员关系，别的组织已有的 id 得到 `out_of_scope`、不存在的 id 得到 `principal_revoked`，
-            // 不用写入就能探测别的组织有哪些成员关系 id（issue #603 N7 残余）。创建成功与否本身仍可探测（成员关系 id 是客户端
-            // 自选的全局命名空间），这个残余消除不了，见设计稿 S2-10。
-            let existing = load_membership(conn, &membership.id)?;
-            let hidden = match &existing {
-                Some(other) if membership_target(other) != &target => {
-                    !authority_is_visible(authorize_op(
-                        conn,
-                        caller,
-                        meta.now,
-                        ControlOp::ManageMembership,
-                        membership_target(other),
-                        None,
-                    ))?
-                }
-                _ => false,
-            };
-            if let Some(existing) = existing.filter(|_| !hidden) {
+            // 已有的成员关系读的时候限定在调用者管得到的范围里（一条语句里按子树过滤，见 `load_manageable_membership`）：管不到的和
+            // 不存在的一样得到空结果，这个 id 对调用者按「不存在」走，既不泄露它存在，也不让「读到之后再去做授权」多出一串已有 id
+            // 独有的查询（数据库工作量和响应时间都会把两种 id 区分开，Codex 预审 M3）。replayed / already_exists 留给管得到它的人。
+            if let Some(existing) = load_manageable_membership(conn, caller, &membership.id)? {
                 return if existing == *membership {
                     Ok(Written {
                         result: WriteResult::Replayed,
@@ -1397,7 +1406,14 @@ impl AccountStore {
                 }
                 Some(_) => {}
             }
-            if hidden {
+            // 新成员关系的结构与付款账户占用校验：调用者管不到的已有 id 和不存在的 id 一起先过这一关，两者的失败和数据库执行的
+            // 语句都一样。否则付款账户已被占用时，不存在的 id 走到 `AccountAlreadyBound`（`invalid_membership`），别的组织已有的
+            // id 却是 `out_of_scope`，调用者借一个被占用的付款账户就能探测别的组织有哪些成员关系 id（Codex 预审 H1）。
+            check_new_membership_in(conn, membership)
+                .map_err(|error| Failure::from_store(error, Ctx::Membership))?;
+            // 到这里才区分：id 已经存在（只可能是调用者管不到的，管得到的上面已经处理）就以同样的 `out_of_scope` 拒绝，
+            // 不存在才创建。创建成功与否本身仍可探测（成员关系 id 是客户端自选的全局命名空间），这个残余消除不了，见设计稿 S2-10。
+            if load_membership(conn, &membership.id)?.is_some() {
                 return Err(Failure::new(ControlReason::OutOfScope));
             }
             create_membership_in(conn, membership, meta.now)

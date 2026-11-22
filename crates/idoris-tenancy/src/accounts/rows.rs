@@ -277,6 +277,39 @@ pub(super) fn load_membership(
     .transpose()
 }
 
+/// 成员关系 `id`，**限定**在 `roots` 里任何一个账户的子树内（成员关系的资源范围是它的付款账户，管理员关系没有付款账户，用所属组织）。
+/// 范围外的和不存在的一样返回 `None`：一条语句，调用方读不到范围外的那一行，两种情形让数据库执行同样的语句序列
+/// （issue #603 N7 残余，Codex 预审 H1 / M3）。`roots` 为空时什么都读不到。
+pub(super) fn load_membership_within(
+    conn: &Connection,
+    id: &MembershipId,
+    roots: &[AccountId],
+) -> Result<Option<Membership>, AccountStoreError> {
+    let marks = (0..roots.len())
+        .map(|index| format!("?{}", index + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH RECURSIVE chain(id) AS ( \
+             SELECT COALESCE(account_id, org_id) FROM memberships WHERE membership_id = ?1 \
+             UNION \
+             SELECT a.parent_id FROM accounts a JOIN chain c ON a.account_id = c.id \
+              WHERE a.parent_id IS NOT NULL) \
+         SELECT {MEMBERSHIP_COLUMNS} FROM memberships \
+          WHERE membership_id = ?1 AND EXISTS (SELECT 1 FROM chain WHERE id IN ({marks}))"
+    );
+    conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(
+            std::iter::once(id.as_str()).chain(roots.iter().map(AccountId::as_str)),
+        ),
+        RawMembership::read,
+    )
+    .optional()?
+    .map(RawMembership::into_membership)
+    .transpose()
+}
+
 pub(super) fn load_memberships_of(
     conn: &Connection,
     principal: &PrincipalId,

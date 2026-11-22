@@ -539,6 +539,33 @@ pub(super) fn create_membership_in(
             membership.id.as_str(),
         ));
     }
+    check_new_membership_in(tx, membership)?;
+    let revoked_at = (membership.status == MembershipStatus::Revoked).then_some(now.0);
+    tx.execute(
+        "INSERT INTO memberships \
+            (membership_id, principal_id, org_id, role, account_id, status, created_at_ms, revoked_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            membership.id.as_str(),
+            membership.principal.as_str(),
+            membership.org.as_str(),
+            to_text(&membership.role)?,
+            membership.account.as_ref().map(AccountId::as_str),
+            to_text(&membership.status)?,
+            now.0,
+            revoked_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// 新成员关系的结构与付款账户占用校验：主体存在、组织与付款账户的结构（S0 `Directory::build`）、付款账户还没有属于别的
+/// 成员关系。**不含**「成员关系 id 是否已经存在」，也不写入。控制面建成员关系时，调用者管不到的已有 id 和不存在的 id
+/// 一起先过这一关，之后才区分两者，所以两者在这里的失败、数据库执行的语句都一样（Codex 预审 H1 / M3）。
+pub(super) fn check_new_membership_in(
+    tx: &Connection,
+    membership: &Membership,
+) -> Result<(), AccountStoreError> {
     let principal = load_principal(tx, &membership.principal)?.ok_or_else(|| {
         DirectoryError::UnknownPrincipal {
             membership: membership.id.clone(),
@@ -579,22 +606,6 @@ pub(super) fn create_membership_in(
             .into());
         }
     }
-    let revoked_at = (membership.status == MembershipStatus::Revoked).then_some(now.0);
-    tx.execute(
-        "INSERT INTO memberships \
-            (membership_id, principal_id, org_id, role, account_id, status, created_at_ms, revoked_at_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![
-            membership.id.as_str(),
-            membership.principal.as_str(),
-            membership.org.as_str(),
-            to_text(&membership.role)?,
-            membership.account.as_ref().map(AccountId::as_str),
-            to_text(&membership.status)?,
-            now.0,
-            revoked_at,
-        ],
-    )?;
     Ok(())
 }
 

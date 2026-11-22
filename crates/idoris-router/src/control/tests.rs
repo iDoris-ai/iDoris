@@ -4160,3 +4160,76 @@ async fn member_credentials_and_pairing_codes_give_a_caller_without_the_operatio
         );
     }
 }
+
+/// 数据库里全部成员关系的 id（升序）。
+fn membership_rows(world: &World) -> Vec<String> {
+    let conn = world.db();
+    let mut stmt = conn
+        .prepare("SELECT membership_id FROM memberships ORDER BY membership_id")
+        .unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_bound_payment_account_gives_a_hidden_and_a_missing_membership_id_the_same_http_answer() {
+    // Codex 预审 H1：school-b 的付款账户 b1 已经属于 m-bee。school-b 的管理员拿 b1 和一个活跃的主体去建成员关系，
+    // 成员关系 id 一次用 eduai 的 `m-kid1`（school-b 管不到）、一次用不存在的 id。旧代码：前者 403 `out_of_scope`，
+    // 后者 400 `invalid_membership`（账户已被占用），靠它就能探测别的组织有哪些成员关系 id。现在两个得到同一个回答，
+    // 只有回答里回显的、调用者自己提交的那个 id 不同；两次都什么也没建。
+    let world = World::new();
+    world.people().await;
+    let other = world.other.secret.clone();
+    for principal in ["bee", "cat"] {
+        world
+            .ok(
+                "/control/v1/principals",
+                &other,
+                json!({"principal_id": principal, "org": "school-b"}),
+            )
+            .await;
+    }
+    world
+        .ok(
+            "/control/v1/memberships",
+            &other,
+            json!({"membership_id": "m-bee", "principal_id": "bee", "org": "school-b",
+                   "role": "member", "account": "b1"}),
+        )
+        .await;
+    let before = membership_rows(&world);
+    let mut answers = Vec::new();
+    // 两个 id 一样长：回答里回显的 id 换成占位符之后，连 content-length 也该逐字节相同
+    for id in ["m-kid1", "m-nope"] {
+        let reply = world
+            .call(
+                "POST",
+                "/control/v1/memberships",
+                Some(&other),
+                Some(
+                    json!({"membership_id": id, "principal_id": "cat", "org": "school-b",
+                            "role": "member", "account": "b1"}),
+                ),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{id}: {}", reply.raw);
+        assert_eq!(reply.reason(), "invalid_membership", "{id}: {}", reply.raw);
+        let message = reply.json["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("b1") && message.contains("m-bee"),
+            "{id}: {message}"
+        );
+        // 回显的 id 换成占位符之后，整份回答（状态、头、正文）逐字节相同
+        let (status, headers, mut body) = answer_without_the_correlation_id(&reply);
+        body["error"]["message"] = json!(message.replace(id, "<id>"));
+        answers.push((status, headers, body));
+    }
+    assert_eq!(answers[0], answers[1], "{answers:?}");
+    assert_eq!(
+        membership_rows(&world),
+        before,
+        "neither request may create anything"
+    );
+}
