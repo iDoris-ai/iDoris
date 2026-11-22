@@ -359,40 +359,35 @@ impl Actor {
         }
     }
 
-    /// 停掉并收尾一个引擎（宽限之后 SIGKILL，删记录）。失败只记日志：认不出的进程不发信号。已经有一个带期限的 `Shutdown` 在等
-    /// 的时候（启动途中被打断、在监管里被打断），这次停止也按那个期限算宽限，不会因为它先停引擎而超过 iDoris 的退出期限。
+    /// 停掉并收尾一个引擎（宽限之后 SIGKILL，删记录），没有期限（照 `stop_grace`）。失败只记日志：认不出的进程不发信号。iDoris 在停时
+    /// 的停止不走这里：那是 `Command::Shutdown` 带着期限交给 [`Self::stop_engine_by`]（等就绪被它打断时，引擎也是放回 `self.engine`
+    /// 交给那条命令，不在 [`Self::abandon`] 里先停，所以这里不会再遇到「已经有带期限的 `Shutdown` 在等」）。
     async fn stop_engine(&self, owned: Owned) {
-        self.stop_engine_by(owned, self.pending_shutdown_deadline())
-            .await;
+        self.stop_engine_by(owned, None).await;
     }
 
-    /// 在 `deadline` 之前停掉并收尾一个引擎：宽限只拿期限里剩下的，不到 2 秒就 SIGTERM 之后立刻 SIGKILL
-    /// （[`super::backoff::stop_windows`]）；没有期限就照 `stop_grace`。确认不了进程已经消失时所有权记录保留，下一个 iDoris
-    /// 认回它再收尾（`OwnedEngine::stop` 只在确认消失之后才删记录）。
+    /// 在 `deadline` 之前停掉并收尾一个引擎：把**绝对期限**交给引擎（`OwnedEngine::stop_until`），宽限与确认窗口由它在真正发 SIGTERM 的那一刻
+    /// 按期限里剩下的时间算（[`super::backoff::stop_windows`]：不到 2 秒就 SIGTERM 之后立刻 SIGKILL）；没有期限就照 `stop_grace`。
+    /// 认回的孤儿要先过身份闸（读启动时间、进程组，可能很慢）：闸花掉的时间从同一个期限里扣，不是在闸之前就换算成固定时长（H3：那样
+    /// 闸慢的时候宽限还是原来那么长，总时间超过期限）。确认不了进程已经消失时所有权记录保留，下一个 iDoris 认回它再收尾
+    /// （`OwnedEngine` 的停止只在确认消失之后才删记录）。
     async fn stop_engine_by(&self, owned: Owned, deadline: Option<tokio::time::Instant>) {
         self.plan.backend.release(&self.plan.endpoint);
         let grace = self.timings().stop_grace;
-        let (term, confirm) = match deadline {
-            None => (grace, grace),
-            Some(deadline) => super::backoff::stop_windows(
-                grace,
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            ),
-        };
-        if let Err(error) = owned.engine.stop_bounded(term, confirm).await {
+        if let Err(error) = owned.engine.stop_until(grace, deadline).await {
             self.log(&format!("停止引擎失败（{}）", error.reason_code()));
         }
     }
 
-    /// 暂存的命令是带期限的 `Shutdown` 时，它的期限。
-    fn pending_shutdown_deadline(&self) -> Option<tokio::time::Instant> {
-        match &self.pending {
+    /// 暂存的命令是 `Shutdown`（iDoris 在停）吗。
+    fn pending_is_shutdown(&self) -> bool {
+        matches!(
+            &self.pending,
             Some(Request {
-                command: Command::Shutdown { deadline, .. },
+                command: Command::Shutdown { .. },
                 ..
-            }) => *deadline,
-            _ => None,
-        }
+            })
+        )
     }
 
     // -----------------------------------------------------------------------------------------
@@ -993,8 +988,17 @@ impl Actor {
         Attempt::Ready
     }
 
-    /// 等就绪失败：停掉这个引擎，按原因回报。
+    /// 等就绪失败：按原因处置这个引擎（失败的原因决定它的去留，不能一概停掉），回报。
+    ///
+    /// **被 `Shutdown` 打断时不在这里停**（H4）：引擎是不是要停是那条命令说了算（`stop_on_exit:"never"` 的信号停止、以 0 退出：
+    /// 引擎留给下一个 iDoris，原来这里一概先停，认回来的、正在探测就绪的引擎就被无条件杀掉了，所有权记录也跟着删）。所有权交给
+    /// 暂存的命令：引擎放回 `self.engine`，回报「被打断」，主循环马上处理那条命令（[`Self::shutdown`] 按它的 `stop_engine` 与期限
+    /// 处置：停就停，不停就放手、记录原样保留）。启动失败（超时、被拒、退出）与别的命令（门控放弃）照旧停掉半拉起的引擎。
     async fn abandon(&mut self, owned: Owned, failure: WaitFailure) -> Attempt {
+        if matches!(failure, WaitFailure::Interrupted) && self.pending_is_shutdown() {
+            self.engine = Some(owned);
+            return Attempt::Interrupted;
+        }
         let inspector = self.shared.config.inspector.clone();
         let port = self.plan.port;
         self.stop_engine(owned).await;

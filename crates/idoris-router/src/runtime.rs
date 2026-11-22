@@ -11,7 +11,9 @@ use idoris_backend::{
 };
 use idoris_contracts::{ComponentCard, component_card::Form};
 use idoris_policy::is_subscription_provider_id;
-use idoris_upstream::factory::{AdapterParams, create_adapter, create_adapter_with};
+use idoris_upstream::factory::{
+    AdapterParams, create_adapter, create_adapter_unkeyed, create_adapter_with,
+};
 use idoris_upstream::{LocalHttpRuntimeAdapter, LocalHttpRuntimeConfig};
 
 use crate::dispatch::BoundSupervisor;
@@ -210,8 +212,10 @@ impl RuntimeRegistry {
     /// uses ([`adapter_for`]) and the adapter dropped: a card whose adapter cannot be built (`no adapter for
     /// provider X`, a form with `no runtime constructor`) is a start-up failure here, not an error at gate-open
     /// (after the engines already started and the discovery file was published) that a degraded projection could
-    /// even have hidden. Constructing an adapter does no I/O; it only reads the environment and settings for the
-    /// oMLX API key, so the dry-run neither depends on nor disturbs the engine's state.
+    /// even have hidden. Constructing an adapter does no I/O, and the dry run **resolves no credential at all** (L10: it goes
+    /// through [`create_adapter_unkeyed`], so it neither reads `IDORIS_OMLX_API_KEY` nor the user's `~/.omlx/settings.json`:
+    /// the credential is resolved only when the adapter is really built, after the managed engine is up and its private key
+    /// registered), so the dry run neither depends on nor disturbs the engine's state.
     pub fn resolve_adapter_params(
         cards: &[ComponentCard],
         local: &BTreeMap<String, LocalHttpRuntimeConfig>,
@@ -231,7 +235,7 @@ impl RuntimeRegistry {
             None => AdapterParams::default(),
         };
         for card in supervised {
-            adapter_for(card, local, |card| create_adapter_with(card, &params))
+            adapter_for(card, local, |card| create_adapter_unkeyed(card, &params))
                 .map_err(|error| format!("provider {}: {error}", card.provider.id))?;
         }
         Ok(params)

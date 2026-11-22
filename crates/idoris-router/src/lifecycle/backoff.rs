@@ -61,32 +61,10 @@ impl Default for Timings {
     }
 }
 
-/// 在期限之前必须收尾的停止里，SIGTERM 之后的宽限不到这么多就不给了：SIGTERM 之后立刻 SIGKILL（宽限本来就比它短的配置，
-/// 即测试里缩短过的，按自己的宽限算）。
-pub const MIN_TERM_GRACE: Duration = Duration::from_secs(2);
-/// SIGKILL 之后等进程被回收、整组消失的最短时间，期限已经到了也给这么多（SIGKILL 之后几毫秒就够，这是给卡在内核里的进程的余量）。
-pub const MIN_CONFIRM: Duration = Duration::from_millis(500);
-
-/// 距期限还有 `remaining` 时开始的停止怎么分配时间，返回 `(term, confirm)`：
-///
-/// - `term`：SIGTERM 之后等整组自己消失多久，`min(grace, remaining)`；不到 `min(MIN_TERM_GRACE, grace)` 就是零，
-///   SIGTERM 之后立刻 SIGKILL，剩下的时间留给确认。
-/// - `confirm`：SIGKILL 之后等进程被回收、整组消失多久：期限里剩下的，至少 [`MIN_CONFIRM`]，至多 `grace`。
-///
-/// iDoris 收到信号之后，launcher 在 17 秒时 SIGKILL 它；`stop_on_exit:"never"` 的信号停止先排空 HTTP（最多 10 秒）再停引擎，
-/// 引擎照 8 秒宽限就是 18 秒，放不下。总期限从信号起算（`crate::stop::STOP_DEADLINE`），宽限只拿剩下的那一段。
-pub fn stop_windows(grace: Duration, remaining: Duration) -> (Duration, Duration) {
-    let term = grace.min(remaining);
-    let term = if term < MIN_TERM_GRACE.min(grace) {
-        Duration::ZERO
-    } else {
-        term
-    };
-    let confirm = remaining
-        .saturating_sub(term)
-        .clamp(MIN_CONFIRM, grace.max(MIN_CONFIRM));
-    (term, confirm)
-}
+/// 期限之前必须收尾的停止怎么分配时间（`stop_windows`、`MIN_TERM_GRACE`、`MIN_CONFIRM`）：定义在引擎那一层（`idoris_upstream::engine`），
+/// 因为认回的孤儿要先过身份闸才发信号，宽限必须在**真正发信号的那一刻**按期限里剩下的时间算（H3，`OwnedEngine::stop_until`），这个计算不能
+/// 留在身份闸的外面。这里只是转出来，让管理器与收尾的测试用同一份。
+pub use idoris_upstream::engine::{MIN_CONFIRM, MIN_TERM_GRACE, stop_windows};
 
 /// 第 `failures`（从 1 起）次失败之后、重启之前的等待：`base × 2^(failures-1)`，封顶 `cap`，再抖动。
 /// 规范：1、2、4 秒起翻倍，封顶 30 秒，±20%。`failures` 为 0 时不等。

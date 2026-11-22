@@ -65,6 +65,33 @@ use crate::local_runtime_process::{
 /// 停止引擎的缺省宽限：SIGTERM 之后等整组消失，到点还在就 SIGKILL 整组（规范 §2.7.6「进程组」：8 秒）。
 /// [`OwnedEngine::stop`] 的宽限由调用方给；这是调用方（S5 的管理器）该给的缺省值。
 pub const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(8);
+/// 在期限之前必须收尾的停止里，SIGTERM 之后的宽限不到这么多就不给了：SIGTERM 之后立刻 SIGKILL（宽限本来就比它短的配置，
+/// 即测试里缩短过的，按自己的宽限算）。
+pub const MIN_TERM_GRACE: Duration = Duration::from_secs(2);
+/// SIGKILL 之后等进程被回收、整组消失的最短时间，期限已经到了也给这么多（SIGKILL 之后几毫秒就够，这是给卡在内核里的进程的余量）。
+pub const MIN_CONFIRM: Duration = Duration::from_millis(500);
+
+/// 距期限还有 `remaining` 时开始的停止怎么分配时间，返回 `(term, confirm)`：
+///
+/// - `term`：SIGTERM 之后等整组自己消失多久，`min(grace, remaining)`；不到 `min(MIN_TERM_GRACE, grace)` 就是零，
+///   SIGTERM 之后立刻 SIGKILL，剩下的时间留给确认。
+/// - `confirm`：SIGKILL 之后等进程被回收、整组消失多久：期限里剩下的，至少 [`MIN_CONFIRM`]，至多 `grace`。
+///
+/// iDoris 收到信号之后，launcher 在 17 秒时 SIGKILL 它；总期限从信号起算，宽限只拿剩下的那一段。**`remaining` 必须在真正发信号的
+/// 那一刻取**（认回的孤儿要先过身份闸，闸可能很慢：[`OwnedEngine::stop_until`]），不能在闸之前换算成固定时长。
+pub fn stop_windows(grace: Duration, remaining: Duration) -> (Duration, Duration) {
+    let term = grace.min(remaining);
+    let term = if term < MIN_TERM_GRACE.min(grace) {
+        Duration::ZERO
+    } else {
+        term
+    };
+    let confirm = remaining
+        .saturating_sub(term)
+        .clamp(MIN_CONFIRM, grace.max(MIN_CONFIRM));
+    (term, confirm)
+}
+
 /// 轮询进程组消失 / 引擎退出的间隔。
 const POLL: Duration = Duration::from_millis(25);
 /// 拉起后读不到身份时，收拾刚拉起的引擎给的宽限。
@@ -82,6 +109,8 @@ pub enum MismatchReason {
     OtherUser,
     /// 启动时间不同：pid 被复用了。
     StartTime,
+    /// 「代」标识不同（比启动时间的秒更细）：pid 被另一个进程复用了，哪怕是同一秒内。
+    Generation,
     /// 这个 pid 不再是它自己那个进程组的组长。
     ProcessGroup,
     /// 命令行不同。
@@ -99,6 +128,7 @@ impl MismatchReason {
             Self::ProcessGone => "process_gone",
             Self::OtherUser => "other_user",
             Self::StartTime => "start_time",
+            Self::Generation => "generation",
             Self::ProcessGroup => "process_group",
             Self::Command => "command",
             Self::Port => "port",
@@ -111,6 +141,8 @@ impl MismatchReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnreadableReason {
     StartTime,
+    /// 「代」标识读不出来；或者旧记录没有它、端口又对不上：只有秒级身份，**无法确认**是不是我们的进程。
+    Generation,
     ProcessGroup,
     Command,
     Port,
@@ -120,6 +152,7 @@ impl UnreadableReason {
     pub fn code(&self) -> &'static str {
         match self {
             Self::StartTime => "start_time",
+            Self::Generation => "generation",
             Self::ProcessGroup => "process_group",
             Self::Command => "command",
             Self::Port => "port",
@@ -348,11 +381,14 @@ impl OwnedEngine {
                 EngineError::IdentityUnavailable
             });
         };
+        // 平台给的进程「代」标识（比秒更细）；读不出来就是 `None`：这条记录只有秒级身份，发信号之前的核对按旧规则。
+        let generation = inspector.generation(pid).await.ok();
         let record = OwnershipRecord {
             engine_kind: launch.kind().clone(),
             pid,
             port: launch.port(),
             started_at,
+            generation,
             command: None,
             executable: launch.executable().to_owned(),
             api_key: launch.api_key().cloned(),
@@ -538,7 +574,26 @@ impl OwnedEngine {
     /// 认回的孤儿身份对不上（进程已经没了、pid 被复用）时什么信号都不发，直接 `Ok`：没有我们的东西在跑。
     /// 身份读不出来 → [`EngineError::IdentityUnreadable`]，同样不发信号。
     pub async fn stop(self, grace: Duration) -> Result<(), EngineError> {
-        self.stop_bounded(grace, grace).await
+        self.stop_with(move || (grace, grace)).await
+    }
+
+    /// [`Self::stop`] against an **absolute deadline**: the SIGTERM grace and the confirmation window are worked out
+    /// from what is left of `deadline` at the moment the signal is really sent ([`stop_windows`]), after the identity
+    /// gate of a recovered orphan (a slow `ps` / `lsof` must eat into the same budget, not be added on top of
+    /// durations that were fixed before it). `None` = no deadline, `grace` for both waits.
+    pub async fn stop_until(
+        self,
+        grace: Duration,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), EngineError> {
+        self.stop_with(move || match deadline {
+            None => (grace, grace),
+            Some(deadline) => stop_windows(
+                grace,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ),
+        })
+        .await
     }
 
     /// [`Self::stop`] with the two waits told apart, for a stop that has to be over by a deadline (the launcher's
@@ -551,6 +606,15 @@ impl OwnedEngine {
         term_grace: Duration,
         confirm: Duration,
     ) -> Result<(), EngineError> {
+        self.stop_with(move || (term_grace, confirm)).await
+    }
+
+    /// The one implementation behind [`Self::stop`], [`Self::stop_bounded`] and [`Self::stop_until`]: `windows` gives
+    /// `(term, confirm)` and is called at the moment the SIGTERM is really about to be sent.
+    async fn stop_with(
+        self,
+        windows: impl FnOnce() -> (Duration, Duration),
+    ) -> Result<(), EngineError> {
         let Self {
             backing,
             record,
@@ -560,18 +624,16 @@ impl OwnedEngine {
         } = self;
         match backing {
             Backing::Spawned(process) => {
+                let (term_grace, confirm) = windows();
+                // Every signalling rescan happens inside `shutdown_bounded`, while the unreaped child still pins the
+                // group id. If it fails, that is only reported: after the reap the numeric group id may belong to an
+                // unrelated process group, so there is no second sweep by number here.
                 if process.shutdown_bounded(term_grace, confirm).await.is_err() {
-                    // `shutdown` sweeps the group with SIGKILL once; a child forked in the instant
-                    // of that sweep is not on its list. Sweep again until nothing is left.
-                    let group = i32::try_from(record.process_group())
-                        .map_err(|_| EngineError::StopFailed)?;
-                    if !sweep_until_gone(group, confirm).await? {
-                        return Err(EngineError::StopFailed);
-                    }
+                    return Err(EngineError::StopFailed);
                 }
             }
             Backing::Recovered => {
-                stop_recovered(inspector.as_ref(), &record, term_grace, confirm).await?;
+                stop_recovered(inspector.as_ref(), &record, windows).await?;
             }
         }
         // 进程已确认消失。记录删不掉也无妨：下一个 iDoris 读到它会因进程不在而作废。
@@ -606,6 +668,16 @@ async fn gate(inspector: &dyn ProcessInspector, record: &OwnershipRecord) -> Gat
             return Gate::NotOurs(MismatchReason::StartTime);
         }
         Ok(_) => {}
+    }
+    // 记录里有「代」标识就必须对得上（发任何信号之前）；读不出来不是不一致，是确认不了：不发信号。
+    if let Some(expected) = &record.generation {
+        match inspector.generation(record.pid).await {
+            Err(_) => return Gate::Unreadable(UnreadableReason::Generation),
+            Ok(current) if current != *expected => {
+                return Gate::NotOurs(MismatchReason::Generation);
+            }
+            Ok(_) => {}
+        }
     }
     match inspector.process_group(record.pid).await {
         Err(_) => Gate::Unreadable(UnreadableReason::ProcessGroup),
@@ -683,7 +755,16 @@ async fn classify(
         },
         // pid、启动时间、进程组、命令都吻合，只是端口上没有它：上一代引擎正在退出，它是我们的。记录不删：
         // 删了就再没有任何东西认得回它，它会成为一个没人管的引擎（上一个 iDoris 在它收尾期间被 SIGKILL）。
-        IdentityVerdict::Mismatch(MismatchReason::Port) => Classified::Exiting { record },
+        //
+        // 但这个结论只在记录有「代」标识（比秒更细的身份，闸里已经核对过）时才成立。旧记录只有秒级的启动时间：同一秒内被复用的 pid、
+        // 碰巧同命令同组长又没有监听那个端口的外部进程，和「正在退出的上一代」分不出来。分不出来就**无法确认**：记录保留、不发信号。
+        IdentityVerdict::Mismatch(MismatchReason::Port) => {
+            if record.generation.is_some() {
+                Classified::Exiting { record }
+            } else {
+                Classified::Unverifiable(UnreadableReason::Generation)
+            }
+        }
         IdentityVerdict::Mismatch(reason) => {
             store.remove_if_same(&record)?;
             Classified::Stale(reason)
@@ -692,12 +773,12 @@ async fn classify(
     })
 }
 
-/// 停认回的孤儿：身份闸 → SIGTERM 整组 → 等整组消失（`term_grace`）→ SIGKILL 整组 → 等整组消失（`confirm`）。
+/// 停认回的孤儿：身份闸 → SIGTERM 整组 → 等整组消失（`term`）→ SIGKILL 整组 → 等整组消失（`confirm`）。`(term, confirm)` 在**身份闸通过之后、
+/// 发 SIGTERM 之前**才由 `windows` 取（闸里的 `ps` 慢了，慢掉的时间已经花在期限上，宽限据此重算）。
 async fn stop_recovered(
     inspector: &dyn ProcessInspector,
     record: &OwnershipRecord,
-    term_grace: Duration,
-    confirm: Duration,
+    windows: impl FnOnce() -> (Duration, Duration),
 ) -> Result<(), EngineError> {
     match gate(inspector, record).await {
         // 没有我们的东西在跑（或 pid 已经给了别人）：什么都不发。
@@ -705,6 +786,7 @@ async fn stop_recovered(
         Gate::Unreadable(reason) => return Err(EngineError::IdentityUnreadable(reason)),
         Gate::Ours => {}
     }
+    let (term_grace, confirm) = windows();
     let group = signal_target(record)?;
     signal_group(group, Signal::SIGTERM).map_err(|_| EngineError::Signal)?;
     if wait_group_gone(group, term_grace).await? {
@@ -787,9 +869,13 @@ mod tests {
     struct Fake {
         state: PidState,
         start: Result<String, InspectError>,
+        /// 默认「读不出来」：只有强身份（记录里有「代」标识）的测试才给它值。
+        generation: Result<String, InspectError>,
         group: Result<u32, InspectError>,
         command: Result<String, InspectError>,
         listens: Result<bool, InspectError>,
+        /// 读启动时间之前先睡这么久（慢 `ps`）。
+        start_delay: Duration,
         asked: Mutex<Vec<&'static str>>,
     }
 
@@ -799,9 +885,11 @@ mod tests {
             Self {
                 state: PidState::Alive,
                 start: Ok("Fri Nov 20 08:14:05 2026".into()),
+                generation: Err(InspectError::NoAnswer),
                 group: Ok(51234),
                 command: Ok("fake-server".into()),
                 listens: Ok(true),
+                start_delay: Duration::ZERO,
                 asked: Mutex::new(Vec::new()),
             }
         }
@@ -818,7 +906,14 @@ mod tests {
         }
         async fn start_time(&self, _pid: u32) -> Result<String, InspectError> {
             self.asked.lock().unwrap().push("start");
+            if !self.start_delay.is_zero() {
+                tokio::time::sleep(self.start_delay).await;
+            }
             self.start.clone()
+        }
+        async fn generation(&self, _pid: u32) -> Result<String, InspectError> {
+            self.asked.lock().unwrap().push("generation");
+            self.generation.clone()
         }
         async fn command(&self, _pid: u32) -> Result<String, InspectError> {
             self.asked.lock().unwrap().push("command");
@@ -848,6 +943,7 @@ mod tests {
             executable: "/opt/engines/fake/bin/fake-server".into(),
             api_key: Some(EngineKey::from_hex(&"ab".repeat(32)).unwrap()),
             launched_by_instance: "3f0c6a52-6a0e-4c0e-9a6e-0d2f1c7a9b11".into(),
+            generation: None,
         }
     }
 
@@ -1047,15 +1143,26 @@ mod tests {
         assert!(present());
     }
 
-    /// pid, start time, process group and command all match but the port is not listening: the previous generation,
-    /// still exiting (it closed its listener on SIGTERM and is waiting for in-flight work). It is ours: the record
-    /// is **kept** (dropping it would leave an engine nobody manages), never classified Stale.
+    /// A record with a strong identity (a process generation finer than a second) whose pid, start time, generation, process
+    /// group and command all match but whose port is not listening is the previous generation of our engine, still exiting
+    /// (it closed its listener on SIGTERM and is waiting for in-flight work). It is ours: the record is **kept** (dropping it
+    /// would leave an engine nobody manages), never classified Stale. An OLD record (second-precision identity only) in the
+    /// same situation cannot be told from a pid that was reused inside the same second by a process of the same user with the
+    /// same command and group leadership that merely does not listen on the port: **cannot confirm**, so the record is kept and
+    /// nothing is signalled. A reused pid (another generation) is Stale; an unreadable generation is "cannot confirm" too.
     #[tokio::test]
-    async fn a_record_whose_only_mismatch_is_the_port_is_an_exiting_generation_and_is_kept() {
+    async fn a_record_whose_only_mismatch_is_the_port_is_an_exiting_generation_only_with_a_strong_identity()
+     {
         let (_state, _inst, store) = fixture();
-        store.write(&record()).unwrap();
+        let strong = || {
+            let mut strong = record();
+            strong.generation = Some("gen-1".into());
+            strong
+        };
         let mut not_listening = Fake::matching();
         not_listening.listens = Ok(false);
+        not_listening.generation = Ok("gen-1".into());
+        store.write(&strong()).unwrap();
         assert!(matches!(
             classify(&store, &not_listening).await.unwrap(),
             Classified::Exiting { .. }
@@ -1064,6 +1171,38 @@ mod tests {
             store.read().unwrap().is_some(),
             "the record of an exiting engine is kept until the engine is confirmed gone"
         );
+        // An old record: cannot confirm. Kept, and not Exiting (so nothing is stopped).
+        store.write(&record()).unwrap();
+        assert!(matches!(
+            classify(&store, &not_listening).await.unwrap(),
+            Classified::Unverifiable(UnreadableReason::Generation)
+        ));
+        assert!(
+            store.read().unwrap().is_some(),
+            "an old record that cannot be confirmed is kept"
+        );
+        // A strong record, but another process generation under the pid: the pid was reused (even inside one second).
+        store.write(&strong()).unwrap();
+        let mut reused = Fake::matching();
+        reused.listens = Ok(false);
+        reused.generation = Ok("gen-2".into());
+        assert!(matches!(
+            classify(&store, &reused).await.unwrap(),
+            Classified::Stale(MismatchReason::Generation)
+        ));
+        assert!(
+            store.read().unwrap().is_none(),
+            "a reused pid drops the record"
+        );
+        // A strong record whose generation cannot be read right now: cannot confirm, kept.
+        store.write(&strong()).unwrap();
+        let mut blind = Fake::matching();
+        blind.listens = Ok(false);
+        assert!(matches!(
+            classify(&store, &blind).await.unwrap(),
+            Classified::Unverifiable(UnreadableReason::Generation)
+        ));
+        assert!(store.read().unwrap().is_some());
         // Every other single mismatch is still Stale (and the record dropped): that is not our process.
         for (tweak, reason) in [
             (
@@ -1094,6 +1233,112 @@ mod tests {
             classify(&store, &fake).await.unwrap(),
             Classified::Verified { sealed: false, .. }
         ));
+    }
+
+    /// M6: the generation is checked before ANY signal. A record with a generation whose pid now shows another generation is
+    /// not ours (nothing is sent); one whose generation cannot be read now is "cannot confirm" (nothing is sent). The record
+    /// names this very process: signalling it would be fatal, so a passing stop would be a failure of the test.
+    #[tokio::test]
+    async fn a_generation_that_differs_or_cannot_be_read_ends_the_stop_before_any_signal() {
+        let grace = Duration::from_millis(100);
+        let mut mine = record();
+        mine.pid = std::process::id();
+        mine.generation = Some("gen-1".into());
+        let mut other = Fake::matching();
+        other.generation = Ok("gen-2".into());
+        stop_recovered(&other, &mine, || (grace, grace))
+            .await
+            .unwrap();
+        let blind = Fake::matching();
+        assert!(matches!(
+            stop_recovered(&blind, &mine, || (grace, grace)).await,
+            Err(EngineError::IdentityUnreadable(
+                UnreadableReason::Generation
+            ))
+        ));
+    }
+
+    /// H3: the stop windows are taken AFTER the identity gate (a slow `ps` eats into the same deadline), not before it.
+    /// The record names this very process, so the stop ends with `UnsafeRecord` right after the windows were asked for:
+    /// no signal is ever sent.
+    #[tokio::test]
+    async fn the_stop_windows_are_taken_after_a_slow_identity_gate_not_before_it() {
+        let mut mine = record();
+        mine.pid = std::process::id();
+        let mut slow = Fake::matching();
+        slow.start_delay = Duration::from_millis(300);
+        slow.group = Ok(std::process::id());
+        let begun = std::time::Instant::now();
+        let asked_after = std::cell::Cell::new(None);
+        let result = stop_recovered(&slow, &mine, || {
+            asked_after.set(Some(begun.elapsed()));
+            (Duration::from_millis(10), Duration::from_millis(10))
+        })
+        .await;
+        assert!(
+            matches!(result, Err(EngineError::UnsafeRecord)),
+            "{result:?}"
+        );
+        let asked_after = asked_after
+            .get()
+            .unwrap_or_else(|| panic!("the windows were asked for"));
+        assert!(
+            asked_after >= Duration::from_millis(300),
+            "the windows must be worked out after the gate (which took 300 ms): {asked_after:?}"
+        );
+    }
+
+    /// H5: a spawned engine whose process group cannot be confirmed gone after the child was reaped is only REPORTED
+    /// (`StopFailed`): no signal goes to the numeric group id after the reap (the id may already belong to an unrelated
+    /// process group). Every rescan that signals happened before the reap, while the unreaped child pinned the id.
+    #[tokio::test]
+    async fn a_spawned_engine_whose_group_cannot_be_confirmed_after_the_reap_is_reported_and_never_swept_by_number()
+     {
+        use crate::local_runtime_process::test_hooks::{self, Event};
+
+        let (_state, inst, store) = fixture();
+        let process = ManagedRuntimeProcess::spawn_test(
+            std::path::Path::new("/bin/sleep"),
+            vec!["600".into()],
+        )
+        .unwrap();
+        let pid = process.id().unwrap();
+        let group = i32::try_from(pid).unwrap();
+        test_hooks::force_live(group);
+        let mut rec = record();
+        rec.pid = pid;
+        store.write(&rec).unwrap();
+        let engine = OwnedEngine {
+            backing: Backing::Spawned(process),
+            endpoint: inst.endpoint(),
+            instance: inst,
+            record: rec,
+            store,
+            inspector: Arc::new(Fake::matching()),
+        };
+        let result = engine
+            .stop_bounded(Duration::from_millis(100), Duration::from_millis(400))
+            .await;
+        assert!(matches!(result, Err(EngineError::StopFailed)), "{result:?}");
+        let events = test_hooks::events_for(group);
+        let reaped = events
+            .iter()
+            .position(|event| *event == Event::Reaped)
+            .unwrap_or_else(|| panic!("the child was reaped"));
+        assert!(
+            events[reaped + 1..]
+                .iter()
+                .all(|event| !matches!(event, Event::Signal(_))),
+            "no group signal after the reap: {events:?}"
+        );
+        assert!(
+            events[..reaped]
+                .iter()
+                .filter(|event| matches!(event, Event::Signal(Signal::SIGKILL)))
+                .count()
+                >= 2,
+            "the rescans happen before the reap, while the leader pins the group id: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -1284,12 +1529,14 @@ mod tests {
         ] {
             let mut fake = Fake::matching();
             tweak(&mut fake);
-            stop_recovered(&fake, &mine, grace, grace).await.unwrap();
+            stop_recovered(&fake, &mine, || (grace, grace))
+                .await
+                .unwrap();
         }
         let mut blind = Fake::matching();
         blind.start = Err(InspectError::TimedOut);
         assert!(matches!(
-            stop_recovered(&blind, &mine, grace, grace).await,
+            stop_recovered(&blind, &mine, || (grace, grace)).await,
             Err(EngineError::IdentityUnreadable(UnreadableReason::StartTime))
         ));
     }

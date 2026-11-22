@@ -103,6 +103,8 @@ struct Scripted {
     team_checks: AtomicUsize,
     /// 端口 → 还剩几次「`listens_on` 为真」，用完之后一律为假：造「等就绪时监听它的是引擎，封印时端口已被别人占了」。
     claim_budget: Mutex<BTreeMap<u16, usize>>,
+    /// 读启动时间、进程组之前先睡这么久（慢 `ps`：认回的孤儿的身份闸因此很慢）。
+    slow: Mutex<Duration>,
 }
 
 impl Scripted {
@@ -114,7 +116,20 @@ impl Scripted {
             teams: Mutex::new(BTreeMap::new()),
             team_checks: AtomicUsize::new(0),
             claim_budget: Mutex::new(BTreeMap::new()),
+            slow: Mutex::new(Duration::ZERO),
         })
+    }
+
+    /// 从现在起每次读启动时间、进程组都先睡 `delay`。
+    fn set_slow(&self, delay: Duration) {
+        *self.slow.lock().unwrap() = delay;
+    }
+
+    async fn dawdle(&self) {
+        let delay = *self.slow.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
     }
 
     /// 自有引擎的端口，但只有第一次问到 `listens_on` 时为真（等就绪那一次），之后为假（封印那一次）。
@@ -150,12 +165,17 @@ impl ProcessInspector for Scripted {
         self.real.pid_state(pid)
     }
     async fn start_time(&self, pid: u32) -> Result<String, InspectError> {
+        self.dawdle().await;
         self.real.start_time(pid).await
+    }
+    async fn generation(&self, pid: u32) -> Result<String, InspectError> {
+        self.real.generation(pid).await
     }
     async fn command(&self, pid: u32) -> Result<String, InspectError> {
         self.real.command(pid).await
     }
     async fn process_group(&self, pid: u32) -> Result<u32, InspectError> {
+        self.dawdle().await;
         self.real.process_group(pid).await
     }
     async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
@@ -1374,8 +1394,8 @@ async fn an_engine_that_never_listens_is_stopped_after_the_startup_timeout_and_r
 // ---------------------------------------------------------------------------------------------
 
 /// `shutdown_by` 带期限：对 SIGTERM 没有反应的引擎只得到期限里剩下的宽限，不是整整 `stop_grace`（这里 10 秒）。就绪的引擎，和启动
-/// 途中被打断的引擎（管理器正在等它就绪，停止命令打断了等待，先收拾半拉起的引擎）都一样：后者走的是「已经有一个带期限的停止在等」
-/// 那条路，宽限同样只拿剩下的。引擎被 SIGKILL、确认消失之后所有权记录才删。
+/// 途中被打断的引擎（管理器正在等它就绪，停止命令打断了等待）都一样：后者的引擎放回实例、交给那条带期限的 `Shutdown` 命令去停（H4），
+/// 宽限同样只拿剩下的。引擎被 SIGKILL、确认消失之后所有权记录才删。
 #[tokio::test]
 async fn a_stop_against_a_deadline_gives_a_sigterm_ignoring_engine_only_the_time_left() {
     for starting in [false, true] {
@@ -1428,6 +1448,114 @@ async fn a_stop_against_a_deadline_gives_a_sigterm_ignoring_engine_only_the_time
             "{case}: the grace is what is left of the deadline, not the full 10 s: {took:?}"
         );
         assert_eq!(rig.records(), 0, "{case}: no record left behind");
+    }
+}
+
+/// H3（管理器这一层）：认回的孤儿要先过身份闸（读启动时间、进程组），慢的 `ps` 让闸花掉 2.4 秒。期限是**绝对**的：闸花掉的时间从同一个期限里扣，
+/// 宽限在真正发 SIGTERM 的那一刻按剩下的时间算（不到 2 秒就 SIGTERM 之后立刻 SIGKILL）。宽限若是在闸之前就换算成固定时长（3.5 秒），
+/// 闸之后还要再等 3.5 秒、总共六秒多，超过这 3.5 秒的期限，对 SIGTERM 没有反应的引擎也等不到期限内的 SIGKILL。
+#[tokio::test]
+async fn a_slow_identity_gate_comes_out_of_the_same_deadline_for_an_adopted_engine_that_ignores_sigterm()
+ {
+    let rig = Rig::new(&Behavior {
+        on_sigterm: OnSigterm::Ignore,
+        ..Behavior::default()
+    });
+    let inspector = Scripted::claiming(rig.port);
+    let pid = leave_an_orphan(&rig, &inspector).await;
+    let mut timings = fast();
+    timings.stop_grace = Duration::from_secs(10);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        timings,
+        StopOnExit::Owned,
+    );
+    let status = h.until_state(UpstreamState::Ready).await;
+    assert!(status.owned, "adopted: the engine is ours");
+    inspector.set_slow(Duration::from_millis(1200));
+
+    let begun = Instant::now();
+    h.manager
+        .shutdown_by(
+            true,
+            Some(tokio::time::Instant::now() + Duration::from_millis(3500)),
+        )
+        .await;
+    let took = begun.elapsed();
+    assert!(
+        !pid_alive(pid),
+        "the engine that ignores SIGTERM received its SIGKILL"
+    );
+    // （剩下的时间不到 2 秒：SIGTERM 之后立刻 SIGKILL，假引擎来不及把这次 SIGTERM 记下来，所以不数它收到过几次。）
+    assert!(
+        took >= Duration::from_millis(2300),
+        "the identity gate really took 2.4 s: {took:?}"
+    );
+    assert!(
+        took < Duration::from_millis(4600),
+        "the gate and the stop share one 3.5 s deadline: {took:?}"
+    );
+    assert_eq!(rig.records(), 0);
+}
+
+/// H4：一个 `Shutdown` 打断了认回的孤儿的就绪等待（它活着、在听，只是回 503，管理器还在等它就绪）。引擎的去留由这条命令说了算：
+/// `stop_engine:false`（`stop_on_exit:"never"` 的信号停止、以退出码 0 退出）就让它活着、所有权记录原样留给下一个 iDoris；
+/// `stop_engine:true` 才停。此前等就绪被打断时一概先停掉半拉起的引擎，认回来的引擎就被无条件杀掉、记录也删了。
+#[tokio::test]
+async fn a_shutdown_that_interrupts_the_readiness_wait_of_an_adopted_engine_leaves_its_fate_to_that_command()
+ {
+    for stop in [false, true] {
+        let case = if stop {
+            "stop_engine true"
+        } else {
+            "stop_engine false"
+        };
+        let rig = Rig::new(&Behavior::default());
+        let inspector = Scripted::claiming(rig.port);
+        let pid = leave_an_orphan(&rig, &inspector).await;
+        // 孤儿忙着（503）：下一个管理器认回它之后一直在等它就绪。
+        rig.fake.force_status(503);
+        let probed = rig.fake.requests().len();
+        let h = Harness::start(
+            &rig,
+            default_backend(&rig),
+            inspector,
+            fast(),
+            StopOnExit::Never,
+        );
+        wait_for("the adopted engine to be probed for readiness", || {
+            rig.fake.requests().len() > probed
+        })
+        .await;
+        assert_ne!(
+            h.view().state,
+            UpstreamState::Ready,
+            "{case}: still waiting for it to be ready"
+        );
+
+        h.manager
+            .shutdown_by(
+                stop,
+                Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+            )
+            .await;
+        if stop {
+            wait_for("the engine to be stopped", || !pid_alive(pid)).await;
+            assert_eq!(rig.records(), 0, "{case}: stopped and its record reclaimed");
+        } else {
+            assert!(
+                pid_alive(pid),
+                "{case}: handed over, not stopped: the original process survives"
+            );
+            assert_eq!(rig.records(), 1, "{case}: its ownership record is kept");
+            assert_eq!(rig.fake.launches(), 1, "{case}: nothing was relaunched");
+            assert!(
+                rig.fake.sigterm_times().is_empty(),
+                "{case}: it was never even signalled"
+            );
+        }
     }
 }
 

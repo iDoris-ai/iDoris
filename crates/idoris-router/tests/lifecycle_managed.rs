@@ -1773,14 +1773,14 @@ async fn a_lifecycle_card_whose_provider_has_no_adapter_fails_startup_before_any
     }
 }
 
-/// L6：SIGTERM 在 iDoris 还在启动的时候就到了（它停在读 launcher 的启动帧上，帧还没写给它）：信号处理器是 `run` 一开始就注册的，
-/// 信号被记下，帧到了、开始服务之后停止流程第一次读它就读到，走优雅停止，退出码 0。（此前处理器在停止流程第一次被 poll 时才注册，
-/// 启动期间到的 SIGTERM 按默认动作直接杀死进程：没有退出码，自己拉起的引擎也来不及收尾。）
+/// L6、H1：SIGTERM 在 iDoris 还在启动的时候就到了（它停在读 launcher 的启动帧上，帧紧接着才写给它）：信号处理器是 `run` 一开始就注册的，
+/// 信号被记下，走优雅停止，退出码 0。（此前处理器在停止流程第一次被 poll 时才注册，启动期间到的 SIGTERM 按默认动作直接杀死进程：
+/// 没有退出码。）已经到过的信号一定在**拉起引擎之前**处理：帧虽然紧接着到了，引擎一个也没有拉起（此前是先把引擎拉起来、再立刻停掉）。
 ///
 /// 怎么知道 iDoris 已经走过 `run` 的开头：实例锁文件（`<db>.lock`）在 `run` 里、处理器注册**之后**才创建，它出现就说明处理器已经装好，
 /// 而帧此刻还没给它，所以它一定还在启动里。
 #[tokio::test]
-async fn a_sigterm_that_arrives_while_idoris_is_still_starting_up_is_held_and_ends_in_a_graceful_exit()
+async fn a_sigterm_that_arrives_while_idoris_is_still_starting_up_is_handled_before_any_engine_is_started()
  {
     let env = Env::new();
     let fake = env.fake("engine", &Behavior::default());
@@ -1804,5 +1804,459 @@ async fn a_sigterm_that_arrives_while_idoris_is_still_starting_up_is_held_and_en
         status.code(),
         Some(0),
         "a SIGTERM during start-up is held, not fatal (killed by signal = no exit code): {status:?} {stderr}"
+    );
+    assert_eq!(
+        fake.launches(),
+        0,
+        "a signal that had already arrived is handled before any engine is started: {stderr}"
+    );
+    assert!(
+        !env.discovery_path().exists(),
+        "nothing was published either"
+    );
+}
+
+/// 两个不同的空闲端口（数据面与 Admin 的）。
+fn two_free_ports() -> (u16, u16) {
+    let first = free_port();
+    loop {
+        let second = free_port();
+        if second != first {
+            return (first, second);
+        }
+    }
+}
+
+/// 一个进程此刻打开的文件的名字（`lsof -Fn`：每行 `n<路径>`）。
+fn open_files_of(pid: u32) -> String {
+    let lsof = if Path::new("/usr/sbin/lsof").is_file() {
+        "/usr/sbin/lsof"
+    } else {
+        "/usr/bin/lsof"
+    };
+    let output = Command::new(lsof)
+        .args(["-p", &pid.to_string(), "-Fn"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// H1：iDoris 停在读 stdin 上（launcher 慢，或就是不写：帧至多等 10 秒，Admin token 也是），这时的 SIGTERM 不能等读超时自己结束：
+/// launcher 在 SIGTERM 之后 17 秒就 SIGKILL，而读超时之后此前是以退出码 1 退出（「launcher 帧无效（timeout）」），而不是信号该有的 0。
+/// 现在读的等待每一小段看一眼停止信号，看到就放弃：退出码 0、一个引擎也没拉起、没有发布任何东西。两种 stdin 输入各试一次。
+///
+/// 怎么知道 iDoris 正停在读 stdin 上：端口在读 stdin 之前才绑定，所以两个端口都在监听，就说明它已经装好了信号处理器、走到了那一步。
+/// stdin 一直开着、什么也不写。
+#[tokio::test]
+async fn a_sigterm_while_idoris_waits_on_stdin_ends_promptly_with_exit_0_and_nothing_started() {
+    for flag in ["--launcher-stdin", "--admin-token-stdin"] {
+        let (data_port, admin_port) = two_free_ports();
+        let env = Env::new()
+            .with_env("IDORIS_PORT", &data_port.to_string())
+            .with_env("IDORIS_ADMIN_PORT", &admin_port.to_string());
+        let fake = env.fake("engine", &Behavior::default());
+        let mut command = env.command();
+        command.args(["serve", flag]);
+        let mut child = spawn_retrying(&mut command).unwrap();
+        let stdin = child.stdin.take().unwrap();
+        wait_for("idoris to bind its ports (it then waits on stdin)", || {
+            port_listens(data_port) && port_listens(admin_port)
+        });
+
+        let signalled = Instant::now();
+        send("-TERM", child.id());
+        let status = wait_exit(&mut child, Duration::from_secs(8));
+        let took = signalled.elapsed();
+        drop(stdin);
+        let stdout = read_all(child.stdout.take().unwrap());
+        let stderr = stderr_of(&mut child);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{flag}: a SIGTERM is a graceful stop, not a read timeout (exit 1): {stderr}"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "{flag}: the wait on stdin was cut short, not run to its 10 s limit: {took:?}"
+        );
+        assert!(stdout.contains("idoris: 已停止"), "{flag}: {stdout}");
+        assert!(stderr.contains("启动期间收到停止信号"), "{flag}: {stderr}");
+        assert_eq!(fake.launches(), 0, "{flag}: no engine was started");
+        assert!(
+            !env.discovery_path().exists(),
+            "{flag}: nothing was published"
+        );
+    }
+}
+
+/// H1：iDoris 在等 `idoris setup` 放开组件目录的锁（setup 落盘时持独占锁；serve 最多等 30 秒，可配到 10 分钟），这时的 SIGTERM 不能等锁等完。
+/// 此前 `std::thread::sleep` 一个 20 毫秒的轮询直到等够，信号根本没人看：launcher 在 SIGTERM 之后 17 秒 SIGKILL。现在每一轮看一眼停止信号：
+/// 退出码 0、没有读卡、一个引擎也没拉起。
+///
+/// 怎么知道 iDoris 已经在等锁：它拿锁之前先打开组件目录（在信号处理器装好之后），`lsof` 看到它打开了这个目录就说明到了那一步；
+/// 锁在测试手里（独占），所以它一定在等。等锁的上限给到两分钟：等够不是这条测试的出路。
+#[tokio::test]
+async fn a_sigterm_while_idoris_waits_for_the_components_lock_ends_promptly_with_exit_0_and_nothing_started()
+ {
+    if !require_lsof(
+        "a_sigterm_while_idoris_waits_for_the_components_lock_ends_promptly_with_exit_0_and_nothing_started",
+    ) {
+        return;
+    }
+    let env = Env::new().with_env("IDORIS_COMPONENTS_LOCK_WAIT_MS", "120000");
+    let fake = env.fake("engine", &Behavior::default());
+    let components = fs::canonicalize(env.components.path()).unwrap();
+    // `idoris setup` 正在落盘：组件目录上的独占锁。
+    let setup = fs::File::open(&components).unwrap();
+    setup.lock().unwrap();
+
+    let mut command = env.command();
+    command.args(["serve", "--launcher-stdin"]);
+    let mut child = spawn_retrying(&mut command).unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let wanted = format!("n{}", components.display());
+    wait_for(
+        "idoris to open the components directory and wait for its lock",
+        || open_files_of(child.id()).lines().any(|line| line == wanted),
+    );
+
+    let signalled = Instant::now();
+    send("-TERM", child.id());
+    let status = wait_exit(&mut child, Duration::from_secs(8));
+    let took = signalled.elapsed();
+    drop(stdin);
+    let stdout = read_all(child.stdout.take().unwrap());
+    let stderr = stderr_of(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a SIGTERM is a graceful stop, not a failed components load (exit 1): {stderr}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "the wait for the components lock was cut short, not run to its limit: {took:?}"
+    );
+    assert!(stdout.contains("idoris: 已停止"), "{stdout}");
+    assert!(stderr.contains("等组件目录的锁"), "{stderr}");
+    assert!(!stderr.contains("正被 `idoris setup` 改写"), "{stderr}");
+    assert_eq!(fake.launches(), 0, "no engine was started");
+    drop(setup);
+}
+
+/// H2 + M7：整个退出共用**一个**期限，没有哪一段可以各管各的把它拖过 launcher 的 17 秒 SIGKILL。最坏的一条路：`stop_on_exit:"never"` + 信号 +
+/// 排空失败（一个请求一直挂着，排空超过 10 秒）+ 引擎对 SIGTERM 没有反应（要等宽限之后 SIGKILL）+ 发现文件的旁路锁被别的进程占着
+/// （Agent24 清理陈旧文件时持这把锁）。此前各段各算各的：引擎等到总期限的 16 秒、外面还有 1.5 秒的余量，登记收尾、删发现文件（等锁 2 秒）、
+/// 拆运行时（5 秒）都是接在后面的固定时长，加起来超过 17 秒。现在引擎、登记、发现文件、运行时共用从信号起算的 16 秒，每段有自己的预留：
+/// 引擎在总期限之前被 SIGKILL，等不到锁的发现文件就留着（崩溃残留，下一个实例覆盖），iDoris 在 launcher 动手之前自己退出。
+///
+/// M7（契约例外，见规范 §2.7.5 勘误十二）：信号触发的停止，`bye` 在信号一到就发出（与排空并行），之后排空失败才知道要以退出码 1 退出：
+/// 所以已 ack 的会话上收到了 `bye`，进程却以 1 退出，不是 0。这是有意保留的行为，这里用线上的断言钉住（假 agent24d 记下了 `bye`）。
+#[tokio::test]
+async fn the_whole_exit_stays_inside_the_launchers_seventeen_seconds_with_the_discovery_lock_held_and_bye_was_still_sent()
+ {
+    if !require_lsof(
+        "the_whole_exit_stays_inside_the_launchers_seventeen_seconds_with_the_discovery_lock_held_and_bye_was_still_sent",
+    ) {
+        return;
+    }
+    let env = Env::new();
+    let fake = env.fake(
+        "engine",
+        &Behavior {
+            on_sigterm: OnSigterm::Ignore,
+            ..Behavior::default()
+        },
+    );
+    let socket = env.run_dir.join("register.sock");
+    let agent = FakeAgent24d::start(&socket, env.discovery_path());
+    let frame = env.frame(
+        &fake.executable,
+        json!({"stop_on_exit": "never"}),
+        json!({"register_socket": socket}),
+    );
+    let client = http();
+    let (mut child, data_port, _) = env.start(&frame);
+    health_until(&client, data_port, |body| {
+        body["phase"] == "ready" && body["registered"] == true
+    })
+    .await;
+    let engine_pid = fake.launch(0)["pid"].as_u64().unwrap();
+    env.reaper.track(engine_pid);
+    let record_dir = env.state_dir().join("engines-owned/omlx");
+    assert_eq!(fs::read_dir(&record_dir).unwrap().count(), 1);
+    assert!(
+        agent.ops().iter().any(|op| op == "register"),
+        "the session is established (acked) before the signal: {:?}",
+        agent.ops()
+    );
+
+    let stuck = hold_a_request_open(data_port);
+    // 另一个进程占着发现文件的旁路锁：iDoris 退出时删不了文件。
+    let consumer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(env.run_dir.join(format!("{FILE_NAME}.lock")))
+        .unwrap();
+    consumer.lock().unwrap();
+
+    let signalled = Instant::now();
+    send("-TERM", child.id());
+    let status = wait_exit(&mut child, Duration::from_secs(60));
+    let took = signalled.elapsed();
+    eprintln!("iDoris exited {took:?} after the SIGTERM (launcher SIGKILL: 17 s)");
+    drop(stuck);
+    let _ = consumer.unlock();
+    let stderr = stderr_of(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "signal + a drain that cannot finish is a stop failure: {stderr}"
+    );
+    assert!(
+        took < Duration::from_secs(17),
+        "the whole exit (engine, registration, discovery file, runtime) shares one deadline and ends before the launcher's 17 s SIGKILL: took {took:?}"
+    );
+    assert!(
+        took >= Duration::from_secs(10),
+        "the drain really did run its 10 s: took {took:?}"
+    );
+    // 删不掉的发现文件留着（崩溃残留，由下一个实例覆盖），并且说了为什么。
+    assert!(
+        env.discovery_path().exists(),
+        "the lock was held: the file is left for the next generation to overwrite"
+    );
+    assert!(stderr.contains("发现文件未删除"), "{stderr}");
+    // 引擎收到过 SIGTERM（无视了），之后在期限之前被 SIGKILL，记录随之清理。
+    assert_eq!(fake.sigterm_times().len(), 1, "asked once, ignored it");
+    assert!(
+        !pid_alive(engine_pid),
+        "the engine is gone before iDoris exits"
+    );
+    assert_eq!(
+        fs::read_dir(&record_dir).map(|d| d.count()).unwrap_or(0),
+        0,
+        "the ownership record is reclaimed together with the engine"
+    );
+    // M7：已 ack 的会话上发了 `bye`（信号一到就发），进程仍以 1 退出：契约例外，这里钉住。
+    assert!(
+        agent.ops().iter().any(|op| op == "bye"),
+        "bye on the acked session although the exit code ends up 1: {:?}",
+        agent.ops()
+    );
+}
+
+/// H2（预留）：同一条最坏的路，但发现文件的旁路锁在**引擎确认消失之后一秒**放开。引擎那一段只用到它自己的期限（总期限之前 2.8 秒），后面的段各留着自己
+/// 的预留，所以删发现文件那一段还有两秒左右的预算：等到锁放开、把文件删掉。如果引擎那一段用到了整个总期限（预留被它吃掉），删文件这一段的预算
+/// 就是零，只试一次、锁还占着、文件留下（这条测试变红）；此前各段各算各的，引擎等到 16 秒再等锁，总共超过 17 秒（同样变红）。
+///
+/// 放锁是**事件驱动**的：一个线程盯着引擎进程，它一消失就再等一秒才放锁，所以不依赖 iDoris 走到删文件那一步的时刻。
+#[tokio::test]
+async fn the_discovery_file_is_still_removed_when_the_lock_is_released_after_the_engine_stage_because_the_later_stages_kept_their_reserve()
+ {
+    if !require_lsof(
+        "the_discovery_file_is_still_removed_when_the_lock_is_released_after_the_engine_stage_because_the_later_stages_kept_their_reserve",
+    ) {
+        return;
+    }
+    let env = Env::new();
+    let fake = env.fake(
+        "engine",
+        &Behavior {
+            on_sigterm: OnSigterm::Ignore,
+            ..Behavior::default()
+        },
+    );
+    let frame = env.frame(
+        &fake.executable,
+        json!({"stop_on_exit": "never"}),
+        json!({}),
+    );
+    let client = http();
+    let (mut child, data_port, _) = env.start(&frame);
+    health_until(&client, data_port, |body| body["phase"] == "ready").await;
+    let engine_pid = fake.launch(0)["pid"].as_u64().unwrap();
+    env.reaper.track(engine_pid);
+
+    let stuck = hold_a_request_open(data_port);
+    let consumer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(env.run_dir.join(format!("{FILE_NAME}.lock")))
+        .unwrap();
+    consumer.lock().unwrap();
+    let releaser = std::thread::spawn(move || {
+        // 引擎在 SIGKILL 之后消失，这是引擎那一段结束的标志；再等一秒才放锁。
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while pid_alive(engine_pid) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let _ = consumer.unlock();
+    });
+
+    let signalled = Instant::now();
+    send("-TERM", child.id());
+    let status = wait_exit(&mut child, Duration::from_secs(60));
+    let took = signalled.elapsed();
+    eprintln!("iDoris exited {took:?} after the SIGTERM (launcher SIGKILL: 17 s)");
+    drop(stuck);
+    releaser.join().unwrap();
+    let stderr = stderr_of(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "signal + a drain that cannot finish is a stop failure: {stderr}"
+    );
+    assert!(
+        took < Duration::from_secs(17),
+        "the whole exit ends before the launcher's 17 s SIGKILL: took {took:?}"
+    );
+    assert!(
+        !env.discovery_path().exists(),
+        "the lock was released a second after the engine stage ended, inside the discovery stage's own budget: the file is removed ({stderr})"
+    );
+    assert!(!stderr.contains("发现文件未删除"), "{stderr}");
+    assert!(!pid_alive(engine_pid), "the engine is gone");
+}
+
+/// H4：`stop_on_exit:"never"`，下一个 iDoris 认回了上一代留下的引擎，而它此刻忙着（回 503），iDoris 还在探测它就绪、等它的时候来了 SIGTERM。
+/// 引擎的去留由停止流程说了算：`never` 的信号停止、以退出码 0 退出，引擎必须原样留给下一个 iDoris（原来的进程还活着，所有权记录还在）。
+/// 此前「等就绪被打断」一概先停掉半拉起的引擎，认回来的引擎被无条件 SIGTERM、记录也删了。
+#[tokio::test]
+async fn a_sigterm_while_the_adopted_engine_is_still_being_probed_hands_it_over_instead_of_stopping_it()
+ {
+    if !require_lsof(
+        "a_sigterm_while_the_adopted_engine_is_still_being_probed_hands_it_over_instead_of_stopping_it",
+    ) {
+        return;
+    }
+    let env = Env::new();
+    let fake = env.fake("engine", &Behavior::default());
+    let frame = env.frame(
+        &fake.executable,
+        json!({"stop_on_exit": "never"}),
+        json!({}),
+    );
+    let client = http();
+    let (mut first, data_port, _) = env.start(&frame);
+    health_until(&client, data_port, |body| body["phase"] == "ready").await;
+    let engine_pid = fake.launch(0)["pid"].as_u64().unwrap();
+    env.reaper.track(engine_pid);
+    send("-TERM", first.id());
+    assert_eq!(
+        wait_exit(&mut first, Duration::from_secs(30)).code(),
+        Some(0)
+    );
+    let record_dir = env.state_dir().join("engines-owned/omlx");
+    let first_stderr = stderr_of(&mut first);
+    assert!(
+        pid_alive(engine_pid),
+        "never + a clean exit: the first generation's engine must still be running (SIGTERMs it received: {:?}); first iDoris stderr: {first_stderr}",
+        fake.sigterm_times()
+    );
+    assert_eq!(fs::read_dir(&record_dir).unwrap().count(), 1);
+
+    // 引擎忙着：活着、在听，回 503。下一个 iDoris 认回它，一直探测它、等它就绪。
+    fake.force_status(503);
+    let probed = fake.requests().len();
+    let (mut second, data_port, _) = env.start(&frame);
+    wait_for("the adopted engine to be probed for readiness", || {
+        fake.requests().len() > probed
+    });
+    let body = health(&client, data_port).await;
+    assert_ne!(
+        upstream(&body, "omlx")["state"],
+        "ready",
+        "still waiting for the engine: {body}"
+    );
+
+    send("-TERM", second.id());
+    let status = wait_exit(&mut second, Duration::from_secs(30));
+    let stderr = stderr_of(&mut second);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "never + a clean exit: the engine is handed over, not stopped: {stderr}"
+    );
+    assert!(
+        pid_alive(engine_pid),
+        "the original engine process survives: {stderr}"
+    );
+    assert_eq!(
+        fs::read_dir(&record_dir).unwrap().count(),
+        1,
+        "its ownership record is kept for the next iDoris"
+    );
+    assert_eq!(fake.launches(), 1, "nothing was relaunched");
+    assert!(
+        fake.sigterm_times().is_empty(),
+        "the engine was never signalled"
+    );
+}
+
+/// M8：launcher 先走一步，管道的另一头没人读（stdout、stderr 的读端关了）。服务路径上每一行 `println!`/`eprintln!` 都会 panic：启动时的
+/// 「已注册组件」「监听」行、停止时的「已停止」行，退出码就成了 101（launcher 把它当崩溃、退避重启），不是启动成功、服务、以 0 退出。
+/// 管道在帧给出**之前**就关了，所以此后每一行都写在关了的管道上。三种关法各试一次；iDoris 照常启动、服务、收到 SIGTERM 以 0 退出。
+#[tokio::test]
+async fn closed_stdout_and_stderr_pipes_do_not_turn_start_serve_or_stop_into_a_panic() {
+    for (close_stdout, close_stderr) in [(true, false), (false, true), (true, true)] {
+        let case = format!("stdout closed={close_stdout}, stderr closed={close_stderr}");
+        let env = Env::new();
+        let fake = env.fake("engine", &Behavior::default());
+        let frame = env.frame(&fake.executable, json!({}), json!({}));
+        let _ = fs::remove_file(env.discovery_path());
+        let mut command = env.command();
+        command.args(["serve", "--launcher-stdin"]);
+        let mut child = spawn_retrying(&mut command).unwrap();
+        // 帧还没给它：它在读 stdin。此刻关掉读端，之后它写的每一行都落在关了的管道上。
+        let mut stderr_pipe = child.stderr.take();
+        if close_stdout {
+            drop(child.stdout.take());
+        }
+        if close_stderr {
+            drop(stderr_pipe.take());
+        }
+        let mut stdin = child.stdin.take().unwrap();
+        let _ = stdin.write_all(format!("{frame}\n").as_bytes());
+        drop(stdin);
+        let (data_port, _) = wait_ports(&env.discovery_path(), &mut child);
+        let client = http();
+        let body = health_until(&client, data_port, |body| body["phase"] == "ready").await;
+        assert_eq!(body["phase"], "ready", "{case}: it serves");
+        let engine_pid = fake.launch(0)["pid"].as_u64().unwrap();
+        env.reaper.track(engine_pid);
+
+        send("-TERM", child.id());
+        let status = wait_exit(&mut child, Duration::from_secs(60));
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{case}: a closed pipe is not a crash (101 = a panic in a print): {status:?}"
+        );
+        drop(stderr_pipe);
+    }
+}
+
+/// M8：最终的错误行也一样。stderr 的读端关了、而启动失败（这里是一个无效的启动帧）：`real_main` 最后打印错误，此前用 `eprintln!`，写不出去就 panic，
+/// 退出码成了 101；应该是它本来要返回的 1。帧是在管道关了之后才给的，所以错误行一定写在关了的管道上。
+#[tokio::test]
+async fn the_final_error_line_on_a_closed_stderr_still_exits_1_not_101() {
+    let env = Env::new();
+    let mut command = env.command();
+    command.args(["serve", "--launcher-stdin"]);
+    let mut child = spawn_retrying(&mut command).unwrap();
+    drop(child.stderr.take());
+    let mut stdin = child.stdin.take().unwrap();
+    // 版本号不对的帧：`run` 返回 `Err`（启动失败）。
+    let _ = stdin.write_all(b"{\"v\":2}\n");
+    drop(stdin);
+    let status = wait_exit(&mut child, Duration::from_secs(60));
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a startup failure whose error line cannot be written still exits 1: {status:?}"
     );
 }

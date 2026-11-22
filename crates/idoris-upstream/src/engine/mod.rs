@@ -87,8 +87,8 @@ pub use listener::{
 };
 pub use logfile::{DEFAULT_KEEP, DEFAULT_MAX_BYTES, EngineLog};
 pub use owned::{
-    DEFAULT_STOP_GRACE, EngineError, IdentityVerdict, MismatchReason, OwnedEngine, ReadyPolicy,
-    Recovery, UnreadableReason, verify_identity,
+    DEFAULT_STOP_GRACE, EngineError, IdentityVerdict, MIN_CONFIRM, MIN_TERM_GRACE, MismatchReason,
+    OwnedEngine, ReadyPolicy, Recovery, UnreadableReason, stop_windows, verify_identity,
 };
 pub use probe::{EngineProbe, probe_http};
 pub use recipe::{

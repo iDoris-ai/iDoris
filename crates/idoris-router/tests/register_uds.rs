@@ -1908,6 +1908,82 @@ async fn an_instance_conflict_that_arrives_before_register_is_not_a_reason_to_ex
     registration.finish().await;
 }
 
+/// H2：自愈任务正卡在一次重写里（发现文件被删了，重写要旁路锁，锁被别的进程占着，最多等 5 秒）：`finish_by` 只等到整个收尾共用的期限，
+/// 不是等那 5 秒；没赶上就说没赶上（`false`）。
+#[tokio::test]
+async fn finish_by_gives_up_at_its_deadline_when_a_self_heal_rewrite_is_stuck_on_the_sidecar_lock()
+{
+    let rig = Rig::new();
+    let (target, record) = discovery_for(&rig);
+    target.publish(&record).unwrap();
+    let path = rig.dir_path.join("idoris.json");
+    let registration = rig.start_with(StartOptions {
+        with_socket: false,
+        discovery: Some(SelfHeal {
+            target: target.clone(),
+            record: record.clone(),
+        }),
+        ..StartOptions::new(Timings {
+            self_heal_interval: ms(20),
+            ..fast()
+        })
+    });
+    // 消费者（Agent24 清理陈旧文件时）占着旁路锁，文件又被删了：自愈的重写卡在等锁上。
+    let consumer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(rig.dir_path.join("idoris.json.lock"))
+        .unwrap();
+    consumer.lock().unwrap();
+    fs::remove_file(&path).unwrap();
+    // 自愈每 20 毫秒一轮：等它进了重写、卡在锁上（它写不出文件，因为锁在我们手里）。
+    tokio::time::sleep(ms(400)).await;
+    assert!(
+        !path.exists(),
+        "the rewrite cannot get past the sidecar lock"
+    );
+
+    let started = std::time::Instant::now();
+    let in_time = registration
+        .finish_by(Some(tokio::time::Instant::now() + ms(300)))
+        .await;
+    let waited = started.elapsed();
+    assert!(!in_time, "the stuck rewrite did not end by the deadline");
+    assert!(waited >= ms(250), "{waited:?}");
+    assert!(
+        waited < secs(3),
+        "the deadline, not the 5 s the stuck rewrite may wait for the lock: {waited:?}"
+    );
+    // 放开锁：被丢下的那次阻塞重写自己收尾（不让它拖到测试结束之后）。
+    consumer.unlock().unwrap();
+}
+
+/// 对照：自愈没有卡住时，`finish_by` 在期限之前一次做完，返回 `true`（没有期限的 `finish` 同样做完）。
+#[tokio::test]
+async fn finish_by_reports_true_when_everything_ended_before_the_deadline() {
+    let rig = Rig::new();
+    let (target, record) = discovery_for(&rig);
+    target.publish(&record).unwrap();
+    let registration = rig.start_with(StartOptions {
+        with_socket: false,
+        discovery: Some(SelfHeal {
+            target: target.clone(),
+            record: record.clone(),
+        }),
+        ..StartOptions::new(Timings {
+            self_heal_interval: ms(20),
+            ..fast()
+        })
+    });
+    assert!(
+        registration
+            .finish_by(Some(tokio::time::Instant::now() + secs(10)))
+            .await
+    );
+    // 已经结束了：再收尾一次是空操作，也是 `true`。
+    assert!(registration.finish_by(None).await);
+}
+
 /// 收到 `instance_conflict` 之后不再自愈重写发现文件（规范 §2.7.3、§2.10.4）：自愈在冲突的那一刻立即停止，
 /// 即使停止流程（排空等）还要很久。做法：冲突之前自愈在工作（对照：删掉的文件会被写回）；冲突之后（等在途的那一次
 /// 重写落地）再删一次文件，自愈每 20ms 一轮，之后再也不会把它写回来。

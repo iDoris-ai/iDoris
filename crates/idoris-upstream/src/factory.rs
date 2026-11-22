@@ -58,9 +58,33 @@ pub fn create_adapter_with(
     card: &ComponentCard,
     params: &AdapterParams,
 ) -> Result<Arc<dyn RuntimeAdapter>, BackendError> {
+    build_adapter(card, params, true)
+}
+
+/// [`create_adapter_with`] for a start-up **dry run**: the same provider check and the same construction (so a card that
+/// has no adapter, or whose parameters are refused, fails the same way), but **no credential is resolved**: the key is not
+/// read from the environment or from `~/.omlx/settings.json`. Credentials are resolved only when the adapter is really
+/// built (a managed engine's private key is registered only after the engine is up, and an engine that ends up degraded
+/// never needs an adapter at all), so the dry run must not touch the user's key file early.
+pub fn create_adapter_unkeyed(
+    card: &ComponentCard,
+    params: &AdapterParams,
+) -> Result<Arc<dyn RuntimeAdapter>, BackendError> {
+    build_adapter(card, params, false)
+}
+
+fn build_adapter(
+    card: &ComponentCard,
+    params: &AdapterParams,
+    resolve_credentials: bool,
+) -> Result<Arc<dyn RuntimeAdapter>, BackendError> {
     match card.provider.id.as_str() {
         "omlx" => {
-            let config = super::OmlxAdapterConfig::for_base_url(card.endpoint.clone());
+            let config = if resolve_credentials {
+                super::OmlxAdapterConfig::for_base_url(card.endpoint.clone())
+            } else {
+                super::OmlxAdapterConfig::unkeyed_for_base_url(card.endpoint.clone())
+            };
             // A load is not a management call (IDORIS-CORE S8): it gets its own, much longer deadline.
             Ok(Arc::new(
                 super::OmlxAdapter::new(config)?.with_load_timeout(params.omlx_load_timeout),

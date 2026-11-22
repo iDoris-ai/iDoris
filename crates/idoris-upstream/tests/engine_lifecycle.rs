@@ -474,6 +474,8 @@ struct TestInspector {
     fail_command: AtomicBool,
     /// 假装 pid 被复用：启动时间读出另一个值。
     reuse_pid: AtomicBool,
+    /// 每次读启动时间、进程组之前先睡这么久（慢 `ps`，身份闸因此很慢）。
+    slow: std::sync::Mutex<Duration>,
 }
 
 impl TestInspector {
@@ -487,7 +489,19 @@ impl TestInspector {
             claim_ports: ports.to_vec(),
             fail_command: AtomicBool::new(false),
             reuse_pid: AtomicBool::new(false),
+            slow: std::sync::Mutex::new(Duration::ZERO),
         })
+    }
+
+    fn set_slow(&self, delay: Duration) {
+        *self.slow.lock().unwrap() = delay;
+    }
+
+    async fn dawdle(&self) {
+        let delay = *self.slow.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
     }
 }
 
@@ -496,7 +510,11 @@ impl ProcessInspector for TestInspector {
     fn pid_state(&self, pid: u32) -> PidState {
         self.real.pid_state(pid)
     }
+    async fn generation(&self, pid: u32) -> Result<String, InspectError> {
+        self.real.generation(pid).await
+    }
     async fn start_time(&self, pid: u32) -> Result<String, InspectError> {
+        self.dawdle().await;
         let real = self.real.start_time(pid).await?;
         Ok(if self.reuse_pid.load(Ordering::SeqCst) {
             format!("{real} (reused)")
@@ -511,6 +529,7 @@ impl ProcessInspector for TestInspector {
         self.real.command(pid).await
     }
     async fn process_group(&self, pid: u32) -> Result<u32, InspectError> {
+        self.dawdle().await;
         self.real.process_group(pid).await
     }
     async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
@@ -586,6 +605,23 @@ async fn a_spawned_engine_is_recorded_ready_sealed_and_stopped_with_its_whole_gr
     assert_eq!(record.executable, fake.exe);
     assert_eq!(record.launched_by_instance, LAUNCHED_BY);
     assert_eq!(record.started_at, ps_lstart(record.pid));
+    // M6：拉起时一并记下进程的「代」标识（比 `started_at` 的秒更细）；平台读不出来就没有（记录照常有效）。
+    match SystemInspector::new().generation(record.pid).await {
+        Ok(generation) => assert_eq!(
+            record.generation.as_deref(),
+            Some(generation.as_str()),
+            "the record carries the process generation read at spawn"
+        ),
+        Err(error) => {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            panic!("this platform must be able to read a process generation: {error:?}");
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                let _ = error;
+                assert_eq!(record.generation, None);
+            }
+        }
+    }
     assert!(!engine.is_sealed());
     // 规范 §2.7.6 的布局：记录 `engines-owned/<engine_kind>/<endpoint 编码>.json`，日志 `logs/<engine_kind>.log`。
     let dir = rig.record_dir(FAKE_KIND);
@@ -1030,6 +1066,7 @@ async fn a_record_naming_an_unrelated_live_process_never_signals_it_and_is_dropp
             executable: "/opt/engines/fake/bin/fake-server".into(),
             api_key: Some(EngineKey::generate().unwrap()),
             launched_by_instance: LAUNCHED_BY.into(),
+            generation: None,
         };
         tweak(&mut record);
         record
@@ -1114,7 +1151,23 @@ async fn a_record_that_only_misses_its_port_is_an_exiting_generation_stopped_not
     // reaps it the moment it dies (an unreaped zombie would still count as a live member of its group).
     let reaper = std::thread::spawn(move || lingering.wait());
     wait_until("the stand-in has installed its trap", || ready.exists());
-    let record = OwnershipRecord {
+    let generation = match SystemInspector::new().generation(pid).await {
+        Ok(generation) => generation,
+        Err(error) => {
+            // macOS and Linux must be able to read it; only other platforms may skip.
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            panic!("this platform must be able to read a process generation: {error:?}");
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                let _ = error;
+                eprintln!(
+                    "SKIPPED a_record_that_only_misses_its_port_is_an_exiting_generation_stopped_not_dropped: this platform has no process generation reader"
+                );
+                return;
+            }
+        }
+    };
+    let old_record = OwnershipRecord {
         engine_kind: kind(FAKE_KIND),
         pid,
         port,
@@ -1123,6 +1176,34 @@ async fn a_record_that_only_misses_its_port_is_an_exiting_generation_stopped_not
         executable: "/opt/engines/fake/bin/fake-server".into(),
         api_key: Some(EngineKey::generate().unwrap()),
         launched_by_instance: LAUNCHED_BY.into(),
+        generation: None,
+    };
+    // M6: an OLD record (second-precision identity only) that misses its port cannot be told from a pid reused inside
+    // the same second by an unrelated process of the same user: cannot confirm, so it is neither signalled nor dropped.
+    store.write(&old_record).unwrap();
+    let recovery = OwnedEngine::recover(&instance, &dyn_inspector(&inspector))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            recovery,
+            Recovery::Unverifiable(idoris_upstream::engine::UnreadableReason::Generation)
+        ),
+        "{recovery:?}"
+    );
+    assert!(
+        pid_alive(pid as i32),
+        "an unconfirmed record is never signalled"
+    );
+    assert_eq!(
+        store.read().unwrap().as_ref(),
+        Some(&old_record),
+        "and never dropped"
+    );
+    // A NEW record carries the process generation: that is the strong identity.
+    let record = OwnershipRecord {
+        generation: Some(generation),
+        ..old_record
     };
     store.write(&record).unwrap();
 
@@ -1158,6 +1239,52 @@ async fn a_record_that_only_misses_its_port_is_an_exiting_generation_stopped_not
     assert!(!pid_alive(pid as i32), "the lingering engine is gone");
     assert_eq!(store.read().unwrap(), None, "and its record with it");
     reaper.join().unwrap().unwrap();
+}
+
+/// H3: an adopted engine ignores SIGTERM while the identity gate is slow (one `ps` for the start time and one for the group,
+/// 1.2 s each). The deadline is absolute: the time the gate takes comes out of the same budget, and the grace is worked out
+/// when the signal is really sent, so the engine still gets its SIGKILL inside the deadline. Fixed durations worked out
+/// before the gate (3.5 s of SIGTERM grace after a 2.4 s gate) would have run to about 6 s.
+#[tokio::test]
+async fn a_slow_identity_gate_eats_into_the_same_deadline_and_an_adopted_engine_that_ignores_sigterm_still_gets_its_sigkill()
+ {
+    let rig = Rig::new();
+    let key = EngineKey::generate().unwrap();
+    let http = fake_http(&key).await;
+    let port = http.address().port();
+    let fake = rig.fake("fake-server", Behavior::IgnoresTerm);
+    let inspector = TestInspector::new(Some(port));
+    let instance = rig.fake_instance(port);
+    let engine = sealed_engine(&rig, &instance, &fake, &key, StopOnExit::Never, &inspector).await;
+    let (leader, child) = fake.pids();
+    drop(engine);
+    let Recovery::Adopted(adopted) = OwnedEngine::recover(&instance, &dyn_inspector(&inspector))
+        .await
+        .unwrap()
+    else {
+        panic!("expected Adopted");
+    };
+
+    inspector.set_slow(Duration::from_millis(1200));
+    let begun = Instant::now();
+    adopted
+        .stop_until(
+            Duration::from_secs(8),
+            Some(tokio::time::Instant::now() + Duration::from_millis(3500)),
+        )
+        .await
+        .unwrap();
+    let took = begun.elapsed();
+    wait_group_dead(leader);
+    assert!(
+        !pid_alive(leader) && !pid_alive(child),
+        "the engine that ignores SIGTERM received its SIGKILL"
+    );
+    assert!(
+        took < Duration::from_millis(4600),
+        "the gate (2.4 s) and the stop share one 3.5 s deadline: {took:?}"
+    );
+    assert_eq!(instance.store().read().unwrap(), None);
 }
 
 #[tokio::test]
@@ -1217,6 +1344,7 @@ async fn a_stale_record_is_replaced_when_a_new_engine_is_spawned() {
             executable: "/opt/engines/fake/bin/fake-server".into(),
             api_key: Some(EngineKey::generate().unwrap()),
             launched_by_instance: LAUNCHED_BY.into(),
+            generation: None,
         })
         .unwrap();
 
@@ -1281,6 +1409,7 @@ async fn the_four_identity_items_are_each_required_against_real_ps_and_lsof() {
         executable: "/opt/engines/fake/bin/fake-server".into(),
         api_key: Some(EngineKey::generate().unwrap()),
         launched_by_instance: LAUNCHED_BY.into(),
+        generation: None,
     };
     assert_eq!(
         verify_identity(&inspector, &record).await,

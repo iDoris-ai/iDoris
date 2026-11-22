@@ -988,6 +988,17 @@ impl Registration {
     /// 等自愈与登记客户端都结束，之后才能删发现文件（否则自愈可能在删除之后又把它写回来）。自愈任务会被等到底
     /// （一次进行中的发布至多等旁路锁 5 秒）；登记客户端的 `bye` 有 0.5 秒预算，另给一点余量，超过就中止。
     pub async fn finish(&self) {
+        self.finish_by(None).await;
+    }
+
+    /// [`Self::finish`]，整个收尾共用一个期限（H2）：`deadline` 之前没结束的就不再等、中止它们，返回 `false`；都结束了返回 `true`。
+    /// 没有期限（`None`）就是 [`Self::finish`]：自愈任务等到底。
+    ///
+    /// 自愈任务卡在一次重写里（旁路锁被别的进程占着，最多等 5 秒）时，那次阻塞调用本身取消不了：这里只是不再等它。它之后若还是写成了，
+    /// 发现文件成了崩溃残留，由下一个拿到实例锁的实例覆盖（与退出时删不掉文件同一个语义）；删文件这一步照样会尝试，同一把旁路锁
+    /// 把两者排成先后，不会互相写坏。
+    pub async fn finish_by(&self, deadline: Option<tokio::time::Instant>) -> bool {
+        let mut in_time = true;
         self.inner.heal_cancel.cancel();
         self.inner.stop.send_if_modified(|current| {
             let change = *current == StopMode::Run;
@@ -1002,8 +1013,18 @@ impl Registration {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(heal) = heal {
-            let _ = heal.await;
+        if let Some(mut heal) = heal {
+            match deadline {
+                None => {
+                    let _ = heal.await;
+                }
+                Some(deadline) => {
+                    if tokio::time::timeout_at(deadline, &mut heal).await.is_err() {
+                        heal.abort();
+                        in_time = false;
+                    }
+                }
+            }
         }
         let client = self
             .inner
@@ -1012,11 +1033,21 @@ impl Registration {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(mut client) = client {
-            let budget = self.inner.bye_budget + Duration::from_millis(250);
-            if tokio::time::timeout(budget, &mut client).await.is_err() {
+            let own =
+                tokio::time::Instant::now() + self.inner.bye_budget + Duration::from_millis(250);
+            // 先到的那个：客户端自己的 `bye` 预算（超过就中止，这是老规矩，不算没赶上期限），或整个收尾的期限。
+            let (until, by_deadline) = match deadline {
+                Some(deadline) if deadline < own => (deadline, true),
+                _ => (own, false),
+            };
+            if tokio::time::timeout_at(until, &mut client).await.is_err() {
                 client.abort();
+                if by_deadline {
+                    in_time = false;
+                }
             }
         }
+        in_time
     }
 }
 

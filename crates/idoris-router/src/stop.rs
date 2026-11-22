@@ -35,25 +35,42 @@
 //! 以 0 退出就移交（引擎继续跑，所有权记录留给下一个 iDoris），否则停止并回收。其余情形（`owned`、退出码 3、4、5、启动失败）
 //! 原因一确定就与排空并行地停（[`EnginePlan::StopNow`]），总时长仍在 §2.7.5 的预算内。
 //!
-//! # 总期限（M1）
+//! # 总期限（M1、H2）
 //!
 //! 排空失败之后才停引擎的那条路（`never` + 信号 + 排空失败）是**串行**的：排空最多 10 秒，之后引擎 SIGTERM 加 8 秒宽限，共 18 秒，
 //! 而 launcher 在 SIGTERM 之后 17 秒 SIGKILL iDoris：引擎可能停到一半（收到了 SIGTERM、还在退出）iDoris 就被杀了。
-//! 所以整个收尾有一个**从停止原因锁存那一刻起算的期限**（[`STOP_DEADLINE`]，16 秒，给确认与退出留 1 秒）：[`finish_engines`] 的等待、
-//! 引擎管理器的等待与 `OwnedEngine::stop` 的宽限都只拿期限里剩下的（`min(8 秒, 剩下的)`，不到 2 秒就 SIGTERM 之后立刻 SIGKILL，
-//! [`crate::lifecycle::stop_windows`]）。仍然没能确认消失的引擎，所有权记录保留，下一个 iDoris 认回它（`Recovery::Exiting`：
-//! 身份吻合、只是端口上没有它在监听）再有界地收尾，不会悄悄丢掉记录。
+//! 所以整个收尾有一个**从停止原因锁存那一刻起算的期限**（[`STOP_DEADLINE`]，16 秒，给确认与退出留 1 秒），**所有**后续各段共用它，
+//! 不是各管各的：引擎收尾、登记收尾、删发现文件、拆运行时。每一段有一个绝对的结束时刻（[`StopBudgets`]，从总期限倒着留出后面几段的
+//! 预留），前面的段提前结束，后面的段就多得时间；前面的段超了，后面的段至少还有自己的预留。
+//!
+//! - 引擎：[`finish_engines`] 的等待、引擎管理器的等待与 `OwnedEngine` 的宽限都只拿期限里剩下的（`min(8 秒, 剩下的)`，不到 2 秒就
+//!   SIGTERM 之后立刻 SIGKILL，[`crate::lifecycle::stop_windows`]）。外面这层等待只比里面多一个确认窗口的余量（[`WAIT_SLACK`]），
+//!   不再多留 1.5 秒：那 1.5 秒正是后面几段的预留。仍然没能确认消失的引擎，所有权记录保留，下一个 iDoris 认回它
+//!   （`Recovery::Exiting`：身份吻合、只是端口上没有它在监听）再有界地收尾，不会悄悄丢掉记录。
+//! - 登记：[`crate::register::Registration::finish_by`]；自愈任务在等旁路锁（最多 5 秒）时不会再把整个退出拖过期限。
+//! - 发现文件：[`crate::discovery::DiscoveryTarget::remove_if_owner_within`]；预算用完还没删成就留着（崩溃残留语义：下一个拿到
+//!   实例锁的实例覆盖它），写一行日志。
+//! - 运行时：[`ExitDeadline`]；`main` 在最后拆运行时只等期限里剩下的。
+//!
+//! # 启动期间收到信号（H1）
+//!
+//! 启动期间（读组件目录、等 `idoris setup` 放开目录锁、等 launcher 的启动帧、等 Admin token）收到的 SIGTERM 不能等到这些等待自己
+//! 结束：等组件目录锁最长 30 秒（可配到 10 分钟）、等帧 10 秒，而 launcher 17 秒就 SIGKILL。[`StopSignal`] 是个可以在同步代码里读的
+//! 标志（[`StopSignal::is_set`]）：这些等待每一小段（至多 50 毫秒）看一眼，看到了就放弃等待，`run` 以退出码 0 干净地退出
+//! （还没有拉起任何引擎、没有发布发现文件、没有登记）。拉起引擎之前再看一次：已经到过的信号一定在引擎拉起之前处理。
 //!
 //! # 信号处理器启动时就装好（L6）
 //!
-//! [`TerminationSignals::install`] 在 `run` 一开始就注册 SIGINT/SIGTERM，不是等停止流程第一次被 poll：`select!` 在更靠前的来源
+//! [`StopSignal::install`] 在 `run` 一开始就注册 SIGINT/SIGTERM，不是等停止流程第一次被 poll：`select!` 在更靠前的来源
 //! 已经就绪时根本不 poll 信号那个分支，旧写法里处理器那时还没装，之后到的 SIGTERM 按默认动作直接杀死进程，不走优雅停止。
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -66,8 +83,16 @@ use crate::register::{Registration, StopCause};
 pub const STOP_DEADLINE: Duration = Duration::from_secs(16);
 /// 没有期限时（服务自己倒了：没有信号在催）等引擎收尾的上限：SIGTERM 之后 8 秒宽限，加上 SIGKILL 与收尾。
 pub const OPEN_ENDED_STOP_WAIT: Duration = Duration::from_secs(14);
-/// 外面这层等待比里面的期限多留的余量：里面的停止（宽限加确认窗口）先自己结束并如实报告，外面这层只兜底。
-const WAIT_SLACK: Duration = Duration::from_millis(1500);
+/// 外面这层等待比里面的期限多留的余量：里面的停止（宽限加确认窗口）先自己结束并如实报告，外面这层只兜底。里面的确认窗口至少
+/// [`crate::lifecycle::MIN_CONFIRM`]（期限已到也给这么多：SIGKILL 之后几毫秒就够，这是给卡在内核里的进程的），所以余量就是它加一点调度的
+/// 误差。再大就是在吃后面几段的预留（H2：此前这里是 1.5 秒，加上期限本身就压过了 launcher 的 17 秒）。
+pub const WAIT_SLACK: Duration = Duration::from_millis(600);
+/// 登记收尾（等自愈任务与登记客户端结束；`bye` 已在排空期间并行发出）为后面的段留的时间。
+pub const REGISTRATION_RESERVE: Duration = Duration::from_millis(700);
+/// 删发现文件（旁路锁至多等这么久，剩下的是读、比对、unlink）为后面的段留的时间。
+pub const DISCOVERY_RESERVE: Duration = Duration::from_secs(1);
+/// 拆运行时（等阻塞任务、丢弃所有任务）的预留：总期限的最后这一段。
+pub const RUNTIME_RESERVE: Duration = Duration::from_millis(500);
 
 /// 进程为什么停。只记一次（[`StopLatch`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +135,76 @@ impl StopLatch {
     /// 整个收尾必须完成的期限：锁存那一刻加 [`STOP_DEADLINE`]；还没有锁存时是 `None`（没有信号在催）。
     pub fn deadline(&self) -> Option<Instant> {
         self.slot.get().map(|latched| latched.at + STOP_DEADLINE)
+    }
+}
+
+/// 收尾各段的绝对结束时刻（H2）：从总期限 `exit` 倒着数，每一段给它后面的几段留出预留，所有段共用这**一个**期限。
+///
+/// ```text
+/// engines (+WAIT_SLACK) ─ REGISTRATION_RESERVE ─ registration ─ DISCOVERY_RESERVE ─ discovery ─ RUNTIME_RESERVE ─ exit
+/// ```
+///
+/// 每一段只等到自己的结束时刻（用的是绝对时刻，不是各自的固定时长）：前面的段早结束，后面的段自然多得时间；前面的段用满了
+/// （引擎的确认窗口可以超出它自己的期限 [`WAIT_SLACK`]，所以引擎的期限已经提前了那么多），后面的段至少还有自己的预留，整个
+/// 收尾仍在 `exit` 之前结束。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopBudgets {
+    /// 引擎收尾的期限：[`finish_engines`]、引擎管理器与引擎的宽限都按它算。
+    pub engines: Instant,
+    /// 登记收尾必须完成的时刻。
+    pub registration: Instant,
+    /// 删发现文件必须完成的时刻：到了还没删成就留着，由下一个实例覆盖。
+    pub discovery: Instant,
+    /// 整个进程必须退出的时刻（含拆运行时）。
+    pub exit: Instant,
+}
+
+impl StopBudgets {
+    /// 从整个进程必须退出的时刻 `exit` 倒推各段。
+    pub fn from_exit(exit: Instant) -> Self {
+        // 倒推到平台时钟的起点之前（刚开机十几秒内）不可能发生；真发生了就退回 `exit` 本身：每一段都立刻到期，不 panic。
+        let before = |at: Instant, by: Duration| at.checked_sub(by).unwrap_or(at);
+        let discovery = before(exit, RUNTIME_RESERVE);
+        let registration = before(discovery, DISCOVERY_RESERVE);
+        let engines = before(registration, REGISTRATION_RESERVE + WAIT_SLACK);
+        Self {
+            engines,
+            registration,
+            discovery,
+            exit,
+        }
+    }
+
+    /// 停止流程锁存了原因时从它起算 [`STOP_DEADLINE`]（`latch.deadline()`）；没有锁存（服务自己倒了，没有信号在催）就从现在起算
+    /// 同样长的期限：收尾照样各段有界，不因为没人催就可以无限等。
+    pub fn for_latch(latch: &StopLatch) -> Self {
+        Self::from_exit(
+            latch
+                .deadline()
+                .unwrap_or_else(|| Instant::now() + STOP_DEADLINE),
+        )
+    }
+}
+
+/// 整个进程必须退出的时刻，由 `run` 在算出收尾预算时记下（[`StopBudgets::exit`]），`main` 在最后拆运行时之前读：拆运行时只等期限里
+/// 剩下的，不是固定的 5 秒。
+#[derive(Debug, Default)]
+pub struct ExitDeadline(OnceLock<std::time::Instant>);
+
+impl ExitDeadline {
+    pub fn set(&self, exit: Instant) {
+        let _ = self.0.set(exit.into_std());
+    }
+
+    /// 拆运行时（等阻塞任务结束）至多等多久：`cap` 与期限里剩下的取小；期限已过就是零（任务照样被丢弃，只是不再等阻塞线程）；
+    /// 没有记下期限（没走收尾，例如启动失败）就是 `cap`。
+    pub fn runtime_grace(&self, cap: Duration) -> Duration {
+        match self.0.get() {
+            Some(exit) => exit
+                .saturating_duration_since(std::time::Instant::now())
+                .min(cap),
+            None => cap,
+        }
     }
 }
 
@@ -309,8 +404,11 @@ pub async fn decide_and_begin<C, R, G, S>(
     // 引擎的停止与 HTTP 排空并行：`stop_on_exit:"never"` 只对退出码 0 有效，退出码 4、5 与 3 一律停（接口规范 §2.7.5）；
     // 启动失败当作要停（没有对外服务过，留着引擎没有意义）。`never` 的信号停止此刻不动，保留所有权句柄。
     if let Some(engines) = engines {
-        *stopping.lock().unwrap_or_else(PoisonError::into_inner) =
-            begin_engines(engines, plan.engines, latch.deadline());
+        *stopping.lock().unwrap_or_else(PoisonError::into_inner) = begin_engines(
+            engines,
+            plan.engines,
+            Some(StopBudgets::for_latch(latch).engines),
+        );
     }
 }
 
@@ -332,7 +430,7 @@ pub fn begin_engines<E: EngineControl>(
     }
 }
 
-/// 外面这层等待的上限：期限里剩下的加一点余量；没有期限就是 [`OPEN_ENDED_STOP_WAIT`]。
+/// 外面这层等待的上限：期限里剩下的加 [`WAIT_SLACK`]（里面确认窗口的余量，不是另一段独立的时间）；没有期限就是 [`OPEN_ENDED_STOP_WAIT`]。
 fn wait_budget(deadline: Option<Instant>) -> Duration {
     match deadline {
         Some(deadline) => deadline.saturating_duration_since(Instant::now()) + WAIT_SLACK,
@@ -391,46 +489,94 @@ pub async fn finish_engines<E: EngineControl>(
     }
 }
 
-/// SIGINT 与（unix）SIGTERM 的处理器，**启动一开始就注册**（[`Self::install`]）。
+/// SIGINT 与（unix）SIGTERM，**启动一开始就注册处理器**（[`Self::install`]），三种读法：同步（[`Self::is_set`]，给阻塞的等待每一小段看一眼）、
+/// 异步（[`Self::wait`]，给停止流程）、克隆之后随便传。
 ///
 /// 旧写法是一个 `async fn`，处理器在第一次被 poll 时才注册；而 `select!` 在更靠前的来源已经就绪时不 poll 信号那个分支，
-/// 启动期间（注册之前）到的 SIGTERM 按默认动作直接杀死进程，来不及走优雅停止。注册之后到的信号被记下，第一次 [`Self::recv`]
-/// 就返回。
-pub struct TerminationSignals {
-    #[cfg(unix)]
-    interrupt: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    terminate: tokio::signal::unix::Signal,
+/// 启动期间（注册之前）到的 SIGTERM 按默认动作直接杀死进程，来不及走优雅停止。现在处理器注册之后到的信号由一个后台任务读到、
+/// 置位；之后任何一种读法都读得到。**只记「到过」**，不记次数：之后的信号一概是同一次停止。
+#[derive(Clone)]
+pub struct StopSignal {
+    state: Arc<SignalState>,
 }
 
-impl TerminationSignals {
-    /// 立刻注册 SIGINT 与 SIGTERM 的处理器（必须在 tokio 运行时里调用）。
-    #[cfg(unix)]
-    pub fn install() -> std::io::Result<Self> {
-        use tokio::signal::unix::{SignalKind, signal};
-        Ok(Self {
-            interrupt: signal(SignalKind::interrupt())?,
-            terminate: signal(SignalKind::terminate())?,
-        })
-    }
+#[derive(Default)]
+struct SignalState {
+    set: AtomicBool,
+    wake: Notify,
+}
 
-    #[cfg(not(unix))]
-    pub fn install() -> std::io::Result<Self> {
-        Ok(Self {})
+impl SignalState {
+    fn raise(&self) {
+        self.set.store(true, Ordering::SeqCst);
+        // `notify_waiters` 不留许可：已经在等的被唤醒，之后才来等的由 `wait` 里的二次检查接住。
+        self.wake.notify_waiters();
     }
+}
 
-    /// 等到 SIGINT 或 SIGTERM 之一（两者走同一条优雅停止的路）；注册之后已经到过的信号立即返回。
-    #[cfg(unix)]
-    pub async fn recv(&mut self) {
-        tokio::select! {
-            _ = self.interrupt.recv() => {}
-            _ = self.terminate.recv() => {}
+impl StopSignal {
+    /// 没有挂任何操作系统信号的实例：[`Self::raise`] 才置位。单元测试与诊断用。
+    pub fn manual() -> Self {
+        Self {
+            state: Arc::new(SignalState::default()),
         }
     }
 
+    /// 置位，效果与收到信号相同。
+    pub fn raise(&self) {
+        self.state.raise();
+    }
+
+    /// 立刻注册 SIGINT 与 SIGTERM 的处理器（必须在 tokio 运行时里调用）。注册完成之后到的信号不会再按默认动作杀死进程。
+    #[cfg(unix)]
+    pub fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let this = Self::manual();
+        let state = this.state.clone();
+        tokio::spawn(async move {
+            let arrived = tokio::select! {
+                arrived = interrupt.recv() => arrived,
+                arrived = terminate.recv() => arrived,
+            };
+            // `None`：信号驱动已经关了（运行时在收摊），不会再有信号。
+            if arrived.is_some() {
+                state.raise();
+            }
+        });
+        Ok(this)
+    }
+
     #[cfg(not(unix))]
-    pub async fn recv(&mut self) {
-        let _ = tokio::signal::ctrl_c().await;
+    pub fn install() -> std::io::Result<Self> {
+        let this = Self::manual();
+        let state = this.state.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                state.raise();
+            }
+        });
+        Ok(this)
+    }
+
+    /// 信号到过了吗。便宜、不阻塞，阻塞的等待（等目录锁、等 stdin）每一小段调一次。
+    pub fn is_set(&self) -> bool {
+        self.state.set.load(Ordering::SeqCst)
+    }
+
+    /// 等到信号到过（已经到过就立即返回）。可以被取消，可以有多个等待者。
+    pub async fn wait(&self) {
+        loop {
+            let notified = self.state.wake.notified();
+            tokio::pin!(notified);
+            // 先登记、再检查：置位发生在两者之间也不会丢。
+            notified.as_mut().enable();
+            if self.is_set() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -994,8 +1140,12 @@ mod tests {
                             .await
                             .unwrap();
                         assert_eq!(engines.log(), [call], "{label}");
-                        // 引擎拿到的就是锁存下来的那个期限。
-                        assert_eq!(engines.deadlines(), [latch.deadline()], "{label}");
+                        // 引擎拿到的就是锁存下来的那个期限里属于它的那一段（H2：总期限往回数掉后面几段的预留）。
+                        assert_eq!(
+                            engines.deadlines(),
+                            [Some(StopBudgets::for_latch(&latch).engines)],
+                            "{label}"
+                        );
                     }
                     None => {
                         assert!(started.is_none(), "{label}: nothing runs during the drain");
@@ -1182,10 +1332,11 @@ mod tests {
     // 总期限（M1）与收尾的日志（L7）：用暂停的时钟，不真等
     // -----------------------------------------------------------------------------------------
 
-    /// 期限从**第一次**锁存起算（之后到的原因不挪它），常量是 launcher 的 17 秒减去 1 秒的余量。
+    /// 期限从**第一次**锁存起算（之后到的原因不挪它），常量是 launcher 的 17 秒减去 1 秒的余量；引擎拿到的是各段预算里**引擎那一段**的期限
+    /// （总期限往回数掉后面几段的预留，H2），不是总期限本身。
     #[tokio::test(start_paused = true)]
-    async fn the_deadline_counts_from_the_first_latch_and_the_engines_are_given_exactly_that_deadline()
-     {
+    async fn the_deadline_counts_from_the_first_latch_and_the_engines_are_given_their_share_of_it()
+    {
         assert_eq!(STOP_DEADLINE, Duration::from_secs(16));
         assert_eq!(OPEN_ENDED_STOP_WAIT, Duration::from_secs(14));
         let latch = StopLatch::default();
@@ -1206,7 +1357,10 @@ mod tests {
         assert_eq!(latch.deadline(), Some(t0 + STOP_DEADLINE));
         let started = stopping.lock().unwrap().take();
         started.unwrap().await.unwrap();
-        assert_eq!(engines.deadlines(), [Some(t0 + STOP_DEADLINE)]);
+        assert_eq!(
+            engines.deadlines(),
+            [Some(StopBudgets::from_exit(t0 + STOP_DEADLINE).engines)]
+        );
         // 之后到的原因不挪期限。
         tokio::time::advance(Duration::from_secs(5)).await;
         latch.latch(StopVerdict::Stop(StopCause::EngineFailed));
@@ -1243,13 +1397,13 @@ mod tests {
             .await;
             assert_eq!(
                 t0.elapsed(),
-                Duration::from_millis(7500),
-                "{branch}: 6 s left plus the 1.5 s slack, not a fixed 14 s"
+                Duration::from_millis(6600),
+                "{branch}: 6 s left plus the one confirmation window of slack, not a fixed 14 s and not 1.5 s past the deadline"
             );
             let lines = lines.lock().unwrap().clone();
             assert_eq!(lines.len(), 1, "{branch}: exactly one line: {lines:?}");
             assert!(
-                lines[0].starts_with("[idoris] 停止自有引擎超过 7.5 秒"),
+                lines[0].starts_with("[idoris] 停止自有引擎超过 6.6 秒"),
                 "{lines:?}"
             );
             assert!(lines[0].contains("所有权记录保留"), "{lines:?}");
@@ -1324,31 +1478,162 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // 信号处理器启动时就装好（L6）
+    // 总期限的各段预算（H2）
     // -----------------------------------------------------------------------------------------
 
-    /// 信号在**第一次 `recv` 之前**就到了：处理器是 `install` 时注册的，所以信号被记下、`recv` 立即返回；处理器若是等第一次 poll 才注册
-    /// （旧写法），这两次 `raise` 按默认动作直接杀死整个进程（这个测试进程），根本走不到断言。SIGINT 与 SIGTERM 各来一次。
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn signals_that_arrive_before_the_first_recv_are_recorded_because_the_handlers_are_installed_up_front()
-     {
-        use nix::sys::signal::{Signal, raise};
+    /// 各段结束时刻是从总期限倒着数的，常量写死在这里：引擎的期限比总期限早 [`REGISTRATION_RESERVE`] + [`WAIT_SLACK`] + [`DISCOVERY_RESERVE`] +
+    /// [`RUNTIME_RESERVE`]，引擎的确认窗口超出它自己期限的 [`WAIT_SLACK`] 之后，登记、发现文件、运行时三段各自仍有自己的预留。
+    #[tokio::test(start_paused = true)]
+    async fn the_stages_share_one_deadline_and_each_keeps_the_reserve_of_the_stages_after_it() {
+        let t0 = Instant::now();
+        let budgets = StopBudgets::from_exit(t0 + STOP_DEADLINE);
+        assert_eq!(budgets.exit, t0 + Duration::from_secs(16));
+        assert_eq!(budgets.discovery, t0 + Duration::from_millis(15_500));
+        assert_eq!(budgets.registration, t0 + Duration::from_millis(14_500));
+        assert_eq!(budgets.engines, t0 + Duration::from_millis(13_200));
+        // 引擎最慢也是：期限加上确认窗口的余量；这时登记还剩它自己的预留。
+        assert_eq!(
+            budgets.registration - (budgets.engines + WAIT_SLACK),
+            REGISTRATION_RESERVE
+        );
+        assert_eq!(budgets.discovery - budgets.registration, DISCOVERY_RESERVE);
+        assert_eq!(budgets.exit - budgets.discovery, RUNTIME_RESERVE);
+        // launcher 在 SIGTERM 之后 17 秒 SIGKILL：最后一段也在它之前。
+        assert!(budgets.exit < t0 + Duration::from_secs(17));
+    }
 
-        let mut signals = TerminationSignals::install().unwrap();
-        raise(Signal::SIGTERM).unwrap();
-        tokio::time::timeout(WAIT, signals.recv())
-            .await
-            .expect("SIGTERM raised before the first recv is recorded");
-        raise(Signal::SIGINT).unwrap();
-        tokio::time::timeout(WAIT, signals.recv())
-            .await
-            .expect("SIGINT raised before the next recv is recorded too");
-        // 没有新信号时不返回（不是一个一直就绪的 future）。
+    /// 没有锁存原因（服务自己倒了）：从现在起算同样的期限；锁存了就从锁存那一刻起算，之后再过多久都不挪。
+    #[tokio::test(start_paused = true)]
+    async fn the_budgets_count_from_the_latch_or_from_now_when_nothing_was_latched() {
+        let latch = StopLatch::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            StopBudgets::for_latch(&latch),
+            StopBudgets::from_exit(t0 + STOP_DEADLINE)
+        );
+        latch.latch(StopVerdict::Stop(StopCause::Signal));
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(
+            StopBudgets::for_latch(&latch),
+            StopBudgets::from_exit(t0 + STOP_DEADLINE),
+            "the latch moment, not the moment of asking"
+        );
+    }
+
+    /// 倒推到时钟起点之前不 panic：每一段立刻到期。
+    #[test]
+    fn a_deadline_too_close_to_the_clock_origin_does_not_panic() {
+        // `Instant` 的最小值无从构造；用一个肯定倒推不动的极小间隔检查 `checked_sub` 的退路：期限就在现在，各段都不晚于它。
+        let now = Instant::now();
+        let budgets = StopBudgets::from_exit(now);
+        assert!(budgets.engines <= budgets.registration);
+        assert!(budgets.registration <= budgets.discovery);
+        assert!(budgets.discovery <= budgets.exit);
+    }
+
+    /// 拆运行时只等期限里剩下的，封顶 `cap`；期限已过是零；没有期限是 `cap`。
+    #[test]
+    fn the_runtime_teardown_only_waits_for_what_is_left_of_the_exit_deadline() {
+        let cap = Duration::from_secs(5);
+        let none = ExitDeadline::default();
+        assert_eq!(none.runtime_grace(cap), cap, "no stop flow: the usual cap");
+        let far = ExitDeadline::default();
+        far.set(Instant::now() + Duration::from_secs(60));
+        assert_eq!(far.runtime_grace(cap), cap, "plenty left: capped");
+        let near = ExitDeadline::default();
+        near.set(Instant::now() + Duration::from_secs(2));
+        let grace = near.runtime_grace(cap);
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), signals.recv())
+            grace <= Duration::from_secs(2) && grace > Duration::from_millis(1500),
+            "{grace:?}"
+        );
+        let spent = ExitDeadline::default();
+        spent.set(Instant::now());
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(spent.runtime_grace(cap), Duration::ZERO);
+        // 只记第一次。
+        near.set(Instant::now() + Duration::from_secs(60));
+        assert!(near.runtime_grace(cap) <= Duration::from_secs(2));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // 信号：处理器启动时就装好（L6），同步可读、异步可等（H1）
+    // -----------------------------------------------------------------------------------------
+
+    /// 没有信号时既不置位也不返回（不是一个一直就绪的 future）；置位之后已经在等的与之后才来等的都立即返回。
+    #[tokio::test]
+    async fn a_raised_signal_wakes_every_waiter_and_stays_set() {
+        let signal = StopSignal::manual();
+        assert!(!signal.is_set());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), signal.wait())
                 .await
                 .is_err()
         );
+        let early = {
+            let signal = signal.clone();
+            tokio::spawn(async move { signal.wait().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        signal.raise();
+        assert!(signal.is_set());
+        tokio::time::timeout(WAIT, early).await.unwrap().unwrap();
+        tokio::time::timeout(WAIT, signal.wait())
+            .await
+            .expect("a waiter that comes after the signal returns at once");
+        // 克隆共用同一个标志。
+        assert!(signal.clone().is_set());
+    }
+
+    /// 真并发（多线程运行时加另一个操作系统线程）：`raise` 与一个刚好在登记的等待者同时发生，反复很多轮，等待者每一轮都必须返回。
+    /// `wait` 在检查标志**之前**就建好 `Notified` 并登记（置位发生在两者之间也会唤醒它，不会丢）；这条测试只能抽样那个纳秒级的窗口，
+    /// 不能逼出它，确定性的两头（先等后置位、先置位后等）由 `a_raised_signal_wakes_every_waiter_and_stays_set` 钉住。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_raise_racing_with_a_waiter_that_is_just_registering_is_never_lost() {
+        for round in 0..2000 {
+            let signal = StopSignal::manual();
+            let waiter = {
+                let signal = signal.clone();
+                tokio::spawn(async move { signal.wait().await })
+            };
+            let raiser = {
+                let signal = signal.clone();
+                std::thread::spawn(move || signal.raise())
+            };
+            tokio::time::timeout(WAIT, waiter)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("round {round}: a raise that raced with the waiter was lost")
+                })
+                .unwrap();
+            raiser.join().unwrap();
+        }
+    }
+
+    /// 信号在**没有任何人读之前**就到了：处理器是 `install` 时注册的，所以信号被后台任务记下，同步读（`is_set`）与异步等（`wait`）都
+    /// 读得到。处理器若是等第一次 poll 才注册（旧写法），这两次 `raise` 按默认动作直接杀死整个进程（这个测试进程），根本走不到断言。
+    /// SIGINT 与 SIGTERM 各来一次。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signals_that_arrive_before_anybody_reads_are_recorded_because_the_handlers_are_installed_up_front()
+     {
+        use nix::sys::signal::{Signal, raise};
+
+        for which in [Signal::SIGTERM, Signal::SIGINT] {
+            let signal = StopSignal::install().unwrap();
+            assert!(!signal.is_set(), "{which}: nothing yet");
+            raise(which).unwrap();
+            let deadline = std::time::Instant::now() + WAIT;
+            while !signal.is_set() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{which} raised before anybody read is recorded"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tokio::time::timeout(WAIT, signal.wait())
+                .await
+                .expect("wait returns at once once the signal has arrived");
+        }
     }
 }

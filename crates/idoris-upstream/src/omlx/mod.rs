@@ -181,6 +181,18 @@ impl OmlxAdapterConfig {
     }
 }
 
+impl OmlxAdapterConfig {
+    /// 同 [`Self::for_base_url`]，但**不解析任何凭证**（`api_key` 为 `None`，不读环境、不读 `settings.json`）。给只想知道「这张卡能不能
+    /// 建出适配器」的启动干跑用：凭证只在真正建适配器时才解析（托管引擎的私有 key 要等引擎拉起后才登记）。
+    pub fn unkeyed_for_base_url(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            api_key: None,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+        }
+    }
+}
+
 impl Default for OmlxAdapterConfig {
     /// Resolves the API key via [`key::resolve_omlx_api_key_for`] (env, then settings.json for loopback only) — the one place this
     /// adapter touches the environment for it; every other constructor

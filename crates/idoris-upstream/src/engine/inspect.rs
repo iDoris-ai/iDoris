@@ -75,6 +75,14 @@ pub trait ProcessInspector: Send + Sync {
         Err(InspectError::NoAnswer)
     }
 
+    /// 进程的「代」标识：平台给的、比 `ps -o lstart=` 的秒更细的启动时刻（Linux：boot_id 加 `/proc/<pid>/stat` 的
+    /// starttime 节拍数；macOS：内核记的启动时刻，到微秒），同一个进程每次读到的值相同，pid 被另一个进程复用后读到另一个值。
+    /// 防的是「同一秒内 pid 被同一用户的另一个进程复用、又碰巧同命令同组长」。缺省与不支持的平台「读不出来」：记录里就不写，
+    /// 那样的记录只有秒级身份。
+    async fn generation(&self, _pid: u32) -> Result<String, InspectError> {
+        Err(InspectError::NoAnswer)
+    }
+
     /// 进程**正在运行的代码**的签名团队：`codesign --verify <pid>` 通过、再读 `codesign -d --verbose=2 <pid>` 的
     /// `TeamIdentifier`。签名无效、没有签名、ad-hoc 签名（没有团队）都是 `Ok(None)`：它们不是任何团队的代码。
     /// 读 pid 而不读可执行文件路径，是因为进程可以改自己的进程名（oMLX 把自己改名为 `omlx-server`，`ps` 的 `comm`
@@ -180,6 +188,10 @@ impl ProcessInspector for SystemInspector {
 
     async fn start_time(&self, pid: u32) -> Result<String, InspectError> {
         self.ps_value(pid, "lstart").await
+    }
+
+    async fn generation(&self, pid: u32) -> Result<String, InspectError> {
+        read_generation(pid, self.ps_timeout).await
     }
 
     async fn command(&self, pid: u32) -> Result<String, InspectError> {
@@ -308,7 +320,95 @@ pub(super) async fn retry_exec_busy<T>(
 pub(super) struct ToolOutput {
     pub(super) code: Option<i32>,
     pub(super) stdout: String,
+    /// `stdout` 的原始字节（`sysctl -b` 输出二进制）。
+    pub(super) stdout_bytes: Vec<u8>,
     pub(super) stderr: String,
+}
+
+/// 平台给的进程「代」标识（见 [`ProcessInspector::generation`]）。
+#[allow(clippy::unused_async)]
+async fn read_generation(pid: u32, timeout: Duration) -> Result<String, InspectError> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = timeout;
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_err(|_| InspectError::NoAnswer)?;
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|_| InspectError::NoAnswer)?;
+        let ticks = parse_proc_stat_starttime(&stat).ok_or(InspectError::NoAnswer)?;
+        Ok(format!("linux:{}:{ticks}", boot.trim()))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `sysctl` 命令行读不了「某个 pid 的 kinfo_proc」（`kern.proc.pid.<pid>` 不是一个能按名字解析的 OID：`unknown oid`），
+        // 但 `kern.proc` 本身按名字读得出来：整张进程表，每个进程一条 `struct kinfo_proc`。在里面按 pid 找（没有 unsafe，没有 FFI）。
+        let args = [OsString::from("-b"), OsString::from("kern.proc")];
+        let output = run_tool_capped(
+            Path::new("/usr/sbin/sysctl"),
+            &args,
+            timeout,
+            MAX_KINFO_TABLE_BYTES,
+        )
+        .await?;
+        if output.code != Some(0) {
+            return Err(InspectError::NoAnswer);
+        }
+        parse_kinfo_proc_start(&output.stdout_bytes, pid).ok_or(InspectError::NoAnswer)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (pid, timeout);
+        Err(InspectError::NoAnswer)
+    }
+}
+
+/// `/proc/<pid>/stat` 的第 22 个字段（starttime，开机后的时钟节拍数）。`comm` 里可以有空格与括号，所以从最后一个 `)` 之后数：
+/// 之后的字段从第 3 个（state）开始，第 22 个是它的第 20 个。
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_stat_starttime(stat: &str) -> Option<u64> {
+    let rest = stat.rsplit_once(") ")?.1;
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// 进程表的上限：一条 `kinfo_proc` 648 字节，两万个进程也只有十几 MB；超过按「没有答案」处理。
+#[cfg(target_os = "macos")]
+const MAX_KINFO_TABLE_BYTES: usize = 32 * 1024 * 1024;
+/// `struct kinfo_proc` 的大小（macOS 的 x86_64 与 arm64 都是 648 字节）。
+#[cfg(any(target_os = "macos", test))]
+const KINFO_PROC_SIZE: usize = 648;
+/// `p_pid` 在 `kinfo_proc` 里的偏移：`extern_proc` 开头是 16 字节的 `p_un`（里面的 `p_starttime`）、两个 8 字节指针、4 字节 `p_flag`、
+/// 1 字节 `p_stat`，对齐到 4 字节之后就是 `p_pid`。
+#[cfg(any(target_os = "macos", test))]
+const KINFO_PID_OFFSET: usize = 40;
+
+/// `sysctl -b kern.proc` 输出的是整张进程表：一条接一条的 `struct kinfo_proc`（每条 [`KINFO_PROC_SIZE`] 字节，小端）。在里面找 `pid` 那一条，
+/// 取它开头的 `p_starttime`（`struct timeval`：8 字节秒加 4 字节微秒）。长度不是整条的倍数、找不到这个 pid（进程已经没了）、值不合理（读错了），
+/// 都是「没有答案」。
+#[cfg(any(target_os = "macos", test))]
+fn parse_kinfo_proc_start(table: &[u8], pid: u32) -> Option<String> {
+    if table.is_empty() || !table.len().is_multiple_of(KINFO_PROC_SIZE) {
+        return None;
+    }
+    for record in table.chunks_exact(KINFO_PROC_SIZE) {
+        let found = i32::from_le_bytes(
+            record
+                .get(KINFO_PID_OFFSET..KINFO_PID_OFFSET + 4)?
+                .try_into()
+                .ok()?,
+        );
+        if u32::try_from(found).ok() != Some(pid) {
+            continue;
+        }
+        let seconds = i64::from_le_bytes(record.get(0..8)?.try_into().ok()?);
+        let micros = i32::from_le_bytes(record.get(8..12)?.try_into().ok()?);
+        if !(1_000_000_000..=100_000_000_000).contains(&seconds)
+            || !(0..1_000_000).contains(&micros)
+        {
+            return None;
+        }
+        return Some(format!("darwin:{seconds}.{micros:06}"));
+    }
+    None
 }
 
 /// Runs a system tool with a cleared environment (`PATH`, `TZ=UTC`, `LC_ALL=C` only), no stdin,
@@ -317,6 +417,16 @@ pub(super) async fn run_tool(
     program: &Path,
     args: &[OsString],
     timeout: Duration,
+) -> Result<ToolOutput, InspectError> {
+    run_tool_capped(program, args, timeout, MAX_TOOL_OUTPUT_BYTES).await
+}
+
+/// [`run_tool`] with the output cap given by the caller (the process table of `sysctl -b kern.proc` is far bigger than any one-line answer).
+pub(super) async fn run_tool_capped(
+    program: &Path,
+    args: &[OsString],
+    timeout: Duration,
+    max_output: usize,
 ) -> Result<ToolOutput, InspectError> {
     let mut command = Command::new(program);
     command
@@ -341,12 +451,13 @@ pub(super) async fn run_tool(
         .await
         .map_err(|_| InspectError::TimedOut)?
         .map_err(|_| InspectError::NoAnswer)?;
-    if output.stdout.len() > MAX_TOOL_OUTPUT_BYTES || output.stderr.len() > MAX_TOOL_OUTPUT_BYTES {
+    if output.stdout.len() > max_output || output.stderr.len() > MAX_TOOL_OUTPUT_BYTES {
         return Err(InspectError::NoAnswer);
     }
     Ok(ToolOutput {
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stdout_bytes: output.stdout,
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
@@ -358,6 +469,100 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    /// The 22nd field of `/proc/<pid>/stat` counted after the last `)`, whatever spaces and parentheses `comm` has.
+    #[test]
+    fn the_proc_stat_starttime_is_the_twenty_second_field_whatever_comm_looks_like() {
+        let stat = "4242 (my (odd) name) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 3 0 987654321 1000 2 18446744073709551615 1";
+        assert_eq!(parse_proc_stat_starttime(stat), Some(987_654_321));
+        assert_eq!(parse_proc_stat_starttime("4242 (x) S 1"), None);
+        assert_eq!(parse_proc_stat_starttime("garbage"), None);
+    }
+
+    /// One 648-byte `kinfo_proc` record: `p_starttime` (8-byte little-endian seconds, 4-byte microseconds) at the start, `p_pid` at offset 40.
+    fn kinfo_record(pid: i32, seconds: i64, micros: i32) -> Vec<u8> {
+        let mut record = vec![0_u8; KINFO_PROC_SIZE];
+        record[0..8].copy_from_slice(&seconds.to_le_bytes());
+        record[8..12].copy_from_slice(&micros.to_le_bytes());
+        record[KINFO_PID_OFFSET..KINFO_PID_OFFSET + 4].copy_from_slice(&pid.to_le_bytes());
+        record
+    }
+
+    /// `sysctl -b kern.proc` is a table of `struct kinfo_proc`: the record whose `p_pid` is the asked pid gives the start time with microseconds,
+    /// and only that record (another record's start time is never read for this pid). Anything that is not a whole table, no such pid, or an
+    /// absurd value is "no answer".
+    #[test]
+    fn the_kinfo_proc_start_is_found_by_pid_in_the_process_table_with_microseconds() {
+        let table = [
+            kinfo_record(100, 1_700_000_100, 100_100),
+            kinfo_record(200, 1_700_000_200, 123_456),
+            kinfo_record(300, 1_700_000_300, 300_300),
+        ]
+        .concat();
+        assert_eq!(
+            parse_kinfo_proc_start(&table, 200).as_deref(),
+            Some("darwin:1700000200.123456")
+        );
+        assert_eq!(
+            parse_kinfo_proc_start(&table, 100).as_deref(),
+            Some("darwin:1700000100.100100")
+        );
+        assert_eq!(
+            parse_kinfo_proc_start(&table, 300).as_deref(),
+            Some("darwin:1700000300.300300")
+        );
+        assert_eq!(parse_kinfo_proc_start(&table, 999), None, "no such pid");
+        assert_eq!(parse_kinfo_proc_start(&[], 100), None, "empty table");
+        assert_eq!(
+            parse_kinfo_proc_start(&table[..table.len() - 1], 100),
+            None,
+            "not a whole number of records"
+        );
+        let absurd = kinfo_record(7, 1_700_000_000, 2_000_000);
+        assert_eq!(
+            parse_kinfo_proc_start(&absurd, 7),
+            None,
+            "microseconds out of range"
+        );
+        assert_eq!(
+            parse_kinfo_proc_start(&kinfo_record(7, 0, 0), 7),
+            None,
+            "second 0 is no process"
+        );
+    }
+
+    /// On a platform that can read it, a live process's generation is stable between reads and another process has another one.
+    #[tokio::test]
+    async fn the_generation_of_a_live_process_is_stable_and_differs_between_processes() {
+        let inspector = SystemInspector::new();
+        let me = std::process::id();
+        let first = match inspector.generation(me).await {
+            Ok(first) => first,
+            Err(error) => {
+                // macOS and Linux MUST be able to read it (a silently disabled reader would turn the strong identity off): only other
+                // platforms may skip.
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                panic!("this platform must be able to read a process generation: {error:?}");
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                {
+                    let _ = error;
+                    eprintln!(
+                        "SKIPPED the_generation_of_a_live_process_is_stable_and_differs_between_processes: this platform has no generation reader"
+                    );
+                    return;
+                }
+            }
+        };
+        assert_eq!(inspector.generation(me).await.unwrap(), first);
+        let mut other = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let theirs = inspector.generation(other.id()).await.unwrap();
+        let _ = other.kill();
+        let _ = other.wait();
+        assert_ne!(theirs, first);
+    }
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
