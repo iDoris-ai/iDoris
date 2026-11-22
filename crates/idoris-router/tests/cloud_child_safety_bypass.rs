@@ -858,6 +858,8 @@ async fn the_legacy_inference_routes_are_closed_for_children_and_untouched_for_e
             "/v1/rerank",
             json!({"model": "idoris/rerank", "query": "q", "documents": ["a", "b"]}),
         ),
+        // IDORIS-CORE S8：预热同属本地流水线，和上面三条在同一道守卫后面。
+        ("/v1/models/warmup", json!({"model": "idoris/daily"})),
     ];
     for (path, body) in &bodies {
         // 儿童：这些旧路由没有安全管线，换个路径就绕过了——所以一律 403

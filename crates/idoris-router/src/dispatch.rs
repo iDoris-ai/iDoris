@@ -82,7 +82,7 @@ impl BoundSupervisor {
         Ok(Self::new(card, handle))
     }
 
-    fn matches(&self, card: &ComponentCard) -> bool {
+    pub(crate) fn matches(&self, card: &ComponentCard) -> bool {
         self.provider_id == card.provider.id
             && self.endpoint == card.endpoint
             && self.locality == card.provider.locality
@@ -917,6 +917,102 @@ enum LocalSelection<'a> {
     Preselected(&'a Selected),
 }
 
+/// Why [`ensure_loaded`] did not leave the model loaded. The split keeps `dispatch_local_inner`'s
+/// provider-breaker accounting as it was: only a failure of the Supervisor's own load command is
+/// classified into a provider outcome; a refusal before any load was issued is not.
+#[derive(Debug)]
+pub(crate) enum EnsureLoadedError {
+    /// Refused before a load command was sent: the catalog could not be read, the model is not in
+    /// it, or it has no positive pre-load memory footprint. Nothing in the lifecycle changed.
+    Preflight(BackendError),
+    /// The Supervisor's load command failed: admission (headroom confirmation, eviction, `Busy`), or the
+    /// engine's own load.
+    Load(BackendError),
+}
+
+impl EnsureLoadedError {
+    pub(crate) fn into_backend(self) -> BackendError {
+        match self {
+            Self::Preflight(err) | Self::Load(err) => err,
+        }
+    }
+}
+
+/// The lifecycle half of serving a model, shared by `POST /v1/chat/completions` (which then chats)
+/// and `POST /v1/models/warmup` (which stops here; IDORIS-CORE S8): read the engine's catalog, refuse
+/// a model that is not in it or has no positive pre-load footprint, then pass through the
+/// Supervisor's idempotent load (headroom check and eviction included) so it establishes readiness
+/// and applies the card's policy. It generates nothing. Two concurrent callers with the same model,
+/// card policy and headroom confirmation are merged by the Supervisor into one engine load.
+pub(crate) async fn ensure_loaded(
+    bound: &BoundSupervisor,
+    provider_id: &str,
+    backend_model_id: &str,
+    load_policy: LoadPolicy,
+    headroom_breach_confirmed: bool,
+) -> Result<(), EnsureLoadedError> {
+    let admission_memory_override = bound
+        .admission_model
+        .as_ref()
+        .filter(|(model_id, _)| model_id == backend_model_id)
+        .map(|(_, memory_gb)| *memory_gb);
+    let supervisor = &bound.handle;
+    // Process-owned mlx_lm.server/llama.cpp bind a trusted config footprint.
+    // Every other lifecycle runtime (notably oMLX) must provide its exact
+    // selected model plus a positive pre-load footprint via its catalog.
+    // A mismatched bound model intentionally has no override, forcing this
+    // preflight before Supervisor eviction planning can mutate lifecycle state.
+    let catalog = if admission_memory_override.is_none() {
+        let catalog = supervisor
+            .list()
+            .await
+            .map_err(EnsureLoadedError::Preflight)?;
+        if backend_model_id != provider_id
+            && !catalog.iter().any(|model| model.id == backend_model_id)
+        {
+            return Err(EnsureLoadedError::Preflight(BackendError::model_not_found(
+                backend_model_id,
+            )));
+        }
+        Some(catalog)
+    } else {
+        None
+    };
+    let admission_memory_gb = match admission_memory_override {
+        Some(memory_gb) => memory_gb,
+        None => {
+            let Some(model) = catalog
+                .as_ref()
+                .and_then(|models| models.iter().find(|model| model.id == backend_model_id))
+            else {
+                return Err(EnsureLoadedError::Preflight(BackendError::model_not_found(
+                    backend_model_id,
+                )));
+            };
+            model.memory_gb
+        }
+    };
+    if !admission_memory_gb.is_finite() || admission_memory_gb <= 0.0 {
+        return Err(EnsureLoadedError::Preflight(BackendError::Upstream {
+            message: "selected lifecycle model has no positive pre-load memory footprint".into(),
+        }));
+    }
+    // `status.loaded` reports engine residency, which may have been
+    // inherited after a Supervisor restart while the model is still in
+    // Error (not yet adopted and policy-checked). Always pass through the
+    // Supervisor's idempotent load path before chatting so it can establish
+    // readiness and apply the requested policy.
+    supervisor
+        .load_with_headroom(
+            backend_model_id.to_string(),
+            admission_memory_gb,
+            load_policy,
+            headroom_breach_confirmed,
+        )
+        .await
+        .map_err(EnsureLoadedError::Load)
+}
+
 async fn dispatch_local_inner(
     selection: LocalSelection<'_>,
     execution: LocalExecutionContext<'_>,
@@ -1026,90 +1122,24 @@ async fn dispatch_local_inner(
     // cancellation can stop early.
     let _cancel_guard = CancelOnDrop(cancel.clone());
 
-    let admission_memory_override = supervisor
-        .admission_model
-        .as_ref()
-        .filter(|(model_id, _)| model_id == &backend_model_id)
-        .map(|(_, memory_gb)| *memory_gb);
-    let supervisor = &supervisor.handle;
-    // Process-owned mlx_lm.server/llama.cpp bind a trusted config footprint.
-    // Every other lifecycle runtime (notably oMLX) must provide its exact
-    // selected model plus a positive pre-load footprint via its catalog.
-    // A mismatched bound model intentionally has no override, forcing this
-    // preflight before Supervisor eviction planning can mutate lifecycle state.
-    let catalog = if admission_memory_override.is_none() {
-        let catalog = match supervisor.list().await {
-            Ok(models) => models,
-            Err(err) => {
-                return Ok(ChatOutcome {
-                    decision,
-                    served_locality,
-                    result: Err(DispatchFailure::Backend(err)),
-                    actual_cost_minor: None,
-                });
+    // The pre-load preflight and the Supervisor's idempotent load are shared with `POST /v1/models/warmup`
+    // (IDORIS-CORE S8): see [`ensure_loaded`].
+    if let Err(failure) = ensure_loaded(
+        supervisor,
+        &provider_id,
+        &backend_model_id,
+        load_policy,
+        headroom_breach_confirmed,
+    )
+    .await
+    {
+        let err = match failure {
+            EnsureLoadedError::Preflight(err) => err,
+            EnsureLoadedError::Load(err) => {
+                provider_guard.finish(native_provider_outcome(&err, &backend_model_id, true));
+                err
             }
         };
-        if backend_model_id != provider_id
-            && !catalog.iter().any(|model| model.id == backend_model_id)
-        {
-            return Ok(ChatOutcome {
-                decision,
-                served_locality,
-                result: Err(DispatchFailure::Backend(BackendError::model_not_found(
-                    backend_model_id,
-                ))),
-                actual_cost_minor: None,
-            });
-        }
-        Some(catalog)
-    } else {
-        None
-    };
-    let admission_memory_gb = match admission_memory_override {
-        Some(memory_gb) => memory_gb,
-        None => {
-            let Some(model) = catalog
-                .as_ref()
-                .and_then(|models| models.iter().find(|model| model.id == backend_model_id))
-            else {
-                return Ok(ChatOutcome {
-                    decision,
-                    served_locality,
-                    result: Err(DispatchFailure::Backend(BackendError::model_not_found(
-                        backend_model_id,
-                    ))),
-                    actual_cost_minor: None,
-                });
-            };
-            model.memory_gb
-        }
-    };
-    if !admission_memory_gb.is_finite() || admission_memory_gb <= 0.0 {
-        return Ok(ChatOutcome {
-            decision,
-            served_locality,
-            result: Err(DispatchFailure::Backend(BackendError::Upstream {
-                message: "selected lifecycle model has no positive pre-load memory footprint"
-                    .into(),
-            })),
-            actual_cost_minor: None,
-        });
-    };
-    // `status.loaded` reports engine residency, which may have been
-    // inherited after a Supervisor restart while the model is still in
-    // Error (not yet adopted and policy-checked). Always pass through the
-    // Supervisor's idempotent load path before chatting so it can establish
-    // readiness and apply the requested policy.
-    if let Err(err) = supervisor
-        .load_with_headroom(
-            backend_model_id.clone(),
-            admission_memory_gb,
-            load_policy,
-            headroom_breach_confirmed,
-        )
-        .await
-    {
-        provider_guard.finish(native_provider_outcome(&err, &backend_model_id, true));
         return Ok(ChatOutcome {
             decision,
             served_locality,
@@ -1117,6 +1147,7 @@ async fn dispatch_local_inner(
             actual_cost_minor: None,
         });
     }
+    let supervisor = &supervisor.handle;
 
     if let Some(context) = dispatched_event
         && crate::append_dispatched(context, selected).await.is_err()
