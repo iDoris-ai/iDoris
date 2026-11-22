@@ -200,89 +200,125 @@ const LEGACY_OVERAGE_SQL: &str = "CASE WHEN e.kind <> 'settle' THEN 0 ELSE
        FROM ledger_holds h WHERE h.hold_id = e.hold_id)
   END";
 
-/// 一个按归属时刻切的窗口：名字（内层查询里给 `moved_<名字>` 这一列起名用）和判断。判断里的 `{t}` 是归属时刻那一列，窗口自己的开闭边界
-/// 写在这里，[`attributed_sum`] 对预留之内的部分和对还留在 `settle` 里的超出部分各用一次，所以边界照旧。
+/// 一个按归属时刻切的窗口的判断。判断里的 `{t}` 是归属时刻那一列，窗口自己的开闭边界写在这里，[`attributed_sum`] 对预留之内的部分和对
+/// 还留在 `settle` 里的超出部分各用一次，所以边界照旧。
 struct WindowSpec {
-    name: &'static str,
     condition: &'static str,
 }
 
 /// 额度窗口：从最早生效的额度的起点（`?2`）算起，没有上界。
 const ALLOWANCE_WINDOW: WindowSpec = WindowSpec {
-    name: "window",
     condition: "{t} >= ?2",
 };
 /// 分钟速率窗口：滑动窗口 `(now - 60 秒, now]`，`?3` 是 `now - 60 秒`。
 const MINUTE_WINDOW: WindowSpec = WindowSpec {
-    name: "minute",
     condition: "{t} > ?3",
 };
 /// 小时速率窗口：滑动窗口 `(now - 3600 秒, now]`，`?4` 是 `now - 3600 秒`。
 const HOUR_WINDOW: WindowSpec = WindowSpec {
-    name: "hour",
     condition: "{t} > ?4",
 };
 /// 补贴池的账期：`[?2, ?3)`。
 const POOL_PERIOD: WindowSpec = WindowSpec {
-    name: "pool",
     condition: "{t} >= ?2 AND {t} < ?3",
 };
 
-/// 一个账户（`?1`）的全部分录，对每个窗口加一列 `moved_<名字>`：这条 `settle` 里**还留着、要按结算时刻算**的超出预留的部分
-/// （[`LEGACY_OVERAGE_SQL`]，取不到按 0）。按归属时刻求和的地方都从这里取数，见 [`attributed_sum`]。
-///
-/// **只在这条 `settle` 的两块落在窗口两边时才去查预留表**（预留之内的部分在 `window_at_ms`，超出的部分在 `at_ms`）：两块在窗口的
-/// 同一边（都在里面或都在外面）时，拆开求和和不拆求和结果一样，没有必要为每条 `settle` 去读一遍预留表——十万笔的历史里，需要读的只有
-/// 预留和结算跨过窗口边界的那几笔，不是十万笔。
-fn attributed_entries_sql(windows: &[&WindowSpec]) -> String {
-    let moved: String = windows
+/// 这几个窗口里，有没有哪条 `settle` 的两块（预留之内的部分在 `window_at_ms`，超出的部分在 `at_ms`）落在窗口的**两边**（SQL 条件，
+/// `e` 是 `ledger_entries` 的别名）。两块在窗口的同一边（都在里面或都在外面）时，拆开求和和不拆求和结果一样，没有必要去读预留表。
+fn straddles_sql(windows: &[&WindowSpec]) -> String {
+    windows
         .iter()
         .map(|window| {
             let reservation = window.condition.replace("{t}", "e.window_at_ms");
             let settlement = window.condition.replace("{t}", "e.at_ms");
-            format!(
-                ", CASE WHEN e.kind = 'settle' AND ({reservation}) <> ({settlement})
-                        THEN COALESCE({LEGACY_OVERAGE_SQL}, 0) ELSE 0 END AS moved_{name}",
-                name = window.name
-            )
+            format!("({reservation}) <> ({settlement})")
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// 一个窗口里的 `Σ (held + spent)`，**不拆**：每条分录整条按 `window_at_ms` 判（旧写法）。没有 `settle` 跨过窗口边界时，它就是按归属规则
+/// 求出的和（见 [`straddles_sql`]）。
+fn raw_sum(window: &WindowSpec) -> String {
+    let at_reservation = window.condition.replace("{t}", "e.window_at_ms");
+    format!(
+        "COALESCE(SUM(CASE WHEN {at_reservation} THEN e.held_micros + e.spent_micros ELSE 0 END), 0)"
+    )
+}
+
+/// 跨过这几个窗口的边界的 `settle` 有几条。
+fn straddler_count(windows: &[&WindowSpec]) -> String {
+    let straddles = straddles_sql(windows);
+    format!("COALESCE(SUM(CASE WHEN e.kind = 'settle' AND ({straddles}) THEN 1 ELSE 0 END), 0)")
+}
+
+/// 一个账户（`?1`）的全部分录，加一列 `moved`：这条 `settle` 里**还留着、要按结算时刻算**的超出预留的部分（[`LEGACY_OVERAGE_SQL`]，
+/// 取不到按 0）。按归属时刻求和的地方都从这里取数，见 [`attributed_sum`]。
+///
+/// **只在这条 `settle` 的两块落在任何一个窗口的两边时才去查预留表**（[`straddles_sql`]）：十万笔的历史里，需要读的只有预留和结算跨过
+/// 窗口边界的那几笔，不是十万笔。对没有被跨过的窗口，`moved` 非 0 也不改变那个窗口的和（两块都在里面：`(held + spent - moved) + moved`；
+/// 都在外面：`0 + 0`），所以所有窗口共用这一列，查预留表的子查询在语句里只出现一次。
+fn attributed_entries_sql(windows: &[&WindowSpec]) -> String {
+    let straddles = straddles_sql(windows);
     format!(
         "SELECT e.kind AS kind, e.held_micros AS held_micros, e.spent_micros AS spent_micros, e.funds_micros AS funds_micros,
-                e.window_at_ms AS window_at_ms, e.at_ms AS at_ms{moved}
+                e.window_at_ms AS window_at_ms, e.at_ms AS at_ms,
+                CASE WHEN e.kind = 'settle' AND ({straddles})
+                     THEN COALESCE({LEGACY_OVERAGE_SQL}, 0) ELSE 0 END AS moved
            FROM ledger_entries e WHERE e.account_id = ?1"
     )
 }
 
 /// [`attributed_entries_sql`] 上一个窗口里的 `Σ (held + spent)`：预留之内的部分按 `window_at_ms` 判，还留在 `settle` 里的超出部分
-/// （`moved_<名字>`）按这条 `settle` 的 `at_ms`（结算时刻）判，窗口的判断各用一次。
+/// （`moved`）按这条 `settle` 的 `at_ms`（结算时刻）判，窗口的判断各用一次。
 fn attributed_sum(window: &WindowSpec) -> String {
     let at_reservation = window.condition.replace("{t}", "window_at_ms");
     let at_settlement = window.condition.replace("{t}", "at_ms");
-    let moved = format!("moved_{}", window.name);
     format!(
-        "COALESCE(SUM(CASE WHEN {at_reservation} THEN held_micros + spent_micros - {moved} ELSE 0 END), 0)
-         + COALESCE(SUM(CASE WHEN {moved} <> 0 AND {at_settlement} THEN {moved} ELSE 0 END), 0)"
+        "COALESCE(SUM(CASE WHEN {at_reservation} THEN held_micros + spent_micros - moved ELSE 0 END), 0)
+         + COALESCE(SUM(CASE WHEN moved <> 0 AND {at_settlement} THEN moved ELSE 0 END), 0)"
     )
 }
 
 /// 补贴池账户在 `[start_ms, end_ms)` 这个账期里的消耗（已结算 + 在途），和额度窗口、速率窗口用同一条归属规则
 /// （[`LEGACY_OVERAGE_SQL`]）。准入的视图（[`project_chain_with_books`]）和报表（`subsidy.rs` 的 `pool_report_in`）共用。
+///
+/// 和 [`entry_sums`] 一样分两步：先用一条短语句求不拆的和，同时数一数跨过账期边界的 `settle`；一条也没有（绝大多数情况）就是它；
+/// 有才用带查预留表子查询的那条长语句。
 pub(super) fn pool_consumed_micros(
     conn: &Connection,
     pool: &str,
     start_ms: i64,
     end_ms: i64,
 ) -> Result<i64, LedgerError> {
-    let consumed = attributed_sum(&POOL_PERIOD);
-    let entries = attributed_entries_sql(&[&POOL_PERIOD]);
+    let windows = [&POOL_PERIOD];
+    let params: &[&dyn rusqlite::ToSql] = &[&pool, &start_ms, &end_ms];
+    let raw = raw_sum(&POOL_PERIOD);
+    let count = straddler_count(&windows);
+    let (consumed, straddlers): (i64, i64) = conn.query_row(
+        &format!("SELECT {raw}, {count} FROM ledger_entries e WHERE e.account_id = ?1"),
+        params,
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if straddlers == 0 {
+        return Ok(consumed);
+    }
+    let attributed = attributed_sum(&POOL_PERIOD);
+    let entries = attributed_entries_sql(&windows);
     Ok(conn.query_row(
-        &format!("SELECT {consumed} FROM ({entries})"),
-        rusqlite::params![pool, start_ms, end_ms],
+        &format!("SELECT {attributed} FROM ({entries})"),
+        params,
         |row| row.get(0),
     )?)
 }
 
+/// 一个账户的分录总量：在途、已花、自有资金，和额度 / 分钟 / 小时窗口里的消耗（按归属规则，见 [`LEGACY_OVERAGE_SQL`]）。
+///
+/// **分两步，因为准备语句本身就有代价**：账户存储的每一次准入、结算都要投影好几次，每次投影对链上每个账户都走这里，语句是现编、现准备的。
+/// 带着查预留表子查询的长语句（约 1.5 KB）在调试构建里每次准备要几百微秒（实测 526 µs，原来那条短语句 40 µs）；路由 crate 的并发测试里
+/// 十个请求在账户存储的那把锁后面排队，累计起来超过了上游响应头的超时。所以先用一条短语句求不拆的和（就是原来那条，多一列：
+/// 跨过窗口边界的 `settle` 有几条），一条也没有（绝大多数情况：预留和结算落在窗口同一边，求和结果一样）就是它；有才用长语句重新求三个
+/// 窗口里的和（[`attributed_entries_sql`]）。
 fn entry_sums(
     conn: &Connection,
     account: &str,
@@ -291,32 +327,52 @@ fn entry_sums(
 ) -> Result<EntrySums, LedgerError> {
     let minute_from = sub(now_ms, MINUTE_MS)?;
     let hour_from = sub(now_ms, HOUR_MS)?;
+    let windows = [&ALLOWANCE_WINDOW, &MINUTE_WINDOW, &HOUR_WINDOW];
+    let params: &[&dyn rusqlite::ToSql] = &[&account, &window_from_ms, &minute_from, &hour_from];
+    let (raw_window, raw_minute, raw_hour) = (
+        raw_sum(&ALLOWANCE_WINDOW),
+        raw_sum(&MINUTE_WINDOW),
+        raw_sum(&HOUR_WINDOW),
+    );
+    let count = straddler_count(&windows);
+    let (mut sums, straddlers) = conn.query_row(
+        &format!(
+            "SELECT COALESCE(SUM(e.held_micros), 0),
+                    COALESCE(SUM(e.held_micros + e.spent_micros), 0),
+                    COALESCE(SUM(e.funds_micros), 0),
+                    COALESCE(SUM(CASE WHEN e.kind = 'fund' THEN 1 ELSE 0 END), 0),
+                    {raw_window}, {raw_minute}, {raw_hour}, {count}
+               FROM ledger_entries e WHERE e.account_id = ?1"
+        ),
+        params,
+        |row| {
+            Ok((
+                EntrySums {
+                    held: row.get(0)?,
+                    committed: row.get(1)?,
+                    funds: row.get(2)?,
+                    has_funds: row.get::<_, i64>(3)? > 0,
+                    window: row.get(4)?,
+                    minute: row.get(5)?,
+                    hour: row.get(6)?,
+                },
+                row.get::<_, i64>(7)?,
+            ))
+        },
+    )?;
+    if straddlers == 0 {
+        return Ok(sums);
+    }
     let window = attributed_sum(&ALLOWANCE_WINDOW);
     let minute = attributed_sum(&MINUTE_WINDOW);
     let hour = attributed_sum(&HOUR_WINDOW);
-    let entries = attributed_entries_sql(&[&ALLOWANCE_WINDOW, &MINUTE_WINDOW, &HOUR_WINDOW]);
-    Ok(conn.query_row(
-        &format!(
-            "SELECT COALESCE(SUM(held_micros), 0),
-                    COALESCE(SUM(held_micros + spent_micros), 0),
-                    COALESCE(SUM(funds_micros), 0),
-                    COALESCE(SUM(CASE WHEN kind = 'fund' THEN 1 ELSE 0 END), 0),
-                    {window}, {minute}, {hour}
-               FROM ({entries})"
-        ),
-        rusqlite::params![account, window_from_ms, minute_from, hour_from],
-        |row| {
-            Ok(EntrySums {
-                held: row.get(0)?,
-                committed: row.get(1)?,
-                funds: row.get(2)?,
-                has_funds: row.get::<_, i64>(3)? > 0,
-                window: row.get(4)?,
-                minute: row.get(5)?,
-                hour: row.get(6)?,
-            })
-        },
-    )?)
+    let entries = attributed_entries_sql(&windows);
+    (sums.window, sums.minute, sums.hour) = conn.query_row(
+        &format!("SELECT {window}, {minute}, {hour} FROM ({entries})"),
+        params,
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(sums)
 }
 
 /// 账户此刻有效的授信额度（没有 / 关闭 / 过期 / 还没生效 = 0）。
@@ -1048,8 +1104,10 @@ mod tests {
     //! 同时到期的先创建的）。期望数字手算；另外和暴力扫描对一遍随机的窗口和时刻。
     //!
     //! 窗口求和（[`entry_sums`]、[`pool_consumed_micros`]）按归属规则（[`LEGACY_OVERAGE_SQL`]）切：随机的历史（新格式 / 中间形态 / 旧格式的预留，
-    //! 放掉的、迟到结算的、还在途的）对一份独立写的暴力期望——一笔笔算出每个预留的花费落在哪个时刻——必须逐窗口一模一样。
-    //! 这也是「只在预留和结算落在窗口两边时才读预留表」的恒等式的检验：期望里没有这个捷径。
+    //! 放掉的、迟到结算的、还在途的）对一份独立写的暴力期望——一笔笔算出每个预留的花费落在哪个时刻——必须逐窗口一模一样（并且统计每个窗口
+    //! 里「按归属规则求的和」和「不拆的和」不一样的次数，保证随机历史真的让每个窗口都需要拆）。这也是「没有 `settle` 跨过窗口边界就用短语句，
+    //! 有才用带预留表子查询的长语句」的恒等式的检验：期望里没有这个捷径。另一条把预留表整个拿掉：没有跨过边界的历史照样求得出来
+    //! （短语句不读预留表，这是耗时的要求，见 [`entry_sums`]），有一条跨过的就要去读它。
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
@@ -1418,7 +1476,8 @@ mod tests {
             state ^= state >> 27;
             state.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
         };
-        let mut straddlers = 0_u32;
+        // 每个窗口里，按归属规则求出的和和「不拆」的和（每条分录整条按预留的时刻判）不一样的次数：随机历史要真的让每个窗口都需要拆
+        let mut corrected = [0_u32; 4];
         for round in 0..300 {
             let conn = open_sums_schema();
             let count = 1 + next(12);
@@ -1484,18 +1543,20 @@ mod tests {
                             entry("late_settle", 0, moved, settled_at, settled_at);
                         }
                         hold_row("settled", 0, Some(charged));
-                        if (reserved_at < 300) != (settled_at < 300) {
-                            straddlers += 1;
-                        }
                     }
                 }
             }
             let pieces = expected_pieces(&conn, "acct");
             for _ in 0..6 {
                 let from = i64::try_from(next(700)).unwrap() - 50;
-                // 读的时刻取 `from + 59_999`：分钟窗口 `t > now - 60 000` 就是 `t > from - 1`，小时窗口 `t > now - 3 600 000`
-                // 就是 `t > from - 3 540 001`；额度窗口 `t >= from`，没有上界
-                let now = from + 59_999;
+                // 读的时刻：一半在一分钟多一点（分钟窗口的下界 `now - 60 000` 落在历史的时间范围 [0, 600) 里，小时窗口什么都装得下），
+                // 一半在一小时多一点（反过来）。三个窗口的判断各不相同（额度窗口 `t >= from`、分钟窗口 `t > now - 60 000`、
+                // 小时窗口 `t > now - 3 600 000`），跨过边界的 `settle` 有时只跨过其中一两个窗口
+                let now = if next(2) == 0 {
+                    MINUTE_MS + i64::try_from(next(600)).unwrap()
+                } else {
+                    HOUR_MS + i64::try_from(next(600)).unwrap()
+                };
                 let sums = entry_sums(&conn, "acct", from, now).unwrap();
                 let expected = |keep: &dyn Fn(i64) -> bool| -> i64 {
                     pieces
@@ -1504,32 +1565,111 @@ mod tests {
                         .map(|(_, amount)| amount)
                         .sum()
                 };
-                assert_eq!(
-                    sums.window,
-                    expected(&|at| at >= from),
-                    "round {round}: allowance window from {from}"
-                );
-                assert_eq!(
-                    sums.minute,
-                    expected(&|at| at > now - MINUTE_MS),
-                    "round {round}: minute window"
-                );
-                assert_eq!(
-                    sums.hour,
-                    expected(&|at| at > now - HOUR_MS),
-                    "round {round}: hour window"
-                );
+                // 不拆的和：每条分录整条按 `window_at_ms` 判
+                let unsplit = |condition: String| -> i64 {
+                    conn.query_row(
+                        &format!(
+                            "SELECT COALESCE(SUM(held_micros + spent_micros), 0) FROM ledger_entries WHERE {condition}"
+                        ),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+                };
                 let (start, end) = (from, from + 200);
-                assert_eq!(
-                    pool_consumed_micros(&conn, "acct", start, end).unwrap(),
-                    expected(&|at| start <= at && at < end),
-                    "round {round}: pool period [{start}, {end})"
-                );
+                let pool = pool_consumed_micros(&conn, "acct", start, end).unwrap();
+                let checks = [
+                    (
+                        "allowance window",
+                        sums.window,
+                        expected(&|at| at >= from),
+                        unsplit(format!("window_at_ms >= {from}")),
+                    ),
+                    (
+                        "minute window",
+                        sums.minute,
+                        expected(&|at| at > now - MINUTE_MS),
+                        unsplit(format!("window_at_ms > {}", now - MINUTE_MS)),
+                    ),
+                    (
+                        "hour window",
+                        sums.hour,
+                        expected(&|at| at > now - HOUR_MS),
+                        unsplit(format!("window_at_ms > {}", now - HOUR_MS)),
+                    ),
+                    (
+                        "pool period",
+                        pool,
+                        expected(&|at| start <= at && at < end),
+                        unsplit(format!("window_at_ms >= {start} AND window_at_ms < {end}")),
+                    ),
+                ];
+                for (slot, (name, got, want, unsplit)) in checks.into_iter().enumerate() {
+                    assert_eq!(got, want, "round {round}: {name} (now {now}, from {from})");
+                    if want != unsplit {
+                        corrected[slot] += 1;
+                    }
+                }
             }
         }
         assert!(
-            straddlers >= 100,
-            "the random histories must cross the window boundaries often enough: {straddlers}"
+            corrected.iter().all(|&times| times >= 100),
+            "the random histories must need the split in every window often enough: {corrected:?}"
+        );
+    }
+
+    /// 没有 `settle` 跨过窗口边界时，求和不去读预留表（`ledger_holds`）：只走短语句。这不是为了结果（两条路的结果一样，上面的随机对照管那个），
+    /// 是为了耗时：长语句带着查预留表的子查询，准备一次在调试构建里要几百微秒，每次准入、结算的每次投影、链上每个账户都要走一遍
+    /// （路由 crate 的并发测试里排队的十个请求，累计起来超过了上游响应头的超时）。这里把预留表整个拿掉：没有跨过边界的历史照样求得出来，
+    /// 有一条跨过的就要去读它（所以读不出来）；表放回去之后，手算的数字：
+    ///
+    /// 预留 100 在 1 000 毫秒，实际 160，旧格式（超出的 60 留在 `settle` 里，结算在 1 500 毫秒）：新窗口从 1 200 毫秒起，预留之内的 100 在窗口外，
+    /// 超出的 60 在结算时刻 1 500，在窗口里：窗口里是 60（不拆的和是 0）；分钟 / 小时窗口两块都在里面：160。
+    #[test]
+    fn window_sums_read_the_holds_only_when_a_settlement_straddles_a_window() {
+        let conn = open_sums_schema();
+        conn.execute_batch("DROP TABLE ledger_holds").unwrap();
+        let entry = |hold: &str, kind: &str, held: i64, spent: i64, window_at: i64, at: i64| {
+            conn.execute(
+                "INSERT INTO ledger_entries (account_id, hold_id, kind, held_micros, spent_micros, window_at_ms, at_ms)
+                 VALUES ('acct', ?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![hold, kind, held, spent, window_at, at],
+            )
+            .unwrap();
+        };
+        // 预留 100 在 1 000，按 100 结算在 1 500：新格式，没有超出
+        entry("h-1", "reserve", 100, 0, 1_000, 1_000);
+        entry("h-1", "settle", -100, 100, 1_000, 1_500);
+        // 额度窗口从 900 起、分钟窗口 `t > 2 000 - 60 000`、小时窗口 `t > 2 000 - 3 600 000`、账期 [900, 10 000)：预留和结算都在里面
+        let sums = entry_sums(&conn, "acct", 900, 2_000).unwrap();
+        assert_eq!((sums.window, sums.minute, sums.hour), (100, 100, 100));
+        assert_eq!(
+            pool_consumed_micros(&conn, "acct", 900, 10_000).unwrap(),
+            100
+        );
+        // 额度窗口从 1 200 起、账期 [1 200, 10 000)：预留（1 000）在外面，结算（1 500）在里面，跨过了边界，要去读预留表，没有这张表就读不出来
+        assert!(entry_sums(&conn, "acct", 1_200, 2_000).is_err());
+        assert!(pool_consumed_micros(&conn, "acct", 1_200, 10_000).is_err());
+
+        // 表放回去，补上这个预留（旧格式，超出的 60 还在 `settle` 里）
+        conn.execute_batch(
+            "CREATE TABLE ledger_holds (
+                 hold_id TEXT NOT NULL PRIMARY KEY, state TEXT NOT NULL, late INTEGER NOT NULL DEFAULT 0,
+                 reserved_micros INTEGER NOT NULL, charged_micros INTEGER);
+             INSERT INTO ledger_holds VALUES ('h-1', 'settled', 0, 100, 160);
+             DELETE FROM ledger_entries WHERE kind = 'settle';",
+        )
+        .unwrap();
+        entry("h-1", "settle", -100, 160, 1_000, 1_500);
+        let sums = entry_sums(&conn, "acct", 1_200, 2_000).unwrap();
+        assert_eq!(
+            (sums.window, sums.minute, sums.hour),
+            (60, 160, 160),
+            "the 60 above the reservation is spent at the settlement, inside the allowance window; the other 100 is before it"
+        );
+        assert_eq!(
+            pool_consumed_micros(&conn, "acct", 1_200, 10_000).unwrap(),
+            60
         );
     }
 }
