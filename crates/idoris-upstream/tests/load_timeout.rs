@@ -2,7 +2,8 @@
 //! 10 秒的管理调用超时；不分开，它会被当作「结果未知」并留下 `load.pending` 围栏。
 //! 只有 `with_load_timeout` 打开之后才生效（生产的工厂打开它）。这个预算管**整个加载**：`POST …/load`，以及它之后的钉住（pin）与
 //! 状态核对（#634 预审 W-3），全部要在预算里完成，否则报「结果未知」（`load_unconfirmed`）；`status`、`unload`、`probe_ready`、
-//! `list` 永远用 `call_timeout`。
+//! `list` 永远用 `call_timeout`。预算快用完才被引擎接受的加载，确认仍有一个下限的时间（`min(call_timeout, 5 秒)`，本地预审 L-5）；
+//! POST 自己就用掉了整个预算时，之后的确认一个也不发。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::ffi::OsStr;
@@ -385,6 +386,24 @@ async fn the_floor_is_the_most_the_confirmation_may_run_past_the_budget() {
         waited >= Duration::from_millis(1_100) && waited < Duration::from_millis(2_800),
         "cut at about budget + 0.2 s, not at the 4 s the check needs: {waited:?}"
     );
+}
+
+#[tokio::test]
+async fn the_floor_is_never_longer_than_one_call_timeout() {
+    // 下限是 min(call_timeout, 5 秒)：一次调用本来就最多 call_timeout，比它更长的下限没有意义。call_timeout 0.8 秒，预算 1 秒，POST 用
+    // 0.3 秒，剩 0.7 秒；resident 的钉住与核对是登录、PUT、GET 三步，PUT 与 GET 各 0.7 秒（各自在 call_timeout 之内），要约 1.4 秒。
+    // 下限是 min：拿到 max(剩下的 0.7 秒, 0.8 秒) = 0.8 秒，来不及，「结果未知」；下限若还是 5 秒，会一直等到 1.4 秒然后成功。
+    let server = resident_engine(
+        Duration::from_millis(300),
+        Duration::from_millis(700),
+        Duration::from_millis(700),
+    )
+    .await;
+    let adapter = adapter_with_call_timeout(&server, Duration::from_millis(800))
+        .with_load_timeout(Duration::from_secs(1))
+        .with_confirmation_floor(Duration::from_secs(5));
+    let error = adapter.load("m", Some(&resident())).await.unwrap_err();
+    assert_eq!(error.reason_code(), "load_unconfirmed", "{error}");
 }
 
 #[tokio::test]
