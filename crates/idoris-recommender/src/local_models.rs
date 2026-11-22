@@ -73,6 +73,8 @@ pub fn default_models_dir(home: &Path) -> PathBuf {
 pub struct ScanReport {
     pub models: Vec<LocalModel>,
     pub unchecked: Vec<String>,
+    /// 根目录条目多到超过整体预算：读到的那些名字之外还有条目没被看见（它们的名字不在 `unchecked` 里）。
+    pub root_truncated: bool,
 }
 
 /// 扫描 `dir`。目录不存在、读不了都返回空列表。结果按 `omlx_id` 排序，输出稳定。
@@ -241,10 +243,11 @@ fn scan_with(dir: &Path, bindings: &[OmlxBinding], limits: Limits) -> ScanReport
     ) else {
         return report;
     };
-    let Ok((mut names, _overflow)) = list_names(&mut root, dir, limits.max_scan_entries) else {
+    let Ok((mut names, root_overflow)) = list_names(&mut root, dir, limits.max_scan_entries) else {
         return report;
     };
-    // 根目录的条目也计入整体预算；超出的部分不再往下看。
+    // 根目录的条目也计入整体预算；超出的部分不再往下看（它们的名字没读出来，只能用 `root_truncated` 报告）。
+    report.root_truncated = root_overflow;
     names.truncate(limits.max_scan_entries);
     let mut remaining = limits.max_scan_entries.saturating_sub(names.len());
     names.sort();
@@ -405,6 +408,9 @@ fn walk_dir(
             return;
         }
     };
+    // 列出来的名字立刻计入（在处理它们、在往子目录里走之前）：同级的兄弟越多，留给子目录的空间越少，
+    // 溢出的那一次也按已列出的个数计费，下一个模型看到的预算是扣过的。预算数的是目录项个数，不是字节数。
+    walk.entries += names.len();
     if overflow {
         if room_model <= room_budget {
             walk.broken = true;
@@ -414,7 +420,6 @@ fn walk_dir(
         return;
     }
     for name in names {
-        walk.entries += 1;
         let child = path.join(&name);
         let lower = name.to_string_lossy().to_lowercase();
         let (kind, len) = match stat_entry(dir, &child, &name) {
@@ -810,8 +815,66 @@ mod tests {
         let fewer = scan_with(root.path(), &[], limits(100, 8, 6));
         assert_eq!(ids(&fewer), ["a"]);
         assert_eq!(fewer.unchecked, ["b", "c"]);
-        // 预算比根目录项还少：一个模型也没检查。
+        // 预算比根目录项还少：一个模型也没检查，读到的名字进 unchecked，并报告根目录被截断。
         let none = scan_with(root.path(), &[], limits(100, 8, 2));
         assert!(none.models.is_empty());
+        assert!(none.root_truncated);
+        assert_eq!(none.unchecked.len(), 2);
+        assert!(!all.root_truncated && !some.root_truncated);
+    }
+
+    /// #609（PR-Daemon B1）：单模型上限数的是已列出的全部名字，不是已处理的。嵌套的兄弟越多，子目录越没空间；
+    /// 与 readdir 的顺序无关（上限只看个数）。
+    #[test]
+    fn the_per_model_cap_is_enforced_for_siblings_listed_before_descending() {
+        // Codex 的最小例子：d/、config、权重、d/x，上限 3：共 4 项，不完整。
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("m");
+        fs::create_dir_all(dir.join("d")).unwrap();
+        fs::write(dir.join("config.json"), "{}").unwrap();
+        fs::write(dir.join("w.safetensors"), b"w").unwrap();
+        fs::write(dir.join("d").join("x"), b"x").unwrap();
+        assert!(
+            scan_with(root.path(), &[], limits(3, 8, 1_000))
+                .models
+                .is_empty()
+        );
+        assert_eq!(
+            scan_with(root.path(), &[], limits(4, 8, 1_000))
+                .models
+                .len(),
+            1
+        );
+
+        // 评审的例子：config、权重、f0..f9 加 sub/（里面 s 个文件）：顶层 13 项，总数 13 + s。
+        for s in 0..=25usize {
+            let root = tempfile::tempdir().unwrap();
+            let dir = model(root.path(), "m");
+            for index in 0..10 {
+                fs::write(dir.join(format!("f{index}")), b"f").unwrap();
+            }
+            fs::create_dir(dir.join("sub")).unwrap();
+            for index in 0..s {
+                fs::write(dir.join("sub").join(format!("s{index}")), b"s").unwrap();
+            }
+            let listed = !scan_with(root.path(), &[], limits(30, 8, 1_000))
+                .models
+                .is_empty();
+            assert_eq!(listed, 13 + s <= 30, "s={s}");
+        }
+    }
+
+    /// #609（PR-Daemon B2）：溢出的那个模型已列出的名字也计入整体预算，下一个模型看到的是扣过的预算。
+    #[test]
+    fn a_model_that_overflows_still_charges_the_global_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let a = model(root.path(), "a");
+        fs::write(a.join("x"), b"x").unwrap();
+        fs::write(a.join("y"), b"y").unwrap();
+        model(root.path(), "b");
+        // 根 2 项，预算 5 剩 3；a 有 4 项溢出（计 3），b 没有预算了：unchecked。
+        let report = scan_with(root.path(), &[], limits(3, 8, 5));
+        assert!(report.models.is_empty(), "{report:?}");
+        assert_eq!(report.unchecked, ["b"]);
     }
 }
