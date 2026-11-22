@@ -299,6 +299,7 @@ pub fn infer_kind(config: &Value) -> ModelKind {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
