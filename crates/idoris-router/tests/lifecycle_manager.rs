@@ -16,6 +16,7 @@ mod child_guard;
 mod fake_omlx;
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,9 +34,10 @@ use idoris_router::readiness::{
 };
 use idoris_router::register::{JitterSource, LogSink};
 use idoris_upstream::engine::{
-    CodesignPolicy, EngineInstance, EngineKey, EngineKind, EngineLaunch, EngineLaunchSpec,
-    EngineRecipe, InspectError, ListenerPolicy, OwnedEngine, PidState, ProcessInspector,
-    StopOnExit, SystemInspector,
+    CodesignPolicy, DiscoveryError, DiscoveryPlan, EngineExecutable, EngineInstance, EngineKey,
+    EngineKind, EngineLaunch, EngineLaunchSpec, EngineProbe, EngineRecipe, InspectError,
+    LaunchError, LaunchInput, LaunchPlan, ListenerPolicy, OwnedEngine, PidState, ProcessInspector,
+    StopOnExit, SystemInspector, VersionError,
 };
 use idoris_upstream::omlx::key::{EndpointKey, governed_endpoint};
 
@@ -103,6 +105,8 @@ struct Scripted {
     team_checks: AtomicUsize,
     /// 端口 → 还剩几次「`listens_on` 为真」，用完之后一律为假：造「等就绪时监听它的是引擎，封印时端口已被别人占了」。
     claim_budget: Mutex<BTreeMap<u16, usize>>,
+    /// `listens_on` 一律读不出来（`lsof` 不答）。
+    unreadable: std::sync::atomic::AtomicBool,
 }
 
 impl Scripted {
@@ -114,6 +118,7 @@ impl Scripted {
             teams: Mutex::new(BTreeMap::new()),
             team_checks: AtomicUsize::new(0),
             claim_budget: Mutex::new(BTreeMap::new()),
+            unreadable: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -159,6 +164,9 @@ impl ProcessInspector for Scripted {
         self.real.process_group(pid).await
     }
     async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
+        if self.unreadable.load(Ordering::SeqCst) {
+            return Err(InspectError::NoAnswer);
+        }
         if self.claims.lock().unwrap().contains(&port) {
             return Ok(true);
         }
@@ -238,6 +246,14 @@ impl Rig {
     fn pid(&self, launch: usize) -> u64 {
         self.fake.launch(launch)["pid"].as_u64().unwrap()
     }
+
+    /// 第 `launch` 次拉起的引擎的私有 key（它的环境变量 `OMLX_API_KEY`）。
+    fn key(&self, launch: usize) -> String {
+        self.fake.launch(launch)["api_key"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
 }
 
 impl Drop for Rig {
@@ -272,6 +288,7 @@ fn fast() -> Timings {
         crash_limit: 2,
         half_open_interval: Duration::from_millis(400),
         stop_grace: Duration::from_secs(3),
+        drain_timeout: Duration::from_secs(5),
         unverifiable_retries: 2,
         unverifiable_pause: Duration::from_millis(20),
     }
@@ -343,8 +360,8 @@ impl EngineBackend for TestBackend {
     fn govern_external(&self, endpoint: &str, settings_key_verified: bool) {
         self.inner.govern_external(endpoint, settings_key_verified);
     }
-    fn release(&self, endpoint: &str) {
-        self.inner.release(endpoint);
+    fn block(&self, endpoint: &str) {
+        self.inner.block(endpoint);
     }
     fn current_key(&self, _endpoint: &str) -> Option<String> {
         self.external_key.lock().unwrap().clone()
@@ -381,7 +398,7 @@ impl Harness {
     /// 起一个管理器（一个托管上游 `omlx`）。`budget` 是额度；`stop_on_exit` 是 launcher 的设置。
     fn start(
         rig: &Rig,
-        backend: Arc<TestBackend>,
+        backend: Arc<dyn EngineBackend>,
         inspector: Arc<dyn ProcessInspector>,
         timings: Timings,
         stop_on_exit: StopOnExit,
@@ -399,7 +416,7 @@ impl Harness {
     /// 同 [`Self::start`]，引擎的可执行文件由调用方给（给一个不存在的路径就是「没装 oMLX」）。
     fn start_with(
         rig: &Rig,
-        backend: Arc<TestBackend>,
+        backend: Arc<dyn EngineBackend>,
         inspector: Arc<dyn ProcessInspector>,
         timings: Timings,
         stop_on_exit: StopOnExit,
@@ -502,10 +519,14 @@ async fn an_engine_that_is_not_there_is_spawned_and_becomes_ready_and_owned_with
     // 引擎只认这个 key：就绪探测带着它，每个请求都是 ok。
     assert!(rig.fake.requests().iter().all(|(_, auth)| auth == "ok"));
     h.manager.shutdown(true).await;
-    // 停止之后：引擎没了，记录删了，私有 key 不再留在进程里。
+    // 停止之后：引擎没了，记录删了，私有 key 不再留在进程里；端点被封上（什么凭证都不发），不是撤销登记：撤销会让环境变量与
+    // `settings.json` 的回退链重新适用。
     assert!(!pid_alive(rig.pid(0)));
     assert_eq!(rig.records(), 0);
-    assert!(governed_endpoint(&rig.endpoint()).is_none());
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
 }
 
 #[tokio::test]
@@ -930,14 +951,21 @@ async fn stop_restart_and_start_act_only_on_an_engine_idoris_owns() {
     h.until_state(UpstreamState::Ready).await;
     let first_pid = rig.pid(0);
 
-    // stop：自有引擎停掉（整个进程组），状态 `stopped`，记录与私有 key 都没了。
+    // stop：自有引擎停掉（整个进程组），状态 `stopped`，记录与私有 key 都没了。受理时状态就已经是 `stopped`（不可服务），进程
+    // 还在退出的这几秒 `owned` 还是 true；进程没了才是 `owned: false`。端点被封上，不是撤销登记。
     h.manager.stop_upstream("omlx").await.unwrap();
-    let stopped = h.until_state(UpstreamState::Stopped).await;
-    assert!(!stopped.owned);
+    let stopped = h
+        .until("the engine to be gone", |s| {
+            s.state == UpstreamState::Stopped && !s.owned
+        })
+        .await;
     assert_eq!(stopped.reason, None);
     wait_for("the engine to die", || !pid_alive(first_pid)).await;
     assert_eq!(rig.records(), 0);
-    assert!(governed_endpoint(&rig.endpoint()).is_none());
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
     assert_eq!(
         h.health.view().phase,
         Phase::Degraded,
@@ -1101,9 +1129,10 @@ async fn an_external_engine_is_adopted_without_a_signal_and_survives_idoris_even
         "iDoris never signals an engine it does not own"
     );
     assert_eq!(rig.records(), 0);
-    assert!(
-        governed_endpoint(&rig.endpoint()).is_none(),
-        "released at shutdown"
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked),
+        "blocked at shutdown (not released: the fallback chain must not apply to a managed endpoint)"
     );
     // 引擎看到的只有匿名请求（它没要求 key）：没有带 key 的请求。
     assert!(
@@ -1679,10 +1708,14 @@ async fn an_engine_that_keeps_rejecting_its_own_key_while_starting_is_given_up_w
 #[tokio::test]
 async fn an_engine_whose_port_turns_out_to_be_held_by_another_process_when_sealed_is_stopped() {
     let rig = Rig::new(&Behavior::default());
-    // 等就绪的时候监听这个端口的是引擎（`listens_on` 为真），封印所有权记录时再看，端口已经是别人的了。
+    // 等就绪的时候监听这个端口的是引擎（`listens_on` 为真，只有一次），封印所有权记录时再看，端口已经是别人的了。等就绪的循环在每一次
+    // 带 key 的探测之前都重新问（H3），所以「一次为真」要花在第一次带 key 的探测上：那一次探测是编排好的 `Ready`，不管真引擎启动
+    // 要走几轮。
+    let script =
+        ProbeScript::new(|call| (call.keyed && call.index == 0).then_some(EngineProbe::Ready));
     let h = Harness::start(
         &rig,
-        default_backend(&rig),
+        ScriptedProbeBackend::new(default_backend(&rig), script),
         Scripted::claiming_once(rig.port),
         observable_restarts(),
         StopOnExit::Owned,
@@ -1693,15 +1726,15 @@ async fn an_engine_whose_port_turns_out_to_be_held_by_another_process_when_seale
         })
         .await;
     assert!(!status.owned);
-    wait_for("the engine to be stopped", || !pid_alive(rig.pid(0))).await;
+    // 探测是编排的（引擎可能连启动记录都还没来得及写，就被停掉了）：看所有权记录，不看进程号。
+    wait_for("the ownership record to be removed", || rig.records() == 0).await;
+    if rig.fake.launches() > 0 {
+        wait_for("the engine to be stopped", || !pid_alive(rig.pid(0))).await;
+    }
     assert_eq!(
-        rig.records(),
-        0,
-        "no ownership record is left for an engine that was refused"
-    );
-    assert!(
-        governed_endpoint(&rig.endpoint()).is_none(),
-        "its private key was never registered"
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked),
+        "its private key was never registered: the endpoint stayed blocked"
     );
     h.manager.shutdown(true).await;
 }
@@ -1790,7 +1823,10 @@ async fn an_external_listener_that_turns_into_another_service_is_failed_with_por
 async fn an_external_listener_that_stops_passing_the_owner_check_is_failed_and_the_settings_key_goes_off()
  {
     // 接管之后，端口上换了一个没通过属主校验的监听者（另一个进程，没有签名团队）：`failed` + `port_in_use`；`settings.json` 的 key
-    // 立刻不再允许（之后任何走这个端点的请求都不会带它），也不再有任何请求发给它。
+    // 立刻不再允许（登记表里是「未验证」）。**这里只钉管理器这一层**：key 登记表的口径与管理器自己的探测次数。数据面的请求怎么
+    // 办是另一层的事，在 `lifecycle_admin.rs` 的 `b_g1_…` 里用真的 Router 钉：Router 创建之后才失败的卡，请求在运行期被挡住，
+    // 503 带 `port_in_use`，没有一个字节发给那个端口；已经存在的适配器每个请求都按登记表此刻的口径取 key（`OmlxAdapter::
+    // with_per_request_key`，在 `idoris-upstream` 的单元测试里钉）。
     let work = tempfile::tempdir().unwrap();
     let external = External::start(work.path(), Some("ext-secret"));
     let rig = rig_for(&external);
@@ -1813,17 +1849,15 @@ async fn an_external_listener_that_stops_passing_the_owner_check_is_failed_and_t
     assert!(!status.owned);
     assert_eq!(
         governed_endpoint(&rig.endpoint()),
-        Some(EndpointKey::External {
-            settings_key_verified: false
-        }),
-        "the settings.json key is off again for a listener that failed the check"
+        Some(EndpointKey::Blocked),
+        "no credential of any kind goes to a listener that failed the check (the env key included)"
     );
     let before = external.fake.requests().len();
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(
         external.fake.requests().len(),
         before,
-        "nothing more is sent to the engine once its listener failed the check"
+        "the manager sends no more probes to a listener that failed the check"
     );
     assert!(pid_alive(u64::from(external.pid())), "never signalled");
     h.manager.shutdown(true).await;
@@ -2508,4 +2542,591 @@ async fn a_cancelled_gate_task_never_swaps() {
         .unwrap();
     assert_eq!(swapped.load(Ordering::SeqCst), 0);
     manager.shutdown(true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 启动决策里的探测不是引擎失败（IDORIS-CORE S6，Codex 预审 6）
+// ---------------------------------------------------------------------------------------------
+//
+// 第一次启动之前对端口的探测，答案可能是「有东西在监听、但答不上来」（`Unavailable`：超时，或者连接被接受之后被重置——一个正在被
+// 拆掉的监听者，别的进程刚用过这个端口），紧接着端口就空了（`ConnectionRefused`）。这时**还没有哪个我们拉起的进程出过问题**：
+// 管理器回到决策的开头重来、拉起引擎；不能记一次失败（`failure_count`、熔断窗口、退避、`restarting`）。S5 的实现把它当成了引擎
+// 失败（`Attempt::Failure`），于是首次启动偶尔就带着一次失败、退避一轮，机器忙的时候测试里的 `failure_count == 0` 断言因此偶发地红。
+//
+// 下面分两类钉住：**编排**的探测序列（确定的，每一个分支各一个测试）与**真的套接字**（一个占着端口的监听者：接受连接之后重置，或者
+// 一直不答，然后走掉）。
+
+/// 一次探测的编号：`keyed` = 这次探测带了 key；`index` = 同一类（带 key / 不带 key）里的第几次，从 0 起。
+#[derive(Debug, Clone, Copy)]
+struct ProbeCall {
+    keyed: bool,
+    index: usize,
+}
+
+/// 编排探测的回答：`answer` 返回 `Some` 就用它，返回 `None` 就去问真的端口。
+struct ProbeScript {
+    answer: Box<dyn Fn(ProbeCall) -> Option<EngineProbe> + Send + Sync>,
+    keyless: AtomicUsize,
+    keyed: AtomicUsize,
+}
+
+impl std::fmt::Debug for ProbeScript {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProbeScript").finish_non_exhaustive()
+    }
+}
+
+impl ProbeScript {
+    fn new(answer: impl Fn(ProbeCall) -> Option<EngineProbe> + Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            answer: Box::new(answer),
+            keyless: AtomicUsize::new(0),
+            keyed: AtomicUsize::new(0),
+        })
+    }
+
+    fn next(&self, bearer: Option<&str>) -> Option<EngineProbe> {
+        let keyed = bearer.is_some();
+        let counter = if keyed { &self.keyed } else { &self.keyless };
+        let index = counter.fetch_add(1, Ordering::SeqCst);
+        (self.answer)(ProbeCall { keyed, index })
+    }
+}
+
+/// 别的方法都是真配方的，`probe_ready` 先问编排。
+#[derive(Debug)]
+struct ScriptedRecipe {
+    inner: Arc<dyn EngineRecipe>,
+    script: Arc<ProbeScript>,
+}
+
+#[async_trait]
+impl EngineRecipe for ScriptedRecipe {
+    fn kind(&self) -> EngineKind {
+        self.inner.kind()
+    }
+    fn discovery_plan(&self) -> DiscoveryPlan {
+        self.inner.discovery_plan()
+    }
+    async fn discover(&self, explicit: Option<&Path>) -> Result<EngineExecutable, DiscoveryError> {
+        self.inner.discover(explicit).await
+    }
+    async fn version(&self, executable: &Path, timeout: Duration) -> Result<String, VersionError> {
+        self.inner.version(executable, timeout).await
+    }
+    fn launch_plan(&self, input: &LaunchInput<'_>) -> Result<LaunchPlan, LaunchError> {
+        self.inner.launch_plan(input)
+    }
+    async fn probe_ready(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        bearer: Option<&str>,
+        timeout: Duration,
+    ) -> EngineProbe {
+        if let Some(answer) = self.script.next(bearer) {
+            return answer;
+        }
+        self.inner
+            .probe_ready(client, endpoint, bearer, timeout)
+            .await
+    }
+}
+
+/// [`TestBackend`]，但启动决策用的探测配方按 [`ProbeScript`] 回答。
+#[derive(Debug)]
+struct ScriptedProbeBackend {
+    inner: Arc<TestBackend>,
+    script: Arc<ProbeScript>,
+}
+
+impl ScriptedProbeBackend {
+    fn new(inner: Arc<TestBackend>, script: Arc<ProbeScript>) -> Arc<Self> {
+        Arc::new(Self { inner, script })
+    }
+}
+
+impl EngineBackend for ScriptedProbeBackend {
+    fn kind(&self) -> EngineKind {
+        self.inner.kind()
+    }
+    fn probe_recipe(&self) -> Arc<dyn EngineRecipe> {
+        Arc::new(ScriptedRecipe {
+            inner: self.inner.probe_recipe(),
+            script: self.script.clone(),
+        })
+    }
+    /// 拉起之后等就绪用的探测（带自己的私有 key）走的是拉起用的配方：它同样按编排回答。
+    fn launch_recipe(&self, state_dir: &Path) -> Result<Arc<dyn EngineRecipe>, PrepareFailure> {
+        let inner = self.inner.launch_recipe(state_dir)?;
+        Ok(Arc::new(ScriptedRecipe {
+            inner,
+            script: self.script.clone(),
+        }))
+    }
+    fn supports_private_key(&self) -> bool {
+        self.inner.supports_private_key()
+    }
+    fn listener_policy(&self) -> Option<ListenerPolicy> {
+        self.inner.listener_policy()
+    }
+    fn fence_path(&self, state_dir: &Path, endpoint: &str) -> Option<PathBuf> {
+        self.inner.fence_path(state_dir, endpoint)
+    }
+    fn govern_private(&self, endpoint: &str, key: &EngineKey) {
+        self.inner.govern_private(endpoint, key);
+    }
+    fn govern_external(&self, endpoint: &str, settings_key_verified: bool) {
+        self.inner.govern_external(endpoint, settings_key_verified);
+    }
+    fn block(&self, endpoint: &str) {
+        self.inner.block(endpoint);
+    }
+    fn current_key(&self, endpoint: &str) -> Option<String> {
+        self.inner.current_key(endpoint)
+    }
+}
+
+impl Harness {
+    /// 这个实例此刻的失败事实（Admin 读到的同一份）：`(failure_count, last_failure_at_ms)`。
+    fn failures(&self) -> (u32, Option<u64>) {
+        let view = self.manager.views().remove("omlx").unwrap();
+        (view.failure_count, view.last_failure_at_ms)
+    }
+
+    /// 日志里（按顺序）包含 `needle` 的行数。
+    fn logged_count(&self, needle: &str) -> usize {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+}
+
+/// 一次没有失败的首次启动：引擎只拉起了一次，状态从来没有进过 `restarting`，没有失败事实，日志里有「重新判断（不算失败）」。
+fn assert_started_without_a_failure(rig: &Rig, h: &Harness, redecided: usize) {
+    assert_eq!(rig.fake.launches(), 1, "{:?}", h.log.lock().unwrap());
+    assert_eq!(
+        h.failures(),
+        (0, None),
+        "not an engine failure: {:?}",
+        h.log.lock().unwrap()
+    );
+    assert_eq!(
+        h.logged_count("：restarting"),
+        0,
+        "never entered restarting: {:?}",
+        h.log.lock().unwrap()
+    );
+    assert_eq!(
+        h.logged_count("重新判断（不算失败）"),
+        redecided,
+        "{:?}",
+        h.log.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_startup_probe_that_cannot_answer_and_then_finds_the_port_empty_is_not_an_engine_failure()
+{
+    let rig = Rig::new(&Behavior::default());
+    // 第一次探测：有东西在监听但答不上来；等它的时候再探一次：端口已经空了；再重新判断：问真的端口，空的，拉起。
+    let script = ProbeScript::new(|call| match (call.keyed, call.index) {
+        (false, 0) => Some(EngineProbe::Unavailable),
+        (false, 1) => Some(EngineProbe::ConnectionRefused),
+        _ => None,
+    });
+    let h = Harness::start(
+        &rig,
+        ScriptedProbeBackend::new(default_backend(&rig), script),
+        Scripted::claiming(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    let ready = h.until_state(UpstreamState::Ready).await;
+    assert!(ready.owned);
+    assert_started_without_a_failure(&rig, &h, 1);
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn a_listener_that_is_gone_before_the_owner_check_is_decided_again_and_is_not_an_engine_failure()
+ {
+    let rig = Rig::new(&Behavior::default());
+    // 第一次探测说「就绪」（有一个外部引擎）；校验端口属主的时候那里已经没有监听者了（检查器没有编排任何监听者）。
+    let script =
+        ProbeScript::new(|call| (!call.keyed && call.index == 0).then_some(EngineProbe::Ready));
+    let h = Harness::start(
+        &rig,
+        ScriptedProbeBackend::new(default_backend(&rig), script),
+        Scripted::claiming(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    let ready = h.until_state(UpstreamState::Ready).await;
+    assert!(ready.owned, "the engine was spawned, not adopted");
+    assert_started_without_a_failure(&rig, &h, 1);
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn an_external_engine_that_is_gone_when_asked_with_its_key_is_decided_again_and_is_not_an_engine_failure()
+ {
+    let rig = Rig::new(&Behavior::default());
+    let backend = default_backend(&rig);
+    *backend.external_key.lock().unwrap() = Some("sk-external".to_owned());
+    // 第一次探测：401（有外部引擎，要 key）。属主校验通过（监听者是一个同用户、团队对的进程）。带 key 再问的时候它已经走了：连接被拒。
+    let inspector = Scripted::claiming(rig.port);
+    inspector.external_listener(rig.port, std::process::id(), Some(TEAM));
+    let script = {
+        let (inspector, port) = (inspector.clone(), rig.port);
+        ProbeScript::new(move |call| match (call.keyed, call.index) {
+            (false, 0) => Some(EngineProbe::AuthRejected(401)),
+            (true, 0) => {
+                inspector.forget_listener(port);
+                Some(EngineProbe::ConnectionRefused)
+            }
+            _ => None,
+        })
+    };
+    let h = Harness::start(
+        &rig,
+        ScriptedProbeBackend::new(backend, script),
+        inspector,
+        fast(),
+        StopOnExit::Owned,
+    );
+    let ready = h.until_state(UpstreamState::Ready).await;
+    assert!(ready.owned, "the engine was spawned, not adopted");
+    assert_started_without_a_failure(&rig, &h, 1);
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn a_port_that_keeps_flip_flopping_between_unanswered_and_empty_gives_up_at_the_startup_timeout_and_is_never_counted()
+ {
+    let rig = Rig::new(&Behavior::default());
+    // 每一轮：答不上来，然后空了；永远如此。重新判断受启动超时约束，到点按「有东西占着端口答不上来」收尾；没有拉起任何东西，
+    // 没有失败。
+    let script = ProbeScript::new(|call| match (call.keyed, call.index % 2) {
+        (false, 0) => Some(EngineProbe::Unavailable),
+        (false, _) => Some(EngineProbe::ConnectionRefused),
+        _ => None,
+    });
+    let mut timings = fast();
+    timings.startup_timeout = Duration::from_millis(700);
+    let h = Harness::start(
+        &rig,
+        ScriptedProbeBackend::new(default_backend(&rig), script),
+        Scripted::claiming(rig.port),
+        timings,
+        StopOnExit::Owned,
+    );
+    let gave_up = h.until_state(UpstreamState::Unavailable).await;
+    assert_eq!(gave_up.reason, Some(UpstreamReason::StartupTimeout));
+    assert!(!gave_up.owned);
+    assert_eq!(rig.fake.launches(), 0, "nothing was spawned");
+    assert_eq!(h.failures(), (0, None), "{:?}", h.log.lock().unwrap());
+    assert_eq!(h.logged_count("：restarting"), 0);
+    assert!(
+        h.logged_count("重新判断（不算失败）") >= 2,
+        "it did decide again, more than once: {:?}",
+        h.log.lock().unwrap()
+    );
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn a_real_crash_loop_still_trips_the_breaker_even_when_every_start_is_preceded_by_an_unanswered_probe()
+ {
+    let rig = Rig::new(&Behavior {
+        exit_immediately: Some(5),
+        ..Behavior::default()
+    });
+    // 每一轮启动决策：答不上来、空了、问真的端口（空的：拉起）。引擎一起来就退出：这才是引擎失败，每一轮恰好一次。
+    let script = ProbeScript::new(|call| match (call.keyed, call.index % 3) {
+        (false, 0) => Some(EngineProbe::Unavailable),
+        (false, 1) => Some(EngineProbe::ConnectionRefused),
+        _ => None,
+    });
+    let h = Harness::start(
+        &rig,
+        ScriptedProbeBackend::new(default_backend(&rig), script),
+        Scripted::claiming(rig.port),
+        observable_restarts(),
+        StopOnExit::Owned,
+    );
+    let failed = h.until_state(UpstreamState::Failed).await;
+    assert_eq!(failed.reason, Some(UpstreamReason::CrashLoop));
+    // 熔断的那一刻之前：恰好两次 `restarting`（上限 2，第三次失败就是 `failed`）、三次拉起、三次「不算失败」的重新判断。
+    let log = h.log.lock().unwrap().clone();
+    let tripped = log
+        .iter()
+        .position(|line| line.contains("failed（crash_loop）"))
+        .unwrap();
+    let before = &log[..tripped];
+    let count = |needle: &str| before.iter().filter(|line| line.contains(needle)).count();
+    assert_eq!(count("：restarting"), 2, "{log:?}");
+    assert_eq!(count("拉起引擎"), 3, "{log:?}");
+    assert_eq!(count("重新判断（不算失败）"), 3, "{log:?}");
+    assert_eq!(rig.fake.launches(), 3);
+    h.manager.shutdown(true).await;
+}
+
+/// 占着端口的监听者怎么处置它接受的那一个连接。
+#[derive(Debug, Clone, Copy)]
+enum Squat {
+    /// 等请求到了，不读就关：对端收到的是 RST（`ECONNRESET`），不是正常的 FIN。
+    Reset,
+    /// 一个字节也不答，拿着连接，直到对端放弃（探测超时）。
+    Silent,
+}
+
+/// 在 `listener` 上只接受第一个连接，然后立刻关掉监听（端口空了，之后的连接被拒），那个连接按 `mode` 处置。
+fn squat(listener: std::net::TcpListener, mode: Squat) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        drop(listener);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        match mode {
+            Squat::Reset => {
+                // 等请求到了（peek 不消耗它），然后带着没读的数据关掉连接。
+                let mut byte = [0_u8; 1];
+                let _ = stream.peek(&mut byte);
+                drop(stream);
+            }
+            Squat::Silent => {
+                let mut buffer = [0_u8; 1024];
+                let mut stream = stream;
+                while matches!(stream.read(&mut buffer), Ok(read) if read > 0) {}
+            }
+        }
+    })
+}
+
+/// 端口上先有一个真的监听者（接受第一个探测的连接，然后重置它或者不答），之后它走了：管理器的探测先答不上来、再被拒，之后拉起
+/// 引擎，**没有任何失败**。这是 S5 那次偶发的失败的真实形状（`SendRequest … ECONNRESET`）。
+async fn a_squatter_that_leaves_does_not_cost_the_engine_a_failure(mode: Squat) {
+    let mut rig = Rig::new(&Behavior::default());
+    let listener = loop {
+        let port = free_port();
+        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            rig.port = port;
+            break listener;
+        }
+    };
+    let squatter = squat(listener, mode);
+    let mut timings = fast();
+    // 不答的那一个靠探测超时放弃。
+    timings.probe_timeout = Duration::from_millis(300);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        timings,
+        StopOnExit::Owned,
+    );
+    let ready = h.until_state(UpstreamState::Ready).await;
+    assert!(ready.owned);
+    squatter.join().unwrap();
+    assert_started_without_a_failure(&rig, &h, 1);
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn a_listener_that_resets_the_first_probe_connection_and_leaves_does_not_cost_the_engine_a_failure()
+ {
+    a_squatter_that_leaves_does_not_cost_the_engine_a_failure(Squat::Reset).await;
+}
+
+#[tokio::test]
+async fn a_listener_that_never_answers_the_first_probe_and_leaves_does_not_cost_the_engine_a_failure()
+ {
+    a_squatter_that_leaves_does_not_cost_the_engine_a_failure(Squat::Silent).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 自有引擎的私有 key 只发给确认过的监听者，每一次（IDORIS-CORE S6，Codex 审计 H3）
+// ---------------------------------------------------------------------------------------------
+
+/// `Ok(true)` 的次数不限，直到 [`Scripted::release`]：造「引擎进程活着、端口却不再是它的」。
+impl Scripted {
+    /// 从现在起，`listens_on` 对这个端口回 `Ok(false)`（进程还活着，监听这个端口的不是它了）。
+    fn lose(&self, port: u16) {
+        self.claims
+            .lock()
+            .unwrap()
+            .retain(|claimed| *claimed != port);
+        self.claim_budget.lock().unwrap().insert(port, 0);
+    }
+
+    /// 又是它在监听了。
+    fn regain(&self, port: u16) {
+        self.claim_budget.lock().unwrap().remove(&port);
+        self.claims.lock().unwrap().push(port);
+    }
+}
+
+/// 在这个引擎的记录里，带着一个 key 的请求有几个（`ok` = 引擎自己的私有 key，`bad` = 别的 key；没带 key 的是 `none`）。
+fn keyed_requests(rig: &Rig) -> usize {
+    rig.fake
+        .requests()
+        .iter()
+        .filter(|(_, auth)| auth != "none")
+        .count()
+}
+
+#[tokio::test]
+async fn an_engine_that_listens_late_gets_no_key_once_the_port_stopped_being_confirmed_during_startup()
+ {
+    // 引擎 0.8 秒之后才开始监听。第一次问「监听这个端口的是不是这个进程」是真的（那时引擎还没起来，带 key 的探测被拒，端口上没有任何东西
+    // 收到它），之后一直是假的。S5 的实现把第一次的「是」缓存下来，之后每一次探测都带着 key 出去：引擎一开始监听就收到了私有 key。
+    // 现在每一次带 key 的探测之前都重新问，所以之后没有一个带 key 的请求到过这个端口。
+    let rig = Rig::new(&Behavior {
+        listen_delay_secs: 0.8,
+        ..Behavior::default()
+    });
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming_once(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    // 起点是引擎的启动记录（python 一起来就写）：它在这之后 0.8 秒才开始监听。机器忙时进程起得慢，所以不按固定的时间算，
+    // 也不给启动一个紧的上限（`fast()` 是 30 秒）：引擎开始监听之后再多等两秒（探测每 20 到 100 毫秒一次），这段时间里任何
+    // 一个带 key 的探测都会被记下来。
+    wait_for("the engine process to start", || rig.fake.launches() >= 1).await;
+    tokio::time::sleep(Duration::from_millis(2800)).await;
+    assert_eq!(
+        keyed_requests(&rig),
+        0,
+        "a key went to a port nobody had confirmed: {:?}",
+        rig.fake.requests()
+    );
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn an_engine_that_stops_being_the_listener_loses_its_key_at_once_and_gets_it_back_when_it_is_again()
+ {
+    let rig = Rig::new(&Behavior::default());
+    let inspector = Scripted::claiming(rig.port);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    let key = rig.key(0);
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Private(key.clone()))
+    );
+    wait_for("keyed probes to be flowing", || keyed_requests(&rig) >= 2).await;
+
+    // 进程活着，端口却不再是它的（放掉了，或别的进程绑上了）：先收回私有 key（端点封上）、发布 `unavailable` 加 `port_in_use`
+    // （数据面 503），之后没有一个带 key 的请求发往那个端口。
+    inspector.lose(rig.port);
+    let lost = h
+        .until("unavailable, port_in_use", |s| {
+            s.state == UpstreamState::Unavailable && s.reason == Some(UpstreamReason::PortInUse)
+        })
+        .await;
+    assert!(lost.owned, "the process is still ours and alive");
+    assert!(pid_alive(rig.pid(0)));
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked),
+        "no credential of any kind goes to a port the engine no longer owns"
+    );
+    let keyed = keyed_requests(&rig);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        keyed_requests(&rig),
+        keyed,
+        "a keyed probe went out after the engine lost its port"
+    );
+
+    // 又是它在监听了：私有 key 登记回去，探测恢复，回到 `ready`；同一个进程，没有重启。
+    inspector.regain(rig.port);
+    h.until_state(UpstreamState::Ready).await;
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Private(key))
+    );
+    assert_eq!(rig.fake.launches(), 1, "the same process, never restarted");
+    wait_for("keyed probes to flow again", || {
+        keyed_requests(&rig) > keyed
+    })
+    .await;
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn an_external_engine_that_cannot_be_used_leaves_its_endpoint_blocked_after_the_terminal_failure()
+ {
+    // 外部引擎要 key。接管它的时候校验通过的监听者已经被登记成「外部」（为了带 key 探测它）；key 没有（`auth_required`）或被拒
+    // （`auth_failed`）是终局，之后没有监督再去重新校验端口，所以那个口径不能留着：端点回到封上，端口上之后出现的任何东西都拿不到
+    // `settings.json` 的 key（Codex 审计 H1：终局的失败之后保持默认拒绝）。
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start(work.path(), Some("ext-secret"));
+    let rig = rig_for(&external);
+    let inspector = Scripted::new();
+    inspector.external_listener(external.port, external.pid(), Some(TEAM));
+    for (key, reason) in [
+        (None, UpstreamReason::AuthRequired),
+        (Some("wrong"), UpstreamReason::AuthFailed),
+    ] {
+        let backend = default_backend(&rig);
+        *backend.external_key.lock().unwrap() = key.map(str::to_owned);
+        let h = Harness::start(&rig, backend, inspector.clone(), fast(), StopOnExit::Owned);
+        let status = h.until_state(UpstreamState::Unavailable).await;
+        assert_eq!(status.reason, Some(reason));
+        assert_eq!(
+            governed_endpoint(&rig.endpoint()),
+            Some(EndpointKey::Blocked),
+            "{reason:?}: after a terminal failure the endpoint stays closed to every credential"
+        );
+        h.manager.shutdown(true).await;
+    }
+}
+
+#[tokio::test]
+async fn an_engine_whose_listener_cannot_be_read_is_not_a_confirmed_listener_and_gets_no_key() {
+    // 检查器读不出来（`lsof` 不答）不是「确认了」：重读几次（`unverifiable_retries`）之后仍读不出来就当作没有确认，先收回私有 key。
+    let rig = Rig::new(&Behavior::default());
+    let inspector = Scripted::claiming(rig.port);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    wait_for("keyed probes to be flowing", || keyed_requests(&rig) >= 2).await;
+    inspector
+        .unreadable
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    h.until("unavailable, port_in_use", |s| {
+        s.state == UpstreamState::Unavailable && s.reason == Some(UpstreamReason::PortInUse)
+    })
+    .await;
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
+    let keyed = keyed_requests(&rig);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(keyed_requests(&rig), keyed);
+    h.manager.shutdown(true).await;
 }

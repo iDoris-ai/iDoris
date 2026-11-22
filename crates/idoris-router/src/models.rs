@@ -98,31 +98,9 @@ fn auth_failure(card: &ComponentCard, field: &str, value: Value) -> ModelsError 
 /// （`setup upstream` 的卡必带 `idoris_upstream`）即使把 `flavor`、`version_pin` 写成 oMLX、端口写成 oMLX 的，
 /// 也不带 key。key 的来源不在这里（见 `idoris_upstream::omlx::key`），S5 换成私有 key 表时只改来源。
 pub(crate) fn is_loopback_omlx(card: &ComponentCard) -> bool {
-    if card.provider.family != idoris_contracts::provider::Family::Local
-        || card.provider.locality != Locality::Loopback
-        || !card.version_pin.starts_with("omlx@")
-        || card
-            .extensions
-            .as_ref()
-            .is_some_and(|ext| ext.contains_key(crate::engine_kind::UPSTREAM_EXTENSION))
-    {
-        return false;
-    }
-    let Ok(url) = reqwest::Url::parse(&card.endpoint) else {
-        return false;
-    };
-    matches!(url.scheme(), "http" | "https")
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.query().is_none()
-        && url.fragment().is_none()
-        && url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        })
+    // 唯一的实现在 `idoris-upstream`：生命周期适配器的工厂用的是同一个（IDORIS-CORE S6，Codex 审计 H2），所以一张手写的、伪装成
+    // oMLX 的卡在代理、模型列表、预热和适配器里得到同一个判决。
+    idoris_upstream::omlx::key::card_may_carry_omlx_key(card)
 }
 
 async fn fetch_models_body(

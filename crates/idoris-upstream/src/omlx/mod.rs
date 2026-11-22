@@ -224,7 +224,11 @@ impl Default for OmlxAdapterConfig {
 
 pub struct OmlxAdapter {
     base_url: String,
+    /// The key given at construction (explicitly, or resolved by [`OmlxAdapterConfig::for_base_url`] at that
+    /// moment). Used only while `per_request_key` is off.
     api_key: Option<String>,
+    /// Look the key up on **every request** ([`Self::with_per_request_key`]) instead of using `api_key`.
+    per_request_key: bool,
     call_timeout: Duration,
     /// Deadline of one whole load (the `POST .../load` and the pin/state verification after it); `None` =
     /// use `call_timeout` for the POST and, as before, `call_timeout` for each later call (see
@@ -246,6 +250,7 @@ impl OmlxAdapter {
         Ok(Self {
             base_url: config.base_url.trim_end_matches('/').to_string(),
             api_key: config.api_key,
+            per_request_key: false,
             call_timeout: config.call_timeout,
             load_timeout: None,
             confirmation_floor: LOAD_CONFIRMATION_FLOOR,
@@ -297,30 +302,70 @@ impl OmlxAdapter {
         self
     }
 
-    fn api_key(&self) -> Option<&str> {
+    /// Resolve the key **on every request**, from what the engine manager has registered for this endpoint
+    /// *now* (interface spec §2.7.7; IDORIS-CORE S6): an engine iDoris owns gets only its current private
+    /// key, an external engine's `settings.json` key goes out only while its listener is verified, and an
+    /// endpoint the manager has released (engine stopped, replaced, port changed hands) falls back to the
+    /// ordinary order of §2.9. A key read once at construction goes stale in all three cases: after a
+    /// restart it is the old engine's private key (every request is a 401), and after the port changed owner
+    /// it would still carry the old verification. Construction-time `api_key` is ignored in this mode.
+    ///
+    /// This is what the engine manager's adapters use (`create_adapter`, `BoundSupervisor::spawn_omlx`);
+    /// the proxy and the model listing already resolve per request. An adapter built from an explicit
+    /// [`OmlxAdapterConfig`] keeps its fixed key unless this is called.
+    pub fn with_per_request_key(mut self) -> Self {
+        self.per_request_key = true;
+        // Cache no key (IDORIS-CORE S6, Codex audit H2): the adapter reads the endpoint's current authorization, and
+        // its generation, right before each send. A key string read at construction is the old engine's the moment
+        // the engine is replaced, and must not even be held.
+        self.api_key = None;
+        self
+    }
+
+    /// Test-only: the key string this adapter holds (always `None` in per-request mode).
+    #[cfg(test)]
+    fn held_key(&self) -> Option<&str> {
         self.api_key.as_deref()
+    }
+
+    /// The credential for the request about to be made — the **one place** this adapter resolves one.
+    ///
+    /// In per-request mode the request's engine generation (bound by the Supervisor at admission, see
+    /// [`idoris_backend::generation`]) is checked against the endpoint's current one in the same read that
+    /// yields the key: work admitted for an engine that has since been replaced is **refused**, and so is
+    /// anything aimed at a blocked endpoint — nothing is sent, so neither the new engine's credentials nor
+    /// the request body (a prompt) can reach a process the work was not admitted for. An adapter with a
+    /// fixed key is unchanged.
+    fn api_key(&self) -> Result<Option<String>, BackendError> {
+        if !self.per_request_key {
+            return Ok(self.api_key.clone());
+        }
+        key::resolve_omlx_api_key_checked(&self.base_url, idoris_backend::pinned_generation())
+            .map_err(|refusal| upstream_error(refusal.to_string()))
     }
 
     // Thin wrappers binding `http`'s free functions to this instance's
     // client/base_url/api_key/call_timeout — every call site below reads
     // as just "GET/POST/PUT `path`" instead of repeating all four fields.
     async fn get(&self, path: &str) -> Result<serde_json::Value, BackendError> {
+        let key = self.api_key()?;
         http::get_json(
             &self.client,
             &self.base_url,
             path,
-            self.api_key(),
+            key.as_deref(),
             self.call_timeout,
         )
         .await
     }
 
     async fn post(&self, path: &str) -> Result<(), BackendError> {
+        let key = self.api_key()?;
         http::post_empty(
             &self.client,
             &self.base_url,
             path,
-            self.api_key(),
+            key.as_deref(),
             self.call_timeout,
         )
         .await
@@ -332,11 +377,12 @@ impl OmlxAdapter {
         body: &serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, BackendError> {
+        let key = self.api_key()?;
         http::post_and_parse(
             &self.client,
             &self.base_url,
             path,
-            self.api_key(),
+            key.as_deref(),
             timeout,
             body,
         )
@@ -383,11 +429,12 @@ impl OmlxAdapter {
     pub async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
         let budget = self.load_timeout.unwrap_or(self.call_timeout);
         let started = tokio::time::Instant::now();
+        let key = self.api_key()?;
         http::post_load(
             &self.client,
             &self.base_url,
             &self.encoded_path("/v1/models/", id, "/load"),
-            self.api_key(),
+            key.as_deref(),
             budget,
             id,
         )
@@ -633,6 +680,14 @@ fn is_ready(raw: &serde_json::Value, id: &str) -> bool {
 /// shadowing rule silently doing the right thing.
 #[async_trait::async_trait]
 impl RuntimeAdapter for OmlxAdapter {
+    /// In per-request mode: the generation of the engine behind this endpoint *now* (the engine manager
+    /// bumps it whenever the credentials it registered for the endpoint change). The Supervisor binds
+    /// every admitted operation to it; see [`Self::api_key`].
+    fn engine_generation(&self) -> Option<u64> {
+        self.per_request_key
+            .then(|| key::endpoint_generation(&self.base_url))
+    }
+
     fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
         if let Some(path) = &self.load_fence_path {
             return Ok(path.clone());
@@ -728,6 +783,136 @@ mod tests {
             call_timeout: Duration::from_millis(500),
         })
         .expect("adapter must build")
+    }
+
+    /// The `Authorization` header of the `index`-th request the mock server saw (`None` = no header).
+    async fn authorization_of(server: &MockServer, index: usize) -> Option<String> {
+        let requests = server.received_requests().await.expect("recording is on");
+        requests[index]
+            .headers
+            .get("authorization")
+            .map(|value| value.to_str().expect("ascii").to_owned())
+    }
+
+    async fn models_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models/status"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": []})),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// IDORIS-CORE S6 (G1): the engine manager's adapters look the key up on every request. A key read once at
+    /// construction is the old engine's private key after a restart (every request a 401) and still carries the
+    /// old verification after the port changed hands.
+    #[tokio::test]
+    async fn a_per_request_adapter_follows_the_registry_on_every_request_and_a_fixed_one_does_not()
+    {
+        let server = models_server().await;
+        let endpoint = server.uri();
+        let config = |key: &str| OmlxAdapterConfig {
+            base_url: endpoint.clone(),
+            api_key: Some(key.to_owned()),
+            call_timeout: Duration::from_millis(500),
+        };
+        let per_request = OmlxAdapter::new(config("constructed"))
+            .unwrap()
+            .with_per_request_key();
+        let fixed = OmlxAdapter::new(config("constructed")).unwrap();
+
+        // The engine manager registers the engine's private key: the adapter built *before* it existed uses it.
+        key::govern_endpoint(&endpoint, key::EndpointKey::Private("first-engine".into()));
+        per_request.list().await.unwrap();
+        fixed.list().await.unwrap();
+        assert_eq!(
+            authorization_of(&server, 0).await.as_deref(),
+            Some("Bearer first-engine")
+        );
+        assert_eq!(
+            authorization_of(&server, 1).await.as_deref(),
+            Some("Bearer constructed"),
+            "an adapter built from an explicit config keeps its fixed key"
+        );
+
+        // The engine was replaced: a new private key. The same adapter instance sends the new one.
+        key::govern_endpoint(&endpoint, key::EndpointKey::Private("second-engine".into()));
+        per_request.list().await.unwrap();
+        assert_eq!(
+            authorization_of(&server, 2).await.as_deref(),
+            Some("Bearer second-engine")
+        );
+
+        // The manager released the endpoint (engine stopped): the dead engine's key does not go to whatever
+        // listens there next, nor does the construction-time key.
+        key::release_endpoint(&endpoint);
+        per_request.list().await.unwrap();
+        let after_release = authorization_of(&server, 3).await;
+        assert_ne!(after_release.as_deref(), Some("Bearer second-engine"));
+        assert_ne!(after_release.as_deref(), Some("Bearer first-engine"));
+        assert_ne!(after_release.as_deref(), Some("Bearer constructed"));
+    }
+
+    /// IDORIS-CORE S6 (Codex audit H2b): a per-request adapter holds no key at all, whatever it was constructed with
+    /// (a string read at construction is the old engine's after a restart); a fixed adapter keeps its key.
+    #[tokio::test]
+    async fn a_per_request_adapter_holds_no_key_string() {
+        let config = || OmlxAdapterConfig {
+            base_url: "http://127.0.0.1:1".to_owned(),
+            api_key: Some("read-at-construction".to_owned()),
+            call_timeout: Duration::from_millis(500),
+        };
+        assert_eq!(
+            OmlxAdapter::new(config())
+                .unwrap()
+                .with_per_request_key()
+                .held_key(),
+            None
+        );
+        assert_eq!(
+            OmlxAdapter::new(config()).unwrap().held_key(),
+            Some("read-at-construction")
+        );
+    }
+
+    /// The registry's verdict decides on every request, in both directions: an external engine whose listener
+    /// stopped passing the owner check is no longer sent the `settings.json` key, and a private key takes over
+    /// from an unverified external one the moment it is registered.
+    #[tokio::test]
+    async fn a_per_request_adapter_never_sends_a_key_the_registry_withdrew() {
+        let server = models_server().await;
+        let endpoint = server.uri();
+        let adapter = OmlxAdapter::new(OmlxAdapterConfig {
+            base_url: endpoint.clone(),
+            api_key: Some("settings-key-read-at-construction".to_owned()),
+            call_timeout: Duration::from_millis(500),
+        })
+        .unwrap()
+        .with_per_request_key();
+
+        // Unverified external: whatever else may go out, never the construction-time key.
+        key::govern_endpoint(
+            &endpoint,
+            key::EndpointKey::External {
+                settings_key_verified: false,
+            },
+        );
+        adapter.list().await.unwrap();
+        assert_ne!(
+            authorization_of(&server, 0).await.as_deref(),
+            Some("Bearer settings-key-read-at-construction")
+        );
+
+        key::govern_endpoint(&endpoint, key::EndpointKey::Private("owned".into()));
+        adapter.list().await.unwrap();
+        assert_eq!(
+            authorization_of(&server, 1).await.as_deref(),
+            Some("Bearer owned")
+        );
+        key::release_endpoint(&endpoint);
     }
 
     // Per-failure-mode coverage (4xx/5xx/timeout/malformed body) already

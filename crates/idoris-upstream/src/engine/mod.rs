@@ -81,7 +81,8 @@ pub use launch::{
     StopOnExit,
 };
 pub use listener::{
-    ListenerPolicy, ListenerRejection, ListenerVerdict, ListenerVerifier, fresh_connection_client,
+    ListenerIdentity, ListenerPolicy, ListenerRejection, ListenerVerdict, ListenerVerifier,
+    fresh_connection_client,
 };
 pub use logfile::{DEFAULT_KEEP, DEFAULT_MAX_BYTES, EngineLog};
 pub use owned::{

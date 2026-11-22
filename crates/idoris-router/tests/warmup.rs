@@ -32,7 +32,7 @@ use idoris_backend::{
 };
 use idoris_contracts::common::{Capability, PrivacyClass};
 use idoris_contracts::{ComponentCard, LoadPolicy};
-use idoris_router::readiness::{ManagedFailure, UpstreamReason, UpstreamState};
+use idoris_router::readiness::{HealthState, UpstreamReason, UpstreamState, UpstreamStatus};
 use idoris_router::runtime::RuntimeRegistry;
 use idoris_router::{AppState, auth, build_app, build_starting_app};
 use idoris_tenancy::budget::{BudgetLedger, SpendGate};
@@ -3367,15 +3367,20 @@ async fn while_the_startup_gate_is_closed_warmup_is_503_idoris_starting() {
     }
 }
 
-fn frozen(reason: Option<UpstreamReason>) -> Arc<BTreeMap<String, ManagedFailure>> {
-    Arc::new(BTreeMap::from([(
-        "omlx".to_string(),
-        ManagedFailure {
-            engine_kind: "omlx".into(),
+/// 一个托管上游 `omlx` 此刻是 `failed`（带 `reason`）：数据面读的是此刻的状态（IDORIS-CORE S6，每个请求读 `HealthState`，
+/// 不是完整的 Router 创建时拍下的名单），所以冻结的卡就是健康快照里一个没在服务的托管上游。
+fn frozen(reason: Option<UpstreamReason>) -> HealthState {
+    HealthState::with_upstreams(
+        0,
+        vec![UpstreamStatus {
+            id: "omlx".to_owned(),
+            engine_kind: "omlx".to_owned(),
             state: UpstreamState::Failed,
             reason,
-        },
-    )]))
+            managed: true,
+            owned: false,
+        }],
+    )
 }
 
 fn managed_lifecycle(roles: &[(&str, &str)]) -> ComponentCard {
@@ -3398,7 +3403,7 @@ async fn a_frozen_managed_lifecycle_card_answers_exactly_like_chat_without_touch
         // 降级放行：没就绪的托管卡不建 Supervisor（`runtimes` 里没有它）。
         let app = build_app(AppState {
             cards: vec![managed_lifecycle(&[("fast", "qwen-fast")])],
-            managed_failures: frozen(reason),
+            health_state: frozen(reason),
             ..AppState::default()
         });
         let warmed = warm(&app, json!({"model": "idoris/fast"})).await;
@@ -3429,7 +3434,7 @@ async fn a_frozen_managed_resident_card_never_gets_the_minimal_request() {
     );
     let app = build_app(AppState {
         cards: vec![card],
-        managed_failures: frozen(Some(UpstreamReason::StartupTimeout)),
+        health_state: frozen(Some(UpstreamReason::StartupTimeout)),
         ..AppState::default()
     });
     let reply = warm(&app, json!({"model": "idoris/daily"})).await;
@@ -3462,7 +3467,7 @@ async fn a_healthy_sibling_card_still_warms_while_the_managed_one_is_frozen() {
                 false,
             ),
         ],
-        managed_failures: frozen(Some(UpstreamReason::CrashLoop)),
+        health_state: frozen(Some(UpstreamReason::CrashLoop)),
         ..AppState::default()
     });
     let healthy = warm(&app, json!({"model": "idoris/daily"})).await;

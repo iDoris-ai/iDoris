@@ -24,11 +24,14 @@ impl AdminRequestError {
 
 impl OmlxAdapter {
     async fn admin_login(&self) -> Result<HeaderValue, AdminRequestError> {
-        let key = self.api_key().ok_or_else(|| {
-            AdminRequestError::Definite(upstream_error(
-                "oMLX admin login requires the main API key",
-            ))
-        })?;
+        let key = self
+            .api_key()
+            .map_err(AdminRequestError::Definite)?
+            .ok_or_else(|| {
+                AdminRequestError::Definite(upstream_error(
+                    "oMLX admin login requires the main API key",
+                ))
+            })?;
         let response = self
             .client
             .post(format!("{}/admin/api/login", self.base_url))

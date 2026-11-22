@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/admin-v0-upstream.schema.json",
+  "title": "AdminV0Upstream",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "engine_kind", "state", "managed", "owned", "restart_required"],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "engine_kind": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+    "state": {
+      "enum": ["ready", "starting", "unavailable", "restarting", "failed", "stopped", "absent"]
+    },
+    "reason": {
+      "enum": [
+        "engine_not_found",
+        "port_in_use",
+        "auth_required",
+        "auth_failed",
+        "startup_timeout",
+        "crash_loop",
+        "fence_pending",
+        "budget_zero",
+        "base_unavailable",
+        "startup_latched"
+      ]
+    },
+    "managed": { "type": "boolean" },
+    "owned": { "type": "boolean" },
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "pid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+    "restart_required": { "type": "boolean" },
+    "failure_count": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+    "last_failure_at_ms": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+  }
+}

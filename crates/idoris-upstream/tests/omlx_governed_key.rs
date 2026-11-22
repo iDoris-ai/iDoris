@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use idoris_upstream::omlx::key::{
-    EndpointKey, endpoint_identity, govern_endpoint, governed_endpoint, release_endpoint,
-    resolve_for_endpoint, resolve_from_for, resolve_governed_os, resolve_omlx_api_key_for,
+    EndpointKey, KeyRefusal, block_endpoint, endpoint_generation, endpoint_identity,
+    govern_endpoint, governed_endpoint, release_endpoint, resolve_for_endpoint, resolve_from_for,
+    resolve_governed_os, resolve_omlx_api_key_checked, resolve_omlx_api_key_for,
     resolve_omlx_api_key_os_for,
 };
 
@@ -257,5 +258,147 @@ fn a_private_key_is_never_printed() {
             }
         )
         .contains("true")
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// IDORIS-CORE S6 (Codex 预审 3 与 1)：封上的端点、代际
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_blocked_endpoint_is_sent_no_credential_whatever_the_environment_and_the_settings_hold() {
+    let home = Home::with_settings_key("from-file");
+    // The fallback chain of §2.9 (env key, then the settings key) does not apply to a blocked endpoint, loopback or not,
+    // and an unregistered endpoint still gets it (the contrast is what the blocking is about).
+    for env in [None, os("from-env")] {
+        for loopback in [true, false] {
+            assert_eq!(
+                resolve_for_endpoint(
+                    env.clone(),
+                    Some(home.path()),
+                    loopback,
+                    Some(&EndpointKey::Blocked)
+                ),
+                None,
+                "{env:?} loopback={loopback}"
+            );
+        }
+    }
+    assert_eq!(
+        resolve_for_endpoint(None, Some(home.path()), true, None),
+        os("from-file"),
+        "an endpoint nobody governs still falls back"
+    );
+    assert_eq!(format!("{:?}", EndpointKey::Blocked), "Blocked");
+}
+
+#[test]
+fn blocking_an_endpoint_is_not_releasing_it() {
+    let endpoint = "http://127.0.0.1:19831";
+    govern_endpoint(endpoint, EndpointKey::Private("old-engine".to_owned()));
+    // Blocked, not released: the endpoint is still governed, so no fallback can apply to it.
+    assert!(block_endpoint(endpoint));
+    assert_eq!(governed_endpoint(endpoint), Some(EndpointKey::Blocked));
+    assert_eq!(
+        resolve_omlx_api_key_checked(endpoint, None),
+        Err(KeyRefusal::Blocked)
+    );
+    // Only a verified listener's registration lifts it.
+    govern_endpoint(endpoint, EndpointKey::Private("new-engine".to_owned()));
+    assert_eq!(
+        resolve_omlx_api_key_checked(endpoint, None),
+        Ok(Some("new-engine".to_owned()))
+    );
+    release_endpoint(endpoint);
+    assert!(!block_endpoint("not a url"));
+}
+
+#[test]
+fn the_generation_moves_on_every_change_of_what_is_registered_and_only_then() {
+    let endpoint = "http://127.0.0.1:19832";
+    assert_eq!(endpoint_generation(endpoint), 0, "never registered");
+    let private = |key: &str| EndpointKey::Private(key.to_owned());
+    govern_endpoint(endpoint, private("a"));
+    let first = endpoint_generation(endpoint);
+    assert!(first > 0);
+    // The same registration again is not a change.
+    govern_endpoint(endpoint, private("a"));
+    assert_eq!(endpoint_generation(endpoint), first);
+    // A different key, a block, a lift, a changed verification, a release: each is one step.
+    let mut expected = first;
+    for step in [
+        private("b"),
+        EndpointKey::Blocked,
+        private("b"),
+        EndpointKey::External {
+            settings_key_verified: false,
+        },
+        EndpointKey::External {
+            settings_key_verified: true,
+        },
+    ] {
+        govern_endpoint(endpoint, step);
+        expected += 1;
+        assert_eq!(endpoint_generation(endpoint), expected);
+    }
+    release_endpoint(endpoint);
+    expected += 1;
+    assert_eq!(endpoint_generation(endpoint), expected);
+    // Releasing what is already released is not a change; and a generation is never reused.
+    release_endpoint(endpoint);
+    assert_eq!(endpoint_generation(endpoint), expected);
+    govern_endpoint(endpoint, private("c"));
+    assert_eq!(endpoint_generation(endpoint), expected + 1);
+    release_endpoint(endpoint);
+    // An endpoint that is not a URL has no generation.
+    assert_eq!(endpoint_generation("not a url"), 0);
+}
+
+#[test]
+fn a_request_admitted_for_an_older_generation_is_refused_by_the_checked_resolver() {
+    let endpoint = "http://127.0.0.1:19833";
+    govern_endpoint(endpoint, EndpointKey::Private("first-engine".to_owned()));
+    let admitted = endpoint_generation(endpoint);
+    // Admitted under the current generation: the key of the engine that is there.
+    assert_eq!(
+        resolve_omlx_api_key_checked(endpoint, Some(admitted)),
+        Ok(Some("first-engine".to_owned()))
+    );
+    // The engine is replaced: the work admitted before must not get the new engine's key.
+    govern_endpoint(endpoint, EndpointKey::Private("second-engine".to_owned()));
+    let refusal = resolve_omlx_api_key_checked(endpoint, Some(admitted)).unwrap_err();
+    assert_eq!(
+        refusal,
+        KeyRefusal::StaleGeneration {
+            admitted,
+            current: endpoint_generation(endpoint)
+        }
+    );
+    // The refusal says what happened and nothing else: no key, old or new.
+    let text = refusal.to_string();
+    assert!(
+        !text.contains("first-engine") && !text.contains("second-engine"),
+        "{text}"
+    );
+    // Work admitted afterwards (and work that was never bound) gets the current one.
+    assert_eq!(
+        resolve_omlx_api_key_checked(endpoint, Some(endpoint_generation(endpoint))),
+        Ok(Some("second-engine".to_owned()))
+    );
+    assert_eq!(
+        resolve_omlx_api_key_checked(endpoint, None),
+        Ok(Some("second-engine".to_owned()))
+    );
+    release_endpoint(endpoint);
+}
+
+#[test]
+fn the_checked_resolver_leaves_an_ungoverned_endpoint_as_it_was() {
+    // Not managed: generation 0, no registration, an unbound request passes straight to the ordinary order.
+    let endpoint = "http://127.0.0.1:19834";
+    assert_eq!(endpoint_generation(endpoint), 0);
+    assert_eq!(
+        resolve_omlx_api_key_checked(endpoint, Some(0)),
+        resolve_omlx_api_key_checked(endpoint, None)
     );
 }

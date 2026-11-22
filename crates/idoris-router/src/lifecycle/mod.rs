@@ -49,6 +49,74 @@
 //! `startup_timeout`），不等熔断（熔断最坏要近 10 分钟）。降级放行之后，没就绪的托管引擎**冻结**：不再半开重试，不再接受
 //! `start`（[`CommandError::RestartRequired`]），要重启 iDoris：它们的 Supervisor 是放行时创建的，之后引擎好了也读不到
 //! （运行期引擎换代是 v0.6.1 / S10 的事）。退出码 5 的语义不变：只有放行时已经就绪的自有引擎，之后进程退出才触发。
+//!
+//! # 门控放行之后的命令与 Supervisor 的账本（S6，规范 §2.11.4、勘误十）
+//!
+//! Admin 的 `start`/`stop`/`restart` 经 [`EngineManager::start_upstream`] 等进来。门控放行之后完整的 Router 里的 Supervisor 在放行时
+//! 对引擎采样了一次：账本里是当时已加载的模型。**引擎换了一个进程**（`restart`，`stop` 之后的 `start`，外部引擎换了监听者），
+//! 这份账本就过期了——它以为 Ready 的模型已经不在引擎里，共享容量账本里还占着旧进程的内存。光复位账本不够，**次序**才是正确性
+//! 所在（Codex 预审 1–4）：旧引擎上还有没做完的加载或聊天时，不能清围栏、不能拉起新进程；旧一代的任务不能拿到新一代的凭证。
+//!
+//! ## 退役与换代的次序
+//!
+//! `stop`、`restart`、`start` 一个还活着却不答的引擎、外部引擎换了进程，都是这一套：
+//!
+//! 1. **关门**（`SupervisorHandle::close_admission`）：Supervisor 不再准入新的加载、卸载、聊天、目录读取（`supervisor_unavailable`）。
+//!    聊天与预热（`ensure_loaded`）走 Supervisor 的同一个入口，所以同时关上，没有第二个入口。没有 Supervisor（门控还没放行、
+//!    resident 的托管卡）什么都不用做。
+//! 2. **发布不可服务的状态**（`stop` 是 `stopped`，`restart` 是 `restarting`），再回答 202：数据面立刻 503，不靠请求入口那一次性的
+//!    状态检查。引擎这时还握在手里，所以元素的 `owned`、`pid` 还在。
+//! 3. **排空**：等已经准入的加载与聊天做完，至多 [`Timings::drain_timeout`]；它们拿着准入时的凭证在旧引擎上照常跑完。到点还有在途的
+//!    就**切断旧一代的凭证**（封上端点，代际前进），它们之后发的每个请求都被适配器拒绝。
+//! 4. **停进程**（SIGTERM、宽限、SIGKILL），**确认**它消失；没能确认就不清围栏、不拉起新的。
+//! 5. **封上端点**（[`EngineBackend::block`]，什么凭证都不发）、**清围栏**（进程确认消失之后才清）、拉起新进程，新引擎通过校验后登记
+//!    它的私有 key（代际前进）。
+//! 6. **复位账本**（`SupervisorHandle::engine_replaced`）：只在静止时（有进行中的加载或聊天回 `Busy`，管理器等；所以旧一代的完成消息
+//!    不可能落在重建的账本上），对着新进程重新采样（和启动采样同一套规矩）。
+//! 7. **开门**（`reopen_admission`），发布 `ready`。
+//!
+//! **代际绑定**：每个被 Supervisor 准入的操作绑定准入时的引擎代际（[`idoris_backend::pinned_generation`]，任务局部量；后台任务与
+//! 延迟的卸载也一样），适配器取 key 的唯一入口核对它：代际不是当前的、或端点被封上，**在发送任何东西之前**拒绝。代理对 resident
+//! 的托管卡（没有 Supervisor）在每一次发送前同样核对，预热的最小请求在自己的任务里跑，绑定准入时的代际。
+//!
+//! ## 端点的口径：私有、外部、封上
+//!
+//! [`idoris_upstream::omlx::key::EndpointKey`] 只有三种：私有 key、外部（`settings.json` 的 key 要先过属主校验）、**封上**（什么凭证都不发，
+//! 回退链不适用）。托管的端点在管理器启动时就先封上；停止、替换、外部监听者没了、端口上换了别的东西都回到封上，直到下一个监听者
+//! 通过校验。**没有「撤销」**：撤销会让环境变量与 `settings.json` 的回退链重新适用于这个端点。
+//!
+//! ## 密钥只发给确认过的监听者（Codex 审计 H1–H3）
+//!
+//! - **自有引擎，每一次**：等就绪的循环里每次带私有 key 的探测之前、监管的每个节拍里，都重新确认监听这个端口的此刻还是我们的进程
+//!   （`listens_on(pid, port)`，不缓存）。进程活着不等于端口还是它的：引擎可以放掉端口而不退出，别的进程接着绑上来。确认不了就先
+//!   收回私有 key（端点封上）、发布 `unavailable` 加 `port_in_use`，这一轮不发探测；又确认了，把私有 key 登记回去。
+//! - **终局的失败之后保持封上**：接管外部引擎时校验通过的监听者已经被登记成「外部」，它要 key 而没有、key 被拒、围栏还在……之后
+//!   没有监督再去重新校验端口，那个口径不能留着。
+//! - **共用引擎的卡继承它的失败**：管理器启动时把每个托管引擎的 endpoint 登记进 `HealthState`；与它同一个 endpoint 的别的卡（伴生卡
+//!   `omlx-embed`）在后台探测、模型列表、预热、转发里都读到同一个状态与原因码，一个请求都不碰那个端口。不共用引擎的上游照常服务。
+//! - **生命周期适配器按卡定能不能带 key**：与代理同一个判据（`idoris_upstream::omlx::key::card_may_carry_omlx_key`），不是 `provider.id`；
+//!   不能带的卡得到一个没有 key、也不查登记表的适配器；能带的每个请求取此刻的口径与代际，不缓存任何 key 字符串。
+//!
+//! ## 外部引擎与引擎进程的身份
+//!
+//! 复位只在**进程身份**变了时做：自有引擎是 pid 加启动时间，外部引擎是校验通过的监听者的 pid 加启动时间（pid 被回收也分得出来）。
+//! 监听者没了：封上端点、关门、`unavailable`；**同一个进程**回来：开门，账本不动；**换了进程**：走上面的次序，之后才回 `ready`。
+//! `start` 重新认回同一个自有引擎也不复位，不会忘掉对未确认加载的记忆。
+//!
+//! ## 并发的命令与启动决策里的探测
+//!
+//! - 命令在**入队时**盖章；一次 `start`、`restart` 操作做完时记下序号，入队时序号不超过它的 `restart` 直接并入这次操作
+//!   （Codex 预审 5）。
+//! - 启动决策里的探测答不上来、端口随后空了，监听者在属主校验前没了，带 key 再问时外部引擎走了：回到决策的开头重来（
+//!   `Attempt::Redecide`），**不是引擎失败**，不记入熔断窗口、不退避、不加 `failure_count`；整体受一个启动超时约束（Codex 预审 6）。
+//!
+//! - 复位失败（引擎答不上采样、围栏还在）：Supervisor 把错误粘滞住（fail closed），这个引擎不放行，停掉，按一次失败算，退避之后
+//!   重来；Supervisor 没有了（actor 退出，或检测到自己的账本损坏）是终局，要重启 iDoris。
+//! - **放行时没就绪的上游（降级放行）冻结**：完整的 Router 里根本没有它的 Supervisor，`start`、`restart`
+//!   [`CommandError::RestartRequired`]。这是 S5 起的已知限制，不是账本过期的问题。
+//!
+//! 门控放行之前这些命令照旧（真的 `start`、`restart`），但 Admin 的完整路由只在放行之后才有（放行之前除 `status` 外一律
+//! 503 `idoris_starting`），所以只有进程内的调用方用得到。
 
 mod backend;
 mod backoff;
@@ -59,6 +127,6 @@ mod manager;
 pub use backend::{EngineBackend, OmlxBackend, PrepareFailure};
 pub use backoff::{CrashWindow, Timings, restart_delay};
 pub use manager::{
-    CommandError, EngineFailure, EngineManager, GateOutcome, ManagedPlan, ManagerConfig, PlanError,
-    plan_managed, plan_managed_with,
+    CommandError, EngineFailure, EngineManager, GateOutcome, ManagedPlan, ManagedView,
+    ManagerConfig, PlanError, plan_managed, plan_managed_with,
 };

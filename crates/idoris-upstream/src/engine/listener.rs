@@ -75,11 +75,19 @@ impl ListenerRejection {
     }
 }
 
+/// 通过校验的一个监听者的**身份**：pid 加 `ps` 的启动时间。pid 会被复用，所以只比 pid 分不出「还是它」与「换了一个进程」；
+/// 加上启动时间就分得开（IDORIS-CORE S6：外部引擎换了进程，Supervisor 的账本就过期了）。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ListenerIdentity {
+    pub pid: u32,
+    pub started_at: String,
+}
+
 /// [`ListenerVerifier::check`] 的结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListenerVerdict {
-    /// 监听这个端口的每个进程都通过了：uid 与签名团队都对。`pids` 升序。
-    Verified { pids: Vec<u32> },
+    /// 监听这个端口的每个进程都通过了：uid 与签名团队都对。`listeners` 按 pid 升序，各带启动时间。
+    Verified { listeners: Vec<ListenerIdentity> },
     /// 此刻没有人监听这个端口。
     NoListener,
     /// 有监听者不合格：**不能**发 key。
@@ -91,6 +99,14 @@ pub enum ListenerVerdict {
 impl ListenerVerdict {
     pub fn is_verified(&self) -> bool {
         matches!(self, Self::Verified { .. })
+    }
+
+    /// 通过校验的监听者的 pid（升序）；没通过时是空的。
+    pub fn pids(&self) -> Vec<u32> {
+        match self {
+            Self::Verified { listeners } => listeners.iter().map(|listener| listener.pid).collect(),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -146,36 +162,41 @@ impl ListenerVerifier {
         if pids.is_empty() {
             return ListenerVerdict::NoListener;
         }
+        let mut listeners = Vec::with_capacity(pids.len());
         for &pid in &pids {
             let started_at = match self.inspector.start_time(pid).await {
                 Ok(started_at) => started_at,
                 Err(error) => return ListenerVerdict::Unverifiable(error),
             };
-            if self.cached(pid, &started_at) {
-                continue;
-            }
-            match self.inspector.uid_of(pid).await {
-                Ok(uid) if uid == self.policy.uid => {}
-                Ok(_) => return ListenerVerdict::Rejected(ListenerRejection::OtherUser { pid }),
-                Err(error) => return ListenerVerdict::Unverifiable(error),
-            }
-            match self.inspector.signing_team(pid).await {
-                Ok(Some(team)) if team == self.policy.team_id => {}
-                Ok(Some(_)) => {
-                    return ListenerVerdict::Rejected(ListenerRejection::WrongTeam { pid });
+            if !self.cached(pid, &started_at) {
+                match self.inspector.uid_of(pid).await {
+                    Ok(uid) if uid == self.policy.uid => {}
+                    Ok(_) => {
+                        return ListenerVerdict::Rejected(ListenerRejection::OtherUser { pid });
+                    }
+                    Err(error) => return ListenerVerdict::Unverifiable(error),
                 }
-                Ok(None) => return ListenerVerdict::Rejected(ListenerRejection::NoTeam { pid }),
-                Err(error) => return ListenerVerdict::Unverifiable(error),
+                match self.inspector.signing_team(pid).await {
+                    Ok(Some(team)) if team == self.policy.team_id => {}
+                    Ok(Some(_)) => {
+                        return ListenerVerdict::Rejected(ListenerRejection::WrongTeam { pid });
+                    }
+                    Ok(None) => {
+                        return ListenerVerdict::Rejected(ListenerRejection::NoTeam { pid });
+                    }
+                    Err(error) => return ListenerVerdict::Unverifiable(error),
+                }
+                // 校验期间这个 pid 若换了进程（旧的退出、pid 被复用），上面查的就不是现在的它。
+                match self.inspector.start_time(pid).await {
+                    Ok(after) if after == started_at => {}
+                    Ok(_) => return ListenerVerdict::Unverifiable(InspectError::NoAnswer),
+                    Err(error) => return ListenerVerdict::Unverifiable(error),
+                }
+                self.remember(pid, started_at.clone());
             }
-            // 校验期间这个 pid 若换了进程（旧的退出、pid 被复用），上面查的就不是现在的它。
-            match self.inspector.start_time(pid).await {
-                Ok(after) if after == started_at => {}
-                Ok(_) => return ListenerVerdict::Unverifiable(InspectError::NoAnswer),
-                Err(error) => return ListenerVerdict::Unverifiable(error),
-            }
-            self.remember(pid, started_at);
+            listeners.push(ListenerIdentity { pid, started_at });
         }
-        ListenerVerdict::Verified { pids }
+        ListenerVerdict::Verified { listeners }
     }
 }
 
@@ -305,6 +326,14 @@ mod tests {
         }
     }
 
+    /// A listener as `Proc::ok()` is scripted: its pid and the start time it reads.
+    fn identity(pid: u32) -> ListenerIdentity {
+        ListenerIdentity {
+            pid,
+            started_at: "Fri Nov 20 15:14:05 2026".to_owned(),
+        }
+    }
+
     fn rig(scripted: Scripted) -> (ListenerVerifier, Arc<Scripted>) {
         let scripted = Arc::new(scripted);
         let verifier =
@@ -319,7 +348,9 @@ mod tests {
             .process(42, Proc::ok()));
         assert_eq!(
             verifier.check(19731).await,
-            ListenerVerdict::Verified { pids: vec![42] }
+            ListenerVerdict::Verified {
+                listeners: vec![identity(42)]
+            }
         );
     }
 
@@ -391,8 +422,11 @@ mod tests {
         let (verifier, _) = verifier_two_good();
         assert_eq!(
             verifier.check(19731).await,
-            ListenerVerdict::Verified { pids: vec![41, 42] }
+            ListenerVerdict::Verified {
+                listeners: vec![identity(41), identity(42)]
+            }
         );
+        assert_eq!(verifier.check(19731).await.pids(), vec![41, 42]);
     }
 
     fn verifier_two_good() -> (ListenerVerifier, Arc<Scripted>) {

@@ -854,9 +854,31 @@ impl ChatProxy {
     /// loopback oMLX card (`omlx_key`, decided per card by
     /// [`crate::models::is_loopback_omlx`]) — from the env var, or from
     /// `~/.omlx/settings.json` only when `url` is loopback, and is never logged.
-    fn outbound(&self, url: &str, payload: &Value, omlx_key: bool) -> reqwest::RequestBuilder {
+    ///
+    /// **`None` — nothing is built and nothing is sent — when the endpoint is one the engine manager governs and
+    /// this request may not go there** (IDORIS-CORE S6): the endpoint is blocked (no verified engine is behind it: it
+    /// is stopped, being replaced, or its listener is gone), or this call is bound to an engine generation
+    /// ([`idoris_backend::pinned_generation`]; the resident warmup task binds the one it was admitted under) that has
+    /// since been replaced. Neither the key nor the request body (the user's prompt) may reach whatever is behind
+    /// that port now. This is the one place the proxy resolves the key, so every send — and every retry of one — is
+    /// checked here.
+    fn outbound(
+        &self,
+        url: &str,
+        payload: &Value,
+        omlx_key: bool,
+    ) -> Option<reqwest::RequestBuilder> {
+        let key = if omlx_key {
+            idoris_upstream::omlx::key::resolve_omlx_api_key_checked(
+                url,
+                idoris_backend::pinned_generation(),
+            )
+            .ok()?
+        } else {
+            None
+        };
         let mut request = self.client.post(url);
-        if omlx_key && let Some(key) = idoris_upstream::omlx::key::resolve_omlx_api_key_for(url) {
+        if let Some(key) = key {
             request = request.bearer_auth(key);
         }
         // Keep local runtimes byte-for-byte compatible; remote providers get
@@ -868,7 +890,7 @@ impl ChatProxy {
             decorrelated = decorrelate(payload);
             &decorrelated
         };
-        match serde_json::to_vec(payload) {
+        Some(match serde_json::to_vec(payload) {
             Ok(body) => {
                 self.egress.record(url, body.len());
                 request
@@ -877,7 +899,21 @@ impl ChatProxy {
             }
             // Unreachable for a `Value`; let reqwest report its own error.
             Err(_) => request.json(payload),
-        }
+        })
+    }
+
+    /// Whether [`Self::outbound`] would build a request for `url` right now. Asked **before** the provider breaker is
+    /// claimed and before the dispatched observation is written, so a request that is refused because its engine
+    /// was replaced (or is blocked) leaves neither a breaker fault nor an event behind: it was never a call to the
+    /// provider. [`Self::outbound`] still decides at the moment of sending (a refusal there is the safety net for a
+    /// change that lands in between, and for every retry).
+    fn may_send(url: &str, omlx_key: bool) -> bool {
+        !omlx_key
+            || idoris_upstream::omlx::key::resolve_omlx_api_key_checked(
+                url,
+                idoris_backend::pinned_generation(),
+            )
+            .is_ok()
     }
 
     /// Creates a proxy. The injected `client` must have redirects disabled
@@ -1663,6 +1699,11 @@ impl ChatProxy {
             }
         }
 
+        // A blocked endpoint, or a request admitted for an engine that has since been replaced (IDORIS-CORE S6):
+        // nothing is sent, and the provider breaker is not involved (this was never a call to the provider).
+        if !Self::may_send(url, opts.attach_omlx_key) {
+            return Ok(Self::failure(503, 0));
+        }
         // Claim both gates before observation; either refusal sends nothing
         // (no dispatched observation, nothing executed).
         let Some(claim) = self.claim_send(opts.provider_id, url) else {
@@ -1711,13 +1752,16 @@ impl ChatProxy {
     ) -> Result<ForwardOutcome, std::convert::Infallible> {
         let mut attempt = 0usize;
         loop {
+            // Every attempt, a retry included, resolves the key afresh: an engine replaced (or blocked) since the
+            // first attempt refuses it (IDORIS-CORE S6), so a request admitted for the old engine is never retried
+            // onto the new one.
+            #[allow(clippy::cast_possible_truncation)]
+            let Some(request) = self.outbound(url, payload, opts.attach_omlx_key) else {
+                return Ok(Self::failure(503, attempt as u32));
+            };
             // Keep the transport error until retry classification: only a
             // connection failure proves that this POST was not executed.
-            let sent = tokio::time::timeout(
-                header_timeout,
-                self.outbound(url, payload, opts.attach_omlx_key).send(),
-            )
-            .await;
+            let sent = tokio::time::timeout(header_timeout, request.send()).await;
             match sent {
                 Ok(Ok(resp)) => {
                     let status = resp.status().as_u16();
@@ -1915,6 +1959,11 @@ impl ChatProxy {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
         }
+        // A blocked endpoint, or a request admitted for an engine that has since been replaced (IDORIS-CORE S6):
+        // nothing is sent, and the provider breaker is not involved.
+        if !Self::may_send(&url, provider.omlx_key) {
+            return Ok(Self::stream_failure(503, ExecutionDisposition::NotExecuted));
+        }
         let Some(claim) = self.claim_send(provider_id, &url) else {
             let failure = Self::flight_failure(503, "provider_circuit_open");
             return Ok(StreamOutcome::Buffered {
@@ -1925,12 +1974,12 @@ impl ChatProxy {
             });
         };
         observer().await?;
-        let sent = match tokio::time::timeout(
-            self.header_timeout,
-            self.outbound(&url, &payload, provider.omlx_key).send(),
-        )
-        .await
-        {
+        // The safety net for a change that landed after the check above: the claim is dropped, not finished (a
+        // refused send is not a provider fault).
+        let Some(request) = self.outbound(&url, &payload, provider.omlx_key) else {
+            return Ok(Self::stream_failure(503, ExecutionDisposition::NotExecuted));
+        };
+        let sent = match tokio::time::timeout(self.header_timeout, request.send()).await {
             Ok(sent) => sent,
             Err(_) => {
                 claim.finish(504, None);
@@ -2200,6 +2249,10 @@ mod slow_reader_tests;
 mod path_tests;
 
 #[cfg(test)]
+#[path = "proxy_governance_tests.rs"]
+mod governance_tests;
+
+#[cfg(test)]
 #[path = "proxy_observation_tests.rs"]
 mod observation_tests;
 
@@ -2247,6 +2300,7 @@ mod tests {
             let auth = |url: &str, omlx_key: bool| {
                 proxy
                     .outbound(url, &serde_json::json!({"model": "m"}), omlx_key)
+                    .unwrap()
                     .build()
                     .unwrap()
                     .headers()
