@@ -426,13 +426,27 @@ async fn warmups_of_different_models_each_send_their_own_request_and_hold_their_
 
 #[tokio::test]
 async fn the_same_model_name_on_two_cards_is_two_requests() {
-    // 合并认的是（卡、端点、最小请求、模型）：两张卡后面各有一个叫 `shared` 的模型，是两个请求，不是一个。
-    let first_upstream = slow_upstream(Duration::from_millis(800)).await;
-    let second_upstream = slow_upstream(Duration::from_millis(800)).await;
+    // 合并认的是（卡、端点、最小请求、模型、引擎代际）：两张卡后面各有一个叫 `shared` 的模型，是两个请求，不是一个。
+    //
+    // 两张卡的端点指向同一个上游进程，只是带不同的路径前缀：同一个端点标识（`scheme://host:port`，不含路径），引擎代际相同，所以
+    // 合并键里只有卡与端点两处不同。要是用两个端口不同的上游，这个用例会受进程全局的引擎登记表影响：端口很快被复用，前面的用例
+    // 登记过又撤销的端点，代际不会归零，两个端点的代际就可能不同，键因为代际而不同，键即使漏了卡与端点，两个请求也不会合并，
+    // 这个用例就看不出来了（变异 F08 在整批单元测试里存活过一次，原因就是这个）。
+    let upstream = slow_upstream(Duration::from_millis(800)).await;
     let (app, proxy) = app_with_warmup_deadline(
         vec![
-            resident("first", &first_upstream.uri(), "chat", "daily: \"shared\""),
-            resident("second", &second_upstream.uri(), "chat", "fast: \"shared\""),
+            resident(
+                "first",
+                &format!("{}/first", upstream.uri()),
+                "chat",
+                "daily: \"shared\"",
+            ),
+            resident(
+                "second",
+                &format!("{}/second", upstream.uri()),
+                "chat",
+                "fast: \"shared\"",
+            ),
         ],
         Duration::from_secs(30),
     );
@@ -445,8 +459,23 @@ async fn the_same_model_name_on_two_cards_is_two_requests() {
     assert_eq!(fast.0, StatusCode::OK, "{}", fast.1);
     assert_eq!(daily.1["provider_id"], "first");
     assert_eq!(fast.1["provider_id"], "second");
-    assert_eq!(first_upstream.received_requests().await.unwrap().len(), 1);
-    assert_eq!(second_upstream.received_requests().await.unwrap().len(), 1);
+    // 一个上游进程收到两个请求，各自带着自己那张卡的路径前缀。
+    let paths: Vec<String> = upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    assert!(
+        paths.iter().any(|path| path.starts_with("/first/")),
+        "{paths:?}"
+    );
+    assert!(
+        paths.iter().any(|path| path.starts_with("/second/")),
+        "{paths:?}"
+    );
     wait_for_all_permits(&proxy, total, Duration::from_secs(10)).await;
 }
 
