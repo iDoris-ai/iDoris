@@ -24,10 +24,13 @@ mod fixture;
 use std::path::Path;
 
 use fixture::*;
+use idoris_compute_contracts::account::Allocation;
 use idoris_compute_contracts::admission::AdmissionDecision;
+use idoris_compute_contracts::grant::Purpose;
+use idoris_compute_contracts::ids::{AllocationId, IdempotencyKey};
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_tenancy::accounts::AccountStore;
-use idoris_tenancy::accounts::ledger::AlertKind;
+use idoris_tenancy::accounts::ledger::{AlertKind, CreditLineSetting};
 use rusqlite::Connection;
 
 const FIXTURE: &str = include_str!("fixtures/ledger_v0_5_0_funded_books.sql");
@@ -310,4 +313,115 @@ fn credit_used_alerts_written_by_the_old_code_stay_and_covered_spends_add_none()
     // m-b 的新额度 100 覆盖的这一笔（预留 50）：没动授信，不再记告警；旧代码会记金额 150 的
     assert_eq!(spend(&store, "m-b", "b-cover", READ_AT, 20), Some(50));
     assert_eq!(alerts(&store), written_by_v0_5_0);
+}
+
+#[test]
+fn an_unexpired_overage_that_v0_5_0_booked_whole_at_the_reservation_is_read_as_it_was_booked() {
+    // v0.5.0 把没迟到的结算里超出预留的部分和预留一起记在预留创建的时刻（一条 `settle`，已花是整笔）。现在的代码把超出的部分另记在
+    // 结算那一刻（一条 `late_settle`，Codex 复审 2026-11-22 High 1），但已经写下的行一行都不改：读出来就是它们记下的样子，对账干净。
+    // 夹具里没有 overage 的结算（所有结算都等于预留），所以这里用现在的代码写一笔，再按 v0.5.0 的写法改回去（拆掉只追加的触发器：
+    // 把 `settle` 的已花改成整笔 300，删掉 `late_settle`）。
+    //
+    // 充值 100、授信 100，额度 100 的窗口从 T0 + 10 起（T0 + 5 创建）；T0 + 9 预留 200，T0 + 10 按 300 结算（超出 100）。
+    // 旧写法：整笔 300 在 T0 + 9，额度够不着：自有资金 100 + 授信债务 200，额度剩余 100，净头寸 100 - min(200, 100) = 0。
+    // （债务超过授信额度，正是旧写法对额度被吸收一次又被花一次的记法；只有新结算才按新写法记，已经写下的历史不重写。）
+    let db = TempDb::new("v050-legacy-overage");
+    let store = world(&db);
+    store
+        .fund_account(
+            &aid("paid"),
+            &thb(1_000_000),
+            &IdempotencyKey::new("f-paid").unwrap(),
+            t0(),
+        )
+        .unwrap();
+    allocate(&store, "e-0", "platform", "paid", 9_000_000);
+    store
+        .fund_account(
+            &aid("emp"),
+            &thb(100),
+            &IdempotencyKey::new("f-emp").unwrap(),
+            t0(),
+        )
+        .unwrap();
+    store
+        .set_credit_line(
+            &aid("emp"),
+            &CreditLineSetting {
+                limit: thb(100),
+                valid_until: None,
+            },
+            t0(),
+        )
+        .unwrap();
+    store
+        .create_allocation(
+            &Allocation {
+                id: AllocationId::new("emp-new").unwrap(),
+                parent: aid("paid"),
+                child: aid("emp"),
+                ceiling: grant(100, Purpose::Prepaid, T0 + 10, T0 + 10 + 30 * DAY),
+                idempotency_key: None,
+            },
+            ts(T0 + 5),
+        )
+        .unwrap();
+    let first = Req::new(&store, "r-1", 0, "cred-e", 95).at(T0 + 9);
+    assert_eq!(
+        store
+            .admit_attempt(&first.input())
+            .unwrap()
+            .admitted()
+            .map(|admitted| admitted.reservation.price.micros()),
+        Some(200)
+    );
+    store
+        .settle_attempt(&first.attempt, &price(300), ts(T0 + 10))
+        .unwrap();
+    drop(store);
+
+    // 改回 v0.5.0 写下的样子
+    {
+        let conn = raw(db.path());
+        conn.execute_batch(
+            "DROP TRIGGER ledger_entries_append_only_update;
+             DROP TRIGGER ledger_entries_append_only_delete;
+             UPDATE ledger_entries SET spent_micros = 300 WHERE hold_id = 'r-1#0' AND kind = 'settle';
+             DELETE FROM ledger_entries WHERE hold_id = 'r-1#0' AND kind = 'late_settle';",
+        )
+        .unwrap();
+    }
+
+    let store = AccountStore::open(db.path()).unwrap();
+    let kinds: Vec<(String, i64, i64, i64)> = store
+        .entries_of_hold(&first.attempt, "model")
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.account == "emp")
+        .map(|entry| {
+            (
+                entry.kind,
+                entry.held,
+                entry.spent,
+                entry.window_at.millis(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("reserve".to_string(), 200, 0, T0 + 9),
+            ("settle".to_string(), -200, 300, T0 + 9),
+        ],
+        "the v0.5.0 shape: the overage is inside the settle entry, at the reservation's moment"
+    );
+    let v = store.account_view(&aid("emp"), ts(T0 + 11)).unwrap();
+    assert_eq!(v.balance, None);
+    assert_eq!(
+        v.ceiling_remaining.map(|m| m.micros),
+        Some(0),
+        "read as booked: 300 at T0 + 9 is out of the allowance's reach"
+    );
+    assert_eq!(v.credit_limit, thb(100));
+    assert_clean(&store);
 }

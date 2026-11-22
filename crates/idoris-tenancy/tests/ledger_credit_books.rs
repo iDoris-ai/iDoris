@@ -15,25 +15,29 @@
 //! 能花的   = 此刻有效的额度剩余 + 授信可用    同一笔花费先用额度（先到期的先用），用完才动授信
 //! ```
 //!
-//! 这个文件有一个**独立于被测代码**的模型（[`model`]）：只读原始表（`allocations`、`allocation_revocations`、
+//! 这个文件有两个**独立于被测代码**的模型（`support/ledger_books.rs`）：[`model`] 只读原始表（`allocations`、`allocation_revocations`、
 //! `ledger_allocation_marks`、`ledger_entries`），把「额度创建」「额度撤销」「一笔花费」当成同一条时间线上的事件，按提交先后
 //! 逐件回放「先额度后授信」，不经过被测的投影函数，也不共用被测实现里「这笔额度能不能覆盖这笔花费」的判断（被测实现拿花费的第一条
-//! 分录号和额度的序号直接比，模型靠事件顺序维护「此刻已经存在、没被撤销的额度」），所以两边对不上就是实现有 bug。
+//! 分录号和额度的序号直接比，模型靠事件顺序维护「此刻已经存在、没被撤销的额度」）；[`Sim`] 不读库，只吃测试自己做过的事
+//! （发额度、撤销、预留、释放、结算），随机历史的期望从它来。两个模型也不照抄被测实现的时间假设（读钟更早时不把已提交的花费压到
+//! 读钟上，预留和它超出预留的部分按种类分、不按毫秒合并），所以两边对不上就是实现有 bug。
 //! 所有场景都核对金额守恒：额度覆盖的 + 授信承担的 = 分录里的已花，授信承担的永远不超过授信额度。
+//! 「Codex 复审（2026-11-22）」那一节的测试不用任何模型，期望数字全部手算。
 //!
 //! 数字约定见 `support/ledger_fixture.rs`：`10` 个输入 token 加 `max_tokens = M` 的预留是 `10 + 2M` 微泰铢，
 //! 所以 `max_tokens = 45` 的预留正好是 100，`max_tokens = 10` 是最低有用的预留 30。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/ledger_books.rs"]
+mod books;
 #[path = "support/ledger_fixture.rs"]
 mod fixture;
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
 
+use books::*;
 use fixture::*;
 use idoris_compute_contracts::account::Allocation;
 use idoris_compute_contracts::admission::{AdmissionDecision, AncestorView};
@@ -201,163 +205,8 @@ fn prepaid(store: &AccountStore, id: &str, micros: i64, from: i64, until: i64, c
 }
 
 // ------------------------------------------------------------------------------------------
-// 独立于被测代码的模型
+// 独立于被测代码的模型（`support/ledger_books.rs`）：读原始表回放的 `model`，和不读库、只吃测试自己做过的事的 `Sim`
 // ------------------------------------------------------------------------------------------
-
-/// 一个账户上「先额度后授信」的账。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Books {
-    /// 此刻还能花的额度：没被撤销、此刻生效的额度，扣掉它们已经覆盖的花费之后的剩余。
-    allowance_left: i64,
-    /// 已花（含在途预留）里被额度覆盖的部分。
-    covered: i64,
-    /// 已花（含在途预留）里由授信承担的部分：累计授信债务。
-    credit_debt: i64,
-    /// 分录里 `Σ (held + spent)`：已花加在途。
-    spent: i64,
-}
-
-/// 读原始表，按事件逐笔回放（不经过被测代码）：
-///
-/// * 事件按**提交先后**排：分录号是提交的先后；额度创建 / 撤销的序号 `after_entry` 是「它提交那一刻账本里最后一条分录的号」，
-///   所以它排在这个号的分录之后、下一个号的分录之前；毫秒只用来判断额度自己的窗口 `[valid_from, valid_until)`；
-/// * 一笔花费 = 一个预留在这个账户上、同一个归属时刻上的 `held + spent` 净额（结算、释放、过期都折算进去了），先后看它第一条分录的号；
-/// * 回放时维护「此刻已经创建、没被撤销的额度」：一笔花费先用其中窗口包含它的归属时刻的额度里**先到期**的（同时到期的先创建的先用），
-///   用完才记成授信债务；
-/// * 额度剩余只算此刻（毫秒 `now`）窗口内、没被撤销的。
-fn model(db_path: &Path, account: &str, now: i64) -> Books {
-    struct Bucket {
-        from: i64,
-        until: i64,
-        left: i64,
-        revoked: bool,
-    }
-    // 事件在时间线上的位置：`(分录号, 种类, 下标)`。种类 0 = 一笔花费（排在它第一条分录的号上），1 = 额度创建，2 = 额度撤销。
-    // 同一个号上花费排在额度事件之前：创建序号 c 的额度只覆盖号大于 c 的花费，撤销序号 r 的额度仍然覆盖号不大于 r 的花费。
-    let mut buckets: Vec<Bucket> = Vec::new();
-    let mut events: Vec<(i64, u8, usize)> = Vec::new();
-    let mut spends: Vec<(i64, i64)> = Vec::new(); // (归属时刻, 净额)
-    {
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        conn.busy_timeout(Duration::from_secs(10)).unwrap();
-        // 一个读事务里读完所有表：竞争测试里采样者线程读的时候别的线程还在写，分开读会读到不一致的快照
-        conn.execute_batch("BEGIN").unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT a.valid_from_ms, a.valid_until_ms, a.ceiling_micros,
-                        (SELECT m.after_entry FROM ledger_allocation_marks m
-                          WHERE m.allocation_id = a.allocation_id AND m.event = 'created'),
-                        (SELECT m.after_entry FROM ledger_allocation_marks m
-                          WHERE m.allocation_id = a.allocation_id AND m.event = 'revoked')
-                   FROM allocations a
-                  WHERE a.child_id = ?1 AND a.purpose IN ('free_tier', 'prepaid', 'org_quota')
-                    AND a.valid_from_ms <= ?2 AND a.ceiling_micros > 0
-                  ORDER BY a.rowid",
-            )
-            .unwrap();
-        let rows = stmt
-            .query_map(rusqlite::params![account, now], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                ))
-            })
-            .unwrap();
-        for row in rows {
-            let (from, until, cap, created_after, revoked_after) = row.unwrap();
-            let index = buckets.len();
-            buckets.push(Bucket {
-                from,
-                until,
-                left: cap,
-                revoked: false,
-            });
-            events.push((
-                created_after.expect("every allocation has a creation mark"),
-                1,
-                index,
-            ));
-            if let Some(after) = revoked_after {
-                events.push((after, 2, index));
-            }
-        }
-        drop(stmt);
-        let mut stmt = conn
-            .prepare(
-                "SELECT MIN(entry_id), window_at_ms, SUM(held_micros + spent_micros) FROM ledger_entries
-                  WHERE account_id = ?1 AND hold_id IS NOT NULL
-                  GROUP BY hold_id, window_at_ms
-                 HAVING SUM(held_micros + spent_micros) <> 0",
-            )
-            .unwrap();
-        let rows = stmt
-            .query_map([account], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .unwrap();
-        for row in rows {
-            let (first_entry, at, amount) = row.unwrap();
-            assert!(amount > 0, "a hold never nets to a negative amount");
-            // 读的是比这笔花费更早的某一刻（排队乱序时取到的时间比前面已经提交的花费更早）：往后的花费按读的那一刻算，
-            // 也就是用读的那一刻此刻生效的额度
-            events.push((first_entry, 0, spends.len()));
-            spends.push((at.min(now), amount));
-        }
-        drop(stmt);
-        conn.execute_batch("COMMIT").unwrap();
-    }
-    events.sort_unstable();
-
-    let mut known: Vec<usize> = Vec::new();
-    let (mut covered, mut credit_debt, mut spent) = (0_i64, 0_i64, 0_i64);
-    for (_, kind, index) in events {
-        match kind {
-            // 额度创建：此后的花费才可能用它
-            1 => known.push(index),
-            // 额度撤销：此后的花费不再用它，剩下的额度作废
-            2 => buckets[index].revoked = true,
-            _ => {
-                let (at, amount) = spends[index];
-                spent += amount;
-                let mut rest = amount;
-                let mut usable: Vec<usize> = known
-                    .iter()
-                    .copied()
-                    .filter(|i| {
-                        !buckets[*i].revoked && buckets[*i].from <= at && at < buckets[*i].until
-                    })
-                    .collect();
-                // 先到期的先用；同时到期的先创建的先用
-                usable.sort_by_key(|i| (buckets[*i].until, *i));
-                for i in usable {
-                    let take = rest.min(buckets[i].left);
-                    buckets[i].left -= take;
-                    rest -= take;
-                    covered += take;
-                }
-                credit_debt += rest;
-            }
-        }
-    }
-    let allowance_left = buckets
-        .iter()
-        .filter(|bucket| !bucket.revoked && bucket.from <= now && now < bucket.until)
-        .map(|bucket| bucket.left)
-        .sum();
-    Books {
-        allowance_left,
-        covered,
-        credit_debt,
-        spent,
-    }
-}
 
 /// 视图和模型对得上，并且金额守恒。返回模型的账。
 ///
@@ -1860,8 +1709,12 @@ fn an_account_with_funds_keeps_its_old_debt_apart_from_a_new_allowance() {
 }
 
 // ------------------------------------------------------------------------------------------
-// 随机历史：视图、独立模型、准入决定三方对得上
+// 随机历史：视图、两个独立模型、准入决定、结算分摊对得上
 // ------------------------------------------------------------------------------------------
+//
+// 期望从 [`Sim`] 来：它只吃这个测试自己做过的事（发额度、撤销额度、预留、释放、结算）和业务规则，不读库、不读被测实现。
+// 每一步之后，视图、读原始表回放的 `model`（账本的分录有没有记对）、`Sim` 三方必须逐项一致。历史里有超出预留的结算
+// （超出的部分记在结算那一刻）、读钟乱序（`jitter`）和迟发、起点倒填的额度。
 
 /// xorshift64*：不引入依赖，结果确定。
 struct Rng(u64);
@@ -1881,7 +1734,7 @@ impl Rng {
 /// 按模型预测一个预留 `reserve` 微泰铢的请求在账上的结果：能花的 = 额度剩余 + 授信可用；
 /// 放得下就全额放行，放不下但够最低有用的预留（30）就压到「能花的」里最大的偶数，再小就拒绝。
 fn expected_price(books: &Books, credit: i64, reserve: i64) -> Option<i64> {
-    let room = books.allowance_left + (credit - books.credit_debt.min(credit));
+    let room = books.room(credit);
     if reserve <= room {
         Some(reserve)
     } else if room >= 30 {
@@ -1889,6 +1742,46 @@ fn expected_price(books: &Books, credit: i64, reserve: i64) -> Option<i64> {
     } else {
         None
     }
+}
+
+/// 视图、读原始表回放的 `model`、不读库的 `Sim` 三方一致。返回账。
+fn check_against_sim(store: &AccountStore, db: &TempDb, sim: &Sim, now: i64) -> Books {
+    let books = check_books(store, db, "emp", now);
+    assert_eq!(
+        books,
+        sim.books(now),
+        "the entries in the ledger replay to something other than what the events say, read at {now}"
+    );
+    books
+}
+
+/// 结算 `req`（预留 `reserved`，实际 `charged`），同步到 `Sim`，并核对这次结算的分摊：调用方保证超出预留的部分不超过此刻整条链
+/// 能吸收的，所以全由担保人承担，没有平台损失，不冻结凭证。
+#[allow(clippy::too_many_arguments)]
+fn settle_both(
+    store: &AccountStore,
+    sim: &mut Sim,
+    req: &Req,
+    spend: usize,
+    reserved: i64,
+    charged: i64,
+    at: i64,
+    reached: &mut Reached,
+) {
+    let extra = (charged - reserved).max(0);
+    if extra > 0 {
+        reached.overage_settled += 1;
+        if sim.books(at).allowance_left > 0 {
+            reached.overage_with_allowance += 1;
+        }
+    }
+    let outcome = settle_at(store, req, charged, at);
+    assert!(!outcome.late, "{outcome:?}");
+    assert_eq!(outcome.overage, thb(extra), "{outcome:?}");
+    assert_eq!(outcome.sponsor_covered, thb(extra), "{outcome:?}");
+    assert_eq!(outcome.platform_loss, thb(0), "{outcome:?}");
+    assert!(!outcome.credential_frozen, "{outcome:?}");
+    sim.settle(spend, charged, at);
 }
 
 /// 随机历史走过了哪些有意思的状态（防止随机测试悄悄退化成只走平凡路径）。
@@ -1908,8 +1801,14 @@ struct Reached {
     in_flight_at_check: u32,
     /// 已经发过额度，但此刻额度剩余是 0（花光、到期或被撤销之后），债务仍留着。
     debt_without_allowance: u32,
+    /// 超出预留的结算。
+    overage_settled: u32,
+    /// 超出预留的结算，结算那一刻还有额度可花：超出的部分用了结算那一刻的额度。
+    overage_with_allowance: u32,
     /// 写进表里的毫秒取的是排队之前的旧时间的步骤数（只有抖动的随机历史才有）。
     stale_stamped: u32,
+    /// 读钟比已经提交的某笔花费的归属时刻更早的请求数：回放不能把那笔花费压到读钟上。
+    read_behind_a_spend: u32,
 }
 
 impl Reached {
@@ -1924,30 +1823,38 @@ impl Reached {
         self.half_settled += other.half_settled;
         self.in_flight_at_check += other.in_flight_at_check;
         self.debt_without_allowance += other.debt_without_allowance;
+        self.overage_settled += other.overage_settled;
+        self.overage_with_allowance += other.overage_with_allowance;
         self.stale_stamped += other.stale_stamped;
+        self.read_behind_a_spend += other.read_behind_a_spend;
     }
 }
 
-/// `jitter`：一部分步骤写进表里的毫秒比提交顺序更早（排队乱序），也会和前一步相同（同毫秒）；先后仍是调用顺序。
+/// `jitter`：一半的步骤写进表里的毫秒（额度的创建时间、撤销时间、请求的读钟）比提交顺序更早（排队乱序，最多早 6 秒），也会和
+/// 前一步相同（同毫秒）；先后仍是调用顺序。
 fn run_random_history(seed: u64, steps: usize, jitter: bool) -> Reached {
     const CREDIT: i64 = 200;
     let db = TempDb::new(&format!("books-random-{seed}-{jitter}"));
     let store = credit_only_world(&db);
     credit_line(&store, "emp", CREDIT, T0);
+    let mut sim = Sim::new(CREDIT);
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut now = T0;
-    let mut allowances: Vec<String> = Vec::new();
+    // （额度 id，它在 Sim 里的编号）
+    let mut allowances: Vec<(String, usize)> = Vec::new();
     let mut revoked: Vec<String> = Vec::new();
-    let mut open: Vec<Req> = Vec::new();
+    // 在途的请求，和它在 Sim 里的花费编号
+    let mut open: Vec<(Req, usize)> = Vec::new();
     let mut next_request = 0_u32;
     let mut reached = Reached::default();
     for step in 0..steps {
         now += 1_000 * (1 + rng.below(4));
-        // 这一步写进表里的毫秒（额度的创建时间、撤销时间、请求的准入时间）。不抖动时就是 `now`；抖动时三分之一的步骤
-        // 取到的是排队之前的旧时间（最多早 2 秒），所以会比前面已经提交的花费更早，也会和前一步的毫秒相同。
-        let stamp = if jitter && rng.below(3) == 0 {
+        // 这一步写进表里的毫秒（额度的创建时间、撤销时间、请求的读钟）。不抖动时就是 `now`；抖动时一半的步骤取到的是排队之前的
+        // 旧时间（最多早 6 秒），所以会比前面已经提交的花费更早，也会和前一步的毫秒相同。
+        let stamp = if jitter && rng.below(2) == 0 {
             reached.stale_stamped += 1;
-            now - 1_000 * rng.below(3)
+            // 授信是 T0 起生效的：读钟不早于 T0（更早时授信还没生效，模型里的授信额度是个常数）
+            (now - 1_000 * rng.below(7)).max(T0)
         } else {
             now
         };
@@ -1957,47 +1864,78 @@ fn run_random_history(seed: u64, steps: usize, jitter: bool) -> Reached {
                 // 抖动的历史里一半的额度是「迟发、起点倒填」的：起点比创建时刻早 3 ~ 10 秒，窗口里已经有更早的花费，
                 // 它们不是这笔额度覆盖的（只有创建之后提交的花费才可能是）。
                 let backdated = jitter && rng.below(2) == 0;
-                let from = if backdated {
-                    stamp - 1_000 * (3 + rng.below(8))
+                let (from, until) = if backdated {
+                    (
+                        stamp - 1_000 * (3 + rng.below(8)),
+                        stamp + 1_000 * (5 + rng.below(40)),
+                    )
                 } else {
-                    stamp + 1_000 * (rng.below(6) - 2)
-                };
-                let until = if backdated {
-                    stamp + 1_000 * (5 + rng.below(40))
-                } else {
-                    from + 1_000 * (5 + rng.below(40))
+                    let from = stamp + 1_000 * (rng.below(6) - 2);
+                    (from, from + 1_000 * (5 + rng.below(40)))
                 };
                 let cap = [50_i64, 100, 150, 250][usize::try_from(rng.below(4)).unwrap()];
                 let id = format!("rnd-{seed}-{step}");
                 prepaid(&store, &id, cap, from, until, stamp);
-                allowances.push(id);
+                let bucket = sim.allowance(from, until, cap);
+                allowances.push((id, bucket));
             }
             2 => {
-                if let Some(id) = allowances.iter().find(|id| !revoked.contains(id)).cloned() {
-                    if model(db.path(), "emp", now).covered > 0 {
+                if let Some((id, bucket)) = allowances
+                    .iter()
+                    .find(|(id, _)| !revoked.contains(id))
+                    .cloned()
+                {
+                    if sim.books(now).covered > 0 {
                         reached.revoked_after_cover += 1;
                     }
                     revoke_allocation_at(&db, &id, stamp);
+                    sim.revoke(bucket);
                     revoked.push(id);
                 }
             }
             3 => {
-                // 收尾一个在途的预留：释放，或者按一半结算
-                if let Some(req) = open.pop() {
+                // 收尾一个在途的预留：释放，按一半结算，或者超出预留结算（额外的部分不超过结算那一刻整条链能吸收的）
+                if let Some((req, spend)) = open.pop() {
                     let reserved = store
                         .hold(&req.attempt, "model")
                         .unwrap()
                         .unwrap()
                         .reserved
                         .micros;
-                    if rng.below(2) == 0 {
-                        store.release_attempt(&req.attempt, ts(now)).unwrap();
-                        reached.released += 1;
-                    } else {
-                        store
-                            .settle_attempt(&req.attempt, &price(reserved / 2), ts(now))
-                            .unwrap();
-                        reached.half_settled += 1;
+                    match rng.below(3) {
+                        0 => {
+                            store.release_attempt(&req.attempt, ts(now)).unwrap();
+                            sim.release(spend);
+                            reached.released += 1;
+                        }
+                        1 => {
+                            settle_both(
+                                &store,
+                                &mut sim,
+                                &req,
+                                spend,
+                                reserved,
+                                reserved / 2,
+                                now,
+                                &mut reached,
+                            );
+                            reached.half_settled += 1;
+                        }
+                        _ => {
+                            let extra = [1_i64, 20, 60, 150]
+                                [usize::try_from(rng.below(4)).unwrap()]
+                            .min(sim.room(now));
+                            settle_both(
+                                &store,
+                                &mut sim,
+                                &req,
+                                spend,
+                                reserved,
+                                reserved + extra,
+                                now,
+                                &mut reached,
+                            );
+                        }
                     }
                 }
             }
@@ -2005,8 +1943,11 @@ fn run_random_history(seed: u64, steps: usize, jitter: bool) -> Reached {
                 next_request += 1;
                 let max_tokens = [10_u64, 20, 45, 100][usize::try_from(rng.below(4)).unwrap()];
                 let reserve = i64::try_from(10 + 2 * max_tokens).unwrap();
-                let before = model(db.path(), "emp", stamp);
+                let before = sim.books(stamp);
                 let want = expected_price(&before, CREDIT, reserve);
+                if stamp < sim.latest_at() {
+                    reached.read_behind_a_spend += 1;
+                }
                 let req = Req::new(
                     &store,
                     &format!("q-{seed}-{next_request}"),
@@ -2029,21 +1970,36 @@ fn run_random_history(seed: u64, steps: usize, jitter: bool) -> Reached {
                     _ => reached.rejected += 1,
                 }
                 if let Some(charged) = got {
+                    let spend = sim.reserve(stamp, charged);
                     if rng.below(4) == 0 {
-                        open.push(req); // 留着在途，之后的某一步再收尾
+                        open.push((req, spend)); // 留着在途，之后的某一步再收尾
                     } else {
-                        store
-                            .settle_attempt(&req.attempt, &price(charged), ts(now + 500))
-                            .unwrap();
+                        let at = now + 500;
+                        let extra = if rng.below(4) == 0 {
+                            [1_i64, 20, 60, 150][usize::try_from(rng.below(4)).unwrap()]
+                                .min(sim.room(at))
+                        } else {
+                            0
+                        };
+                        settle_both(
+                            &store,
+                            &mut sim,
+                            &req,
+                            spend,
+                            charged,
+                            charged + extra,
+                            at,
+                            &mut reached,
+                        );
                     }
                 } else {
                     assert_eq!(denied(&decision), Some(ReasonCode::BudgetExhausted));
                 }
             }
         }
-        // 每一步之后：视图对得上模型，授信占用不超过授信额度
+        // 每一步之后：视图、模型、事件三方对得上，授信占用不超过授信额度
         let check_at = now + 700;
-        let books = check_books(&store, &db, "emp", check_at);
+        let books = check_against_sim(&store, &db, &sim, check_at);
         assert!(
             books.credit_debt <= CREDIT,
             "seed {seed} step {step}: credit use beyond the line: {books:?}"
@@ -2064,13 +2020,13 @@ fn run_random_history(seed: u64, steps: usize, jitter: bool) -> Reached {
 }
 
 #[test]
-fn random_histories_agree_with_the_independent_model_and_the_owner_rule() {
+fn random_histories_agree_with_the_independent_models_and_the_owner_rule() {
     let mut total = Reached::default();
     for seed in [1_u64, 2, 3, 4, 5, 6] {
         total.add(run_random_history(seed, 50, false));
     }
     eprintln!("random histories reached: {total:?}");
-    // 没有走到这些状态，上面「三方对得上」就没有说服力
+    // 没有走到这些状态，上面「几方对得上」就没有说服力
     assert!(total.allowed >= 30, "{total:?}");
     assert!(total.degraded >= 3, "{total:?}");
     assert!(total.rejected >= 10, "{total:?}");
@@ -2081,23 +2037,29 @@ fn random_histories_agree_with_the_independent_model_and_the_owner_rule() {
     assert!(total.half_settled >= 3, "{total:?}");
     assert!(total.in_flight_at_check >= 10, "{total:?}");
     assert!(total.debt_without_allowance >= 10, "{total:?}");
+    assert!(total.overage_settled >= 5, "{total:?}");
+    assert!(total.overage_with_allowance >= 3, "{total:?}");
 }
 
 #[test]
-fn random_histories_with_out_of_order_timestamps_still_agree_with_the_independent_model() {
-    // 同样的随机历史，但额度的创建时间、撤销时间、请求的准入时间有三分之一取的是排队之前的旧时间：比前面已经提交的花费更早，
-    // 也会和前一步同一毫秒。先后始终是调用顺序（提交顺序），视图、独立模型、准入决定三方必须仍然对得上，授信占用仍不超过授信额度。
+fn random_histories_with_out_of_order_clocks_still_agree_with_the_independent_models() {
+    // 同样的随机历史（有超出预留的结算），但额度的创建时间、撤销时间、请求的读钟有一半取的是排队之前的旧时间：比前面已经提交的
+    // 花费更早，也会和前一步同一毫秒；一半的新额度起点倒填。先后始终是调用顺序（提交顺序），视图、两个模型、准入决定、
+    // 结算分摊必须仍然对得上，授信占用仍不超过授信额度。
     let mut total = Reached::default();
     for seed in [11_u64, 12, 13, 14, 15, 16, 17, 18] {
         total.add(run_random_history(seed, 60, true));
     }
     eprintln!("jittered random histories reached: {total:?}");
-    assert!(total.stale_stamped >= 40, "{total:?}");
+    assert!(total.stale_stamped >= 100, "{total:?}");
+    assert!(total.read_behind_a_spend >= 15, "{total:?}");
     assert!(total.allowed >= 40, "{total:?}");
     assert!(total.rejected >= 10, "{total:?}");
     assert!(total.allowance_and_debt >= 10, "{total:?}");
     assert!(total.credit_full >= 10, "{total:?}");
     assert!(total.debt_without_allowance >= 10, "{total:?}");
+    assert!(total.overage_settled >= 10, "{total:?}");
+    assert!(total.overage_with_allowance >= 3, "{total:?}");
 }
 
 fn attempt_of(request: &str) -> idoris_compute_contracts::ids::AttemptId {
