@@ -181,12 +181,14 @@ fn a_symlinked_settings_file_is_ignored() {
     assert_eq!(settings_api_key(home.path()).as_deref(), Some("via-link"));
 }
 
-/// #609：检查与打开之间没有窗口——类型由已打开的句柄说了算。FIFO 里即使有一份合法的 JSON（写端先开着、
-/// 读端 `O_NONBLOCK` 打开能成功并读到内容），也必须因为不是常规文件而被拒绝。
+/// #609：检查与打开之间没有窗口——类型由已打开的句柄说了算。测试自己先开着一个读端（让管道里的数据留得住），
+/// 再开写端写入合法的、带 key 的 JSON 并关掉写端：这时 FIFO 里躺着完整内容、也没有写端，实现若不核对句柄类型，
+/// `O_NONBLOCK` 打开后能读到内容并遇到 EOF，就会返回 key。正确的实现因为不是常规文件而返回 `None`。
 #[cfg(unix)]
 #[test]
 fn a_fifo_with_valid_content_is_rejected_by_the_opened_handles_type() {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let home = Home::new();
     let path = home.path().join(".omlx/settings.json");
     assert!(
@@ -196,15 +198,21 @@ fn a_fifo_with_valid_content_is_rejected_by_the_opened_handles_type() {
             .unwrap()
             .success()
     );
-    // 读写方式打开 FIFO 不会阻塞，也让之后的读端打开成功；内容是合法的带 key 的 JSON。
-    let mut writer = fs::OpenOptions::new()
+    let nonblock = nix::fcntl::OFlag::O_NONBLOCK.bits();
+    let _keeper = fs::OpenOptions::new()
         .read(true)
+        .custom_flags(nonblock)
+        .open(&path)
+        .unwrap();
+    let mut writer = fs::OpenOptions::new()
         .write(true)
+        .custom_flags(nonblock)
         .open(&path)
         .unwrap();
     writer
         .write_all(br#"{"auth":{"api_key":"from-fifo"}}"#)
         .unwrap();
+    drop(writer);
     assert_eq!(settings_api_key(home.path()), None);
     assert_eq!(resolve_from(None, Some(home.path())), None);
 }
