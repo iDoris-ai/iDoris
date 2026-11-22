@@ -129,7 +129,6 @@ mod tests {
     #[tokio::test]
     async fn only_a_card_the_proxy_would_give_a_key_gets_an_adapter_that_carries_one() {
         use crate::omlx::key::{EndpointKey, govern_endpoint, release_endpoint};
-        use idoris_backend::RuntimeAdapter;
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
