@@ -3131,10 +3131,18 @@ async fn h2_after_the_port_changed_hands_the_cached_adapter_sends_nothing_to_who
     let (status, body) = full.chat().await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // 外部引擎退出，端口上换了一个冒名者；检查器说监听者是另一个进程（测试进程自己，同一个用户、没有签名团队）。
+    // 外部引擎退出：管理器看到监听者没了，封上端点、`unavailable`。冒名者在这之后才绑上端口（先有「校验通过、然后发 key」这一步
+    // 与端口换主人之间的检查到使用的间隙，是任何校验都消除不了的；这里要证明的是：封上之后，端口上无论换成谁，都没有凭证发过去）。
+    // 检查器这时说监听者是另一个进程（测试进程自己，同一个用户、没有签名团队）。
     external.kill();
-    inspector.external_listener(port, std::process::id(), None);
+    inspector.forget_listener(port);
+    wait_for("unavailable, endpoint blocked", || {
+        full.health.view().upstreams[0].state == UpstreamState::Unavailable
+            && governed_endpoint(&full.rig.endpoint()) == Some(EndpointKey::Blocked)
+    })
+    .await;
     let impostor = Impostor::on_port(port).await;
+    inspector.external_listener(port, std::process::id(), None);
     wait_for("failed, port_in_use", || {
         let upstream = &full.health.view().upstreams[0];
         upstream.state == UpstreamState::Failed
@@ -3173,12 +3181,12 @@ async fn h3_an_engine_that_stays_alive_but_gives_the_port_away_never_sends_its_p
     let engine = full.rig.pid(0);
     let private_key = full.rig.key(0);
 
-    // 引擎放掉端口、但不退出（进程活着）；检查器也不再说它在监听；之后冒名者绑上同一个端口。
+    // 引擎放掉端口、但不退出（进程活着）；检查器也不再说它在监听。
     full.rig.fake.release_port();
     inspector.lose(port);
-    let impostor = Impostor::on_port(port).await;
 
-    // 管理器的下一个节拍：先收回私有 key（端点封上）、发布 `unavailable` 加 `port_in_use`（数据面 503），不发探测。
+    // 管理器的下一个节拍：先收回私有 key（端点封上）、发布 `unavailable` 加 `port_in_use`（数据面 503），不发探测。收不回来（没有每个
+    // 节拍重新确认），状态永远不会变，这一步就超时。
     wait_for("unavailable, port_in_use", || {
         let upstream = &full.health.view().upstreams[0];
         upstream.state == UpstreamState::Unavailable
@@ -3190,6 +3198,9 @@ async fn h3_an_engine_that_stays_alive_but_gives_the_port_away_never_sends_its_p
         governed_endpoint(&full.rig.endpoint()),
         Some(EndpointKey::Blocked)
     );
+    // 冒名者在这之后绑上同一个端口（先有「确认、然后发 key」与端口换主人之间的检查到使用的间隙，是任何确认都消除不了的）：
+    // 之后好几个探测间隔里，没有凭证发过去。
+    let impostor = Impostor::on_port(port).await;
     let (status, body) = full.chat().await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     // 好几个探测间隔（`fast()` 是 100 毫秒一次）：冒名者没收到任何带 key 的请求，更没有引擎的私有 key。

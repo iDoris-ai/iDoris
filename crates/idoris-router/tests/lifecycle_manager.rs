@@ -2992,21 +2992,18 @@ async fn an_engine_that_listens_late_gets_no_key_once_the_port_stopped_being_con
         listen_delay_secs: 0.8,
         ..Behavior::default()
     });
-    let mut timings = fast();
-    timings.startup_timeout = Duration::from_millis(2500);
     let h = Harness::start(
         &rig,
         default_backend(&rig),
         Scripted::claiming_once(rig.port),
-        timings,
+        fast(),
         StopOnExit::Owned,
     );
-    wait_for("the engine to listen", || {
-        !rig.fake.requests().is_empty() || rig.fake.launches() >= 2
-    })
-    .await;
-    // 等引擎真的开始监听之后再多等一会儿（探测每 20 到 100 毫秒一次）：这段时间里任何一个带 key 的探测都会被记下来。
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // 起点是引擎的启动记录（python 一起来就写）：它在这之后 0.8 秒才开始监听。机器忙时进程起得慢，所以不按固定的时间算，
+    // 也不给启动一个紧的上限（`fast()` 是 30 秒）：引擎开始监听之后再多等两秒（探测每 20 到 100 毫秒一次），这段时间里任何
+    // 一个带 key 的探测都会被记下来。
+    wait_for("the engine process to start", || rig.fake.launches() >= 1).await;
+    tokio::time::sleep(Duration::from_millis(2800)).await;
     assert_eq!(
         keyed_requests(&rig),
         0,
