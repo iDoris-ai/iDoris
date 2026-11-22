@@ -350,7 +350,8 @@ impl IngressConfig {
     ///
     /// 认证之前，单个来源的份额（`per_source_auth_unknown`）超过全局总闸（`auth_unknown`）的一半——突发或速率任何一项——
     /// 两个来源就能耗光总闸，别的来源冷的合法凭证会跟着被拒（429 `auth_capacity_limited`）：#603 N4 要防的正是这个，
-    /// 份额配得太大等于没修。刚好一半（三个来源才耗得光）不警告。原来份额不小于总闸才警告，119 / 199 对 1200 / 200 静默通过，
+    /// 份额配得太大等于没修。刚好一半不警告：这时两个来源仍能刚好耗光突发预算，一半是约定的提示线，不是安全边界（份额不小于总闸的
+    /// 三分之一、小于一半要三个来源，更小的要四个以上）。原来份额不小于总闸才警告，119 / 199 对 1200 / 200 静默通过，
     /// 而这个配置下一个来源能拿走 199 / 200 个令牌（PR-Daemon 在 #607 评审里指出）。
     pub fn budget_warnings(&self) -> Vec<String> {
         let (source, global) = (&self.auth_unknown_per_source, &self.auth_unknown);
@@ -848,7 +849,8 @@ tenants:
 
     /// PR-Daemon 在 #607 评审里指出：份额不小于总闸才警告，119 / 199 对 1200 / 200 静默通过，而这个配置下一个来源能拿走
     /// 199 / 200 个令牌，再来一个来源就耗光总闸（等于没分份额）。现在份额超过总闸的一半（突发或速率任何一项）就警告：
-    /// 两个来源就能耗光认证之前的全局查询预算。刚好一半（三个来源才耗得光）不警告；默认（十分之一）不警告。
+    /// 两个来源就能耗光认证之前的全局查询预算。刚好一半不警告（这时两个来源仍能刚好耗光突发预算，一半只是约定的提示线）；
+    /// 默认（十分之一，十个来源才耗得光）不警告。
     #[test]
     fn a_source_share_above_half_of_the_global_gate_is_warned_about_at_startup() {
         let warnings = |rate: u32, burst: u32| {
@@ -861,7 +863,7 @@ tenants:
         };
         assert!(
             warnings(600, 100).is_empty(),
-            "exactly half: three sources are needed"
+            "exactly half is not warned about, although two sources can exactly exhaust the burst budget"
         );
         assert!(warnings(120, 20).is_empty(), "the default is a tenth");
         for (rate, burst) in [(601, 100), (600, 101), (119, 199), (1199, 199), (1200, 200)] {

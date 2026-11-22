@@ -706,13 +706,19 @@ async fn the_admin_token_the_local_data_key_and_the_control_credential_are_three
     );
 }
 
-/// 源码里（注释除外）读取请求来源的行：对端地址、转发头、回环判断……返回 `文件名:行号: 命中的词: 原行`。
+/// 源码里（注释除外）读取请求来源的行：对端地址（`ConnectInfo`）、控制面边缘算好的客户端来源（`ClientAddr`）、转发头、回环判断……
+/// 返回 `文件名:行号: 命中的词: 原行`。
 ///
 /// `extractor` 给了的话，这份源码里**只有**那个提取器（`impl<S: Send + Sync> FromRequestParts<S> for <extractor>` 到它结尾的
-/// `}`）允许读来源；`use` 行不算（导入本身读不了什么），`#[cfg(test)]` 之后的单元测试不算运行期代码。
+/// `}`）允许读来源；`use` 行不算（导入本身读不了什么）。
+///
+/// `#[cfg(test)]` 标注的那一项（`mod tests { … }`、单个 `fn`、`mod tests;`、`use …;`）整项跳过，按大括号配平找它的结尾；
+/// 它后面的运行期代码照样扫（Codex 预审 L：以前遇到第一个 `#[cfg(test)]` 就整段停掉，文件前面放一个测试用的小函数，
+/// 后面的运行期代码就没人扫了）。字符串里的大括号不处理，测试项里有的话可能多跳或少跳几行。
 fn origin_reads(name: &str, source: &str, extractor: Option<&str>) -> Vec<String> {
-    const NEEDLES: [&str; 8] = [
+    const NEEDLES: [&str; 9] = [
         "connectinfo",
+        "clientaddr",
         "x-forwarded",
         "x-real-ip",
         "remote_addr",
@@ -721,16 +727,36 @@ fn origin_reads(name: &str, source: &str, extractor: Option<&str>) -> Vec<String
         "forwarded",
         "origin",
     ];
+    const TEST_ATTRIBUTE: &str = "#[cfg(test)]";
     let allowed_impl = extractor
         .map(|extractor| format!("impl<S: Send + Sync> FromRequestParts<S> for {extractor}"));
     let mut inside_extractor = false;
+    // 正在跳过 `#[cfg(test)]` 标注的那一项：`depth` 是它里面还没闭合的大括号，`opened` 表示出现过大括号
+    let mut in_test_item = false;
+    let (mut depth, mut opened) = (0_i32, false);
     let mut found = Vec::new();
     for (number, line) in source.lines().enumerate() {
         let code = line.trim_start();
-        if extractor.is_some() {
-            if code.starts_with("#[cfg(test)]") {
-                break;
+        if in_test_item || code.starts_with(TEST_ATTRIBUTE) {
+            let text = if in_test_item {
+                code
+            } else {
+                in_test_item = true;
+                (depth, opened) = (0, false);
+                &code[TEST_ATTRIBUTE.len()..]
+            };
+            if !text.trim_start().starts_with("//") {
+                let opens = i32::try_from(text.matches('{').count()).unwrap_or(i32::MAX);
+                let closes = i32::try_from(text.matches('}').count()).unwrap_or(i32::MAX);
+                opened |= opens > 0;
+                depth += opens - closes;
+                if (opened && depth <= 0) || (!opened && text.trim_end().ends_with(';')) {
+                    in_test_item = false;
+                }
             }
+            continue;
+        }
+        if extractor.is_some() {
             if allowed_impl
                 .as_deref()
                 .is_some_and(|head| code.starts_with(head))
@@ -833,6 +859,60 @@ mod tests {
             .any(|line| line.contains(":11: connectinfo:")),
         "{renamed:#?}"
     );
+}
+
+/// Codex 预审 L：提取器读的不只是 `ConnectInfo`，还有控制面边缘算好的 `ClientAddr`（`extensions.get::<ClientAddr>()`）。
+/// 限速器自己或别的函数照这个写法读，也要被扫描抓到；提取器里的同一行不报。
+#[test]
+fn the_origin_scan_flags_a_clientaddr_read_outside_the_allowed_extractor() {
+    let sample = "\
+use crate::cloud::ingress::net::ClientAddr;
+impl FailureLimiter {
+    fn acquire(&self, parts: &Parts) -> Option<Ticket> {
+        let resolved = parts.extensions.get::<ClientAddr>();
+        None
+    }
+}
+impl<S: Send + Sync> FromRequestParts<S> for RedeemSource {
+    async fn from_request_parts(parts: &mut Parts) -> Result<Self, Self::Rejection> {
+        let resolved = parts.extensions.get::<ClientAddr>();
+        Ok(Self(resolved))
+    }
+}
+";
+    let found = origin_reads("sample.rs", sample, Some("RedeemSource"));
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(
+        found[0].starts_with("sample.rs:4: clientaddr:"),
+        "{found:#?}"
+    );
+}
+
+/// Codex 预审 L：扫描只跳过测试项本身，不是遇到第一个 `#[cfg(test)]` 就停。以前在文件前面放一个 `#[cfg(test)]` 的小函数，
+/// 它后面的运行期代码就整段没人扫了。这里：前面的测试项、末尾的测试模块都不报，夹在中间的运行期代码要报。
+#[test]
+fn the_origin_scan_skips_only_the_test_items_not_everything_after_the_first_cfg_test() {
+    let sample = "\
+#[cfg(test)]
+fn helper(source: IpAddr) -> bool { source.is_loopback() }
+fn acquire(&self, source: IpAddr) -> Option<Ticket> {
+    if source.is_loopback() { return None; }
+    None
+}
+#[cfg(test)]
+mod tests {
+    fn t(source: IpAddr) { source.is_loopback(); }
+}
+";
+    let found = origin_reads("sample.rs", sample, Some("RedeemSource"));
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(
+        found[0].starts_with("sample.rs:4: is_loopback:"),
+        "{found:#?}"
+    );
+    // 没有提取器的白名单时也一样：测试项照样跳过，后面的运行期代码照样扫
+    let strict = origin_reads("sample.rs", sample, None);
+    assert_eq!(strict.len(), 1, "{strict:#?}");
 }
 
 // ================================================================================================
@@ -4151,7 +4231,20 @@ async fn member_credentials_and_pairing_codes_give_a_caller_without_the_operatio
         let mut answers = Vec::new();
         for (path, body) in calls {
             let reply = world.call("POST", &path, Some(&reader), body).await;
-            assert!(!reply.status.is_success(), "{label} {path}: {}", reply.raw);
+            // 先逐条断言预期的答案（Codex 预审 L：只比较「彼此相同」会放过「三个都错得一样」）：reader 没有这个操作，
+            // 每个 id 都是 403 `op_not_granted`；然后才比较整份回答
+            assert_eq!(
+                reply.status,
+                StatusCode::FORBIDDEN,
+                "{label} {path}: {}",
+                reply.raw
+            );
+            assert_eq!(
+                reply.reason(),
+                "op_not_granted",
+                "{label} {path}: {}",
+                reply.raw
+            );
             answers.push(answer_without_the_correlation_id(&reply));
         }
         assert!(
