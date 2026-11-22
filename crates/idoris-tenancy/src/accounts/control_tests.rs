@@ -4632,6 +4632,48 @@ fn a_manager_with_a_narrow_scope_replays_and_conflicts_inside_it_and_is_blind_ou
         );
     }
     assert_eq!(membership_ids(&env), before, "nothing was created");
+    // 范围判定只认同一个操作（ManageMembership）的范围：同一张凭证上别的操作的范围（IssueCredential、Read 管着 eduai）不让
+    // eduai 下 teacher 之外的 m-kid2 对它可见
+    let mixed = env.issue_as_operator(Issue::service(
+        "eduai",
+        vec![
+            sc(ControlOp::ManageMembership, "teacher", None),
+            sc(ControlOp::IssueCredential, "eduai", None),
+            sc(ControlOp::Read, "eduai", None),
+        ],
+    ));
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-kid2",
+            principal: "kid1",
+            org: "eduai",
+            account: "s3"
+        }
+        .run(&env, &mixed.who(), T0 + 7),
+        Err(ControlReason::OutOfScope)
+    );
+    // 本机运维不受授权约束，看得到全部成员关系：同一个定义是 replayed，不同的定义是 already_exists
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-kid2",
+            principal: "kid2",
+            org: "eduai",
+            account: "s2"
+        }
+        .run(&env, &Env::operator(), T0 + 8),
+        Ok(WriteResult::Replayed)
+    );
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-kid2",
+            principal: "kid1",
+            org: "eduai",
+            account: "s2"
+        }
+        .run(&env, &Env::operator(), T0 + 9),
+        Err(ControlReason::AlreadyExists)
+    );
+    assert_eq!(membership_ids(&env), before, "still nothing was created");
     // 残余（无法消除，只钉住）：不存在的 id 同样的请求创建成功
     assert_eq!(
         Action::CreateMembership {
@@ -4640,7 +4682,7 @@ fn a_manager_with_a_narrow_scope_replays_and_conflicts_inside_it_and_is_blind_ou
             org: "eduai",
             account: "s3"
         }
-        .run(&env, &narrow.who(), T0 + 7),
+        .run(&env, &narrow.who(), T0 + 10),
         Ok(WriteResult::Created)
     );
 }

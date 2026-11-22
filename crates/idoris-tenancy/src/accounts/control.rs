@@ -1206,7 +1206,8 @@ pub(super) fn authority_is_visible<T>(result: Result<T, Failure>) -> Result<bool
 
 /// 成员关系 `id`，读的时候限定在调用者对 `manage_membership` 管得到的范围里：管不到的和不存在的一样返回 `None`
 /// （一条语句，见 [`load_membership_within`]）。本机运维管得到全部；凭证管得到的范围是它身上 `manage_membership` 权限的子树
-/// （带额度上限的权限不算：契约的 `scope_covers` 对没有额度的请求不认带上限的授权）；配对码身份没有任何授权。
+/// （带额度上限的权限不算：契约的 `scope_covers` 对没有额度的请求不认带上限的授权。签发时已经拒绝带上限的 `manage_membership`
+/// 范围，这里照同一口径再滤一次，让这个读和授权判定保持一致，将来放宽签发校验时可见范围仍与授权判定同步）；配对码身份没有任何授权。
 ///
 /// 管得到的成员关系，行为和以前的「读出来再授权」完全一样；管不到的不再被读出来，所以后面没有已有 id 独有的授权查询
 /// （issue #603 N7 残余，Codex 预审 H1 / M3）。
