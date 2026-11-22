@@ -353,8 +353,9 @@ impl AccountStore {
                 .account
                 .clone()
                 .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;
-            spec.scope_account = Some(account.to_string());
             authorize_op(conn, caller, meta.now, ControlOp::IssueCredential, &account, None)?;
+            // 审计里由目标派生的账户等目标授权通过之后才填：被拒的请求不论成员关系存不存在，留下同样的审计行（Codex 预审 M2）
+            spec.scope_account = Some(account.to_string());
             let payer = require_live_payer(conn, &found)?;
             debug_assert_eq!(payer, account);
             if !(MIN_PAIRING_TTL_MS..=MAX_PAIRING_TTL_MS).contains(&request.ttl_ms) {
@@ -443,8 +444,6 @@ impl AccountStore {
                 .account
                 .clone()
                 .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;
-            spec.scope_account = Some(account.to_string());
-            spec.related_id = Some(record.membership.to_string());
             authorize_op(
                 conn,
                 caller,
@@ -453,6 +452,9 @@ impl AccountStore {
                 &account,
                 None,
             )?;
+            // 审计里由目标派生的字段（账户、码所属的成员关系）等目标授权通过之后才填（Codex 预审 M2）
+            spec.scope_account = Some(account.to_string());
+            spec.related_id = Some(record.membership.to_string());
             match record.status {
                 PairingStatus::Revoked => {
                     return Ok(Written {

@@ -1441,8 +1441,6 @@ impl AccountStore {
             let Some(found) = load_membership(conn, &request.membership)? else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
-            spec.scope_account = Some(membership_target(&found).to_string());
-            spec.related_id = Some(found.principal.to_string());
             authorize_op(
                 conn,
                 caller,
@@ -1451,6 +1449,10 @@ impl AccountStore {
                 membership_target(&found),
                 None,
             )?;
+            // 审计里由目标派生的字段（账户、关联的主体）等目标授权通过之后才填：被拒的请求不论目标存不存在，留下同样的审计行
+            // （Codex 预审 M2）
+            spec.scope_account = Some(membership_target(&found).to_string());
+            spec.related_id = Some(found.principal.to_string());
             if found.status == MembershipStatus::Revoked {
                 return Ok(Written {
                     result: WriteResult::Unchanged,
@@ -1638,7 +1640,6 @@ impl AccountStore {
             // 目标账户 = 新凭证的绑定账户。绑定的成员关系不存在，和「不在范围内」是同一个答案。
             let anchor = binding_anchor(conn, &request.binding)?
                 .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;
-            spec.scope_account = Some(anchor.to_string());
             // **先授权、后校验**：没有资格的调用者永远得到授权类的答案，不会因为请求体写得不对而得到另一种答案。
             authorize_op(
                 conn,
@@ -1648,6 +1649,8 @@ impl AccountStore {
                 &anchor,
                 None,
             )?;
+            // 审计里由目标派生的账户等目标授权通过之后才填（Codex 预审 M2）
+            spec.scope_account = Some(anchor.to_string());
             let id = CredentialId::new(request.key_id.clone()).map_err(|error| {
                 Failure::with_detail(ControlReason::InvalidRequest, error.to_string())
             })?;
@@ -1755,8 +1758,9 @@ impl AccountStore {
             };
             let anchor = binding_anchor(conn, found.binding())?
                 .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;
-            spec.scope_account = Some(anchor.to_string());
             authorize_op(conn, caller, meta.now, op, &anchor, None)?;
+            // 审计里由目标派生的账户等目标授权通过之后才填（Codex 预审 M2）
+            spec.scope_account = Some(anchor.to_string());
             if found.status() == request.status {
                 return Ok(Written {
                     result: WriteResult::Unchanged,
@@ -1977,9 +1981,6 @@ impl AccountStore {
             let Some(record) = load_allocation_record(conn, &request.id)? else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
-            spec.scope_account = Some(record.allocation.parent.to_string());
-            spec.related_id = Some(record.allocation.child.to_string());
-            spec.amount = Some(record.allocation.ceiling.amount().clone());
             authorize_op(
                 conn,
                 caller,
@@ -1988,6 +1989,10 @@ impl AccountStore {
                 &record.allocation.parent,
                 Some(record.allocation.ceiling.amount()),
             )?;
+            // 审计里由目标派生的字段（授权方账户、被授权方、金额）等目标授权通过之后才填（Codex 预审 M2）
+            spec.scope_account = Some(record.allocation.parent.to_string());
+            spec.related_id = Some(record.allocation.child.to_string());
+            spec.amount = Some(record.allocation.ceiling.amount().clone());
             if record.revoked_at_ms.is_some() {
                 return Ok(Written {
                     result: WriteResult::Unchanged,

@@ -14,7 +14,8 @@ use idoris_compute_contracts::reason::ReasonCode;
 use idoris_contracts::common::PrivacyClass;
 
 use super::control_tests::{
-    DAY_MS, Env, Issue, Minted, T0, aid, all_ops, cid, failure_reason, mid, pid, sc, ts,
+    AuditEntry, DAY_MS, Env, Issue, Minted, T0, aid, all_ops, cid, failure_reason, mid, pid,
+    reader_wider_than_its_writer, sc, ts,
 };
 use super::{
     CreatePairingCode, Failure, GateVerdict, MAX_ACTIVE_DEVICES_PER_MEMBERSHIP, MAX_PAIRING_TTL_MS,
@@ -1368,6 +1369,95 @@ fn pairing_code_writes_do_not_tell_a_caller_that_cannot_issue_whether_the_id_exi
                 },
             )
             .is_ok()
+    );
+}
+
+/// Codex 预审 M2：创建 / 撤销配对码被拒（目标不在调用者的写范围里）时，审计行里由目标派生的字段（`scope_account`、`related_id`）
+/// 要等目标授权通过之后才填；目标存在（在读范围里、写范围外）和不存在，留下同样的审计行，调用者按读范围读审计也读不到。
+#[test]
+fn a_denied_pairing_code_write_leaves_the_same_audit_row_whether_or_not_the_target_exists() {
+    let (env, service) = setup();
+    let wide = reader_wider_than_its_writer(&env);
+    // 一个已有的码：m-kid2（eduai 下、teacher 之外）的
+    let existing_code = new_code("audit");
+    create_code(&env, &service.who(), &existing_code, "m-kid2", T0);
+    let mut now = T0 + 1;
+    let mut rows: Vec<(&str, AuditEntry, AuditEntry)> = Vec::new();
+    for op in ["create_pairing_code", "revoke_pairing_code"] {
+        let mut pair = Vec::new();
+        for existing in [true, false] {
+            now += 1;
+            let rid = env.rid();
+            let meta = env.meta(now, &rid);
+            let result = if op == "create_pairing_code" {
+                let membership = if existing { "m-kid2" } else { "m-ghost" };
+                env.store
+                    .control_create_pairing_code(
+                        &wide.who(),
+                        &meta,
+                        &create_request(&new_code("denied"), membership, TTL),
+                    )
+                    .map(|_| ())
+            } else {
+                let pairing = if existing {
+                    existing_code.pairing_id.clone()
+                } else {
+                    "pc_nope".to_string()
+                };
+                env.store
+                    .control_revoke_pairing_code(
+                        &wide.who(),
+                        &meta,
+                        &RevokePairingCode {
+                            pairing_id: pairing,
+                        },
+                    )
+                    .map(|_| ())
+            };
+            assert_eq!(
+                result.map_err(|failure| failure.reason),
+                Err(ControlReason::OutOfScope),
+                "{op} existing={existing}"
+            );
+            let row = env.last_audit();
+            assert_eq!(row.op, op);
+            assert_eq!(
+                (row.outcome.as_str(), row.reason_code.as_str()),
+                ("denied", "out_of_scope"),
+                "{op}"
+            );
+            assert_eq!(
+                row.scope_account, None,
+                "{op} existing={existing}: nothing derived from the target before it is authorized: {row:?}"
+            );
+            pair.push(row);
+        }
+        let missing = pair.pop().unwrap();
+        let existing = pair.pop().unwrap();
+        rows.push((op, existing, missing));
+    }
+    for (op, existing, missing) in &rows {
+        // 创建的 `related_id` 是请求里自己写的成员关系 id（不是从库里读的），所以两行只有它不同；其余逐字段相同
+        let normalize = |row: &AuditEntry| AuditEntry {
+            target_id: None,
+            related_id: None,
+            request_id: String::new(),
+            ..row.clone()
+        };
+        assert_eq!(normalize(existing), normalize(missing), "{op}");
+        if *op == "revoke_pairing_code" {
+            // 撤销的 `related_id` 来自库里的码，被拒时同样不填
+            assert_eq!(existing.related_id, None);
+            assert_eq!(missing.related_id, None);
+        }
+    }
+    let view = env
+        .store
+        .control_read_audit(&wide.who(), ts(now + 1), &aid("eduai"), 200, None)
+        .unwrap();
+    assert!(
+        view.rows.iter().all(|row| row.outcome != "denied"),
+        "a denied attempt must not be readable through a target-derived scope"
     );
 }
 

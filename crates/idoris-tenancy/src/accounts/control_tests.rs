@@ -4433,6 +4433,125 @@ fn hidden_and_missing_membership_ids_run_the_same_statements_when_attaching_fail
     }
 }
 
+/// 一个读范围（eduai）比各项写范围（teacher 子树）宽的凭证：它能读 eduai 的审计，但管不到 eduai 下 teacher 之外的东西。
+pub(super) fn reader_wider_than_its_writer(env: &Env) -> Minted {
+    env.issue_as_operator(Issue::service(
+        "eduai",
+        vec![
+            sc(ControlOp::Read, "eduai", None),
+            sc(ControlOp::IssueCredential, "teacher", None),
+            sc(ControlOp::ManageMembership, "teacher", None),
+            sc(ControlOp::FreezeCredential, "teacher", None),
+            sc(ControlOp::RevokeCredential, "teacher", None),
+            sc(ControlOp::GrantAllocation, "teacher", Some(1_000_000_000)),
+        ],
+    ))
+}
+
+/// 最近一条审计行的金额列（`AuditEntry` 不带它）。
+fn last_audit_amount(env: &Env) -> (Option<String>, Option<i64>) {
+    env.raw()
+        .query_row(
+            "SELECT amount_unit, amount_micros FROM control_audit ORDER BY audit_id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+/// M2：按 id 查的写操作被拒（目标不在调用者的写范围里）时，审计行里由目标派生的字段（`scope_account`、`related_id`、金额）
+/// 要等目标授权通过之后才填。旧代码在授权判定之前就填了：目标存在（在调用者的读范围里、写范围外）的那一行带着目标的账户和关联 id，
+/// 调用者按 eduai 子树读审计就看得到；目标不存在的那一行是空的、读不到，两种被拒留下的记录不一样。
+#[test]
+fn a_denied_id_keyed_write_leaves_the_same_audit_row_whether_or_not_the_target_exists() {
+    let env = Env::new();
+    env.tree();
+    env.allocation_chain();
+    let wide = reader_wider_than_its_writer(&env);
+    // 目标凭证：绑定 eduai，在 wide 的读范围里、写范围外
+    let target_credential = env.issue_as_operator(Issue::service("eduai", all_ops("eduai", 1)));
+    let cases: Vec<(&str, Action, Action)> = vec![
+        (
+            "issue_credential",
+            Action::IssueCredential {
+                membership: "m-kid2",
+            },
+            Action::IssueCredential {
+                membership: "m-ghost",
+            },
+        ),
+        (
+            "revoke_membership",
+            Action::RevokeMembership { id: "m-kid2" },
+            Action::RevokeMembership { id: "m-ghost" },
+        ),
+        (
+            "revoke_credential",
+            Action::SetCredential {
+                credential: target_credential.id().to_string(),
+                status: CredentialStatus::Revoked,
+            },
+            Action::SetCredential {
+                credential: "k-ghost".to_string(),
+                status: CredentialStatus::Revoked,
+            },
+        ),
+        (
+            "revoke_allocation",
+            Action::RevokeAllocation { id: "a-teacher" },
+            Action::RevokeAllocation { id: "a-ghost" },
+        ),
+    ];
+    let mut now = T0 + 1;
+    for (op, existing, missing) in &cases {
+        let mut rows = Vec::new();
+        for action in [existing, missing] {
+            now += 1;
+            assert_eq!(
+                action.run(&env, &wide.who(), now),
+                Err(ControlReason::OutOfScope),
+                "{op}: {action:?}"
+            );
+            let row = env.last_audit();
+            assert_eq!(row.op, *op);
+            assert_eq!(
+                (row.outcome.as_str(), row.reason_code.as_str()),
+                ("denied", "out_of_scope"),
+                "{op}"
+            );
+            assert_eq!(
+                (row.scope_account.clone(), row.related_id.clone()),
+                (None, None),
+                "{op}: a denied row must not carry anything derived from the target: {row:?}"
+            );
+            assert_eq!(last_audit_amount(&env), (None, None), "{op}");
+            rows.push(row);
+        }
+        // 两种被拒的审计行，除了请求里自己写的目标 id 和请求号，逐字段相同
+        let normalize = |row: &AuditEntry| AuditEntry {
+            target_id: None,
+            request_id: String::new(),
+            ..row.clone()
+        };
+        assert_eq!(normalize(&rows[0]), normalize(&rows[1]), "{op}");
+    }
+    // 调用者按自己的读范围读审计：这些被拒的尝试，不论目标存不存在，都不在它能读到的行里
+    let view = env
+        .store
+        .control_read_audit(&wide.who(), ts(now + 1), &aid("eduai"), 200, None)
+        .unwrap();
+    let seen: Vec<&str> = view
+        .rows
+        .iter()
+        .filter(|row| row.outcome == "denied")
+        .map(|row| row.op.as_str())
+        .collect();
+    assert!(
+        seen.is_empty(),
+        "denied attempts are not readable through the target-derived scope: {seen:?}"
+    );
+}
+
 /// 范围限定的读（`rows::load_membership_within`，一条 SQL 里按子树过滤）和授权判定（契约的 `authorize`）用两套写法表达同一个
 /// 「调用者管得到哪些成员关系」。这条把两者的一致钉住：只管 teacher 子树的凭证，对子树里的成员关系（付款账户在 teacher 下）
 /// 照旧能重放、能得到冲突；管理员关系没有付款账户，范围看所属组织，管着 eduai 的凭证对它也照旧能重放；子树之外的
