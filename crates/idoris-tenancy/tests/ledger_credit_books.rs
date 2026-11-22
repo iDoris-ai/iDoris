@@ -1431,49 +1431,6 @@ fn a_settle_entry_on_a_hold_that_is_neither_being_settled_nor_settled_on_time_fa
     }
 }
 
-/// 让一个预留在 `account` 上的净额变成 `-(release_more - reserved)`（库被改坏了的样子）：先拆掉「在途净额必须落在 [0, 预留额]」的触发器，
-/// 再多插一条 `release`，把预留 `reserved` 之外又放掉 `release_more - reserved`。账户、预留、币种、归属时刻抄这个预留的 `reserve` 那条。
-fn make_the_net_negative(db: &TempDb, account: &str, hold_id: &str, release_more: i64) {
-    let conn = rusqlite::Connection::open(db.path()).unwrap();
-    conn.execute_batch("DROP TRIGGER ledger_entries_held_bounds")
-        .unwrap();
-    let inserted = conn
-        .execute(
-            "INSERT INTO ledger_entries
-                 (account_id, hold_id, kind, unit, held_micros, spent_micros, funds_micros, liability_micros,
-                  window_at_ms, at_ms, idempotency_key)
-             SELECT account_id, hold_id, 'release', unit, ?3, 0, 0, 0, window_at_ms, at_ms, 'tampered-negative-' || hold_id
-               FROM ledger_entries WHERE hold_id = ?2 AND account_id = ?1 AND kind = 'reserve'",
-            rusqlite::params![account, hold_id, -release_more],
-        )
-        .unwrap();
-    assert_eq!(
-        inserted, 1,
-        "the reservation has one reserve entry on {account}"
-    );
-}
-
-/// 给一个预留在 `account` 上插一条负的 `late_settle`（结算那一刻才发生的花费的净额变成负数）：CHECK 要求 `spent >= 0`，所以这里把检查关掉。
-fn make_the_settlement_time_spend_negative(db: &TempDb, account: &str, hold_id: &str, spent: i64) {
-    let conn = rusqlite::Connection::open(db.path()).unwrap();
-    conn.execute_batch("PRAGMA ignore_check_constraints = ON")
-        .unwrap();
-    let inserted = conn
-        .execute(
-            "INSERT INTO ledger_entries
-                 (account_id, hold_id, kind, unit, held_micros, spent_micros, funds_micros, liability_micros,
-                  window_at_ms, at_ms, idempotency_key)
-             SELECT account_id, hold_id, 'late_settle', unit, 0, ?3, 0, 0, window_at_ms + 5, at_ms + 5, 'tampered-late-' || hold_id
-               FROM ledger_entries WHERE hold_id = ?2 AND account_id = ?1 AND kind = 'reserve'",
-            rusqlite::params![account, hold_id, spent],
-        )
-        .unwrap();
-    assert_eq!(
-        inserted, 1,
-        "the reservation has one reserve entry on {account}"
-    );
-}
-
 #[test]
 fn a_negative_amount_cannot_offset_the_debt_of_a_reservation_with_or_without_allowances() {
     // Codex 三复审 Medium：账户上没有任何花费类额度时，三本账不逐笔回放，已花（含在途）全是额度之外的部分。原来直接取整个账户的

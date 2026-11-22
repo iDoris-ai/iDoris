@@ -45,7 +45,7 @@ use idoris_compute_contracts::ids::{AllocationId, IdempotencyKey};
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_tenancy::accounts::AccountStore;
 use idoris_tenancy::accounts::ledger::{
-    AlertKind, ComponentDecision, CreditLineSetting, SettleOutcome, SettleResult,
+    AlertKind, ComponentDecision, CreditLineSetting, LedgerError, SettleOutcome, SettleResult,
 };
 
 /// `max_tokens = 45`：预留 100。
@@ -949,6 +949,98 @@ fn a_funded_account_with_a_credit_line_and_no_allowance_is_exactly_what_it_was()
     let books = check_books(&store, &db, "emp", T0 + 2_000);
     assert_eq!((books.funds_left, books.credit_debt), (0, 50));
     assert_clean(&store);
+}
+
+#[test]
+fn a_negative_amount_cannot_offset_the_spending_of_a_reservation_on_an_account_whose_books_are_not_replayed()
+ {
+    // Codex 四复审 Medium：不走三本账的花钱账户——充了值却从没有过花费类额度、或者从没有过授信——视图直接用整个账户的 `Σ (held + spent)`
+    // （`balance = 充值 - 已花`，`ceiling_remaining = 额度 - 窗口里的消耗`），不按预留查净额：一个被改坏了的预留的负净额抵掉别的预留真实的占用，
+    // 余额被抬高。充值 100 + 授信 200，没有额度：r-1 预留 90、r-2 预留 30，余额 100 - 120 = -20；把 r-2 的净额改成 -40（在 30 的预留之外又放掉 70）：
+    // 90 和 -40 并存，整个账户的求和是 50，旧代码读出余额 50，多出 70。现在失败即关闭：每个预留的净额必须不为负，读到负的返回 `Corrupt`，
+    // 视图和准入都不例外。四种不走三本账的形状 × 负的预留净额 / 负的结算时刻花费（负的 `late_settle` 要关掉 CHECK 才插得进去）。
+    //
+    // 旧代码读出的数（手算，改坏之后，r-1 的 90 + r-2 的 30 + 改坏的 -70）：负的预留净额：余额 / 额度剩余各比健康时多 70；
+    // 负的 `late_settle`（-40）：多 40。
+    for (label, funds, credit, allowance) in [
+        ("funded with a credit line, no allowance", 100, 200, 0),
+        ("funded, no credit line, no allowance", 200, 0, 0),
+        ("funded with an allowance, no credit line", 200, 0, 500),
+        ("an allowance only", 0, 0, 200),
+    ] {
+        for negative_settlement_spend in [false, true] {
+            let what = format!(
+                "{label}, negative {}",
+                if negative_settlement_spend {
+                    "settlement-time spend"
+                } else {
+                    "reservation"
+                }
+            );
+            let db = TempDb::new(&format!(
+                "raw-negative-net-{funds}-{credit}-{allowance}-{negative_settlement_spend}"
+            ));
+            let store = credit_world(&db);
+            if funds > 0 {
+                top_up(&store, funds, "emp", T0);
+            }
+            if credit > 0 {
+                credit_line(&store, credit, T0);
+            }
+            if allowance > 0 {
+                prepaid(&store, "emp-allow", allowance, T0 - DAY, T0 + 30 * DAY, T0);
+            }
+            assert_eq!(
+                price_of(&spend(&store, "r-1", T0 + 1_000, 40)),
+                Some(90),
+                "{what}"
+            );
+            assert_eq!(
+                price_of(&spend(&store, "r-2", T0 + 2_000, M30)),
+                Some(30),
+                "{what}"
+            );
+            // 改坏之前账是对的：这个账户不走三本账（`balance` 或 `ceiling_remaining` 是整个账户求和出来的数）
+            let sound = view(&store, T0 + 3_000);
+            assert_eq!(
+                sound.balance,
+                (funds > 0).then(|| thb(funds - 120)),
+                "{what}: balance before the tampering (r-1 90 + r-2 30)"
+            );
+            assert_eq!(
+                sound.ceiling_remaining,
+                (allowance > 0).then(|| thb(allowance - 120)),
+                "{what}: allowance left before the tampering"
+            );
+            drop(store);
+            if negative_settlement_spend {
+                make_the_settlement_time_spend_negative(&db, "emp", "r-2#0", -40);
+            } else {
+                make_the_net_negative(&db, "emp", "r-2#0", 70);
+            }
+
+            let store = AccountStore::open(db.path()).unwrap();
+            let error = store
+                .account_view(&aid("emp"), ts(T0 + 4_000))
+                .expect_err("the view must fail closed");
+            assert!(
+                matches!(error, LedgerError::Corrupt(_)),
+                "{what}: {error:?}"
+            );
+            let next = Req::new(&store, "r-3", 0, "cred-e", M30).at(T0 + 4_000);
+            let error = store
+                .admit_attempt(&next.input())
+                .expect_err("admission must fail closed");
+            assert!(
+                matches!(error, LedgerError::Corrupt(_)),
+                "{what}: {error:?}"
+            );
+            assert!(
+                store.hold(&next.attempt, "model").unwrap().is_none(),
+                "{what}: nothing was reserved"
+            );
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------------

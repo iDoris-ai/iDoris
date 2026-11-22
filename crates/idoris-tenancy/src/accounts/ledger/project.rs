@@ -4,7 +4,7 @@
 //!
 //! | `AncestorView` 的字段 | 怎么得到 |
 //! |---|---|
-//! | `balance`（自有资金） | 有充值分录才有：`Σ funds − Σ (held + spent)`（所有时间）。没有充值过 = `None`。例外：有过授信、又有过花费类额度的充值账户走下面「授信的旧债与新额度分开记」的口径，自有资金并进 `ceiling_remaining` 的净头寸，这里是 `None` |
+//! | `balance`（自有资金） | 有充值分录才有：`Σ funds − Σ (held + spent)`（所有时间）。没有充值过 = `None`。读之前每个预留的净额都要不为负（负的是库被改坏了，`Corrupt`，见 [`ensure_no_negative_net`]）。例外：有过授信、又有过花费类额度的充值账户走下面「授信的旧债与新额度分开记」的口径，自有资金并进 `ceiling_remaining` 的净头寸，这里是 `None` |
 //! | `ceiling_remaining`（授权额度剩余） | 流入这个账户的、此刻有效的**花费类**额度（免费额度、预付、组织配额，不含授信）之和，减去这些额度**窗口内**（从最早的有效起点算起）的 `Σ (held + spent)`（超出预留的部分按结算时刻算，见下「按归属时刻切的窗口」）。曾经有过额度、现在一个都不生效（比如上个月的免费额度过期了）= `Some(0)`，**不是** `None`。例外：有过授信的账户（没充值的，或者充了值又有过花费类额度的）走下面「授信的旧债与新额度分开记」的口径 |
 //! | `credit_limit` | 此刻有效的**授信额度**（`allocations` 里 purpose = `credit_line`、窗口内、没被撤销的）之和，没有 = 0 |
 //! | `rate_windows` | 配了分钟 / 小时上限才有：`Σ (held + spent)` 里归属时刻落在最近 60 秒 / 3600 秒（滑动窗口，不是日历桶：任意一个窗口长度的区间里都不会超过上限）的部分（超出预留的部分按结算时刻算） |
@@ -828,7 +828,7 @@ fn separate_books(
 /// **每个预留的净额都要不为负**（Codex 三复审 Medium）：一个预留在这个账户上的净额 = `Σ (held + spent)`（预留、结算、释放、过期；
 /// 结算那一刻才发生的花费 `late_settle` 另算一笔），触发器和 CHECK 保证它不为负。读到负的是库被改坏了：失败即关闭。
 /// 不能直接用整个账户的 `Σ (held + spent)`——一个被改坏的负净额会抵掉别的预留真实的债务（90 和 -40 并存，只看到 50）。
-/// 有额度时的回放（[`load_spends`]）也是同一条规矩。
+/// 有额度时的回放（[`load_spends`]）也是同一条规矩；不走三本账的账户（视图直接用整个账户的求和）见 [`ensure_no_negative_net`]。
 fn uncovered_without_allowances(conn: &Connection, account: &str) -> Result<i64, LedgerError> {
     let (lowest, total): (i64, i64) = conn.query_row(
         "SELECT COALESCE(MIN(net), 0), COALESCE(SUM(net), 0) FROM (
@@ -845,6 +845,15 @@ fn uncovered_without_allowances(conn: &Connection, account: &str) -> Result<i64,
         )));
     }
     Ok(total)
+}
+
+/// 不走三本账的花钱账户（视图里的 `balance` 是 `充值 - Σ (held + spent)`，`ceiling_remaining` 是额度减窗口里的消耗）也要查每个预留的净额：
+/// 一个被改坏了的预留的负净额会抵掉别的预留真实的占用，余额和额度剩余被抬高（Codex 四复审 Medium：充值 100，两个预留的净额 90 和 30，
+/// 第二个多放掉了 70 变成 -40，整个账户的求和是 50，余额读成 50，本来是 -20）。和 [`uncovered_without_allowances`] 同一条规矩、同一条语句：
+/// 读到负的返回 `Corrupt`，准入和视图都不例外。健康的库里净额都不为负（触发器和 CHECK 保证），所以这条检查从不触发，正常账户的余额、
+/// 授信的口径一个字没变。代价是多读一遍这个账户的分录（按预留分组），约是 `entry_sums` 那一遍的两倍：10 万笔（20 万条分录）的资金账户祖先，一次准入多约 0.1 s（release）；投影随账户历史线性增长这件事（S3-24）没有变。
+fn ensure_no_negative_net(conn: &Connection, account: &str) -> Result<(), LedgerError> {
+    uncovered_without_allowances(conn, account).map(|_| ())
 }
 
 /// 回放的核心（不碰数据库）：`spends`（已经按提交先后排好）一笔一笔找额度。返回（没被额度覆盖的部分之和，每笔额度回放之后的剩余）。
@@ -1014,6 +1023,13 @@ pub(super) fn project_chain_with_books(
         } else {
             None
         };
+        // 没有走三本账、视图直接用整个账户的 `Σ (held + spent)` 的账户（充了值却从没有过额度，或者从没有过授信；`balance` 是 `充值 - 已花`，
+        // 额度窗口里的消耗也是求和）：每个预留的净额同样要不为负，否则一个被改坏了的预留的负净额会抵掉别的预留真实的占用，余额和额度剩余
+        // 被抬高（Codex 四复审 Medium：充值 100，两个预留的净额 90 和 30，第二个被多放掉 70 变成 -40，整个账户的求和是 50，余额读成 50，
+        // 本来是 -20）。走三本账的账户在 `separate_books` 里已经查过；不花钱的账户（平台根、补贴池）没有这样的数字。
+        if books.is_none() && spends_money && (sums.has_funds || ever_had_allocation) {
+            ensure_no_negative_net(conn, id)?;
+        }
         if let Some(books) = &books {
             balance = None;
             ceiling_remaining = Some(money(books.net_position(credit_limit)?));
