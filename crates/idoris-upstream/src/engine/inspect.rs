@@ -3,7 +3,12 @@
 //! workspace `unsafe_code = "forbid"`，取别的进程的启动时间、命令行、监听端口，不能裸调 libproc /
 //! `proc_pidinfo`，也没有已有依赖的安全封装；设计稿 R5 选的办法是用系统工具，与 Agent24
 //! `omlx-kept.ts` 同一套：`kill(pid, 0)` 判存在，`ps -o lstart=` / `command=` / `pgid=`，
-//! `lsof` 判某个 pid 是否监听某个端口。不加新依赖。
+//! `lsof` 判某个 pid 是否监听某个端口。不加新依赖。**这一套仍是所有「问一次」的问题的办法**（管理器的状态变化与监督节拍）。
+//!
+//! 唯一的例外是**每个请求**的那一次确认（IDORIS-CORE S6，Codex 终审 H1 之后的要求：p99 < 5 毫秒、请求路径上不起子进程）：一次
+//! `lsof` 要花约 100 毫秒和一个子进程，每个请求都来一次不可接受。那一问换成原生的监视（[`ProcessInspector::watch_listener`]，
+//! 在 `idoris-sockprobe` 里：macOS 的 libproc、Linux 的 `/proc`）；libproc 在 `libc` 之外没有安全的封装，所以那个 crate 是 workspace
+//! 里**唯一**带 `unsafe` 的地方（一个文件，窄的 `allow`，见它的 crate 文档），别的 crate 一律保持 `forbid`。
 //!
 //! 约定（都照 `omlx-kept.ts`）：
 //! - 工具走绝对路径，环境清空，只给 `PATH`、`TZ=UTC`、`LC_ALL=C`：换时区、换语言，同一个进程读出同一段文本；
@@ -15,9 +20,11 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use idoris_sockprobe as native;
 use tokio::process::Command;
 
 /// 工具的 `PATH`（只用于工具自己找它的辅助程序）。
@@ -49,6 +56,20 @@ pub enum InspectError {
     NoAnswer,
 }
 
+/// 没有原生监视的平台、或原生读不了某个进程时，每个请求的确认退回到那个贵的问题（自有引擎 `lsof`，外部引擎 [`super::ListenerVerifier`]）；
+/// 它的**肯定**答案至多重用这么久（IDORIS-CORE S6）：每个请求一次 `lsof` 要花约 100 毫秒和一个子进程，重用把它压成每秒至多四次，
+/// 代价是「监听者换了」最多晚这么久才被请求路径看到（管理器的监督节拍照常每个节拍问一次，不重用）。
+pub const FALLBACK_TTL: Duration = Duration::from_millis(250);
+
+/// 每个请求的确认（IDORIS-CORE S6）：对**一个**进程的一个端口，问「它此刻还握着这个端口上的一个 LISTEN 套接字吗」。
+/// 引擎管理器登记引擎时建（[`ProcessInspector::watch_listener`]），进程的身份在建的那一刻钉死；必须便宜：不起子进程，不扫别的进程。
+#[async_trait]
+pub trait ListenerWatch: Send + Sync + std::fmt::Debug {
+    /// `Ok(true)`：还握着，绑在客户端连得到的地址上（回环地址或通配）。`Ok(false)`：不再握着（进程没了、pid 被回收成了另一个进程、
+    /// 或者套接字关了）。`Err`：这一次读不出来（调用方问那个贵的问题）。
+    async fn holds(&self) -> Result<bool, InspectError>;
+}
+
 /// 读一个进程的身份。生产用 [`SystemInspector`]；测试可以换成假的，来表达「读不出来」「读出另一个值」。
 #[async_trait]
 pub trait ProcessInspector: Send + Sync {
@@ -75,6 +96,23 @@ pub trait ProcessInspector: Send + Sync {
         Err(InspectError::NoAnswer)
     }
 
+    /// 为**每个请求**的那一次确认建一个原生监视（IDORIS-CORE S6）：引擎管理器登记一个引擎时，守卫（[`super::OwnedListenerGuard`]、
+    /// [`super::ExternalListenerGuard`]）对它的进程建一个，这一刻就钉死进程的身份（启动时间），之后每个发往这个端点的请求只问
+    /// [`ListenerWatch::holds`]：「**这个进程**此刻还握着这个端口上的一个 LISTEN 套接字吗」。它不起子进程、不扫别的进程；「端口上
+    /// 是不是只有它一个监听者」那种贵的问法（`lsof`，[`Self::listens_on`]）留给管理器的监督节拍和每次状态变化。
+    ///
+    /// 缺省没有（`None`）：守卫每个请求问那个贵的问题（测试用的假检查器就这样，它们的回答是编排好的、不花钱）。[`SystemInspector`]
+    /// 返回 macOS 的 libproc、Linux 的 `/proc` 做的监视；别的平台、读不了那个进程（进程没了、不是我们的用户）是 `None`。
+    fn watch_listener(&self, _pid: u32, _port: u16) -> Option<Arc<dyn ListenerWatch>> {
+        None
+    }
+
+    /// 守卫在没有原生监视（或它这一次读不出来）时，那个贵的问题的**肯定**答案可以重用多久。缺省 0：每个请求都问（测试里编排好的假
+    /// 检查器）；[`SystemInspector`] 是 [`FALLBACK_TTL`]。
+    fn fallback_ttl(&self) -> Duration {
+        Duration::ZERO
+    }
+
     /// 进程**正在运行的代码**的签名团队：`codesign --verify <pid>` 通过、再读 `codesign -d --verbose=2 <pid>` 的
     /// `TeamIdentifier`。签名无效、没有签名、ad-hoc 签名（没有团队）都是 `Ok(None)`：它们不是任何团队的代码。
     /// 读 pid 而不读可执行文件路径，是因为进程可以改自己的进程名（oMLX 把自己改名为 `omlx-server`，`ps` 的 `comm`
@@ -94,6 +132,8 @@ pub struct SystemInspector {
     ps_timeout: Duration,
     lsof_timeout: Duration,
     codesign_timeout: Duration,
+    /// 用原生的监视（libproc、`/proc`）做每个请求的确认；`false` 时一律走那个贵的问题，肯定的答案重用至多 [`FALLBACK_TTL`]。
+    native_probe: bool,
 }
 
 impl Default for SystemInspector {
@@ -114,16 +154,25 @@ impl SystemInspector {
             ps_timeout: Duration::from_secs(2),
             lsof_timeout: Duration::from_secs(3),
             codesign_timeout: Duration::from_secs(10),
+            native_probe: true,
         }
     }
 
-    /// 换掉工具路径（测试用：假 `ps` / `lsof` 脚本）。
+    /// 换掉工具路径（测试用：假 `ps` / `lsof` 脚本）。换了工具就是要用工具：原生的监视关掉（要的话再 [`Self::with_native_probe`]）。
     pub fn with_tools(ps: impl Into<PathBuf>, lsof: impl Into<PathBuf>) -> Self {
         Self {
             ps: ps.into(),
             lsof: vec![lsof.into()],
+            native_probe: false,
             ..Self::new()
         }
+    }
+
+    /// 开、关每个请求的确认用的原生监视（见 [`ProcessInspector::watch_listener`]）。关掉就是没有原生监视的平台上的样子：每个请求问那个
+    /// 贵的问题（自有引擎 `lsof`），肯定的答案重用至多 [`FALLBACK_TTL`]。
+    pub fn with_native_probe(mut self, native_probe: bool) -> Self {
+        self.native_probe = native_probe;
+        self
     }
 
     pub fn with_timeouts(mut self, ps: Duration, lsof: Duration) -> Self {
@@ -242,6 +291,18 @@ impl ProcessInspector for SystemInspector {
             .map_err(|_| InspectError::NoAnswer)
     }
 
+    fn watch_listener(&self, pid: u32, port: u16) -> Option<Arc<dyn ListenerWatch>> {
+        if !self.native_probe {
+            return None;
+        }
+        let watch = native::ListenerWatch::establish(pid, port)?;
+        Some(Arc::new(NativeWatch { watch }))
+    }
+
+    fn fallback_ttl(&self) -> Duration {
+        FALLBACK_TTL
+    }
+
     async fn signing_team(&self, pid: u32) -> Result<Option<String>, InspectError> {
         let pid = OsString::from(pid.to_string());
         let verified = run_tool(
@@ -266,6 +327,29 @@ impl ProcessInspector for SystemInspector {
         }
         Ok(super::discovery::team_identifier(&described.stderr)
             .or_else(|| super::discovery::team_identifier(&described.stdout)))
+    }
+}
+
+/// 原生的监视：两三次系统调用，没有子进程（macOS 的 libproc、Linux 的 `/proc`）。原生读不了这个进程（权限、意外的错误）是 `Err`：
+/// 守卫这一次问那个贵的问题。系统调用是同步的、微秒级，直接在任务里做（不值得 `spawn_blocking`）。
+#[derive(Debug)]
+struct NativeWatch {
+    watch: native::ListenerWatch,
+}
+
+#[async_trait]
+impl ListenerWatch for NativeWatch {
+    async fn holds(&self) -> Result<bool, InspectError> {
+        answer_of(self.watch.check())
+    }
+}
+
+/// 探针的答案到守卫的答案：读不了（`Unavailable`）**不是**「是」，也不是「不是」，是「读不出来」（守卫这一次问那个贵的问题）。
+fn answer_of(probe: native::Probe) -> Result<bool, InspectError> {
+    match probe {
+        native::Probe::Holds => Ok(true),
+        native::Probe::NotHolding => Ok(false),
+        native::Probe::Unavailable => Err(InspectError::NoAnswer),
     }
 }
 
@@ -921,5 +1005,173 @@ mod tests {
             seen.starts_with("UTC|C|/usr/bin:/bin:/usr/sbin:/sbin|"),
             "{seen}"
         );
+    }
+
+    /// A fake `lsof` that records every invocation (one line per call in `calls.log`) and answers "pid 4242 listens on 127.0.0.1".
+    fn counting_lsof(dir: &Path) -> (PathBuf, PathBuf) {
+        let log = dir.join("calls.log");
+        let lsof = script(
+            dir,
+            "lsof-counting",
+            &format!(
+                "echo called >> '{}'\nprintf 'p4242\\nn127.0.0.1:19999\\n'",
+                log.display()
+            ),
+        );
+        (lsof, log)
+    }
+
+    fn calls(log: &Path) -> usize {
+        std::fs::read_to_string(log).map_or(0, |text| text.lines().count())
+    }
+
+    /// IDORIS-CORE S6 (main session's follow-up): the per-request check starts **no child process**. The inspector is built with a fake
+    /// `lsof` that counts its invocations; a watch on a real listener of this process answers every request natively (held while the
+    /// listener is open, not held on the very next call once it is closed) and the fake tool is never run.
+    #[tokio::test]
+    async fn the_per_request_watch_spawns_no_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lsof, log) = counting_lsof(dir.path());
+        let ps = script(dir.path(), "ps", "exit 1");
+        let inspector = with_fake_tools(ps, lsof).with_native_probe(true);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let watch = inspector.watch_listener(std::process::id(), port).unwrap();
+        for _ in 0..50 {
+            assert_eq!(watch.holds().await, Ok(true));
+        }
+        drop(listener);
+        assert_eq!(
+            watch.holds().await,
+            Ok(false),
+            "the very next request sees the released port"
+        );
+        assert_eq!(watch.holds().await, Ok(false));
+        assert_eq!(
+            calls(&log),
+            0,
+            "a child process was started on the request path"
+        );
+    }
+
+    /// With the native probe off (a platform without one) the guard asks the expensive question, `lsof`, and reuses a **yes** for at most
+    /// [`FALLBACK_TTL`]: many requests inside the window cost one `lsof`, a request after it asks again, and an `lsof` that cannot answer is
+    /// neither reused nor mistaken for a yes.
+    #[tokio::test]
+    async fn without_the_native_probe_the_guard_asks_lsof_at_most_once_per_window() {
+        use crate::engine::OwnedListenerGuard;
+        use crate::omlx::key::{EndpointGuard, Verification};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls.log");
+        let answer = dir.path().join("answer");
+        std::fs::write(&answer, "p4242\nn127.0.0.1:19999\n").unwrap();
+        let lsof = script(
+            dir.path(),
+            "lsof-scripted",
+            &format!(
+                "echo called >> '{}'\nif [ -f '{}' ]; then cat '{}'; else exit 2; fi",
+                log.display(),
+                answer.display(),
+                answer.display()
+            ),
+        );
+        let ps = script(dir.path(), "ps", "exit 1");
+        let inspector = Arc::new(with_fake_tools(ps, lsof).with_native_probe(false));
+        assert!(inspector.watch_listener(4242, 19999).is_none());
+        assert_eq!(inspector.fallback_ttl(), FALLBACK_TTL);
+        let guard = OwnedListenerGuard::new(inspector, 4242, 19999);
+        for _ in 0..20 {
+            assert_eq!(guard.verify().await, Verification::Verified);
+        }
+        assert_eq!(calls(&log), 1, "twenty requests inside the window");
+        tokio::time::sleep(FALLBACK_TTL + Duration::from_millis(100)).await;
+        assert_eq!(guard.verify().await, Verification::Verified);
+        assert_eq!(calls(&log), 2, "a request after the window asks again");
+        // The tool stops answering: not reused past its window, not a yes; asked twice (the one retry), and again on the next request.
+        std::fs::remove_file(&answer).unwrap();
+        tokio::time::sleep(FALLBACK_TTL + Duration::from_millis(100)).await;
+        assert_eq!(guard.verify().await, Verification::Unverifiable);
+        assert_eq!(calls(&log), 4);
+        assert_eq!(guard.verify().await, Verification::Unverifiable);
+        assert_eq!(calls(&log), 6);
+    }
+
+    /// The probe's three answers and what the guard makes of them: only "holds" is a yes, only "not holding" is a no, and a probe that could
+    /// not read the process is neither (the guard asks the expensive question instead).
+    #[test]
+    fn the_probes_answers_map_to_yes_no_and_unreadable() {
+        assert_eq!(answer_of(native::Probe::Holds), Ok(true));
+        assert_eq!(answer_of(native::Probe::NotHolding), Ok(false));
+        assert_eq!(
+            answer_of(native::Probe::Unavailable),
+            Err(InspectError::NoAnswer)
+        );
+    }
+
+    /// The reuse window of the fallback is short: at most a quarter of a second (spec errata ten (8) writes this number down).
+    #[test]
+    fn the_fallback_reuse_window_is_at_most_a_quarter_of_a_second() {
+        assert!(FALLBACK_TTL <= Duration::from_millis(250));
+        assert!(FALLBACK_TTL > Duration::ZERO);
+    }
+
+    /// No watch is offered for what cannot be watched: the native probe switched off, a pid that is never an engine, a process that is not
+    /// there; and the trait's own default (the fakes of the tests) offers none and reuses nothing.
+    #[tokio::test]
+    async fn no_watch_is_offered_for_what_cannot_be_watched() {
+        // Fake tools mean the tools are what is asked: no native watch unless it is asked for.
+        assert!(
+            SystemInspector::with_tools("/bin/ps", "/usr/sbin/lsof")
+                .watch_listener(std::process::id(), 1)
+                .is_none()
+        );
+        let on = SystemInspector::new();
+        assert!(on.watch_listener(std::process::id(), 1).is_some());
+        assert!(on.watch_listener(0, 1).is_none());
+        assert!(on.watch_listener(1, 1).is_none());
+        assert!(on.watch_listener(u32::MAX, 1).is_none());
+        assert!(
+            SystemInspector::new()
+                .with_native_probe(false)
+                .watch_listener(std::process::id(), 1)
+                .is_none()
+        );
+        // A process that has exited.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(on.watch_listener(pid, 1).is_some());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(on.watch_listener(pid, 1).is_none());
+    }
+
+    /// An inspector that does not offer a watch (the default; the fakes of the tests) leaves the guards on the per-request `listens_on`.
+    #[tokio::test]
+    async fn an_inspector_without_a_watch_offers_none() {
+        struct Bare;
+        #[async_trait]
+        impl ProcessInspector for Bare {
+            fn pid_state(&self, _pid: u32) -> PidState {
+                PidState::Alive
+            }
+            async fn start_time(&self, _pid: u32) -> Result<String, InspectError> {
+                Err(InspectError::NoAnswer)
+            }
+            async fn command(&self, _pid: u32) -> Result<String, InspectError> {
+                Err(InspectError::NoAnswer)
+            }
+            async fn process_group(&self, _pid: u32) -> Result<u32, InspectError> {
+                Err(InspectError::NoAnswer)
+            }
+            async fn listens_on(&self, _pid: u32, _port: u16) -> Result<bool, InspectError> {
+                Ok(true)
+            }
+        }
+        assert!(Bare.watch_listener(1234, 80).is_none());
+        assert_eq!(Bare.fallback_ttl(), Duration::ZERO);
     }
 }

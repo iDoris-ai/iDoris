@@ -75,7 +75,9 @@ pub use discovery::{
 // 「0700、自己的真目录」规则：crate 内可见，不是公开 API。
 pub(crate) use fsutil::{DirError, effective_uid, ensure_private_dir};
 pub use guard::{ExternalListenerGuard, OwnedListenerGuard};
-pub use inspect::{InspectError, PidState, ProcessInspector, SystemInspector};
+pub use inspect::{
+    FALLBACK_TTL, InspectError, ListenerWatch, PidState, ProcessInspector, SystemInspector,
+};
 pub use instance::{ENGINES_OWNED_DIR, EngineInstance, InstanceError, LOGS_DIR, RECORD_EXTENSION};
 pub use key::{ENGINE_KEY_HEX_LEN, EngineKey, KeyError};
 pub use launch::{

@@ -138,6 +138,11 @@ impl ListenerVerifier {
         }
     }
 
+    /// 这个校验器用的检查器：守卫（[`super::ExternalListenerGuard`]）从它为每个被校验的监听者建每个请求的监视。
+    pub fn inspector(&self) -> &Arc<dyn ProcessInspector> {
+        &self.inspector
+    }
+
     fn cached(&self, pid: u32, started_at: &str) -> bool {
         self.verified
             .lock()

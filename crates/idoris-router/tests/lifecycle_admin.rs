@@ -41,8 +41,8 @@ use idoris_router::runtime::RuntimeRegistry;
 use idoris_router::swap::SwapApp;
 use idoris_router::{AppState, build_app};
 use idoris_upstream::engine::{
-    CodesignPolicy, InspectError, ListenerPolicy, PidState, ProcessInspector, StopOnExit,
-    SystemInspector,
+    CodesignPolicy, InspectError, ListenerPolicy, ListenerWatch, PidState, ProcessInspector,
+    StopOnExit, SystemInspector,
 };
 use idoris_upstream::omlx::key::{
     EndpointKey, endpoint_generation, forget_endpoint, governed_endpoint,
@@ -108,6 +108,21 @@ struct Scripted {
     lost: Mutex<Vec<u16>>,
     /// `listens_on` 一律读不出来（`lsof` 不答；Codex 终审 H1：读不出来也不发）。
     unreadable: AtomicBool,
+    /// `watch_listener` 给一个永远回「进程还握着它的套接字」的原生监视（IDORIS-CORE S6，每个请求的确认不起子进程之后）：引擎自己的 LISTEN
+    /// 套接字还在、另一个进程也在这个端口上监听——每个请求的确认看不见，管理器的监督节拍问的「唯一的监听者」看得见（`lose`）。要在管理器登记引擎
+    /// **之前**打开（守卫建的时候问一次）。缺省 `false`：没有监视，守卫每个请求问一次 `listens_on`（H1 的那些用例就是这样）。
+    native_always_holds: AtomicBool,
+}
+
+/// 永远说「还握着」的原生监视（[`Scripted::offer_a_native_watch_that_always_holds`]）。
+#[derive(Debug)]
+struct StillHolds;
+
+#[async_trait]
+impl ListenerWatch for StillHolds {
+    async fn holds(&self) -> Result<bool, InspectError> {
+        Ok(true)
+    }
 }
 
 impl Scripted {
@@ -120,7 +135,14 @@ impl Scripted {
             start_times: Mutex::new(BTreeMap::new()),
             lost: Mutex::new(Vec::new()),
             unreadable: AtomicBool::new(false),
+            native_always_holds: AtomicBool::new(false),
         })
+    }
+
+    /// 从现在起建的守卫带一个永远说「还握着」的原生监视。
+    fn offer_a_native_watch_that_always_holds(&self) {
+        self.native_always_holds
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 从现在起（或不再）`listens_on` 读不出来。
@@ -207,6 +229,11 @@ impl ProcessInspector for Scripted {
     }
     async fn signing_team(&self, pid: u32) -> Result<Option<String>, InspectError> {
         Ok(self.teams.lock().unwrap().get(&pid).cloned())
+    }
+    fn watch_listener(&self, _pid: u32, _port: u16) -> Option<Arc<dyn ListenerWatch>> {
+        self.native_always_holds
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then(|| Arc::new(StillHolds) as Arc<dyn ListenerWatch>)
     }
 }
 
@@ -3374,6 +3401,206 @@ async fn h1_a_listener_switched_before_the_registration_is_revoked_gets_nothing_
     for request in impostor.requests().await {
         assert!(!format!("{:?}", request.headers).contains(&private_key));
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// H1 之后（主会话的要求）：每个请求的确认 p99 < 5 毫秒、请求路径上不起子进程；贵的「唯一的监听者」留给监督节拍
+// ---------------------------------------------------------------------------------------------
+
+/// 一个替身 `ps` / `lsof`：每被运行一次往 `log` 里追加一行，然后运行真的那个。请求路径上起了子进程，就会在 `log` 里留下一行。
+fn counting_tool(
+    dir: &std::path::Path,
+    name: &str,
+    real: &[&str],
+    log: &std::path::Path,
+) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let mut body = format!("#!/bin/sh\necho {name} >> '{}'\n", log.display());
+    for candidate in real {
+        body.push_str(&format!("[ -x {candidate} ] && exec {candidate} \"$@\"\n"));
+    }
+    body.push_str("exit 127\n");
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn tool_calls(log: &std::path::Path) -> usize {
+    std::fs::read_to_string(log).map_or(0, |text| text.lines().count())
+}
+
+/// 等到工具调用数 300 毫秒内不再变（引擎落定、门控放行之后管理器还在做的那几次 `ps`）：之后的增量只能是后来的东西起的。
+async fn settled_tool_calls(log: &std::path::Path) -> usize {
+    let mut last = tool_calls(log);
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = tool_calls(log);
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+}
+
+/// **每个请求的确认不起子进程，并且在下一个请求就看见引擎放掉了端口**（真的 `SystemInspector`：原生监视，不是编排的检查器）。
+///
+/// 检查器是真的，`ps` 与 `lsof` 换成会数自己被运行了几次的替身（运行完还是真的那个）：引擎落定、门控放行之后，一串聊天请求不让它们多运行一次；
+/// 管理器的监督被拉到小时级，所以挡在引擎的私有 key 与端口之间的只有每个请求的确认。引擎放掉端口（进程还活着），冒名者绑上来：聊天、公共模型
+/// 列表、Admin 的模型观察都在发送前被拒，冒名者**一个请求**也没有收到，更没有 `Authorization`；拒绝同样没有起子进程。
+#[tokio::test]
+async fn h1_the_per_request_check_starts_no_child_process_and_the_very_next_request_sees_the_engine_let_go_of_its_port()
+ {
+    if !in_a_child_with_canary_keys(
+        "h1_the_per_request_check_starts_no_child_process_and_the_very_next_request_sees_the_engine_let_go_of_its_port",
+    ) {
+        return;
+    }
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let endpoint = rig.endpoint();
+    let tools = tempfile::tempdir().unwrap();
+    let log = tools.path().join("calls.log");
+    let ps = counting_tool(tools.path(), "ps", &["/bin/ps"], &log);
+    let lsof = counting_tool(
+        tools.path(),
+        "lsof",
+        &["/usr/sbin/lsof", "/usr/bin/lsof"],
+        &log,
+    );
+    let inspector = Arc::new(
+        SystemInspector::with_tools(ps, lsof)
+            .with_timeouts(PATIENT, PATIENT)
+            .with_native_probe(true),
+    );
+    let full = Full::start_with(rig, inspector, supervision_paused()).await;
+    full.wait_open().await;
+    assert_eq!(
+        full.chat().await.0,
+        StatusCode::OK,
+        "it serves before the engine lets go"
+    );
+    let private_key = full.rig.key(0);
+    let settled = settled_tool_calls(&log).await;
+    assert!(
+        settled >= 1,
+        "the manager asked the tools at the state changes"
+    );
+
+    // 一串请求：每个都在发送前经守卫重新确认，一个子进程也没有起。
+    for _ in 0..30 {
+        assert_eq!(full.chat().await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        tool_calls(&log),
+        settled,
+        "a child process (ps or lsof) was started on the request path"
+    );
+
+    // 引擎放掉端口、不退出；冒名者绑上。管理器没有注意到（节拍被暂停）：登记表里还是引擎的私有 key，状态还是 `ready`。
+    full.rig.fake.release_port();
+    let impostor = Impostor::on_port(port).await;
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Private(private_key.clone())),
+        "the manager has not noticed: only the per-request check stands between the key and the new listener"
+    );
+    assert_eq!(full.health.view().upstreams[0].state, UpstreamState::Ready);
+
+    let (status, _) = full.chat().await;
+    assert_ne!(status, StatusCode::OK, "the very next chat request");
+    let (status, body) = full.data("GET", "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"], json!([]), "{body}");
+    let (status, body) = full.admin("GET", "/admin/api/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let source = body["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["provider_id"] == "omlx")
+        .unwrap_or_else(|| panic!("no source for omlx: {body}"));
+    assert_eq!(source["error"], "unavailable", "{source}");
+
+    assert_eq!(
+        impostor.count().await,
+        0,
+        "not one request reached the new listener"
+    );
+    impostor.assert_never_authorized().await;
+    for request in impostor.requests().await {
+        assert!(!format!("{:?}", request.headers).contains(&private_key));
+    }
+    assert_eq!(
+        tool_calls(&log),
+        settled,
+        "refusing the requests started no child process either"
+    );
+}
+
+/// **一个并存的监听者，由监督节拍的「唯一的监听者」问题抓到，之后没有一个请求发给那个端口。** 引擎自己的 LISTEN 套接字还在（每个请求的原生确认
+/// 永远说「还握着」），另一个进程也在这个端口上监听（`lose`：`listens_on` 回 `false`）。每个请求的确认看不见它，那是它的窗口（规范勘误十（8）：
+/// 「自上一个节拍起」）；管理器的下一个节拍问「唯一的监听者」，收回私有 key、端点封上、状态 `unavailable`（`port_in_use`）。之后聊天、公共模型列表、
+/// Admin 的模型观察都不再发往那个端口（引擎的请求记录不再增加），好几个节拍里也没有探测带着 key 过去。
+#[tokio::test]
+async fn h1_a_second_listener_next_to_the_engines_own_socket_is_caught_within_a_tick_and_nothing_is_sent_to_the_port_after_it()
+ {
+    if !in_a_child_with_canary_keys(
+        "h1_a_second_listener_next_to_the_engines_own_socket_is_caught_within_a_tick_and_nothing_is_sent_to_the_port_after_it",
+    ) {
+        return;
+    }
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let endpoint = rig.endpoint();
+    let inspector = Scripted::claiming(port);
+    inspector.offer_a_native_watch_that_always_holds();
+    let full = Full::start(rig, inspector.clone()).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Private(full.rig.key(0))),
+        "the engine is registered with its private key"
+    );
+
+    // 另一个进程也监听了这个端口；引擎自己的套接字没动。
+    inspector.lose(port);
+
+    // 下一个节拍的「唯一的监听者」问题抓到它：收回私有 key、`unavailable` 加 `port_in_use`。
+    wait_for("unavailable, port_in_use", || {
+        let upstream = &full.health.view().upstreams[0];
+        upstream.state == UpstreamState::Unavailable
+            && upstream.reason == Some(UpstreamReason::PortInUse)
+    })
+    .await;
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Blocked),
+        "the tick revoked the private key"
+    );
+    assert!(
+        full.logged("收回私有 key") >= 1,
+        "it was the supervision tick that noticed"
+    );
+
+    // 之后：不再有任何请求发往那个端口。
+    let before = full.rig.fake.requests().len();
+    let (status, body) = full.chat().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let (status, body) = full.data("GET", "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"], json!([]), "{body}");
+    let (status, body) = full.admin("GET", "/admin/api/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // 好几个节拍（`fast()` 是 50 毫秒一次）：管理器自己也不带 key 探测它。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        full.rig.fake.requests().len(),
+        before,
+        "a request reached the port after the tick revoked the key: {:?}",
+        full.rig.fake.requests()
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
