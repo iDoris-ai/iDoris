@@ -212,6 +212,32 @@ mod tests {
         assert_eq!(watch.check(), Probe::NotHolding);
     }
 
+    /// Requests are concurrent: many threads ask one watch at once. Every answer is right while the listener is open and while it is closed (the
+    /// shared descriptor hint is only a hint: it is validated by every check, and no lock is held across a system call).
+    #[test]
+    fn concurrent_checks_agree_and_follow_the_listener_closing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let watch = std::sync::Arc::new(watch(port));
+        let ask = |expected: Probe| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let watch = watch.clone();
+                    std::thread::spawn(move || (0..2_000).all(|_| watch.check() == expected))
+                })
+                .collect();
+            for thread in threads {
+                assert!(
+                    thread.join().unwrap(),
+                    "a concurrent check said something other than {expected:?}"
+                );
+            }
+        };
+        ask(Probe::Holds);
+        drop(listener);
+        ask(Probe::NotHolding);
+    }
+
     /// A process that has died but has not been reaped yet (a zombie) holds nothing: no watch is established for it.
     #[test]
     fn a_zombie_holds_nothing() {

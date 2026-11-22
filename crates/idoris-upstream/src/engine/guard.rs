@@ -697,4 +697,34 @@ mod tests {
         );
         assert_eq!(fake.listeners_asked(), 2);
     }
+
+    /// Requests are concurrent: many racing callers share one guard and its reuse window. Every one is answered, nothing deadlocks or
+    /// poisons, and the expensive question is asked at most once per caller (after a caller's own first answer the window is open for it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_requests_share_one_reuse_window() {
+        let fake = Fake::new();
+        fake.reuse_for(Duration::from_secs(60));
+        fake.script_listens(vec![Ok(true)]);
+        let guard = Arc::new(OwnedListenerGuard::new(fake.clone(), 42, 19731));
+        let tasks: Vec<_> = (0..32)
+            .map(|_| {
+                let guard = guard.clone();
+                tokio::spawn(async move {
+                    let mut all = true;
+                    for _ in 0..50 {
+                        all &= guard.verify().await == Verification::Verified;
+                    }
+                    all
+                })
+            })
+            .collect();
+        for task in tasks {
+            assert!(task.await.unwrap());
+        }
+        assert!(
+            fake.listens_asked() <= 32,
+            "asked {} times for 32 callers",
+            fake.listens_asked()
+        );
+    }
 }
