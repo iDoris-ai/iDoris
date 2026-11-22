@@ -1121,6 +1121,33 @@ mod tests {
     }
 
     #[test]
+    fn a_window_is_closed_at_its_start_and_open_at_its_end() {
+        // 手算：一笔额度 [10, 20)，容量 100，在所有花费之前创建、没撤销。花费按提交先后：
+        //   at 9  金额 5：窗口还没开始，额度之外 5
+        //   at 10 金额 7：正好在起点，覆盖（左闭）
+        //   at 19 金额 3：窗口里面，覆盖
+        //   at 20 金额 11：正好在终点，不覆盖（右开）：额度之外 11
+        // 额度之外一共 5 + 11 = 16，额度剩余 100 - 7 - 3 = 90。索引和线性回放都一样。
+        let buckets = [Bucket {
+            from: 10,
+            until: 20,
+            capacity: 100,
+            created_after: 0,
+            revoked_after: None,
+        }];
+        let spends = [(9, 5), (10, 7), (19, 3), (20, 11)].map(|(at, amount)| Spend {
+            at,
+            first_entry: at + 1,
+            amount,
+        });
+        for limit in [WindowIndex::MAX_ENTRIES, 0] {
+            let (uncovered, left) = replay_spends(&buckets, &spends, limit).unwrap();
+            assert_eq!(uncovered, 16, "index limit {limit}");
+            assert_eq!(left, [90], "index limit {limit}");
+        }
+    }
+
+    #[test]
     fn an_absurd_number_of_overlapping_windows_is_not_indexed() {
         // 1 500 笔窗口各自在不同的时刻开始、同一时刻结束：第 j 个边界上有 j 笔同时生效，快照总量 ≈ 112 万，超过上限：不建，
         // 回放退回线性扫描（结果一样）

@@ -1839,6 +1839,65 @@ fn an_unexpired_overage_booked_whole_in_the_old_shape_is_split_when_the_books_ar
 }
 
 #[test]
+fn an_old_shape_overage_is_counted_once_not_in_both_the_reservation_and_the_overage() {
+    // 旧格式 `settle` 里整笔 200 = 预留之内 100 + 超出 100。读的时候把超出的 100 分出来记在结算时刻，预留本身就只剩 100；分出来之后
+    // 没从预留本身扣掉，这 100 就被算了两遍（预留 200 + 超出 100 = 300）。授信 100 时债务被授信额度夹住，两种读法的净头寸一样，看不出来
+    // （上面那条测试用的就是授信 100）；授信 300 不夹，债务是 100 还是 200 才分得开。
+    //
+    // 授信 300，额度 100 的窗口从 T0 + 10 起（T0 + 5 创建）；T0 + 9 预留 100，T0 + 10 按 200 结算（超出 100）；分录改回 v0.5.0 的写法。
+    // 读：预留之内的 100 在 T0 + 9，额度够不着：债务 100；超出的 100 在 T0 + 10，额度覆盖，剩余 0。净头寸 0 - min(100, 300) = -100，
+    // 能花 -100 + 300 = 200。算了两遍：债务 200、额度 0，净头寸 -200，能花 100。
+    // 端到端：再来一笔 200 整笔放行（能花的 200 正好用完），之后再来一笔拒绝。
+    let db = TempDb::new("books-legacy-overage-once");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 300, T0);
+    prepaid(&store, "emp-new", 100, T0 + 10, T0 + 10 + 30 * DAY, T0 + 5);
+    let first = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 9);
+    assert_eq!(
+        admit(&store, &first)
+            .admitted()
+            .map(|a| a.reservation.price.micros()),
+        Some(100)
+    );
+    settle_at(&store, &first, 200, T0 + 10);
+    drop(store);
+    rewrite_overage_as_v0_5_0(&db, "r-1#0");
+
+    let store = AccountStore::open(db.path()).unwrap();
+    let v = view(&store, T0 + 11);
+    assert_eq!(
+        v.ceiling_remaining,
+        Some(thb(-100)),
+        "allowance 0 - debt 100, the overage is counted once"
+    );
+    assert_eq!(headroom(&v), 200);
+    let books = check_books(&store, &db, "emp", T0 + 11);
+    assert_eq!(
+        (books.allowance_left, books.covered, books.credit_debt),
+        (0, 100, 100)
+    );
+    let big = Req::new(&store, "r-2", 0, "cred-e", 95).at(T0 + 12);
+    let decision = admit(&store, &big);
+    assert!(
+        matches!(decision, AdmissionDecision::Allow { .. }),
+        "200 fits in what is left, whole: {decision:?}"
+    );
+    assert_eq!(
+        decision.admitted().map(|a| a.reservation.price.micros()),
+        Some(200),
+        "{decision:?}"
+    );
+    let none = Req::new(&store, "r-3", 0, "cred-e", M30).at(T0 + 13);
+    let rejected = admit(&store, &none);
+    assert_eq!(
+        denied(&rejected),
+        Some(ReasonCode::BudgetExhausted),
+        "{rejected:?}"
+    );
+    assert_clean(&store);
+}
+
+#[test]
 fn a_credit_line_raised_inside_the_ttl_covers_the_overage_of_a_grace_round_instead_of_freezing_the_credential()
  {
     // Codex 复审（2026-11-22，7c5a03fe）High 2，没充值的账户（main 上就有）：担保人能吸收多少，要在预留之内的部分记账**之后**读，
