@@ -1494,6 +1494,36 @@ fn card_of(yaml: &str) -> ComponentCard {
     serde_yaml::from_str(yaml).unwrap()
 }
 
+/// #633 评审：目录里已有一张只差大小写的卡（`LM.yaml`，`provider.id: lm`），再 `setup upstream --id lm`（文件名 `lm.yaml`）。
+/// 大小写不敏感的文件系统上它们是同一个文件，大小写敏感的文件系统上是两个文件而 serve 会因重复的 id 起不来；
+/// 两种情况都在写入之前拒绝（`validation_failed`），带不带 `--force` 都一样，目录一个字节不变。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_existing_card_differing_only_in_case_from_the_new_file_is_refused_with_or_without_force()
+ {
+    let server = upstream(&[MODEL]).await;
+    for force in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("components");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("LM.yaml"), card_yaml("lm")).unwrap();
+        let before = files(&out);
+        let mut args = vec!["--bind", "daily=qwen3-8b", "--id", "lm"];
+        if force {
+            args.push("--force");
+        }
+        let result = setup(&server.uri(), &out, &args).await;
+        assert_eq!(err_code(&result), "validation_failed", "force={force}");
+        assert!(
+            result.json["message"].as_str().unwrap().contains("LM.yaml"),
+            "{}",
+            result.stdout
+        );
+        assert_eq!(files(&out), before, "force={force}");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+        assert!(requests(&server).await.is_empty(), "撞名在探测之前就拒绝");
+    }
+}
+
 /// 检查之后才出现的同名文件不被盖掉：`write_added` 自己再核对一次（`hard_link` 遇到已存在的目标失败），不靠前面的检查。
 #[test]
 fn a_same_named_file_that_appears_after_the_checks_is_not_overwritten() {
