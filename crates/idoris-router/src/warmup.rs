@@ -1540,7 +1540,8 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
             capability: Capability::Chat,
             target: "model",
             started: Instant::now(),
-            generation: 0,
+            // 引擎登记表是进程全局的、代际只增不减，而端口会被别的用例复用：取这个端点此刻的代际，不假设是 0（同 `handle`）。
+            generation: idoris_upstream::omlx::key::endpoint_generation(&upstream.uri()),
             coalesced: &coalesced,
         };
         warm_resident(&state, &selected, &job).await.unwrap();
@@ -1845,7 +1846,8 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
             capability: Capability::Chat,
             target: "model",
             started: Instant::now(),
-            generation: 0,
+            // 引擎登记表是进程全局的、代际只增不减，而端口会被别的用例复用：取这个端点此刻的代际，不假设是 0（同 `handle`）。
+            generation: idoris_upstream::omlx::key::endpoint_generation(&upstream.uri()),
             coalesced: &coalesced,
         };
         warm_resident(&state, &selected, &job).await.unwrap();
