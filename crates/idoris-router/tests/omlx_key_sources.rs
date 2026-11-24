@@ -5,6 +5,10 @@
 //! key 来自进程环境，所以每个用例在子进程里跑（同 `resident_omlx_key.rs`），HOME 指向临时假目录。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+use state_isolation::IsolateState;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -240,7 +244,7 @@ async fn omlx_key_sources_on_the_connection_paths() {
         if let Some(key) = env_key {
             cmd.env(KEY_ENV, key);
         }
-        let output = cmd.output().unwrap();
+        let output = cmd.isolate_state().output().unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = std::fs::remove_dir_all(&home);

@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use child_guard::ChildGuard;
+use child_guard::{ChildGuard, IsolateState};
 use fake_omlx::{Behavior, FakeOmlx, spawn_retrying};
 use serde_json::{Value, json};
 use wiremock::{
@@ -274,6 +274,7 @@ impl Env {
         for (name, value) in &self.extra_env {
             command.env(name, value);
         }
+        command.isolate_state();
         command
     }
 

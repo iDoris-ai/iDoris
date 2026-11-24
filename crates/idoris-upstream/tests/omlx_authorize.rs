@@ -625,6 +625,7 @@ mod dial {
             call_timeout: Duration::from_secs(5),
         })
         .unwrap()
+        .with_load_fence_path(idoris_backend::mock::temporary_load_fence_path())
         .with_per_request_key()
     }
 
