@@ -68,7 +68,6 @@ fn an_endpoint_is_identified_by_scheme_host_and_port_only() {
         // loopback 的别名是同一个端点：不能靠换一种写法绕开登记表。
         ("http://127.0.0.1:8088", "http://localhost:8088"),
         ("http://127.0.0.1:8088", "http://localhost.:8088/v1"),
-        ("http://127.0.0.1:8088", "http://[::1]:8088"),
     ] {
         assert_eq!(endpoint_identity(a), endpoint_identity(b), "{a} / {b}");
         assert!(endpoint_identity(a).is_some());
@@ -82,6 +81,8 @@ fn an_endpoint_is_identified_by_scheme_host_and_port_only() {
         "http://127.0.0.1:19732",
         "http://127.0.0.2:19731",
         "http://localhost:19732",
+        // IPv6 的 loopback 上可以是另一个进程：不并入。
+        "http://[::1]:19731",
         "https://localhost:19731",
         "https://127.0.0.1:19731",
     ] {

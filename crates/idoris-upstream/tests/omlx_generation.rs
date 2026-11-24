@@ -229,7 +229,12 @@ async fn a_cached_admin_session_is_not_used_after_the_engine_was_replaced_mid_lo
     };
     let swap = async {
         // Replace the engine only once the second load's POST has reached it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while load_posts(&server.received_requests().await.unwrap()) < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the second load's POST never reached the engine"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         govern_endpoint(&endpoint, EndpointKey::Private("second-engine".into()));
