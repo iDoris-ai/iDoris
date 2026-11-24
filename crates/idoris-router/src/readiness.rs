@@ -40,6 +40,7 @@
 //! （单次调用上限是 `adapter_call_timeout`，默认 30 秒）。期间数据面照常服务（没有托管卡时行为不变，规范 §2.7.6）。
 //! `status` 仍恒为 `"ok"`。
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -137,6 +138,24 @@ pub struct ManagedFailure {
     pub engine_kind: String,
     pub state: UpstreamState,
     pub reason: Option<UpstreamReason>,
+}
+
+/// 一个托管上游处于这个状态与原因时，数据面是不是该把请求交给它（IDORIS-CORE S6，G1；接口规范 §2.7.6 勘误六（9）、勘误十）。
+///
+/// 只有就绪的才交；正在拉起（`starting`、`restarting`）、没有引擎（`absent`）、失败（`failed`，含外部引擎的端口换了主人：
+/// `port_in_use`）、被停下（`stopped`）的不交：请求不碰那个端口，直接 503 带原因。`unavailable` 要看有没有确定的原因：
+/// 有（要 key、key 被拒、围栏还在、Supervisor 粘滞、等不到就绪）是确定的失败，不交；没有（引擎活着、探测没答上来，例如 oMLX
+/// 正忙着加载大模型，`/v1/models` 变慢）还是交：那只是慢，Supervisor 自己的调用有超时，不能因为一次探测慢就让整张卡 503。
+pub fn upstream_serves(state: UpstreamState, reason: Option<UpstreamReason>) -> bool {
+    match state {
+        UpstreamState::Ready => true,
+        UpstreamState::Unavailable => reason.is_none(),
+        UpstreamState::Starting
+        | UpstreamState::Restarting
+        | UpstreamState::Failed
+        | UpstreamState::Stopped
+        | UpstreamState::Absent => false,
+    }
 }
 
 /// `/health.upstreams[]` 的元素。`reason` 出现时 `state` 不是 `ready`。
@@ -259,6 +278,9 @@ struct Inner {
     registered: AtomicBool,
     gate: RwLock<GateState>,
     upstreams: RwLock<Vec<UpstreamStatus>>,
+    /// 引擎管理器登记的：托管引擎的 endpoint（规范化的标识）→ 管着它的托管上游的 id。共用这个引擎的别的卡（同一个 endpoint：伴生卡
+    /// `omlx-embed`）据此继承它的失败（[`HealthState::failure_of_card`]）。
+    managed_endpoints: RwLock<BTreeMap<String, String>>,
 }
 
 /// 共享的就绪状态。克隆很便宜（一个 `Arc`），`/health` 与探测器各持一份。
@@ -294,6 +316,7 @@ impl HealthState {
                 registered: AtomicBool::new(false),
                 gate: RwLock::new(GateState::NotGated),
                 upstreams: RwLock::new(upstreams),
+                managed_endpoints: RwLock::new(BTreeMap::new()),
             }),
         }
     }
@@ -356,6 +379,58 @@ impl HealthState {
             upstream.reason = reason;
             upstream.owned = owned;
         }
+    }
+
+    /// 引擎管理器登记：`endpoint` 上的引擎归托管上游 `id` 管（IDORIS-CORE S6，Codex 审计 H1）。引擎管理器启动时对每个托管上游登记一次，
+    /// 先于它的第一次探测。`endpoint` 不是 http(s) URL 时什么也不做。
+    pub fn register_managed_endpoint(&self, endpoint: &str, id: &str) {
+        if let Some(identity) = idoris_upstream::omlx::key::endpoint_identity(endpoint) {
+            self.inner
+                .managed_endpoints
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(identity, id.to_owned());
+        }
+    }
+
+    /// 这张卡此刻没在服务就给出状态与原因，否则 `None`。两种情况：它自己是没在服务的托管上游（[`Self::managed_failure`]）；或者它与
+    /// 一个这样的托管上游**共用同一个引擎**（同一个 endpoint：伴生卡 `omlx-embed` 与主卡 `omlx`）——共用引擎的卡**继承**那个引擎的
+    /// 失败状态，所以主卡的端口被别的东西占了（`failed` + `port_in_use`）时，伴生卡的后台探测、`/v1/models`、预热与转发同样不碰那个
+    /// 端口（IDORIS-CORE S6，Codex 审计 H1）。不共用引擎的上游不受影响，照常服务。每次调用都读此刻的状态。
+    pub fn failure_of_card(&self, card: &ComponentCard) -> Option<ManagedFailure> {
+        if let Some(failure) = self.managed_failure(&card.provider.id) {
+            return Some(failure);
+        }
+        let identity = idoris_upstream::omlx::key::endpoint_identity(&card.endpoint)?;
+        let owner = self
+            .inner
+            .managed_endpoints
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&identity)
+            .cloned()?;
+        if owner == card.provider.id {
+            return None;
+        }
+        self.managed_failure(&owner)
+    }
+
+    /// 这个托管上游此刻没在服务就给出它的状态与原因（[`upstream_serves`]），否则（在服务、不是托管上游、没有这个 id）`None`。
+    /// **每次调用都读此刻的快照**：数据面据此在每个请求上决定要不要把它交给引擎，引擎在运行期失败、被 Admin 停下、重启中、
+    /// 端口换了主人，下一个请求就 503，不靠完整的 Router 创建时拍下的名单（IDORIS-CORE S6，G1）。
+    pub fn managed_failure(&self, id: &str) -> Option<ManagedFailure> {
+        self.inner
+            .upstreams
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|upstream| upstream.managed && upstream.id == id)
+            .filter(|upstream| !upstream_serves(upstream.state, upstream.reason))
+            .map(|upstream| ManagedFailure {
+                engine_kind: upstream.engine_kind.clone(),
+                state: upstream.state,
+                reason: upstream.reason,
+            })
     }
 
     pub fn view(&self) -> HealthView {
@@ -629,6 +704,10 @@ impl ProberContext {
             UpstreamKind::Resident => {
                 // 这一轮观测准入时的引擎代际，先于状态检查读（Codex 终审 M6）。
                 let admitted = crate::models::admission_generation(plan.card());
+                // 与一个没在服务的托管引擎共用 endpoint 的卡（伴生卡）继承它的失败，一个请求都不发（Codex 审计 H1）。
+                if let Some(failure) = self.health.failure_of_card(plan.card()) {
+                    return Observation::Unavailable(failure.reason);
+                }
                 probe_resident_admitted(
                     &self.client,
                     plan.card(),
@@ -864,6 +943,130 @@ mod tests {
         health.apply("lmstudio", Observation::Ready);
         health.set_managed("omlx", Ready, None, true);
         assert_eq!(health.view().phase, Phase::Ready);
+    }
+
+    /// IDORIS-CORE S6 (G1): which managed states keep a request away from the engine.
+    #[test]
+    fn only_a_ready_engine_or_one_that_is_merely_slow_to_answer_is_handed_requests() {
+        use UpstreamReason::*;
+        use UpstreamState::*;
+        assert!(upstream_serves(Ready, None));
+        // Alive but the probe did not answer, no definite reason (oMLX busy loading a big model): still served.
+        assert!(upstream_serves(Unavailable, None));
+        // A definite reason for `unavailable` is a definite failure.
+        for reason in [
+            AuthRequired,
+            AuthFailed,
+            FencePending,
+            StartupLatched,
+            StartupTimeout,
+            PortInUse,
+        ] {
+            assert!(!upstream_serves(Unavailable, Some(reason)), "{reason:?}");
+        }
+        // Not running, or running a state that has not served yet: never, with or without a reason.
+        for state in [Starting, Restarting, Failed, Stopped, Absent] {
+            assert!(!upstream_serves(state, None), "{state:?}");
+            assert!(!upstream_serves(state, Some(CrashLoop)), "{state:?}");
+        }
+    }
+
+    /// IDORIS-CORE S6 (Codex audit H1): a card that shares a managed engine's endpoint (the companion card) inherits that
+    /// engine's failure; a card that does not share it, and a card whose engine is serving, are untouched.
+    #[test]
+    fn a_card_that_shares_a_failed_managed_engine_inherits_its_failure_and_an_independent_one_does_not()
+     {
+        use UpstreamReason::*;
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", Starting),
+                status("omlx-embed", Ready, None),
+                status("lmstudio", Ready, None),
+            ],
+        );
+        health.register_managed_endpoint("http://127.0.0.1:8088", "omlx");
+        let companion = resident_card("omlx-embed", "http://127.0.0.1:8088/", "omlx@0.6.4");
+        let independent =
+            resident_card("lmstudio", "http://127.0.0.1:1234", "openai_compat@unknown");
+        let main = omlx_card();
+
+        // Not serving yet (`starting`): the companion is held back with the managed card's state.
+        for card in [&main, &companion] {
+            assert_eq!(
+                health.failure_of_card(card).map(|failure| failure.state),
+                Some(Starting),
+                "{}",
+                card.provider.id
+            );
+        }
+        assert_eq!(health.failure_of_card(&independent), None);
+
+        // A terminal failure with a reason: the companion reports the same reason (the endpoint match ignores a
+        // trailing slash, as the governance table does).
+        health.set_managed("omlx", Failed, Some(PortInUse), false);
+        let inherited = health.failure_of_card(&companion).unwrap();
+        assert_eq!(
+            (inherited.state, inherited.reason),
+            (Failed, Some(PortInUse))
+        );
+        assert_eq!(
+            health.failure_of_card(&independent),
+            None,
+            "independent upstreams keep serving"
+        );
+
+        // The engine serves: nobody is held back.
+        health.set_managed("omlx", Ready, None, true);
+        for card in [&main, &companion, &independent] {
+            assert_eq!(health.failure_of_card(card), None, "{}", card.provider.id);
+        }
+
+        // An engine whose endpoint was never registered shares nothing.
+        let unregistered = HealthState::with_upstreams(0, vec![managed_status("omlx", Failed)]);
+        assert_eq!(unregistered.failure_of_card(&companion), None);
+    }
+
+    #[test]
+    fn managed_failure_reads_the_live_snapshot_for_managed_upstreams_only() {
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", Ready),
+                status("lmstudio", Ready, None),
+            ],
+        );
+        assert_eq!(health.managed_failure("omlx"), None, "ready: served");
+        // The engine fails at run time: the very next read says so (nothing was snapshotted at gate time).
+        health.set_managed("omlx", Failed, Some(UpstreamReason::PortInUse), false);
+        assert_eq!(
+            health.managed_failure("omlx"),
+            Some(ManagedFailure {
+                engine_kind: "omlx".to_owned(),
+                state: Failed,
+                reason: Some(UpstreamReason::PortInUse),
+            })
+        );
+        health.set_managed("omlx", Stopped, None, false);
+        assert_eq!(
+            health.managed_failure("omlx").map(|failure| failure.state),
+            Some(Stopped)
+        );
+        health.set_managed("omlx", Ready, None, true);
+        assert_eq!(
+            health.managed_failure("omlx"),
+            None,
+            "and it is served again once ready"
+        );
+        // Not managed: never (the prober's cards keep their v0.5.0 path), however bad the state; unknown id: none.
+        health.apply(
+            "lmstudio",
+            Observation::Unavailable(Some(UpstreamReason::AuthRequired)),
+        );
+        assert_eq!(health.managed_failure("lmstudio"), None);
+        assert_eq!(health.managed_failure("nope"), None);
     }
 
     #[test]

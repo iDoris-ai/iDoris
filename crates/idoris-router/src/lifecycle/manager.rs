@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -14,7 +14,9 @@ use tokio::time::Instant;
 use super::backend::{EngineBackend, OmlxBackend};
 use super::backoff::Timings;
 use super::instance::{Actor, Command, Request};
-use crate::readiness::{HealthState, ManagedFailure, UpstreamPlan, UpstreamReason, UpstreamState};
+use crate::readiness::{
+    HealthState, ManagedFailure, UpstreamPlan, UpstreamReason, UpstreamState, unix_millis_now,
+};
 use crate::register::LogSink;
 use crate::runtime::RuntimeRegistry;
 
@@ -233,9 +235,51 @@ pub enum CommandError {
     NotOwned,
     /// 实例任务已经结束（管理器在停止）。
     Closed,
-    /// 这个上游在门控放行时就没有就绪（降级放行）：完整的 Router 里它的 Supervisor 看到的是一个失败的引擎，之后即使引擎好了
-    /// 也读不到（运行期引擎换代是 v0.6.1 / S10 的事）。保守起见降级放行之后不再重试也不接受 `start`，要重启 iDoris。
+    /// 这个上游在门控放行时没有就绪（降级放行）：完整的 Router 里根本没有它的 Supervisor，之后即使引擎好了也读不到（给它建
+    /// Supervisor 要重建 Router，那是运行期引擎换代之外的事，S5 起就是已知限制）。放行时就绪的上游不冻结：引擎换代（`restart`、
+    /// `stop` 之后的 `start`）时它们的 Supervisor 复位（`instance` 模块的 `sync_supervisor`）。要重启 iDoris。
     RestartRequired,
+}
+
+impl CommandError {
+    /// 稳定的短名字，给日志与测试用（Admin 的错误码另在 `admin` 里定）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::NotOwned => "not_owned",
+            Self::Closed => "closed",
+            Self::RestartRequired => "restart_required",
+        }
+    }
+}
+
+/// 状态从 `previous` 变到 `next` 是不是一次新的失败：进入 `restarting` 或 `failed` 才算，而且是从不是这两个之一的状态进入（
+/// `restarting` 之后又 `failed`、`failed` 之后又发布一次终局的 `failed`，是同一次失败）。`unavailable` 不算：它可能是引擎忙，
+/// 探测恢复就回到 `ready`。
+pub(super) fn counts_as_failure(previous: UpstreamState, next: UpstreamState) -> bool {
+    let failing = |state| matches!(state, UpstreamState::Restarting | UpstreamState::Failed);
+    failing(next) && !failing(previous)
+}
+
+/// Admin 看到的一个托管实例：只读快照，**不含任何 key、token、nonce**（`GET /admin/api/v1/upstreams`，S6）。
+/// `state`、`reason`、`owned` 与 `/health.upstreams[]` 里同一个实例的值同源：管理器发布状态时在同一把锁里同时写这里和
+/// `/health` 的快照，所以这个快照自己是一致的。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedView {
+    pub state: UpstreamState,
+    pub reason: Option<UpstreamReason>,
+    pub owned: bool,
+    /// 卡的 endpoint 里的 loopback 端口。
+    pub port: u16,
+    /// 自有引擎的进程号（`owned` 为真才有）。
+    pub pid: Option<u32>,
+    /// 只有重启 iDoris 才能让这个上游回来：它在门控放行时没就绪（降级放行，冻结），完整的 Router 里没有它的 Supervisor
+    /// （[`CommandError::RestartRequired`]）。
+    pub restart_required: bool,
+    /// iDoris 启动以来这个实例失败过几次：状态进入 `restarting` 或 `failed` 的次数。
+    pub failure_count: u32,
+    /// 最近一次失败的墙钟时间（Unix 毫秒）；没失败过是 `None`。
+    pub last_failure_at_ms: Option<u64>,
 }
 
 /// 门控放行的结果：放行时没有就绪的托管上游（降级放行）。空 = 全部就绪。
@@ -254,6 +298,12 @@ pub(super) struct Status {
     /// 终局：这个实例不会自己再往就绪走了（`Idle::Terminal`、熔断、被 `stop`、被放弃）。和 `state` 分开记：
     /// `owned_engine_exited` 在重启之前会短暂发布一次 `failed`，那不是终局，门控不能把它当成「落定」。
     pub terminal: bool,
+    /// 自有引擎的进程号（`owned` 为真才有）：Admin 的只读细节（[`ManagedView::pid`]）。
+    pub pid: Option<u32>,
+    /// 状态进入 `restarting` 或 `failed` 的次数（[`ManagedView::failure_count`]）。
+    pub failures: u32,
+    /// 最近一次失败的墙钟时间（Unix 毫秒）。
+    pub last_failure_at_ms: Option<u64>,
 }
 
 impl Status {
@@ -273,6 +323,11 @@ pub(super) struct Shared {
     statuses: Mutex<BTreeMap<String, Status>>,
     /// 上游 id → 引擎种类（`GateOutcome` 要带）。
     kinds: BTreeMap<String, String>,
+    /// 上游 id → 卡的 endpoint 里的 loopback 端口（`ManagedView` 要带）。
+    ports: BTreeMap<String, u16>,
+    /// 上游 id → 已经入队的命令的序号（从 1 起）：[`EngineManager::command`] 在**入队时**盖章，`Actor::restart_cover` 据此把
+    /// 一次 `restart` 进行期间到达的 `restart` 并进它的结果里（IDORIS-CORE S6，Codex 预审 5）。
+    enqueued: BTreeMap<String, AtomicU64>,
     /// 门控放行时没有就绪的实例，只在 [`EngineManager::open_gate`] 里写一次（持有 `statuses` 的锁时写，所以与状态一致）。
     /// 这些实例「冻结」：不再半开重试，不再接受 `start`（见 [`CommandError::RestartRequired`]）。
     degraded: Mutex<BTreeMap<String, ManagedFailure>>,
@@ -292,12 +347,46 @@ impl Shared {
     /// 发布一个实例的状态：管理器自己的表（门控判据）与 `/health` 的快照一起更新，在同一把锁里，所以
     /// [`EngineManager::open_gate`] 看到的与 `/health` 说的一致。
     pub fn publish(&self, id: &str, status: Status) {
+        self.publish_with(id, |_| status);
+    }
+
+    /// 同 [`Self::publish`]，新的状态由旧的（没有就是 `None`）算出来，读旧值与写新值在同一把锁里。
+    pub fn publish_with(&self, id: &str, next: impl FnOnce(Option<&Status>) -> Status) {
         let mut statuses = self.statuses.lock().unwrap_or_else(PoisonError::into_inner);
+        let status = next(statuses.get(id));
         statuses.insert(id.to_owned(), status);
         self.health
             .set_managed(id, status.state, status.reason, status.owned);
         drop(statuses);
         self.changed.send_modify(|version| *version += 1);
+    }
+
+    /// 实例任务 panic：按引擎失效发布成终局的 `failed`（失败计数沿用，再记一次）。
+    pub fn publish_panicked(&self, id: &str) {
+        self.publish_with(id, |previous| {
+            let (failures, last_failure_at_ms) = previous.map_or((0, None), |status| {
+                (status.failures, status.last_failure_at_ms)
+            });
+            let counted = previous
+                .is_none_or(|status| counts_as_failure(status.state, UpstreamState::Failed));
+            Status {
+                state: UpstreamState::Failed,
+                reason: None,
+                owned: false,
+                terminal: true,
+                pid: None,
+                failures: if counted {
+                    failures.saturating_add(1)
+                } else {
+                    failures
+                },
+                last_failure_at_ms: if counted {
+                    Some(unix_millis_now())
+                } else {
+                    last_failure_at_ms
+                },
+            }
+        });
     }
 
     /// 每个实例都落定了（就绪，或终局）。
@@ -311,6 +400,20 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains_key(id)
+    }
+
+    /// 给下一个入队的命令盖章：这个上游已入队命令的序号加一。
+    pub fn next_seq(&self, id: &str) -> u64 {
+        self.enqueued
+            .get(id)
+            .map_or(0, |counter| counter.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    /// 此刻已盖出的最大序号：序号不大于它的命令都是在这一刻之前入队的。
+    pub fn seq_now(&self, id: &str) -> u64 {
+        self.enqueued
+            .get(id)
+            .map_or(0, |counter| counter.load(Ordering::SeqCst))
     }
 
     /// 自有引擎失效：通知 `bin` 去走退出码 5 的停止路径。只记第一个。
@@ -345,12 +448,22 @@ impl EngineManager {
             .iter()
             .map(|plan| (plan.id.clone(), plan.backend.kind().as_str().to_owned()))
             .collect();
+        let ports = plans
+            .iter()
+            .map(|plan| (plan.id.clone(), plan.port))
+            .collect();
+        let enqueued = plans
+            .iter()
+            .map(|plan| (plan.id.clone(), AtomicU64::new(0)))
+            .collect();
         let shared = Arc::new(Shared {
             config,
             health,
             gate_open: AtomicBool::new(false),
             statuses: Mutex::new(BTreeMap::new()),
             kinds,
+            ports,
+            enqueued,
             degraded: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             changed,
@@ -366,6 +479,10 @@ impl EngineManager {
             // 托管的端点从一开始就封上：在引擎管理器登记出一个通过校验的监听者之前，没有任何凭证发往它，环境变量与
             // `settings.json` 的回退链从不适用于托管的端点（IDORIS-CORE S6，Codex 预审 3）。
             plan.backend.block(&plan.endpoint);
+            // 共用这个引擎的卡（同一个 endpoint：伴生卡）据此继承它的失败状态（Codex 审计 H1）。
+            shared
+                .health
+                .register_managed_endpoint(&plan.endpoint, &plan.id);
             let (sender, receiver) = mpsc::channel(8);
             // 先登记 `starting`：门控判据与 `/health` 一开始就有这个实例。
             shared.publish(
@@ -375,6 +492,9 @@ impl EngineManager {
                     reason: None,
                     owned: false,
                     terminal: false,
+                    pid: None,
+                    failures: 0,
+                    last_failure_at_ms: None,
                 },
             );
             senders.insert(plan.id.clone(), sender);
@@ -499,6 +619,10 @@ impl EngineManager {
                 .map(|(id, _)| id.clone())
                 .collect()
         };
+        // 一个绝对的截止时间管入队与等回答两头（IDORIS-CORE S6，Codex 终审 M5）：邮箱满了、实例任务又忙着排空或复位时，
+        // 入队本身就会等，不能让它排在「预算开始计时」之前。
+        let deadline =
+            Instant::now() + self.shared.config.timings.stop_grace + Duration::from_secs(3);
         let mut waits = Vec::new();
         for id in unsettled {
             let Some(sender) = self.senders.get(&id) else {
@@ -508,13 +632,17 @@ impl EngineManager {
             let request = Request {
                 command: Command::GiveUp,
                 reply: Some(reply),
+                seq: 0,
+                deadline: None,
             };
-            if sender.send(request).await.is_ok() {
+            if tokio::time::timeout_at(deadline, sender.send(request))
+                .await
+                .is_ok_and(|sent| sent.is_ok())
+            {
                 waits.push(answer);
             }
         }
-        let budget = self.shared.config.timings.stop_grace + Duration::from_secs(3);
-        let _ = tokio::time::timeout(budget, async {
+        let _ = tokio::time::timeout_at(deadline, async {
             for answer in waits {
                 let _ = answer.await;
             }
@@ -549,37 +677,112 @@ impl EngineManager {
     async fn command(&self, id: &str, command: Command) -> Result<(), CommandError> {
         let sender = self.senders.get(id).ok_or(CommandError::NotFound)?;
         let (reply, answer) = oneshot::channel();
-        sender
-            .send(Request {
-                command,
-                reply: Some(reply),
-            })
+        // 入队时盖章（先盖章、后入队）：序号不大于某次操作完成时的 `seq_now` 的 `restart`，都是在那次操作进行期间（或之前）到达的，
+        // 它们并进那次操作的结果，不再换第二次引擎（见 `Actor::restart_cover`）。
+        let seq = self.shared.next_seq(id);
+        // 一个绝对的截止时间管入队、等回答两头（`Timings::command_timeout`，IDORIS-CORE S6，Codex 终审 M5）；同一个截止时间也盖在
+        // 命令上：实例任务到点还没收下它，就当它没有发生过（回答 `Closed`、不执行），所以一个已经超时的、有副作用的命令不会在
+        // 调用方放弃之后才被执行。
+        let deadline = Instant::now() + self.shared.config.timings.command_timeout;
+        let call = async {
+            sender
+                .send(Request {
+                    command,
+                    reply: Some(reply),
+                    seq,
+                    deadline: Some(deadline.into_std()),
+                })
+                .await
+                .map_err(|_| CommandError::Closed)?;
+            answer.await.map_err(|_| CommandError::Closed)?
+        };
+        tokio::time::timeout_at(deadline, call)
             .await
-            .map_err(|_| CommandError::Closed)?;
-        answer.await.map_err(|_| CommandError::Closed)?
+            .unwrap_or(Err(CommandError::Closed))
     }
 
-    /// 从 `stopped`、`failed`、`absent`、`unavailable` 重新走启动决策；已经 `ready`、或正在启动时幂等。
+    /// 下命令并留一行日志（谁的、什么命令、结果；没有 token、key：只有上游 id 与命令名）。不认识的 id 不进日志：它来自调用方，
+    /// 不能让它往日志里写东西。
+    async fn command_logged(
+        &self,
+        id: &str,
+        name: &str,
+        command: Command,
+    ) -> Result<(), CommandError> {
+        let result = self.command(id, command).await;
+        if result != Err(CommandError::NotFound) {
+            let outcome = match result {
+                Ok(()) => "已受理".to_owned(),
+                Err(error) => format!("拒绝（{}）", error.as_str()),
+            };
+            self.shared
+                .log(&format!("[idoris] 引擎 {id}：收到命令 {name}，{outcome}"));
+        }
+        result
+    }
+
+    /// 从 `stopped`、`failed`、`absent`、`unavailable` 重新走启动决策；已经 `ready`、或正在启动时幂等。一个还活着的自有引擎
+    /// （`unavailable`：活着却不答）先走完整的停止路径（优雅停止、撤销私有 key），不是丢弃句柄（G3）。门控放行之后引擎换了一个
+    /// 进程，Supervisor 的账本在发布 `ready` 之前复位（S6）；放行时没就绪而冻结的上游 [`CommandError::RestartRequired`]。
     pub async fn start_upstream(&self, id: &str) -> Result<(), CommandError> {
-        self.command(id, Command::Start).await
+        self.command_logged(id, "start", Command::Start).await
     }
 
     /// 停止 iDoris 自己拥有的引擎，状态 `stopped`；不是自己的（外部引擎、没有引擎）一律 [`CommandError::NotOwned`]，
-    /// 已经 `stopped` 时幂等。
+    /// 已经 `stopped` 时幂等。命令被接受**之前**已经关了 Supervisor 的门、发布了 `stopped`（不可服务：数据面立刻 503，Supervisor 不再
+    /// 准入新的加载与聊天）；之后才排空在途的、停进程（至多一个 `stop_grace` 加排空的上限）：这几秒里引擎还握在手里，`owned`、`pid`
+    /// 还在，进程确认消失之后才是 `owned: false`，调用方轮询 `/health` 或 Admin。进程确认消失之后，端点才被封上（G2，不是撤销登记），
+    /// Supervisor 的账本也清空（引擎已经没有了）。
     pub async fn stop_upstream(&self, id: &str) -> Result<(), CommandError> {
-        self.command(id, Command::Stop).await
+        self.command_logged(id, "stop", Command::Stop).await
     }
 
-    /// `stop` 之后重新走启动决策；不是自己拥有的引擎同样 [`CommandError::NotOwned`]。
+    /// `stop` 之后重新走启动决策；不是自己拥有的引擎同样 [`CommandError::NotOwned`]。门控放行之后新引擎就绪时，Supervisor 的
+    /// 账本在发布 `ready` 之前对着新进程重建（S6）；放行时没就绪而冻结的上游 [`CommandError::RestartRequired`]。
     pub async fn restart_upstream(&self, id: &str) -> Result<(), CommandError> {
-        self.command(id, Command::Restart).await
+        self.command_logged(id, "restart", Command::Restart).await
+    }
+
+    /// 每个托管上游此刻的只读快照（`GET /admin/api/v1/upstreams`，S6）。在管理器自己的状态表的锁里一次读完，所以每个实例的
+    /// 各个字段彼此一致；冻结的名单只在 [`Self::open_gate`] 里同一把锁下写一次，所以 `restart_required` 与状态一致。
+    pub fn views(&self) -> BTreeMap<String, ManagedView> {
+        let statuses = self
+            .shared
+            .statuses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        statuses
+            .iter()
+            .filter_map(|(id, status)| {
+                let port = *self.shared.ports.get(id)?;
+                Some((
+                    id.clone(),
+                    ManagedView {
+                        state: status.state,
+                        reason: status.reason,
+                        owned: status.owned,
+                        port,
+                        pid: status.pid,
+                        restart_required: self.shared.is_frozen(id),
+                        failure_count: status.failures,
+                        last_failure_at_ms: status.last_failure_at_ms,
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// iDoris 停止时调用：各实例收尾。`stop_engines` 为真就停掉自己拉起的引擎（SIGTERM 整组，宽限之后 SIGKILL，
     /// 删记录）；为假（`stop_on_exit:"never"` 的正常退出）就让引擎继续跑，所有权记录留给下一个 iDoris。
     /// 等各实例完成，至多 `stop_grace` 加一点余量；超时的实例任务被中止（`OwnedEngine` 的 `Drop` 仍会兜底）。
     pub async fn shutdown(&self, stop_engines: bool) {
+        // 一个绝对的截止时间管入队与等回答两头（IDORIS-CORE S6，Codex 终审 M5）：Admin 的命令填满了容量为 8 的邮箱、实例任务又忙着
+        // 排空或复位的时候，入队本身会等，预算必须从入队之前开始算，不能在入队之后才启动。
+        let deadline =
+            Instant::now() + self.shared.config.timings.stop_grace + Duration::from_secs(3);
         let mut waits = Vec::new();
+        // 有一个实例没能在预算里收下 `Shutdown`（邮箱满了、它又在忙）：不能等它自己结束，下面中止它的任务。
+        let mut delivered = true;
         for sender in self.senders.values() {
             let (reply, answer) = oneshot::channel();
             let request = Request {
@@ -587,22 +790,27 @@ impl EngineManager {
                     stop_engine: stop_engines,
                 },
                 reply: Some(reply),
+                seq: 0,
+                deadline: None,
             };
-            if sender.send(request).await.is_ok() {
-                waits.push(answer);
+            match tokio::time::timeout_at(deadline, sender.send(request)).await {
+                Ok(Ok(())) => waits.push(answer),
+                // 实例任务已经结束了：没有什么可等的。
+                Ok(Err(_closed)) => {}
+                Err(_elapsed) => delivered = false,
             }
         }
-        let budget = self.shared.config.timings.stop_grace + Duration::from_secs(3);
-        let finished = tokio::time::timeout(budget, async {
+        let finished = tokio::time::timeout_at(deadline, async {
             for answer in waits {
                 let _ = answer.await;
             }
         })
         .await;
+        let finished_in_time = delivered && finished.is_ok();
         let tasks: Vec<JoinHandle<()>> =
             std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner));
         for task in tasks {
-            if finished.is_err() {
+            if !finished_in_time {
                 task.abort();
             }
             let _ = task.await;
@@ -629,6 +837,52 @@ mod tests {
             reason: None,
             owned: false,
             terminal,
+            pid: None,
+            failures: 0,
+            last_failure_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn only_entering_restarting_or_failed_from_something_else_is_a_new_failure() {
+        use UpstreamState::*;
+        let all = [
+            Ready,
+            Starting,
+            Unavailable,
+            Restarting,
+            Failed,
+            Stopped,
+            Absent,
+        ];
+        for previous in all {
+            for next in all {
+                let expected =
+                    matches!(next, Restarting | Failed) && !matches!(previous, Restarting | Failed);
+                assert_eq!(
+                    counts_as_failure(previous, next),
+                    expected,
+                    "{previous:?} -> {next:?}"
+                );
+            }
+        }
+        // The two ways a crash is published back to back are one failure, not two.
+        assert!(counts_as_failure(Ready, Failed));
+        assert!(!counts_as_failure(Failed, Restarting));
+        assert!(!counts_as_failure(Failed, Failed));
+        // `unavailable` flaps with the probe: never a failure.
+        assert!(!counts_as_failure(Ready, Unavailable));
+    }
+
+    #[test]
+    fn command_errors_have_stable_short_names() {
+        for (error, name) in [
+            (CommandError::NotFound, "not_found"),
+            (CommandError::NotOwned, "not_owned"),
+            (CommandError::Closed, "closed"),
+            (CommandError::RestartRequired, "restart_required"),
+        ] {
+            assert_eq!(error.as_str(), name);
         }
     }
 
@@ -678,6 +932,123 @@ mod tests {
         assert!(Shared::all_settled(&table(&[ready])));
         assert!(Shared::all_settled(&table(&[terminal])));
         assert!(Shared::all_settled(&table(&[ready, terminal, ready])));
+    }
+
+    /// 一个邮箱已经被命令填满、实例任务又在忙（谁也不收）的管理器：实例任务握着邮箱的接收端（通道开着、满着），既不收命令也不结束
+    /// （直到被中止）。
+    fn manager_with_a_busy_instance(
+        command_timeout: Duration,
+        stop_grace: Duration,
+    ) -> EngineManager {
+        let timings = Timings {
+            command_timeout,
+            stop_grace,
+            ..Timings::default()
+        };
+        let (sender, receiver) = mpsc::channel::<Request>(8);
+        for seq in 1..=8 {
+            sender
+                .try_send(Request {
+                    command: Command::Stop,
+                    reply: None,
+                    seq,
+                    deadline: None,
+                })
+                .unwrap();
+        }
+        let shared = Arc::new(Shared {
+            config: ManagerConfig {
+                state_dir: std::env::temp_dir(),
+                allocated_budget_bytes: None,
+                stop_on_exit: StopOnExit::Owned,
+                executables: BTreeMap::new(),
+                launched_by: "unit-test".to_owned(),
+                timings,
+                inspector: Arc::new(idoris_upstream::engine::SystemInspector::new()),
+                log: Arc::new(|_| {}),
+            },
+            health: HealthState::default(),
+            gate_open: AtomicBool::new(false),
+            statuses: Mutex::new(BTreeMap::new()),
+            kinds: BTreeMap::new(),
+            ports: BTreeMap::new(),
+            enqueued: BTreeMap::from([("omlx".to_owned(), AtomicU64::new(0))]),
+            degraded: Mutex::new(BTreeMap::new()),
+            started: Instant::now(),
+            changed: watch::channel(0_u64).0,
+            failure: watch::channel(None).0,
+            runtimes: OnceLock::new(),
+        });
+        let task = tokio::spawn(async move {
+            let _mailbox = receiver;
+            std::future::pending::<()>().await;
+        });
+        EngineManager {
+            shared,
+            senders: BTreeMap::from([("omlx".to_owned(), sender)]),
+            tasks: Mutex::new(vec![task]),
+        }
+    }
+
+    /// `shutdown` bounded by an outer timeout: a mutated (or broken) budget must fail the test, never hang the test binary.
+    async fn shutdown_bounded(manager: &EngineManager) {
+        tokio::time::timeout(Duration::from_secs(20), manager.shutdown(true))
+            .await
+            .unwrap_or_else(|_| panic!("shutdown hung on a full mailbox"));
+    }
+
+    /// IDORIS-CORE S6, Codex final review M5: the shutdown budget starts **before** the enqueue. A full mailbox in front of a busy
+    /// instance used to hold `shutdown` at `sender.send().await` for as long as the instance stayed busy, before the budget even
+    /// began; now the enqueue is inside the budget, the instance that could not take the command is aborted, and the call
+    /// returns.
+    #[tokio::test]
+    async fn shutdown_returns_within_its_budget_when_the_mailbox_of_a_busy_instance_is_full() {
+        let manager =
+            manager_with_a_busy_instance(Duration::from_secs(60), Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let finished = tokio::time::timeout(Duration::from_secs(20), manager.shutdown(true)).await;
+        assert!(finished.is_ok(), "shutdown hung on a full mailbox");
+        // The budget is `stop_grace` (100 ms) plus three seconds, counted from before the enqueue.
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The same for the settling gate's give-up: the enqueue is inside its budget.
+    #[tokio::test]
+    async fn giving_up_unsettled_instances_returns_within_its_budget_when_the_mailbox_is_full() {
+        let manager =
+            manager_with_a_busy_instance(Duration::from_secs(60), Duration::from_millis(100));
+        manager
+            .shared
+            .publish("omlx", status(UpstreamState::Starting, false));
+        let finished =
+            tokio::time::timeout(Duration::from_secs(20), manager.give_up_unsettled()).await;
+        assert!(finished.is_ok(), "give_up_unsettled hung on a full mailbox");
+        shutdown_bounded(&manager).await;
+    }
+
+    /// An operator command that cannot be enqueued (the mailbox is full, the instance is busy) is abandoned at its one absolute
+    /// deadline (`command_timeout`) with `Closed` (Admin: 503 `idoris_stopping`), instead of waiting for as long as the instance
+    /// stays busy.
+    #[tokio::test]
+    async fn a_command_that_cannot_be_enqueued_is_abandoned_at_its_deadline() {
+        let manager =
+            manager_with_a_busy_instance(Duration::from_millis(300), Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(20), manager.stop_upstream("omlx"))
+            .await
+            .unwrap_or_else(|_| panic!("the command did not wait forever"));
+        assert_eq!(result, Err(CommandError::Closed));
+        assert!(
+            started.elapsed() >= Duration::from_millis(250)
+                && started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        shutdown_bounded(&manager).await;
     }
 
     #[test]
