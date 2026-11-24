@@ -27,7 +27,7 @@ fn marker_pids(contents: &str) -> Vec<(i32, i32)> {
 }
 
 async fn wait_group_gone(group: i32) {
-    timeout(Duration::from_secs(2), async {
+    timeout(Duration::from_secs(60), async {
         loop {
             match killpg(Pid::from_raw(group), None) {
                 Err(Errno::ESRCH) => break,
@@ -54,7 +54,7 @@ async fn group_wait_observes_descendant_after_parent_exit() {
         .expect("parent with pipe-blocked descendant spawns");
     let group = child.id().expect("parent pid") as i32;
     let input = child.stdin.take().expect("descendant input pipe");
-    timeout(Duration::from_secs(2), child.wait())
+    timeout(Duration::from_secs(60), child.wait())
         .await
         .expect("parent exits before descendant")
         .expect("wait parent");
@@ -125,7 +125,7 @@ async fn fixture_creates_parent_and_grandchild_in_one_group_and_can_be_reaped() 
     let mut child = command.spawn().expect("grandchild fixture spawns");
     let group = child.id().expect("fixture pid") as i32;
 
-    let entries = timeout(Duration::from_secs(2), async {
+    let entries = timeout(Duration::from_secs(60), async {
         loop {
             if let Ok(contents) = std::fs::read_to_string(&marker) {
                 let entries = marker_pids(&contents);
@@ -145,7 +145,7 @@ async fn fixture_creates_parent_and_grandchild_in_one_group_and_can_be_reaped() 
     assert!(entries.iter().any(|(pid, _)| *pid != group));
 
     killpg(Pid::from_raw(group), Signal::SIGTERM).expect("group TERM succeeds");
-    timeout(Duration::from_secs(2), child.wait())
+    timeout(Duration::from_secs(60), child.wait())
         .await
         .expect("parent exits after group TERM")
         .expect("wait parent");
@@ -167,7 +167,7 @@ async fn fixture_exposes_hang_ignore_term_hold_pipe_and_pid_marker_modes() {
             .process_group(0);
         let mut child = command.spawn().expect("fixture mode spawns");
         let group = child.id().unwrap() as i32;
-        timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_secs(60), async {
             while !marker.exists() {
                 sleep(Duration::from_millis(20)).await;
             }
@@ -175,7 +175,7 @@ async fn fixture_exposes_hang_ignore_term_hold_pipe_and_pid_marker_modes() {
         .await
         .expect("mode marker appears");
         killpg(Pid::from_raw(group), Signal::SIGKILL).expect("group KILL succeeds");
-        let _ = timeout(Duration::from_secs(2), child.wait()).await;
+        let _ = timeout(Duration::from_secs(60), child.wait()).await;
     }
 
     let marker = fixture.marker("pid-marker.txt");

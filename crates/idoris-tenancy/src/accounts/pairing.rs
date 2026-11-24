@@ -46,10 +46,11 @@ use subtle::ConstantTimeEq;
 use super::control::{
     Actor, AuditSpec, Caller, Ctx, Failure, Identity, Meta, NewKey, TargetKind, Who, Written,
     authorize_op, check_ceilings, insert_issuance, insert_virtual_key, load_key_by_id,
-    revoke_virtual_key, slice_directory,
+    load_manageable_membership, manageable_roots, require_op_capability, revoke_virtual_key,
+    slice_directory,
 };
 use super::error::AccountStoreError;
-use super::rows::{load_ancestors, load_credential, load_membership, load_principal};
+use super::rows::{load_ancestors, load_credential, load_membership, load_principal, within_roots};
 use super::store::{AccountStore, create_credential_in, directory_slice, set_credential_status_in};
 use crate::virtual_key::VirtualKeyHash;
 
@@ -173,6 +174,25 @@ pub(super) fn load_pairing_by_id(
         )
         .optional()?
         .map(|(record, _hash)| record))
+}
+
+/// 配对码的资源范围：它所属成员关系的付款账户。
+const PAIRING_SCOPE: &str = "SELECT m.account_id FROM pairing_codes p \
+     JOIN memberships m ON m.membership_id = p.membership_id WHERE p.pairing_id = ?1";
+
+/// 按 id 取配对码，读的时候限定在它所属成员关系的付款账户落在调用者对 `issue_credential` 管得到的范围里：管不到的和不存在的
+/// 一样返回 `None`，数据库执行同样的语句（和 `load_manageable_membership` 同一个用意）。
+fn load_manageable_pairing(
+    conn: &Connection,
+    caller: &Caller,
+    pairing_id: &str,
+) -> Result<Option<PairingRecord>, Failure> {
+    if let Some(roots) = manageable_roots(caller, ControlOp::IssueCredential)
+        && !within_roots(conn, PAIRING_SCOPE, pairing_id, &roots)?
+    {
+        return Ok(None);
+    }
+    Ok(load_pairing_by_id(conn, pairing_id)?)
 }
 
 /// 按码的哈希找。找到之后再用常数时间比较一次哈希（数据库按索引找已经只会命中相等的行；这一步是纵深防御，
@@ -344,15 +364,24 @@ impl AccountStore {
             let (Some(issuer), Some(ceilings)) = (caller.credential(), caller.ceilings()) else {
                 return Err(Failure::new(ControlReason::OpNotGranted));
             };
-            let Some(found) = load_membership(conn, &request.membership)? else {
+            // 先做与目标无关的授权判定，再按成员关系 id 去查（见 `require_op_capability`，issue #603 N7 同类）
+            require_op_capability(conn, caller, meta.now, ControlOp::IssueCredential)?;
+            let Some(found) = load_manageable_membership(
+                conn,
+                caller,
+                ControlOp::IssueCredential,
+                &request.membership,
+            )?
+            else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
             let account = found
                 .account
                 .clone()
                 .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;
-            spec.scope_account = Some(account.to_string());
             authorize_op(conn, caller, meta.now, ControlOp::IssueCredential, &account, None)?;
+            // 审计里由目标派生的账户等目标授权通过之后才填：被拒的请求不论成员关系存不存在，留下同样的审计行（Codex 预审 M2）
+            spec.scope_account = Some(account.to_string());
             let payer = require_live_payer(conn, &found)?;
             debug_assert_eq!(payer, account);
             if !(MIN_PAIRING_TTL_MS..=MAX_PAIRING_TTL_MS).contains(&request.ttl_ms) {
@@ -430,7 +459,9 @@ impl AccountStore {
         let spec = AuditSpec::new("revoke_pairing_code", TargetKind::PairingCode)
             .target(&request.pairing_id);
         self.control_write(who, meta, spec, |conn, caller, spec| {
-            let Some(record) = load_pairing_by_id(conn, &request.pairing_id)? else {
+            // 先做与目标无关的授权判定，再按配对码 id 去查（见 `require_op_capability`，issue #603 N7 同类）
+            require_op_capability(conn, caller, meta.now, ControlOp::IssueCredential)?;
+            let Some(record) = load_manageable_pairing(conn, caller, &request.pairing_id)? else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
             let found = load_membership(conn, &record.membership)?
@@ -439,8 +470,6 @@ impl AccountStore {
                 .account
                 .clone()
                 .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;
-            spec.scope_account = Some(account.to_string());
-            spec.related_id = Some(record.membership.to_string());
             authorize_op(
                 conn,
                 caller,
@@ -449,6 +478,9 @@ impl AccountStore {
                 &account,
                 None,
             )?;
+            // 审计里由目标派生的字段（账户、码所属的成员关系）等目标授权通过之后才填（Codex 预审 M2）
+            spec.scope_account = Some(account.to_string());
+            spec.related_id = Some(record.membership.to_string());
             match record.status {
                 PairingStatus::Revoked => {
                     return Ok(Written {
