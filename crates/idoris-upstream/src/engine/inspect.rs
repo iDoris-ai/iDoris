@@ -164,7 +164,8 @@ impl SystemInspector {
         ];
         let output = run_tool(&self.ps, &args, self.ps_timeout).await?;
         // 调用方只会在 `pid_state` 说进程在之后才问；这时空答案或失败不是「进程没了」，是读不出来。
-        let text = output.stdout.trim();
+        let stdout = output.stdout();
+        let text = stdout.trim();
         if output.code != Some(0) || text.is_empty() || text.contains('\n') {
             return Err(InspectError::NoAnswer);
         }
@@ -221,10 +222,10 @@ impl ProcessInspector for SystemInspector {
         match output.code {
             Some(0) => {
                 let wanted = pid.to_string();
-                Ok(output.stdout.lines().any(|line| line.trim() == wanted))
+                Ok(output.stdout().lines().any(|line| line.trim() == wanted))
             }
             // lsof 自己的「没有匹配」：退出码 1，stdout 与 stderr 都是空的。出错同样退出 1，但会在 stderr 说话。
-            Some(1) if output.stdout.trim().is_empty() && output.stderr.trim().is_empty() => {
+            Some(1) if output.stdout().trim().is_empty() && output.stderr.trim().is_empty() => {
                 Ok(false)
             }
             _ => Err(InspectError::NoAnswer),
@@ -236,9 +237,9 @@ impl ProcessInspector for SystemInspector {
         let args = ["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"].map(OsString::from);
         let output = run_tool(lsof, &args, self.lsof_timeout).await?;
         match output.code {
-            Some(0) => parse_lsof_pids(&output.stdout),
+            Some(0) => parse_lsof_pids(&output.stdout()),
             // lsof 自己的「没有匹配」：退出码 1，stdout 与 stderr 都是空的（出错同样退出 1，但会在 stderr 说话）。
-            Some(1) if output.stdout.trim().is_empty() && output.stderr.trim().is_empty() => {
+            Some(1) if output.stdout().trim().is_empty() && output.stderr.trim().is_empty() => {
                 Ok(Vec::new())
             }
             _ => Err(InspectError::NoAnswer),
@@ -275,7 +276,7 @@ impl ProcessInspector for SystemInspector {
             return Err(InspectError::NoAnswer);
         }
         Ok(super::discovery::team_identifier(&described.stderr)
-            .or_else(|| super::discovery::team_identifier(&described.stdout)))
+            .or_else(|| super::discovery::team_identifier(&described.stdout())))
     }
 }
 
@@ -319,10 +320,18 @@ pub(super) async fn retry_exec_busy<T>(
 
 pub(super) struct ToolOutput {
     pub(super) code: Option<i32>,
-    pub(super) stdout: String,
-    /// `stdout` 的原始字节（`sysctl -b` 输出二进制）。
+    /// 标准输出的原始字节：`sysctl -b kern.proc` 输出的是二进制进程表（macOS 读进程「代」标识用），别的工具输出的是文本，用
+    /// [`Self::stdout`] 读。只留这一份，文本是从它派生出来的：每个平台上的每一次读 stdout 都读到它，不靠平台相关的 `cfg`
+    /// 去躲「字段从未被读」（Linux 不读进程表，之前这个字段在 Linux 上就是死的，clippy 的 `dead_code` 拦下了）。
     pub(super) stdout_bytes: Vec<u8>,
     pub(super) stderr: String,
+}
+
+impl ToolOutput {
+    /// 标准输出当文本读：不是合法 UTF-8 的字节按 U+FFFD 替换（与原来的 `String::from_utf8_lossy` 相同）。
+    pub(super) fn stdout(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.stdout_bytes)
+    }
 }
 
 /// 平台给的进程「代」标识（见 [`ProcessInspector::generation`]）。
@@ -456,7 +465,6 @@ pub(super) async fn run_tool_capped(
     }
     Ok(ToolOutput {
         code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stdout_bytes: output.stdout,
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
@@ -972,6 +980,23 @@ mod tests {
             .map(str::to_owned)
             .collect();
         assert_eq!(lines, ["--verify 31337", "-d --verbose=2 31337"]);
+    }
+
+    /// The raw bytes are the one stored copy of a tool's stdout and the text is read from them (so the field is read on every platform, not
+    /// only where a binary table is parsed): non-UTF-8 bytes come out as U+FFFD, exactly as the old `String::from_utf8_lossy` copy did, and the
+    /// bytes themselves are untouched for the binary readers.
+    #[tokio::test]
+    async fn a_tools_stdout_is_kept_as_raw_bytes_and_read_as_lossy_text() {
+        let output = run_tool(
+            Path::new("/bin/sh"),
+            &[OsString::from("-c"), OsString::from("printf 'ab\\377cd'")],
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.code, Some(0));
+        assert_eq!(output.stdout_bytes, b"ab\xffcd");
+        assert_eq!(output.stdout(), "ab\u{fffd}cd");
     }
 
     #[tokio::test]
