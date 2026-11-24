@@ -331,8 +331,8 @@ impl OmlxAdapter {
     /// the engine manager's guard **re-verifies the listener** on this very task, immediately before the send. Nothing
     /// is sent on a refusal, so neither the new engine's credentials nor the request body (a prompt) can reach a
     /// process the work was not admitted for. The authorization is also an in-flight operation the engine manager's
-    /// drain waits for, so hold the returned value until the response has been read. An adapter with a fixed key is
-    /// unchanged.
+    /// drain waits for, so hold the returned value until the response has been read. An adapter with a fixed key that aims
+    /// at an endpoint nobody governs is unchanged (see the next paragraph for one that aims at a governed endpoint).
     ///
     /// **Governed is decided by the endpoint, not by this adapter's mode** (Codex pre-review of layer 2, H1): an adapter that is not
     /// in per-request mode (built for a card that may not carry the oMLX key, or from an explicit config) but aims at an endpoint

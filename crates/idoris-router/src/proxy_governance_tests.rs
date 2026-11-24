@@ -196,20 +196,68 @@ async fn a_request_bound_to_a_replaced_engine_is_refused_and_never_carries_the_n
     }
 }
 
+/// 是否受登记表管，由**端点**决定，不由这张卡能不能带 key 决定（Codex 预审 L2 的 H1；这个用例原来钉的是反过来的「`attach_omlx_key: false`
+/// 的请求不受登记表管」，那正是同一个端口上不能带 key 的卡绕过整套核对的洞）。登记表里没有的端点：与以前完全一样。被引擎管理器接管的端点：
+/// 不带 key 的卡同样过封上与代际的核对（被封上、换代之后什么都不发），通过了也**不带**登记的那个私有 key（key 只给能带它的卡）。
 #[tokio::test]
-async fn a_request_that_is_not_a_loopback_omlx_card_is_not_subject_to_the_registry() {
-    // `attach_omlx_key: false`（别的上游）：登记表里的口径与代际都与它无关，行为不变。
+async fn a_card_that_cannot_carry_the_key_is_still_governed_by_the_endpoint_it_aims_at() {
     let server = engine().await;
     let _governed = Governed(server.uri());
-    block_endpoint(&server.uri());
     let proxy = ChatProxy::new(reqwest::Client::new());
     let mut plain = opts();
     plain.attach_omlx_key = false;
+
+    // 登记表不认识这个端点：什么都不变。
+    let outcome = proxy.forward_buffered(&server.uri(), &body(), &plain).await;
+    assert_eq!(outcome.status, 200);
+    assert_eq!(authorization(&received(&server).await[0]), None);
+
+    // 被接管、登记了私有 key：请求照发，但那个 key 不给这张卡。
+    govern_endpoint(
+        &server.uri(),
+        EndpointKey::Private("key-of-the-engine".into()),
+    );
+    let admitted = endpoint_generation(&server.uri());
     let outcome = proxy.forward_buffered(&server.uri(), &body(), &plain).await;
     assert_eq!(outcome.status, 200);
     let requests = received(&server).await;
-    assert_eq!(requests.len(), 1);
-    assert_eq!(authorization(&requests[0]), None);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(authorization(&requests[1]), None);
+
+    // 被封上：不管哪张卡，一个字节都不发，也不碰提供方的熔断（`NotExecuted`）。
+    block_endpoint(&server.uri());
+    for _ in 0..12 {
+        let outcome = proxy.forward_buffered(&server.uri(), &body(), &plain).await;
+        assert_eq!(outcome.status, 503);
+        assert_eq!(outcome.execution, ExecutionDisposition::NotExecuted);
+    }
+    assert_eq!(received(&server).await.len(), 2, "not a byte was sent");
+
+    // 换了一代的引擎：为上一代准入的请求被拒绝，为当前这一代准入的发得出去，同样不带 key。
+    govern_endpoint(
+        &server.uri(),
+        EndpointKey::Private("key-of-the-next-engine".into()),
+    );
+    let stale = generation::scoped(Some(admitted), async {
+        proxy.forward_buffered(&server.uri(), &body(), &plain).await
+    })
+    .await;
+    assert_eq!(stale.status, 503);
+    assert_eq!(stale.execution, ExecutionDisposition::NotExecuted);
+    assert_eq!(
+        received(&server).await.len(),
+        2,
+        "nothing reached the new engine"
+    );
+    let current = endpoint_generation(&server.uri());
+    let outcome = generation::scoped(Some(current), async {
+        proxy.forward_buffered(&server.uri(), &body(), &plain).await
+    })
+    .await;
+    assert_eq!(outcome.status, 200);
+    let requests = received(&server).await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(authorization(&requests[2]), None);
 }
 
 /// 一次连接失败的重试，落在引擎已经被换掉之后：不发。第一次发送（还是准入时的那一代）连接被拒；等重试的时候引擎换了，端口上

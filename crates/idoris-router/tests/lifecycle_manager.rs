@@ -99,6 +99,9 @@ struct Scripted {
     team_checks: AtomicUsize,
     /// 端口 → 还剩几次「`listens_on` 为真」，用完之后一律为假：造「等就绪时监听它的是引擎，封印时端口已被别人占了」。
     claim_budget: Mutex<BTreeMap<u16, usize>>,
+    /// 同上，但只有端口上此刻真的有东西在接受连接时，那一问才为真、才用掉一次：等就绪的循环在每一次带私有 key 的探测之前都重新问
+    /// （`owned_listener_confirmed`），引擎还没开始监听的那几轮不该把唯一的一次「为真」用掉。
+    claim_when_listening: Mutex<BTreeMap<u16, usize>>,
     /// `listens_on` 一律读不出来（`lsof` 不答）。
     unreadable: std::sync::atomic::AtomicBool,
     /// 读启动时间、进程组之前先睡这么久（慢 `ps`：认回的孤儿的身份闸因此很慢）。
@@ -114,6 +117,7 @@ impl Scripted {
             teams: Mutex::new(BTreeMap::new()),
             team_checks: AtomicUsize::new(0),
             claim_budget: Mutex::new(BTreeMap::new()),
+            claim_when_listening: Mutex::new(BTreeMap::new()),
             unreadable: std::sync::atomic::AtomicBool::new(false),
             slow: Mutex::new(Duration::ZERO),
         })
@@ -131,10 +135,24 @@ impl Scripted {
         }
     }
 
-    /// 自有引擎的端口，但只有第一次问到 `listens_on` 时为真（等就绪那一次），之后为假（封印那一次）。
+    /// 自有引擎的端口，但只有第一次问到 `listens_on` 时为真，之后一律为假。等就绪的循环在每一次带 key 的探测之前都重新问，所以这「第一次」
+    /// 是等就绪的第一轮，不管引擎那时有没有开始监听：之后没有哪个带 key 的探测会发出去（H2 的用例靠它）。要造「等就绪时监听它的是引擎、
+    /// 封印时才发现端口被别人占了」，用 [`Self::claiming_once_when_listening`]。
     fn claiming_once(port: u16) -> Arc<Self> {
         let scripted = Self::new();
         scripted.claim_budget.lock().unwrap().insert(port, 1);
+        scripted
+    }
+
+    /// 自有引擎的端口，`listens_on` 只有一次为真：端口上真的有东西在接受连接的那一问（引擎开始监听之后的第一问，等就绪的那一轮，
+    /// 紧接着的探测因此真的到达引擎并就绪），之后一律为假（封印那一问）。
+    fn claiming_once_when_listening(port: u16) -> Arc<Self> {
+        let scripted = Self::new();
+        scripted
+            .claim_when_listening
+            .lock()
+            .unwrap()
+            .insert(port, 1);
         scripted
     }
 
@@ -191,6 +209,24 @@ impl ProcessInspector for Scripted {
             }
             return Ok(false);
         }
+        let left = self
+            .claim_when_listening
+            .lock()
+            .unwrap()
+            .get(&port)
+            .copied();
+        if let Some(left) = left {
+            if left > 0 && accepts_connections(port).await {
+                let mut budget = self.claim_when_listening.lock().unwrap();
+                if let Some(left) = budget.get_mut(&port)
+                    && *left > 0
+                {
+                    *left -= 1;
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
         self.real.listens_on(pid, port).await
     }
     async fn listeners_on(&self, port: u16) -> Result<Vec<u32>, InspectError> {
@@ -209,6 +245,16 @@ impl ProcessInspector for Scripted {
         self.team_checks.fetch_add(1, Ordering::SeqCst);
         Ok(self.teams.lock().unwrap().get(&pid).cloned())
     }
+}
+
+/// 回环地址的这个端口此刻有没有东西在接受连接（只建连接，什么都不发；假引擎对空连接不记任何请求）。
+async fn accepts_connections(port: u16) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(300),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .is_ok_and(|connected| connected.is_ok())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1916,11 +1962,13 @@ async fn an_engine_that_keeps_rejecting_its_own_key_while_starting_is_given_up_w
 #[tokio::test]
 async fn an_engine_whose_port_turns_out_to_be_held_by_another_process_when_sealed_is_stopped() {
     let rig = Rig::new(&Behavior::default());
-    // 等就绪的时候监听这个端口的是引擎（`listens_on` 为真），封印所有权记录时再看，端口已经是别人的了。
+    // 等就绪的时候监听这个端口的是引擎（`listens_on` 为真，只有一次），封印所有权记录时再看，端口已经是别人的了。等就绪的循环在每一次
+    // 带 key 的探测之前都重新问（H2），所以这一次「为真」要等引擎真的开始监听才给：给得太早，就被引擎还没起来的那几轮用掉，
+    // 之后每一轮都「没有确认」，永远不会就绪，也走不到封印这一步。
     let h = Harness::start(
         &rig,
         default_backend(&rig),
-        Scripted::claiming_once(rig.port),
+        Scripted::claiming_once_when_listening(rig.port),
         observable_restarts(),
         StopOnExit::Owned,
     );
