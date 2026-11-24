@@ -99,6 +99,8 @@ struct Scripted {
     team_checks: AtomicUsize,
     /// 端口 → 还剩几次「`listens_on` 为真」，用完之后一律为假：造「等就绪时监听它的是引擎，封印时端口已被别人占了」。
     claim_budget: Mutex<BTreeMap<u16, usize>>,
+    /// `listens_on` 一律读不出来（`lsof` 不答）。
+    unreadable: std::sync::atomic::AtomicBool,
     /// 读启动时间、进程组之前先睡这么久（慢 `ps`：认回的孤儿的身份闸因此很慢）。
     slow: Mutex<Duration>,
 }
@@ -112,6 +114,7 @@ impl Scripted {
             teams: Mutex::new(BTreeMap::new()),
             team_checks: AtomicUsize::new(0),
             claim_budget: Mutex::new(BTreeMap::new()),
+            unreadable: std::sync::atomic::AtomicBool::new(false),
             slow: Mutex::new(Duration::ZERO),
         })
     }
@@ -175,6 +178,9 @@ impl ProcessInspector for Scripted {
         self.real.process_group(pid).await
     }
     async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
+        if self.unreadable.load(Ordering::SeqCst) {
+            return Err(InspectError::NoAnswer);
+        }
         if self.claims.lock().unwrap().contains(&port) {
             return Ok(true);
         }
@@ -253,6 +259,14 @@ impl Rig {
 
     fn pid(&self, launch: usize) -> u64 {
         self.fake.launch(launch)["pid"].as_u64().unwrap()
+    }
+
+    /// 第 `launch` 次拉起的引擎的私有 key（它的环境变量 `OMLX_API_KEY`）。
+    fn key(&self, launch: usize) -> String {
+        self.fake.launch(launch)["api_key"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 }
 
@@ -2730,4 +2744,231 @@ async fn a_cancelled_gate_task_never_swaps() {
         .unwrap();
     assert_eq!(swapped.load(Ordering::SeqCst), 0);
     manager.shutdown(true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 自有引擎的私有 key 只发给确认过的监听者，每一次（IDORIS-CORE S6，Codex 审计 H3；预审 L2 的 H2）
+// ---------------------------------------------------------------------------------------------
+
+/// `Ok(true)` 的次数不限，直到 [`Scripted::regain`]：造「引擎进程活着、端口却不再是它的」。
+impl Scripted {
+    /// 从现在起，`listens_on` 对这个端口回 `Ok(false)`（进程还活着，监听这个端口的不是它了）。
+    fn lose(&self, port: u16) {
+        self.claims
+            .lock()
+            .unwrap()
+            .retain(|claimed| *claimed != port);
+        self.claim_budget.lock().unwrap().insert(port, 0);
+    }
+
+    /// 又是它在监听了。
+    fn regain(&self, port: u16) {
+        self.claim_budget.lock().unwrap().remove(&port);
+        self.claims.lock().unwrap().push(port);
+    }
+}
+
+/// 在这个引擎的记录里，带着一个 key 的请求有几个（`ok` = 引擎自己的私有 key，`bad` = 别的 key；没带 key 的是 `none`）。
+fn keyed_requests(rig: &Rig) -> usize {
+    rig.fake
+        .requests()
+        .iter()
+        .filter(|(_, auth)| auth != "none")
+        .count()
+}
+
+/// 预审 L2 的 H2：等就绪的循环原来只在第一次确认监听者、之后缓存那个「是」；引擎 0.8 秒之后才开始监听，第一次问的时候（引擎还没起来）是真的，之后一直是假的，
+/// 缓存下来的「是」让之后每一次探测都带着私有 key 出去：引擎一开始监听就收到了它。现在每一次带 key 的探测之前都重新问。
+#[tokio::test]
+async fn an_engine_that_listens_late_gets_no_key_once_the_port_stopped_being_confirmed_during_startup()
+ {
+    let rig = Rig::new(&Behavior {
+        listen_delay_secs: 0.8,
+        ..Behavior::default()
+    });
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming_once(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    // 起点是引擎的启动记录（python 一起来就写）：它在这之后 0.8 秒才开始监听。机器忙时进程起得慢，所以不按固定的时间算，也不给启动一个紧的上限：
+    // 引擎开始监听之后再多等两秒（探测每 20 到 100 毫秒一次），这段时间里任何一个带 key 的探测都会被记下来。
+    wait_for("the engine process to start", || rig.fake.launches() >= 1).await;
+    tokio::time::sleep(Duration::from_millis(2800)).await;
+    assert_eq!(
+        keyed_requests(&rig),
+        0,
+        "a key went to a port nobody had confirmed: {:?}",
+        rig.fake.requests()
+    );
+    h.manager.shutdown(true).await;
+}
+
+/// 预审 L2 的 H2：监督的周期探测原来不问「监听这个端口的此刻还是不是这个进程」就带着私有 key 出去。进程活着、端口却不再是它的（放掉了，或别的进程绑上了）：
+/// 先收回私有 key（端点封上）、发布 `unavailable` 加 `port_in_use`，之后没有一个带 key 的请求发往那个端口；又确认了，私有 key 登记回去，探测恢复。
+#[tokio::test]
+async fn an_engine_that_stops_being_the_listener_loses_its_key_at_once_and_gets_it_back_when_it_is_again()
+ {
+    let rig = Rig::new(&Behavior::default());
+    let inspector = Scripted::claiming(rig.port);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    let key = rig.key(0);
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Private(key.clone()))
+    );
+    wait_for("keyed probes to be flowing", || keyed_requests(&rig) >= 2).await;
+
+    inspector.lose(rig.port);
+    let lost = h
+        .until("unavailable, port_in_use", |s| {
+            s.state == UpstreamState::Unavailable && s.reason == Some(UpstreamReason::PortInUse)
+        })
+        .await;
+    assert!(lost.owned, "the process is still ours and alive");
+    assert!(pid_alive(rig.pid(0)));
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked),
+        "no credential of any kind goes to a port the engine no longer owns"
+    );
+    let keyed = keyed_requests(&rig);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        keyed_requests(&rig),
+        keyed,
+        "a keyed probe went out after the engine lost its port"
+    );
+
+    inspector.regain(rig.port);
+    h.until_state(UpstreamState::Ready).await;
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Private(key))
+    );
+    assert_eq!(rig.fake.launches(), 1, "the same process, never restarted");
+    wait_for("keyed probes to flow again", || {
+        keyed_requests(&rig) > keyed
+    })
+    .await;
+    h.manager.shutdown(true).await;
+}
+
+/// 检查器读不出来（`lsof` 不答）不是「确认了」：重读几次（`unverifiable_retries`）之后仍读不出来就当作没有确认，先收回私有 key。
+#[tokio::test]
+async fn an_engine_whose_listener_cannot_be_read_is_not_a_confirmed_listener_and_gets_no_key() {
+    let rig = Rig::new(&Behavior::default());
+    let inspector = Scripted::claiming(rig.port);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    wait_for("keyed probes to be flowing", || keyed_requests(&rig) >= 2).await;
+    inspector
+        .unreadable
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    h.until("unavailable, port_in_use", |s| {
+        s.state == UpstreamState::Unavailable && s.reason == Some(UpstreamReason::PortInUse)
+    })
+    .await;
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
+    let keyed = keyed_requests(&rig);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(keyed_requests(&rig), keyed);
+    h.manager.shutdown(true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 外部引擎换了监听者：用新校验出来的监听者重新登记，监听者没了就封上（Codex 预审 L2 的 M1）
+// ---------------------------------------------------------------------------------------------
+
+/// 预审 L2 的 M1：合法的外部重启——监听者 A 退出、B 起来。监督原来校验了 B、却拿着 A 的守卫继续对着 B 登记：数据面的每个请求都对着 A 的集合验、一直被拒绝
+/// （登记表也没有新的代际）。现在新校验出来的集合与登记时的不一样，就用它建一个新的守卫登记进去（代际前进），请求对着 B 验、通过。监听者没了（`NoListener`）
+/// 原来只发布 `unavailable`、登记还留着：现在端点立刻封上，什么凭证都不发；同一个监听者回来，再登记回去。
+#[tokio::test]
+async fn m1_a_replaced_external_listener_is_registered_afresh_and_a_vanished_one_blocks_the_endpoint()
+ {
+    use idoris_upstream::omlx::key::{KeyRefusal, authorize_omlx_request, endpoint_generation};
+
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start(work.path(), None);
+    let rig = rig_for(&external);
+    let inspector = Scripted::new();
+    inspector.external_listener(external.port, external.pid(), Some(TEAM));
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    let endpoint = rig.endpoint();
+    let verified = EndpointKey::External {
+        settings_key_verified: true,
+    };
+    assert_eq!(governed_endpoint(&endpoint), Some(verified.clone()));
+    let first_generation = endpoint_generation(&endpoint);
+    assert!(
+        authorize_omlx_request(&endpoint, None).await.is_ok(),
+        "the verified listener is authorized"
+    );
+
+    // A 被 B 取代（B 通过同样的校验，pid 与启动时间都不同）：新登记，代际前进，请求对着 B 验、通过。
+    let b_pid = std::process::id();
+    inspector.external_listener(external.port, b_pid, Some(TEAM));
+    wait_for("the listener to be registered afresh", || {
+        endpoint_generation(&endpoint) > first_generation
+    })
+    .await;
+    h.until_state(UpstreamState::Ready).await;
+    let second_generation = endpoint_generation(&endpoint);
+    assert_eq!(governed_endpoint(&endpoint), Some(verified.clone()));
+    let authorized = authorize_omlx_request(&endpoint, None).await;
+    assert!(
+        authorized.is_ok(),
+        "the guard of the listener that left would refuse the one that came: {authorized:?}"
+    );
+    drop(authorized);
+
+    // 监听者没了：端点立刻封上（之前只发布 `unavailable`，登记留着），授权被拒绝。
+    inspector.forget_listener(external.port);
+    wait_for("the endpoint to be blocked", || {
+        governed_endpoint(&endpoint) == Some(EndpointKey::Blocked)
+    })
+    .await;
+    assert_eq!(
+        authorize_omlx_request(&endpoint, None).await.unwrap_err(),
+        KeyRefusal::Blocked
+    );
+    assert!(endpoint_generation(&endpoint) > second_generation);
+
+    // 同一个监听者回来：校验通过，再登记，回到 `ready`。
+    inspector.external_listener(external.port, b_pid, Some(TEAM));
+    h.until_state(UpstreamState::Ready).await;
+    assert_eq!(governed_endpoint(&endpoint), Some(verified));
+    assert!(authorize_omlx_request(&endpoint, None).await.is_ok());
+    assert_eq!(
+        rig.fake.launches(),
+        0,
+        "an external engine is never replaced by ours"
+    );
+    assert!(pid_alive(u64::from(external.pid())), "never signalled");
+    h.manager.shutdown(true).await;
 }

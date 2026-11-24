@@ -429,3 +429,149 @@ async fn a_half_open_probe_that_is_refused_locally_hands_its_slot_back() {
     assert_eq!(chat(&app).await, StatusCode::OK);
     assert_eq!(engine.received_requests().await.unwrap().len(), 4);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Codex 预审 L2 的 H1、H3：被管理的端点由端点决定、不由卡决定；授权之后到发出之前，重启越过了请求
+// ---------------------------------------------------------------------------------------------
+
+/// 一张**不能**带 oMLX key 的卡（`extensions.idoris_upstream`：手写的自定义上游）：与 `omlx_card` 同一个端点。
+fn credential_ineligible_card(endpoint: &str) -> ComponentCard {
+    let mut card = omlx_card(endpoint, Capability::Chat);
+    card.provider.id = "hand-written".to_owned();
+    card.extensions = Some(
+        json!({"idoris_upstream": {"kind": "openai_compat"}})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    assert!(!idoris_upstream::omlx::key::card_may_carry_omlx_key(&card));
+    card
+}
+
+fn app_for(card: ComponentCard, proxy: ChatProxy) -> axum::Router {
+    build_app(AppState {
+        cards: vec![card],
+        proxy: Arc::new(proxy),
+        ..AppState::default()
+    })
+}
+
+/// H1：同一个端口上的另一张卡（resident、带 `idoris_upstream`、不能带 key）原来绕过整套核对：代理只在「这张卡能带 key」时才查登记表。托管的监听者被拒绝或没了、
+/// 别的本地进程占了这个端口，它的请求照样原样发出去（没有 bearer），连同用户的提示词，还可能把占着端口的东西的回答当成回答。现在由**端点**决定：登记过的端点，
+/// 不管哪张卡发，都过代际、封上、守卫的核对，发往核验过的地址，登记在途；卡的资格只管凭证带不带。
+#[tokio::test]
+async fn a_card_that_may_not_carry_the_key_is_gated_by_its_governed_endpoint_like_the_managed_card()
+{
+    let engine = engine_on(None).await;
+    let endpoint = engine.uri();
+    let _governed = Governed(endpoint.clone());
+    govern_endpoint(&endpoint, EndpointKey::Private(OLD_KEY.to_owned()));
+    let app = app_for(
+        credential_ineligible_card(&endpoint),
+        ChatProxy::new(client()),
+    );
+
+    // Healthy: the request is served, and it carries no credential (the registered key is not this card's).
+    assert_eq!(chat(&app).await, StatusCode::OK);
+    let seen = engine.received_requests().await.unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen[0].headers.get("authorization").is_none(),
+        "the managed engine's private key went to a card that may not carry it"
+    );
+
+    // The managed listener is gone (the endpoint is blocked) and another process now holds the port: nothing more is sent to it.
+    block_endpoint(&endpoint);
+    assert_eq!(chat(&app).await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        engine.received_requests().await.unwrap().len(),
+        1,
+        "a prompt went to whatever holds a blocked governed port"
+    );
+}
+
+/// H1：同一个套接字的 IPv4 映射写法（`[::ffff:127.0.0.1]:端口`）。登记表早就把它并进同一个端口，key 的资格却认为它「不是 loopback」，于是这张卡落在被管理的端口上、
+/// 不归任何人管。现在两处是同一个判据：封上的端点对它也是封上的。
+#[tokio::test]
+async fn a_card_spelled_as_the_ipv4_mapped_loopback_of_a_blocked_governed_port_is_refused_too() {
+    let engine = engine_on(None).await;
+    let canonical = engine.uri();
+    let port = canonical.rsplit(':').next().unwrap().to_owned();
+    let mapped = format!("http://[::ffff:127.0.0.1]:{port}");
+    let _governed = Governed(canonical.clone());
+    block_endpoint(&canonical);
+    assert!(
+        idoris_upstream::omlx::key::card_may_carry_omlx_key(&omlx_card(&mapped, Capability::Chat)),
+        "eligibility and the registry classify the spelling the same way"
+    );
+    for card in [
+        omlx_card(&mapped, Capability::Chat),
+        credential_ineligible_card(&mapped),
+    ] {
+        let app = app_for(card, ChatProxy::new(client()));
+        assert_eq!(chat(&app).await, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    assert!(
+        engine.received_requests().await.unwrap().is_empty(),
+        "a request reached a blocked governed port through its IPv4-mapped spelling"
+    );
+}
+
+/// 同上，换代而不是封上：一张不能带 key 的卡的请求通过了状态门、停在发送之前；引擎被换掉；放行之后被拒绝，一个请求也没有发给新引擎。
+#[tokio::test]
+async fn a_card_that_may_not_carry_the_key_is_refused_when_the_engine_was_replaced_before_its_send()
+{
+    let engine = engine_on(None).await;
+    let endpoint = engine.uri();
+    let _governed = Governed(endpoint.clone());
+    govern_endpoint(&endpoint, EndpointKey::Private(OLD_KEY.to_owned()));
+    let park = park_at(0);
+    let app = app_for(
+        credential_ineligible_card(&endpoint),
+        ChatProxy::new(client()).with_before_outbound(park.hook.clone()),
+    );
+    let request =
+        tokio::spawn(async move { app.oneshot(Route::ChatBuffered.request()).await.unwrap() });
+    park.reached.notified().await;
+    the_engine_is_replaced(&endpoint);
+    park.release.notify_one();
+    let response = request.await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = body_of(response).await;
+    assert!(
+        engine.received_requests().await.unwrap().is_empty(),
+        "the request admitted for the old engine reached the new one"
+    );
+}
+
+/// H3：请求已经通过了最后一次代际核对（授权完成、请求体也序列化好了），在发出之前被耽搁；这时重启完成——旧引擎被封上，替代者登记了它的 key。之前授权就是授权，
+/// 请求照发：旧的请求体连同旧的 bearer 拨给了此刻在那个端口上的替代者。现在发出前最后一刻再同步地看一眼端点（`Authorization::ensure_current`）：代际变了，拒绝。
+/// 六个入口共用 `outbound`，各测一次。
+#[tokio::test]
+async fn a_request_delayed_after_its_authorization_is_refused_when_a_restart_overtakes_it() {
+    for route in Route::ALL {
+        let engine = engine_on(None).await;
+        let endpoint = engine.uri();
+        let _governed = Governed(endpoint.clone());
+        govern_endpoint(&endpoint, EndpointKey::Private(OLD_KEY.to_owned()));
+        let park = park_at(0);
+        let proxy = ChatProxy::new(client()).with_after_authorization(park.hook.clone());
+        let app = app_for(omlx_card(&endpoint, route.capability()), proxy);
+        let request = tokio::spawn(async move { app.oneshot(route.request()).await.unwrap() });
+        park.reached.notified().await;
+        // Authorized for the old engine and built: delayed. The restart completes now.
+        the_engine_is_replaced(&endpoint);
+        park.release.notify_one();
+        let response = request.await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{route:?}"
+        );
+        let _ = body_of(response).await;
+        assert!(
+            engine.received_requests().await.unwrap().is_empty(),
+            "{route:?}: the old authorization was used to dial the replacement"
+        );
+    }
+}

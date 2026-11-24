@@ -524,11 +524,22 @@ pub async fn probe_resident_admitted(
     }
     let url = format!("{}/v1/models", card.endpoint.trim_end_matches('/'));
     let mut key_sent = false;
-    // 持有到响应读完：端点上的一个在途操作。
-    let authorization = if crate::models::is_loopback_omlx(card) {
+    // 持有到响应读完：端点上的一个在途操作。被管理的端点由端点决定（Codex 预审 L2 的 H1）：不能带 key 的卡也过同一道授权，只是不带凭证。
+    let carries_key = crate::models::is_loopback_omlx(card);
+    let authorization = if carries_key {
         let Ok(authorization) =
             idoris_upstream::omlx::key::authorize_omlx_request(&card.endpoint, admitted_generation)
                 .await
+        else {
+            return Observation::Unavailable(None);
+        };
+        Some(authorization)
+    } else if idoris_upstream::omlx::key::is_governed_endpoint(&card.endpoint) {
+        let Ok(authorization) = idoris_upstream::omlx::key::authorize_omlx_request_without_key(
+            &card.endpoint,
+            admitted_generation,
+        )
+        .await
         else {
             return Observation::Unavailable(None);
         };
@@ -543,7 +554,15 @@ pub async fn probe_resident_admitted(
     };
     let mut request = client.get(&send_url).timeout(timeout);
     let _authorization = if let Some(authorization) = authorization {
-        if let Some(key) = authorization.key_os().filter(|key| !key.is_empty()) {
+        // 发出前最后同步看一眼端点（Codex 预审 L2 的 H3）。
+        if authorization.ensure_current().is_err() {
+            return Observation::Unavailable(None);
+        }
+        if let Some(key) = carries_key
+            .then(|| authorization.key_os())
+            .flatten()
+            .filter(|key| !key.is_empty())
+        {
             // 非 UTF-8、放不进请求头的 key 是无效凭证，不是「没有凭证」（与 `GET /v1/models` 同口径）。
             let Some(mut header) = key
                 .to_str()
@@ -1274,15 +1293,14 @@ mod tests {
 
     #[tokio::test]
     async fn probe_never_sends_a_request_to_an_endpoint_that_is_not_a_loopback_literal() {
-        // 监听在 127.0.0.1 的服务器；卡的 endpoint 写成 IPv4-mapped IPv6 字面量，`is_loopback_base_url` 不认它是
-        // loopback：探测器必须一个请求都不发（出站纪律：宁可报 unavailable，也不对「不确定是不是本机」的地址发流量）。
+        // 一个不是 loopback 的 IPv4 映射写法（`::ffff:8.8.8.8`）：探测器必须一个请求都不发（出站纪律：宁可报 unavailable，也不对「不是本机」的地址发流量）。
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
             .expect(0)
             .mount(&server)
             .await;
-        let endpoint = format!("http://[::ffff:127.0.0.1]:{}", server.address().port());
+        let endpoint = format!("http://[::ffff:8.8.8.8]:{}", server.address().port());
         assert!(!idoris_upstream::omlx::key::is_loopback_base_url(&endpoint));
         let card = resident_card("r", &endpoint, "fixture@1");
         assert_eq!(
@@ -1290,6 +1308,102 @@ mod tests {
             Observation::Unavailable(None)
         );
         server.verify().await;
+    }
+
+    /// 登记表把 IPv4 映射的写法（`::ffff:127.0.0.1`）并进同一个端口，key 的资格与「是不是 loopback」也这样认（Codex 预审 L2 的 H1：此前它们对同一个
+    /// 套接字各说各的）。所以映射写法的卡落在一个封上的、被管理的端口上，探测器**一个请求都不发**，不管这张卡能不能带 key。
+    #[tokio::test]
+    async fn probe_of_an_ipv4_mapped_loopback_card_on_a_blocked_governed_port_sends_nothing() {
+        use idoris_upstream::omlx::key::{block_endpoint, forget_endpoint};
+
+        struct Governed(String);
+        impl Drop for Governed {
+            fn drop(&mut self) {
+                forget_endpoint(&self.0);
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let canonical = server.uri();
+        let endpoint = format!("http://[::ffff:127.0.0.1]:{}", server.address().port());
+        assert!(
+            idoris_upstream::omlx::key::is_loopback_base_url(&endpoint),
+            "the same socket as {canonical}"
+        );
+        let _governed = Governed(canonical.clone());
+        block_endpoint(&canonical);
+        // A card that may carry the key, and one that may not: both are the managed port as far as the registry is concerned.
+        for pin in ["omlx@0.6.4", "fixture@1"] {
+            let card = resident_card("r", &endpoint, pin);
+            let admitted = crate::models::admission_generation(&card);
+            assert!(
+                admitted.is_some(),
+                "{pin}: bound to the governed endpoint's generation"
+            );
+            assert_eq!(
+                probe_resident_admitted(&client(), &card, admitted, Duration::from_millis(500))
+                    .await,
+                Observation::Unavailable(None),
+                "{pin}"
+            );
+        }
+        server.verify().await;
+    }
+
+    /// Codex 预审 L2 的 H1：不能带 key 的卡（别的产品名、`idoris_upstream`）发往一个被管理的端点，探测与别的发送走同一道授权：封上的端点一个请求都不发；放开之后
+    /// 请求发出，**不带** bearer（登记的私有 key 不是这张卡的）。
+    #[tokio::test]
+    async fn probe_of_a_card_that_may_not_carry_the_key_is_gated_by_its_governed_endpoint_and_sends_no_key()
+     {
+        use idoris_upstream::omlx::key::{
+            EndpointKey, block_endpoint, forget_endpoint, govern_endpoint,
+        };
+
+        struct Governed(String);
+        impl Drop for Governed {
+            fn drop(&mut self) {
+                forget_endpoint(&self.0);
+            }
+        }
+
+        let server =
+            models_server(ResponseTemplate::new(200).set_body_json(json!({"data": []}))).await;
+        let endpoint = server.uri();
+        let _governed = Governed(endpoint.clone());
+        let card = resident_card("lm", &endpoint, "lmstudio@1");
+        block_endpoint(&endpoint);
+        assert_eq!(
+            probe_resident_admitted(
+                &client(),
+                &card,
+                crate::models::admission_generation(&card),
+                Duration::from_secs(2)
+            )
+            .await,
+            Observation::Unavailable(None)
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a probe went to a blocked governed endpoint"
+        );
+
+        // Registered again (a replacement verified): the probe goes out, without any credential.
+        govern_endpoint(&endpoint, EndpointKey::Private("engine-key".to_owned()));
+        assert_eq!(
+            probe_resident(&client(), &card, Duration::from_secs(2)).await,
+            Observation::Ready
+        );
+        let seen = server.received_requests().await.unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].headers.get("authorization").is_none(),
+            "the engine's private key went to a card that may not carry it"
+        );
     }
 
     #[tokio::test]

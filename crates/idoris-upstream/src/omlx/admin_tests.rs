@@ -506,3 +506,124 @@ async fn an_engine_replaced_while_the_admin_session_was_being_established_gets_n
         "only the login went out"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Codex 预审 L2 的 M2：一个会发好几次的操作，整个操作绑定同一代引擎
+// ---------------------------------------------------------------------------------------------
+
+/// 没有 Supervisor 的绑定时（直接用适配器的调用方），操作自己在边界上钉住此刻的代际。第一次 Admin 发送拿着 A 的 cookie，A 回 401、**同一刻引擎换成了 B**；
+/// 重试在授权时用同一个（A 的）代际核对：被拒绝，不登录 B、不把原来的那个改设置的 `PUT` 发给 B。之前每次授权各读此刻的代际：重试对着 B 登录，
+/// 新的 cookie 与重试的凭证都说是 B，那个本来给 A 的 `PUT` 就落在了 B 上。
+#[tokio::test]
+async fn a_401_whose_retry_would_land_on_the_replacement_engine_is_refused_not_sent_to_it() {
+    let server = MockServer::start().await;
+    let url = server.uri();
+    let _governed = Governed(url.clone());
+    govern_endpoint(&url, EndpointKey::Private(FIRST_KEY.into()));
+    Mock::given(method("POST"))
+        .and(path("/admin/api/login"))
+        .and(body_json(json!({"api_key": FIRST_KEY})))
+        .respond_with(login_response(FIRST_COOKIE))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/api/login"))
+        .and(body_json(json!({"api_key": SECOND_KEY})))
+        .respond_with(login_response(SECOND_COOKIE))
+        .mount(&server)
+        .await;
+    // The first engine answers the settings change with a 401 — and the engine behind the endpoint is replaced at that very moment.
+    let rotated_when_answering = {
+        let url = url.clone();
+        move |_: &wiremock::Request| {
+            govern_endpoint(&url, EndpointKey::Private(SECOND_KEY.into()));
+            ResponseTemplate::new(401)
+        }
+    };
+    Mock::given(method("PUT"))
+        .and(path(SETTINGS))
+        .respond_with(rotated_when_answering)
+        .mount(&server)
+        .await;
+    let adapter = per_request_adapter(&server);
+
+    // No generation is bound by a caller: the operation binds the one in force when it starts.
+    let result = adapter
+        .admin_request(Method::PUT, SETTINGS, Some(&json!({"is_pinned": true})))
+        .await;
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("was replaced"), "{error}");
+    let seen = server.received_requests().await.unwrap();
+    let logins: Vec<Value> = seen
+        .iter()
+        .filter(|request| request.url.path() == "/admin/api/login")
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    assert_eq!(
+        logins.len(),
+        1,
+        "the retry logged in to the replacement: {logins:?}"
+    );
+    assert_eq!(logins[0]["api_key"], FIRST_KEY);
+    assert_eq!(
+        seen.iter()
+            .filter(|request| request.method == Method::PUT)
+            .count(),
+        1,
+        "the settings change was sent a second time (to the replacement)"
+    );
+    assert_eq!(requests_carrying(&server, SECOND_COOKIE).await, 0);
+}
+
+/// 同一个操作的另两次发送：`load` 之后的 pin（一次 Admin 的 `PUT`）。加载落在 A 上，之后引擎换成了 B：pin 被拒绝，不发给 B（之前 pin 对着此刻的代际授权，
+/// 登录 B、把「钉住」发给了一个根本没有加载过这个模型的进程）。`load` 报的是「加载结果不确定」，围栏留着（Supervisor 的老规矩）。
+#[tokio::test]
+async fn a_load_whose_pin_would_land_on_the_replacement_engine_is_refused_not_sent_to_it() {
+    use idoris_contracts::LoadPolicy;
+    use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode};
+
+    let server = MockServer::start().await;
+    let url = server.uri();
+    let _governed = Governed(url.clone());
+    govern_endpoint(&url, EndpointKey::Private(FIRST_KEY.into()));
+    // The load lands on the first engine, which is replaced right after it answers.
+    let rotated_when_answering = {
+        let url = url.clone();
+        move |_: &wiremock::Request| {
+            govern_endpoint(&url, EndpointKey::Private(SECOND_KEY.into()));
+            ResponseTemplate::new(200).set_body_json(json!({}))
+        }
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/models/qwen3-8b/load"))
+        .respond_with(rotated_when_answering)
+        .mount(&server)
+        .await;
+    mock_engine_login(&server, FIRST_KEY, FIRST_COOKIE).await;
+    mock_engine_login(&server, SECOND_KEY, SECOND_COOKIE).await;
+    let adapter = per_request_adapter(&server);
+    let policy = LoadPolicy {
+        mode: LoadMode::Resident,
+        keepalive: Keepalive::Pinned { pinned: true },
+        admission: Admission::Coexist,
+    };
+
+    let result = adapter.load("qwen3-8b", Some(&policy)).await;
+    assert!(result.is_err(), "{result:?}");
+    let seen = server.received_requests().await.unwrap();
+    assert_eq!(
+        seen.iter()
+            .filter(|request| request.url.path() == "/admin/api/login")
+            .count(),
+        0,
+        "the pin logged in to the engine that took over: {seen:?}"
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|request| request.method == Method::PUT)
+            .count(),
+        0,
+        "the pin was sent to an engine that never loaded the model"
+    );
+    assert_eq!(requests_carrying(&server, SECOND_COOKIE).await, 0);
+}
