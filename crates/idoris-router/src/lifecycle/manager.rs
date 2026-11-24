@@ -776,46 +776,99 @@ impl EngineManager {
     /// 删记录）；为假（`stop_on_exit:"never"` 的正常退出）就让引擎继续跑，所有权记录留给下一个 iDoris。
     /// 等各实例完成，至多 `stop_grace` 加一点余量；超时的实例任务被中止（`OwnedEngine` 的 `Drop` 仍会兜底）。
     pub async fn shutdown(&self, stop_engines: bool) {
-        // 一个绝对的截止时间管入队与等回答两头（IDORIS-CORE S6，Codex 终审 M5）：Admin 的命令填满了容量为 8 的邮箱、实例任务又忙着
-        // 排空或复位的时候，入队本身会等，预算必须从入队之前开始算，不能在入队之后才启动。
-        let deadline =
-            Instant::now() + self.shared.config.timings.stop_grace + Duration::from_secs(3);
-        let mut waits = Vec::new();
-        // 有一个实例没能在预算里收下 `Shutdown`（邮箱满了、它又在忙）：不能等它自己结束，下面中止它的任务。
-        let mut delivered = true;
-        for sender in self.senders.values() {
-            let (reply, answer) = oneshot::channel();
-            let request = Request {
-                command: Command::Shutdown {
-                    stop_engine: stop_engines,
-                },
-                reply: Some(reply),
-                seq: 0,
-                deadline: None,
+        self.shutdown_by(stop_engines, None).await;
+    }
+
+    /// [`Self::shutdown`]，带整个停止必须完成的期限（iDoris 收到信号之后，launcher 在 17 秒时 SIGKILL 它）：停引擎的宽限只拿
+    /// 期限里剩下的（[`super::backoff::stop_windows`]：不到 2 秒就 SIGTERM 之后立刻 SIGKILL），等各实例的上限也跟着缩到期限
+    /// 之后一点余量。`None` 与 [`Self::shutdown`] 相同。
+    pub async fn shutdown_by(&self, stop_engines: bool, deadline: Option<tokio::time::Instant>) {
+        // 整个收尾（送达加等各实例答复）只有这**一个**结束时刻：实例自己在期限里收尾（宽限加确认窗口），这是外面的兜底。
+        let end = tokio::time::Instant::now()
+            + match deadline {
+                Some(deadline) => {
+                    deadline.saturating_duration_since(tokio::time::Instant::now())
+                        + super::backoff::MIN_CONFIRM
+                        + Duration::from_millis(100)
+                }
+                None => self.shared.config.timings.stop_grace + Duration::from_secs(3),
             };
-            match tokio::time::timeout_at(deadline, sender.send(request)).await {
-                Ok(Ok(())) => waits.push(answer),
-                // 实例任务已经结束了：没有什么可等的。
-                Ok(Err(_closed)) => {}
-                Err(_elapsed) => delivered = false,
-            }
+        let senders: Vec<(&str, &mpsc::Sender<Request>)> = self
+            .senders
+            .iter()
+            .map(|(id, sender)| (id.as_str(), sender))
+            .collect();
+        let delivered = deliver_shutdown(&senders, stop_engines, deadline, end).await;
+        for id in &delivered.undelivered {
+            self.shared.log(&format!(
+                "[idoris] 引擎 {id}：停止命令没能送到（命令队列一直是满的，直到收尾期限）：中止它的实例任务，所有权记录保留，下一个 iDoris 会认回并收尾"
+            ));
         }
-        let finished = tokio::time::timeout_at(deadline, async {
-            for answer in waits {
+        let finished = tokio::time::timeout_at(end, async {
+            for answer in delivered.answers {
                 let _ = answer.await;
             }
         })
         .await;
-        let finished_in_time = delivered && finished.is_ok();
         let tasks: Vec<JoinHandle<()>> =
             std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner));
         for task in tasks {
-            if !finished_in_time {
+            // 超时、或命令没送到的实例（它没有收到停止命令，不会自己结束）：中止；`OwnedEngine` 的 `Drop` 仍会兜底。
+            if finished.is_err() || !delivered.undelivered.is_empty() {
                 task.abort();
             }
             let _ = task.await;
         }
     }
+}
+
+/// [`deliver_shutdown`] 的结果。
+struct Delivered {
+    /// 已送到的实例的答复。
+    answers: Vec<oneshot::Receiver<Result<(), CommandError>>>,
+    /// 到 `end` 命令队列还是满的、没能送到的实例。
+    undelivered: Vec<String>,
+}
+
+/// 把 `Shutdown` **同时**送给每个实例（M9）：一个实例的命令队列满了（任务忙在一次长停止里、队列里还压着别的命令），不能让后面的实例也收不到停止命令
+/// （此前是逐个 `send().await`，队列一满就卡在那里，之后的实例收不到、送达这一步也没有时限）。每个送达各自受 `end` 约束；到 `end` 还没送到的记进
+/// `undelivered`（调用方点名写日志、中止那个实例任务）。实例任务已经结束（通道已关）的没有东西可停，既不等也不算没送到。
+async fn deliver_shutdown(
+    senders: &[(&str, &mpsc::Sender<Request>)],
+    stop_engine: bool,
+    deadline: Option<tokio::time::Instant>,
+    end: tokio::time::Instant,
+) -> Delivered {
+    let deliveries = senders.iter().map(|(id, sender)| async move {
+        let (reply, answer) = oneshot::channel();
+        let request = Request {
+            command: Command::Shutdown {
+                stop_engine,
+                deadline,
+            },
+            reply: Some(reply),
+            seq: 0,
+            deadline: None,
+        };
+        match tokio::time::timeout_at(end, sender.send(request)).await {
+            Ok(Ok(())) => (*id, Some(answer), false),
+            Ok(Err(_)) => (*id, None, false),
+            Err(_) => (*id, None, true),
+        }
+    });
+    let mut delivered = Delivered {
+        answers: Vec::new(),
+        undelivered: Vec::new(),
+    };
+    for (id, answer, undelivered) in futures_util::future::join_all(deliveries).await {
+        if let Some(answer) = answer {
+            delivered.answers.push(answer);
+        }
+        if undelivered {
+            delivered.undelivered.push(id.to_string());
+        }
+    }
+    delivered
 }
 
 impl Drop for EngineManager {
@@ -887,6 +940,77 @@ mod tests {
     }
 
     /// 引擎种类到 backend 的对应只在 `managed_backend_kind` 一处认定：生产的构造器与纯校验的种类认定同进同退。
+    /// M9：第一个实例的命令队列满了（没人在取），第二个是好的。停止命令是同时送的：好的那个**立刻**收到，不等第一个；第一个到期限还没送到，
+    /// 记进「没送到」（调用方点名写日志、中止它的实例任务）。逐个 `send().await` 时，第二个永远收不到。
+    #[tokio::test(start_paused = true)]
+    async fn one_full_command_queue_does_not_keep_the_stop_from_the_other_instances() {
+        let (blocked, _nobody_reads_it) = mpsc::channel::<Request>(1);
+        blocked
+            .send(Request {
+                command: Command::Start,
+                reply: None,
+                seq: 0,
+                deadline: None,
+            })
+            .await
+            .unwrap();
+        let (healthy, mut healthy_requests) = mpsc::channel::<Request>(8);
+        // 字典序里被堵住的排在前面：旧写法（按顺序逐个送）会先卡在它上面。
+        let senders = [("a-blocked", &blocked), ("b-healthy", &healthy)];
+        let begun = tokio::time::Instant::now();
+        let end = begun + Duration::from_secs(5);
+        let deadline = Some(begun + Duration::from_secs(4));
+        let delivery = deliver_shutdown(&senders, true, deadline, end);
+        tokio::pin!(delivery);
+        let request = tokio::select! {
+            request = healthy_requests.recv() => {
+                request.unwrap_or_else(|| panic!("the healthy instance gets the stop"))
+            }
+            _ = &mut delivery => panic!("the delivery cannot be over while one queue is still full"),
+        };
+        assert_eq!(
+            begun.elapsed(),
+            Duration::ZERO,
+            "the healthy instance had its command before any time passed"
+        );
+        match request.command {
+            Command::Shutdown {
+                stop_engine,
+                deadline: carried,
+            } => {
+                assert!(stop_engine);
+                assert_eq!(carried, deadline, "the deadline travels with the command");
+            }
+            _ => panic!("the healthy instance was sent something other than the stop"),
+        }
+        let delivered = delivery.await;
+        assert_eq!(delivered.undelivered, ["a-blocked"]);
+        assert_eq!(
+            delivered.answers.len(),
+            1,
+            "only the healthy one will answer"
+        );
+        assert_eq!(
+            begun.elapsed(),
+            Duration::from_secs(5),
+            "given up at the end, not before"
+        );
+    }
+
+    /// 实例任务已经结束（通道关了）：没有东西可停，既不等它的答复、也不算没送到。
+    #[tokio::test(start_paused = true)]
+    async fn an_instance_that_has_already_ended_is_neither_waited_for_nor_reported_undelivered() {
+        let (gone, receiver) = mpsc::channel::<Request>(8);
+        drop(receiver);
+        let senders = [("gone", &gone)];
+        let begun = tokio::time::Instant::now();
+        let delivered =
+            deliver_shutdown(&senders, false, None, begun + Duration::from_secs(5)).await;
+        assert!(delivered.answers.is_empty());
+        assert!(delivered.undelivered.is_empty());
+        assert_eq!(begun.elapsed(), Duration::ZERO);
+    }
+
     #[test]
     fn the_production_backend_follows_the_single_kind_mapping() {
         for kind in ["omlx", "lmstudio", "", "OMLX", "omlx "] {

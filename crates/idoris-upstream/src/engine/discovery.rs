@@ -356,7 +356,7 @@ async fn verify_codesign(check: &CodesignCheck, bundle: &Path) -> Result<String,
     if described.code != Some(0) {
         return Err(RejectReason::CodesignFailed(summarize(&described.stderr)));
     }
-    let found = team_identifier(&described.stderr).or_else(|| team_identifier(&described.stdout));
+    let found = team_identifier(&described.stderr).or_else(|| team_identifier(&described.stdout()));
     match found {
         Some(team) if team == check.team_id => Ok(team),
         found => Err(RejectReason::TeamMismatch { found }),

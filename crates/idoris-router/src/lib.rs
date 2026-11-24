@@ -94,6 +94,9 @@ pub mod preflight;
 pub mod readiness;
 /// IDORIS-CORE S2（接口规范 §2.10，修订 1.6）：向 agent24d 登记与心跳（UDS 客户端）、发现文件自愈、孤儿计时。
 pub mod register;
+/// 发版前集成审计（规范勘误十二）：优雅停止的原因只锁存一次、同时成立时按 5 > 4 > 3 > 启动失败 > 信号取一个，
+/// 退出码、`bye`、对自有引擎的处置都从这一个结果推出；`stop_on_exit:"never"` 在排空期间保留所有权句柄。
+pub mod stop;
 /// Persistent record/budget storage bootstrap (B1 task18).
 pub mod storage;
 /// IDORIS-CORE S5（接口规范 §2.7.6）：可原子替换的服务体。启动门控期间服务「starting 体」，引擎落定（就绪，或终局的失败）之后换成完整的 Router。

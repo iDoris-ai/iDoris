@@ -154,42 +154,121 @@ impl ManagedRuntimeProcess {
     }
 
     #[cfg(unix)]
-    pub async fn shutdown(mut self, grace: Duration) -> Result<(), BackendError> {
+    pub async fn shutdown(self, grace: Duration) -> Result<(), BackendError> {
+        self.shutdown_bounded(grace, grace)
+            .await
+            .map_err(ShutdownError::into_backend)
+    }
+
+    /// [`Self::shutdown`] with the two waits told apart: `term_grace` is how long the group gets after SIGTERM to
+    /// leave on its own (`Duration::ZERO`: SIGKILL right after the SIGTERM), `confirm` is how long to wait, after
+    /// the SIGKILL, for the leader to be reaped and the group to be gone. A stop that has to finish by a deadline
+    /// (the launcher's SIGKILL of iDoris) shrinks `term_grace` and keeps a short `confirm`.
+    #[cfg(unix)]
+    pub async fn shutdown_bounded(
+        mut self,
+        term_grace: Duration,
+        confirm: Duration,
+    ) -> Result<(), ShutdownError> {
         // Keep the direct child unreaped while group signals are possible.
         // Its PID is also this group's PGID, so the zombie/live child is
         // the ownership anchor that prevents the numeric PGID from being
         // recycled for an unrelated process group.
-        self.signal_terminate()?;
-        let leader_exited = wait_child_exit_without_reap(self.process_group, grace).await?;
-        if !leader_exited {
-            self.signal_kill()?;
-        } else if group_exists(self.process_group)? {
+        self.signal_terminate().map_err(ShutdownError::Pinned)?;
+        let leader_exited = wait_child_exit_without_reap(self.process_group, term_grace)
+            .await
+            .map_err(ShutdownError::Pinned)?;
+        if !leader_exited || group_exists(self.process_group).map_err(ShutdownError::Pinned)? {
             // The unreaped leader still anchors the PGID here. Sweep any
             // descendants that survived SIGTERM before releasing that anchor.
-            self.signal_kill()?;
+            self.signal_kill().map_err(ShutdownError::Pinned)?;
         }
-        // Linux can retain killed orphan descendants as zombies until PID 1
-        // reaps them. Check for live group members while the unreaped leader
-        // still prevents this PGID from being reused.
-        #[cfg(target_os = "linux")]
-        let group_clean = wait_group_cleanup(self.process_group, grace).await;
-        tokio::time::timeout(grace, self.child.wait())
+        // One budget for every confirmation below: the SIGKILL sweeps, the reap and the post-reap check.
+        let deadline = tokio::time::Instant::now() + confirm;
+        // EVERY rescan that sends a signal happens here, while the unreaped leader still pins the group id: a
+        // descendant forked in the instant of the first sweep is not on its list, and after the reap the numeric id
+        // may belong to an unrelated process group, so no signal may follow it.
+        self.sweep_while_pinned(deadline)
             .await
-            .map_err(|_| BackendError::internal("timed out reaping local runtime process"))?
-            .map_err(|_| BackendError::internal("failed to reap local runtime process"))?;
+            .map_err(ShutdownError::Pinned)?;
+        let remaining = || {
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .max(Duration::from_millis(20))
+        };
+        match tokio::time::timeout(remaining(), self.child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                return Err(ShutdownError::Pinned(BackendError::internal(
+                    "failed to reap local runtime process",
+                )));
+            }
+            Err(_) => {
+                return Err(ShutdownError::Pinned(BackendError::internal(
+                    "timed out reaping local runtime process",
+                )));
+            }
+        }
         // No group signal may happen after wait() reaps the ownership
         // anchor: from this point the old PGID is allowed to be reused.
         self.armed = false;
-        // On other Unix systems, observe group removal after the leader has
-        // been reaped. This is read-only: never signal a numeric PGID here.
-        #[cfg(not(target_os = "linux"))]
-        let group_clean = wait_group_cleanup(self.process_group, grace).await;
-        if !group_clean? {
-            return Err(BackendError::internal(
+        #[cfg(test)]
+        test_hooks::record(self.process_group, test_hooks::Event::Reaped);
+        // Released: read-only from here on. Whatever this check finds is only reported, never signalled.
+        let clean = wait_group_cleanup(self.process_group, remaining())
+            .await
+            .map_err(ShutdownError::Released)?;
+        if !clean {
+            return Err(ShutdownError::Released(BackendError::internal(
                 "timed out waiting for local runtime process group cleanup",
-            ));
+            )));
         }
         Ok(())
+    }
+
+    /// SIGKILL rescans while the unreaped leader still pins the group id, until the group has no live member or the
+    /// budget is spent. Linux tells a zombie from a live member, so it can wait for a really clean group; elsewhere a
+    /// zombie leader keeps the group "existing", so a fixed few extra sweeps are made instead.
+    #[cfg(unix)]
+    async fn sweep_while_pinned(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), BackendError> {
+        let step = || {
+            Duration::from_millis(10)
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        };
+        #[cfg(target_os = "linux")]
+        loop {
+            if !group_has_live_members(self.process_group)? {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            self.signal_kill()?;
+            tokio::time::sleep(step()).await;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            for _ in 0..3 {
+                tokio::time::sleep(step()).await;
+                self.signal_kill()?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Non-unix: there is no process group to sweep, so the two waits are the same wait.
+    #[cfg(not(unix))]
+    pub async fn shutdown_bounded(
+        self,
+        term_grace: Duration,
+        _confirm: Duration,
+    ) -> Result<(), ShutdownError> {
+        self.shutdown(term_grace)
+            .await
+            .map_err(ShutdownError::Pinned)
     }
 
     #[cfg(not(unix))]
@@ -263,6 +342,8 @@ pub(crate) fn signal_group(
     process_group: i32,
     signal: nix::sys::signal::Signal,
 ) -> Result<(), BackendError> {
+    #[cfg(test)]
+    test_hooks::record(process_group, test_hooks::Event::Signal(signal));
     classify_signal_result(nix::sys::signal::killpg(
         nix::unistd::Pid::from_raw(process_group),
         signal,
@@ -297,8 +378,18 @@ async fn wait_group_cleanup(process_group: i32, grace: Duration) -> Result<bool,
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Whether the group still has a live member. (Tests can force "yes" for one group id.)
+#[cfg(unix)]
 pub(crate) fn group_has_live_members(process_group: i32) -> Result<bool, BackendError> {
+    #[cfg(test)]
+    if test_hooks::forced_live(process_group) {
+        return Ok(true);
+    }
+    group_has_live_members_impl(process_group)
+}
+
+#[cfg(target_os = "linux")]
+fn group_has_live_members_impl(process_group: i32) -> Result<bool, BackendError> {
     if !group_exists(process_group)? {
         return Ok(false);
     }
@@ -415,8 +506,77 @@ fn zombie_leader_has_live_threads(
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn group_has_live_members(process_group: i32) -> Result<bool, BackendError> {
+fn group_has_live_members_impl(process_group: i32) -> Result<bool, BackendError> {
     group_exists(process_group)
+}
+
+/// What a failed stop says about the group id.
+#[derive(Debug)]
+pub enum ShutdownError {
+    /// The direct child was not reaped yet, so it still pins the group id: the failure happened before the reap
+    /// (a signal could not be sent, or the reap did not complete).
+    Pinned(BackendError),
+    /// The direct child has been reaped: the group id is **no longer pinned** and may already belong to an unrelated
+    /// process group. The credentials are released; the caller can only report this, and must never signal the
+    /// numeric group id again.
+    Released(BackendError),
+}
+
+impl ShutdownError {
+    pub fn into_backend(self) -> BackendError {
+        match self {
+            Self::Pinned(error) | Self::Released(error) => error,
+        }
+    }
+
+    /// Whether the group id was already released (no further signal may be sent to it).
+    pub fn is_released(&self) -> bool {
+        matches!(self, Self::Released(_))
+    }
+}
+
+/// Test-only recording of every group signal and of the reap, and a switch that makes one group look occupied forever.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Event {
+        Signal(nix::sys::signal::Signal),
+        Reaped,
+    }
+
+    static EVENTS: Mutex<Vec<(i32, Event)>> = Mutex::new(Vec::new());
+    static LIVE: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(group: i32, event: Event) {
+        EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((group, event));
+    }
+
+    pub(crate) fn events_for(group: i32) -> Vec<Event> {
+        EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(id, _)| *id == group)
+            .map(|(_, event)| *event)
+            .collect()
+    }
+
+    pub(crate) fn force_live(group: i32) {
+        LIVE.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(group);
+    }
+
+    pub(crate) fn forced_live(group: i32) -> bool {
+        LIVE.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&group)
+    }
 }
 
 #[cfg(unix)]
@@ -563,6 +723,66 @@ mod tests {
 
         process.shutdown(Duration::from_millis(50)).await.unwrap();
         assert!(!group_has_live_members(pid.as_raw()).unwrap());
+    }
+
+    /// H5：回收（`wait()`）之后进程组号不再被钉住，可能已经属于一个不相干的进程组。组在回收之后仍确认不了消失（这里用测试开关让它
+    /// 一直「有成员」）时，底层返回 **「凭证已释放」**（`Released`），不是「还钉着」，上层据此只报告、不再按组号发任何信号。
+    /// 逐条记下的信号事件证明两件事：回收之前，SIGKILL 一补再补（每一次重扫都在子进程还钉着组号的时候）；回收之后，一个信号也没有。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_group_that_cannot_be_confirmed_gone_after_the_reap_is_released_and_never_signalled_again()
+     {
+        use nix::sys::signal::Signal;
+        use test_hooks::Event;
+
+        let process = ManagedRuntimeProcess::spawn_command(
+            std::path::Path::new("/bin/sleep"),
+            vec!["600".into()],
+        )
+        .unwrap();
+        let group = i32::try_from(process.id().unwrap()).unwrap();
+        test_hooks::force_live(group);
+
+        let result = process
+            .shutdown_bounded(Duration::from_millis(50), Duration::from_millis(300))
+            .await;
+        let Err(error) = result else {
+            panic!("the group is reported occupied after the reap");
+        };
+        assert!(error.is_released(), "{error:?}");
+
+        let events = test_hooks::events_for(group);
+        let reaped = events
+            .iter()
+            .position(|event| *event == Event::Reaped)
+            .unwrap_or_else(|| panic!("the child was reaped"));
+        assert!(
+            events[reaped + 1..]
+                .iter()
+                .all(|event| !matches!(event, Event::Signal(_))),
+            "no signal to the numeric group id after the reap: {events:?}"
+        );
+        let kills_before_the_reap = events[..reaped]
+            .iter()
+            .filter(|event| **event == Event::Signal(Signal::SIGKILL))
+            .count();
+        assert!(
+            kills_before_the_reap >= 2,
+            "the rescans that signal all happen while the leader still pins the group id: {events:?}"
+        );
+    }
+
+    /// 回收之前的失败是「还钉着」，回收之后的才是「已释放」；两者各自如实说明，`into_backend` 取出原来的错误。
+    #[test]
+    fn a_stop_failure_says_whether_the_group_id_was_still_pinned() {
+        let pinned = ShutdownError::Pinned(BackendError::internal("before the reap"));
+        assert!(!pinned.is_released());
+        let released = ShutdownError::Released(BackendError::internal("after the reap"));
+        assert!(released.is_released());
+        assert_eq!(
+            format!("{:?}", released.into_backend()),
+            format!("{:?}", BackendError::internal("after the reap"))
+        );
     }
 
     #[cfg(unix)]

@@ -2955,6 +2955,97 @@ fn run_load_timeout_case(case: &str) {
         }
         other => panic!("unknown case {other}"),
     }
+    run_resolved_params_case(case, &card);
+}
+
+/// 规范勘误十二（3）(a)（M4）：适配器的环境参数在启动时按**原始卡集**解析一次（引擎还没起、发现文件还没发布），
+/// 门控放行时用解析好的参数建适配器，不再读环境。
+fn run_resolved_params_case(case: &str, card: &ComponentCard) {
+    use idoris_upstream::factory::{AdapterParams, create_adapter_with};
+    let cards = std::slice::from_ref(card);
+    let none = BTreeMap::new();
+    let resolved = RuntimeRegistry::resolve_adapter_params(cards, &none);
+    // 一张 resident 卡走直连代理，不要适配器；没有任何卡需要适配器时不读环境（与 v0.5.0 一致）。
+    let mut resident = card.clone();
+    resident.load_policy = Some(
+        serde_json::from_value(
+            json!({"mode": "resident", "keepalive": {"pinned": true}, "admission": "coexist"}),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        RuntimeRegistry::resolve_adapter_params(std::slice::from_ref(&resident), &none).unwrap(),
+        AdapterParams::default(),
+        "{case}: no card needs an adapter, so the environment is not consulted"
+    );
+    assert_eq!(
+        RuntimeRegistry::resolve_adapter_params(&[], &none).unwrap(),
+        AdapterParams::default()
+    );
+    match case {
+        "unset" | "blank" | "seven" | "padded" => {
+            let secs = match case {
+                "seven" => 7,
+                "padded" => 42,
+                _ => 180,
+            };
+            let params = resolved.unwrap();
+            assert_eq!(
+                params.omlx_load_timeout,
+                Duration::from_secs(secs),
+                "{case}"
+            );
+            let adapter = create_adapter_with(card, &params).unwrap();
+            assert_eq!(adapter.load_timeout(), Some(Duration::from_secs(secs)));
+        }
+        _ => {
+            // 非法值：启动失败，错误点名变量，与引擎是否就绪无关（这里没有引擎，卡也可能被降级拿掉）。
+            let Err(error) = resolved else {
+                panic!("an invalid {LOAD_ENV} must fail the start-up resolution ({case})");
+            };
+            assert!(error.contains(LOAD_ENV), "{error}");
+            assert!(error.starts_with("provider omlx:"), "{error}");
+            // 配了本地 runtime 配置的卡不走适配器工厂，不读环境。
+            let config = idoris_upstream::LocalHttpRuntimeConfig::new(
+                idoris_upstream::LocalRuntimeLaunch::new(
+                    idoris_upstream::LocalRuntimeKind::MlxLmServer,
+                    "/usr/bin/python3",
+                    "/models/m",
+                    18141,
+                )
+                .unwrap(),
+                "m",
+                1.0,
+                std::env::temp_dir().join("idoris-warmup-load-case.pending"),
+            )
+            .unwrap();
+            let local = BTreeMap::from([(card.provider.id.clone(), config)]);
+            assert!(RuntimeRegistry::resolve_adapter_params(cards, &local).is_ok());
+            // 门控放行时不再读环境：用启动时解析好的参数照样建得出来（降级拿掉的卡则一个也不建）。
+            let registry = RuntimeRegistry::spawn_after_gate(
+                cards,
+                &none,
+                |_| false,
+                None,
+                false,
+                &AdapterParams::default(),
+            )
+            .expect(
+                "the gate builds adapters from the resolved parameters, not from the environment",
+            );
+            assert_eq!(registry.len(), 1);
+            let registry = RuntimeRegistry::spawn_after_gate(
+                cards,
+                &none,
+                |_| true,
+                None,
+                false,
+                &AdapterParams::default(),
+            )
+            .unwrap();
+            assert!(registry.is_empty());
+        }
+    }
 }
 
 #[tokio::test]

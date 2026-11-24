@@ -42,6 +42,8 @@ pub struct Behavior {
     /// `GET /admin/api/activity`（要有效的 cookie，否则 401）。每个 Admin 请求记进 `admin.log`：`<pid> <方法> <路径> <none|ok|bad>`（带的
     /// cookie 是不是这个进程签发的），测试据此断言「旧进程的会话 cookie 没有发给新进程」。`false` = 没有 `/admin/api/*`（404）。
     pub admin_api: bool,
+    /// 收到 SIGTERM 怎么办。
+    pub on_sigterm: OnSigterm,
 }
 
 /// 引擎可以「收下请求、记进 `requests.log`，然后不回答」的几类请求（IDORIS-CORE S6，[`FakeOmlx::hold`]）。
@@ -99,6 +101,19 @@ pub struct AdminRequest {
     pub method: String,
     pub path: String,
     pub cookie: String,
+}
+
+/// 假引擎收到 SIGTERM 的反应。非 `Die` 的两种都在 `records/sigterm.log` 里记一行收到的时刻（Unix 秒），测试据此知道信号是否到过、
+/// 什么时候到的；它们都只有 SIGKILL 杀得掉。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnSigterm {
+    /// 照常：SIGTERM 终止进程（解释器的默认动作）。
+    #[default]
+    Die,
+    /// 记下来，然后什么也不做，照常服务（引擎卡住了，对 SIGTERM 没有反应）。
+    Ignore,
+    /// 记下来，关掉监听 socket，然后赖着不走（模拟「正在退出」的引擎：关了监听、在等在途的生成结束，而那一刻起端口上已经没有它）。
+    CloseListenerAndLinger,
 }
 
 /// 一个生成好的假引擎。
@@ -205,6 +220,15 @@ impl FakeOmlx {
     /// `requests.log` 里路径是 `path` 的请求有几条（`POST:` 前缀的是 POST）。
     pub fn requests_of(&self, path: &str) -> usize {
         self.requests().iter().filter(|(p, _)| p == path).count()
+    }
+
+    /// 引擎收到 SIGTERM 的时刻（Unix 秒），按先后；没收到过就是空（`on_sigterm` 为 `Die` 时进程直接没了，也不记）。
+    pub fn sigterm_times(&self) -> Vec<f64> {
+        std::fs::read_to_string(self.record_dir.join("sigterm.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
     }
 
     /// 已经启动过几次（`launch-*.json` 的个数）。
@@ -339,6 +363,7 @@ NEVER_LISTEN = {never}
 EXIT_AFTER = {exit_after}
 EXIT_IMMEDIATELY = {exit_now}
 TRAP_SIGTERM = {trap}
+ON_SIGTERM = {on_sigterm}
 STATEFUL = {stateful}
 STATUS_FAILS_FROM = {status_fails_from}
 ADMIN_API = {admin_api}
@@ -356,8 +381,28 @@ def hold(name):
     while os.path.exists(path):
         time.sleep(0.02)
 
-# One record per launch: what the engine was started with. Numbered by the files already there.
 os.makedirs(RECORDS, exist_ok=True)
+
+# The SIGTERM reaction is in place BEFORE the launch record exists: a test that has seen the record can signal the engine
+# and know it will react as configured (not die in the interpreter's start-up).
+server = None
+
+def on_sigterm_reaction(signum, frame):
+    # One line per SIGTERM: the moment it arrived. Then what this engine does with it (see `OnSigterm`).
+    with open(os.path.join(RECORDS, "sigterm.log"), "a") as f:
+        f.write("%f\n" % time.time())
+    if ON_SIGTERM == "linger" and server is not None:
+        # The listener goes away at once (the port has no listener from here on) while the process stays.
+        # `shutdown()` waits for `serve_forever()` to return and that runs in this very (main) thread: from a helper thread.
+        def close_listener():
+            server.shutdown()
+            server.server_close()
+        threading.Thread(target=close_listener, daemon=True).start()
+
+if ON_SIGTERM != "die":
+    signal.signal(signal.SIGTERM, on_sigterm_reaction)
+
+# One record per launch: what the engine was started with. Numbered by the files already there.
 index = len([n for n in os.listdir(RECORDS) if n.startswith("launch-")])
 tmp = os.path.join(RECORDS, "tmp-%04d-%d" % (index, os.getpid()))
 with open(tmp, "w") as f:
@@ -601,8 +646,12 @@ def release_port_on_request():
             report("error %s" % error.errno)
 
 threading.Thread(target=release_port_on_request, daemon=True).start()
-server.serve_forever()
-# serve_forever returned: the port was released. The process stays alive (and not listening) until it is killed.
+try:
+    server.serve_forever()
+except BaseException:
+    pass
+# serve_forever returned: the port was released (the test asked, or the SIGTERM reaction closed the listener) and every in-flight request is done.
+# The process stays alive (and not listening) until it is killed.
 while True:
     time.sleep(3600)
 "#,
@@ -633,5 +682,10 @@ while True:
             None => "None".to_owned(),
         },
         admin_api = if behavior.admin_api { "True" } else { "False" },
+        on_sigterm = match behavior.on_sigterm {
+            OnSigterm::Die => "\"die\"",
+            OnSigterm::Ignore => "\"ignore\"",
+            OnSigterm::CloseListenerAndLinger => "\"linger\"",
+        },
     )
 }
