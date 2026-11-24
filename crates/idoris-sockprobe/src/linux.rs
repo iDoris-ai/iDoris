@@ -2,42 +2,51 @@
 //!
 //! The parsers are pure functions of the text the kernel writes, and the glue takes the root of the proc tree as a parameter: both are
 //! compiled (and tested, against a fake tree in a temporary directory) on every platform; only [`establish`] with the real `/proc` is
-//! Linux-only. Per request the watch reads `/proc/<pid>/stat` (is it still the same process: the start time in clock ticks since boot) and
-//! reads the link `/proc/<pid>/fd/<fd>` (is it still the same socket: `socket:[<inode>]`). The tables `/proc/net/tcp{,6}` are read only
-//! to (re)locate the socket, when the descriptor is not known or no longer points at it.
+//! Linux-only.
 //!
-//! A listening socket that stays open but stops listening (`shutdown(2)` on it) is not noticed by the fast path; it is noticed the next
-//! time the table is read. No engine does that.
+//! Per request the watch reads `/proc/<pid>/stat` (is it still the same process: the start time in clock ticks since boot), reads the link
+//! `/proc/<pid>/fd/<fd>` (is it still the same socket: `socket:[<inode>]`) and then reads `/proc/net/tcp{,6}` **up to that inode's row**:
+//! the socket must still be in the LISTEN state and bound to an address that covers the dial address. (The kernel lists the listening
+//! sockets first and formats the rows lazily, so the row of a socket that does listen is reached after reading a few kilobytes; a socket
+//! that left LISTEN has no row, and then the table is read to its end and the socket is looked for again by a scan.) The tables are in the
+//! network namespace of **this** process, which is the one the client connects in: a socket of another namespace has no row here and is
+//! never "held".
+//!
+//! `/proc/net/tcp6` does not say whether an IPv6 socket is `IPV6_V6ONLY`: an IPv6 wildcard is taken to cover IPv6 dial addresses only
+//! ([`Bind::v6`] with `v4_too = false`).
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
-use super::Probe;
+use super::{Bind, Probe, Quick};
 
 /// The real proc tree.
 #[cfg(target_os = "linux")]
 const PROC: &str = "/proc";
 
-/// The descriptor and socket inode the listening socket had at the last check.
-pub(crate) type Hint = (i32, u64);
+/// The descriptor and socket inode the listening socket had at the last check, and whether it was found in the IPv6 table.
+pub(crate) type Hint = (i32, u64, bool);
 
 #[derive(Debug)]
 pub(crate) struct Watch {
     root: PathBuf,
     pid: u32,
     port: u16,
+    dial: IpAddr,
     /// `starttime` (field 22 of `/proc/<pid>/stat`), pinned when the watch was established.
     started: u64,
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn establish(pid: u32, port: u16) -> Option<(Watch, Option<Hint>)> {
-    establish_at(Path::new(PROC), pid, port)
+pub(crate) fn establish(pid: u32, port: u16, dial: IpAddr) -> Option<Watch> {
+    establish_at(Path::new(PROC), pid, port, dial)
 }
 
-pub(crate) fn establish_at(root: &Path, pid: u32, port: u16) -> Option<(Watch, Option<Hint>)> {
+/// Pin the identity of `pid`: one read of its `stat`. Nothing is scanned.
+pub(crate) fn establish_at(root: &Path, pid: u32, port: u16, dial: IpAddr) -> Option<Watch> {
     if pid < 2 || i32::try_from(pid).is_err() {
         return None;
     }
@@ -45,61 +54,109 @@ pub(crate) fn establish_at(root: &Path, pid: u32, port: u16) -> Option<(Watch, O
         Ok(Some(started)) => started,
         _ => return None,
     };
-    let watch = Watch {
+    Some(Watch {
         root: root.to_owned(),
         pid,
         port,
+        dial,
         started,
-    };
-    let hint = watch.locate().ok().flatten();
-    Some((watch, hint))
+    })
+}
+
+/// Is it still the process the watch was established for?
+enum Identity {
+    Same,
+    /// Gone, a zombie, or another process under the same pid.
+    Different,
+    /// Cannot be read (permission, an I/O error).
+    Unreadable,
 }
 
 impl Watch {
-    pub(crate) fn check(&self, hint: Option<Hint>) -> (Probe, Option<Hint>) {
-        match self.find(hint) {
+    fn identity(&self) -> Identity {
+        match read_start(&self.root, self.pid) {
+            Ok(Some(started)) if started == self.started => Identity::Same,
+            Ok(_) => Identity::Different,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Identity::Different,
+            Err(_) => Identity::Unreadable,
+        }
+    }
+
+    fn fd_dir(&self) -> PathBuf {
+        self.root.join(self.pid.to_string()).join("fd")
+    }
+
+    /// The cheap check (see [`super::ListenerWatch::check_cached`]).
+    pub(crate) fn quick(&self, hint: Option<Hint>) -> Quick<Hint> {
+        match self.identity() {
+            Identity::Same => {}
+            Identity::Different => return Quick::Answer(Probe::NotHolding, None),
+            Identity::Unreadable => return Quick::Answer(Probe::Unavailable, hint),
+        }
+        let Some((fd, inode, v6)) = hint else {
+            return Quick::Scan;
+        };
+        // 1. The descriptor still names that socket?
+        match fs::read_link(self.fd_dir().join(fd.to_string())) {
+            Ok(target) if socket_inode(&target.to_string_lossy()) == Some(inode) => {}
+            Ok(_) => return Quick::Scan,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Quick::Scan,
+            Err(_) => return Quick::Answer(Probe::Unavailable, hint),
+        }
+        // 2. And is that socket still listening, on an address the dial address reaches? The descriptor alone proves nothing: a listening
+        //    socket that was `shutdown(2)` keeps its descriptor and its inode but is no longer in LISTEN state.
+        match self.listening(inode, v6) {
+            Ok(true) => Quick::Answer(Probe::Holds, hint),
+            // Not listening any more (or not on such an address): the process may still hold another socket that does, so look again.
+            Ok(false) => Quick::Scan,
+            Err(_) => Quick::Answer(Probe::Unavailable, hint),
+        }
+    }
+
+    /// The full check after the cheap one found nothing to go on: locate the socket again.
+    pub(crate) fn scan(&self, hint: Option<Hint>) -> (Probe, Option<Hint>) {
+        match self.identity() {
+            Identity::Same => {}
+            Identity::Different => return (Probe::NotHolding, None),
+            Identity::Unreadable => return (Probe::Unavailable, hint),
+        }
+        match self.locate() {
             Ok(Some(found)) => (Probe::Holds, Some(found)),
-            // The process (or its descriptor table) is gone: it holds nothing.
             Ok(None) => (Probe::NotHolding, None),
+            // The process (or its descriptor table) is gone: it holds nothing.
             Err(error) if error.kind() == io::ErrorKind::NotFound => (Probe::NotHolding, None),
-            // Not allowed to look (another user's process), or an unexpected error: not a "no", the caller decides.
+            // Not allowed to look (another user's process, a restricted `/proc`), a table that cannot be asked, or an unexpected error: not
+            // a "no", the caller decides.
             Err(_) => (Probe::Unavailable, hint),
         }
     }
 
-    /// The descriptor and socket inode of a LISTEN socket of this process on the port at a target address, if there is one.
-    fn find(&self, hint: Option<Hint>) -> io::Result<Option<Hint>> {
-        // 1. Is it still the process we registered? (Another process under the same pid, or a zombie, is not.)
-        match read_start(&self.root, self.pid)? {
-            Some(started) if started == self.started => {}
-            _ => return Ok(None),
-        }
-        // 2. The fast path: the descriptor still points at the same socket.
-        if let Some((fd, inode)) = hint {
-            let link = self
-                .root
-                .join(self.pid.to_string())
-                .join("fd")
-                .join(fd.to_string());
-            match fs::read_link(link) {
-                Ok(target) if socket_inode(&target.to_string_lossy()) == Some(inode) => {
-                    return Ok(Some((fd, inode)));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
-        // 3. The slow path: find the socket again.
-        self.locate()
+    fn table(&self, v6: bool) -> PathBuf {
+        self.root.join("net").join(if v6 { "tcp6" } else { "tcp" })
     }
 
-    /// The descriptor and socket inode of a LISTEN socket of this process on the port at a target address.
+    /// Is the socket with this inode, in the given table, in LISTEN state on this watch's port and bound to an address that covers the dial
+    /// address? Read up to its row; a socket with no row is not listening.
+    fn listening(&self, inode: u64, v6: bool) -> io::Result<bool> {
+        let reader = BufReader::with_capacity(8 * 1024, File::open(self.table(v6))?);
+        for line in reader.lines().skip(1) {
+            let line = line?;
+            let Some(row) = parse_row(&line, v6) else {
+                continue;
+            };
+            if row.inode == inode {
+                return Ok(row.listening && row.port == self.port && row.bind.covers(self.dial));
+            }
+        }
+        Ok(false)
+    }
+
+    /// The descriptor and socket inode of a LISTEN socket of this process on the port that covers the dial address.
     fn locate(&self) -> io::Result<Option<Hint>> {
-        let mut listening = Vec::new();
-        for (name, v6) in [("tcp", false), ("tcp6", true)] {
-            let text = match fs::read_to_string(self.root.join("net").join(name)) {
-                Ok(text) => text,
+        let mut candidates: Vec<(u64, bool)> = Vec::new();
+        for v6 in [false, true] {
+            let reader = match File::open(self.table(v6)) {
+                Ok(file) => BufReader::with_capacity(64 * 1024, file),
                 // No IPv6 on this host.
                 Err(error) if v6 && error.kind() == io::ErrorKind::NotFound => continue,
                 // No IPv4 table at all (an unusual /proc): this host cannot be asked, which is not "the process is gone".
@@ -111,34 +168,56 @@ impl Watch {
                 }
                 Err(error) => return Err(error),
             };
-            listening.extend(
-                parse_net_tcp(&text, v6)
-                    .into_iter()
-                    .filter(|entry| entry.port == self.port && entry.target)
-                    .map(|entry| entry.inode),
-            );
+            for line in reader.lines().skip(1) {
+                let line = line?;
+                if let Some(row) = parse_row(&line, v6)
+                    && row.listening
+                    && row.port == self.port
+                    && row.bind.covers(self.dial)
+                {
+                    candidates.push((row.inode, v6));
+                }
+            }
         }
-        if listening.is_empty() {
+        if candidates.is_empty() {
             return Ok(None);
         }
-        for entry in fs::read_dir(self.root.join(self.pid.to_string()).join("fd"))? {
-            let Ok(entry) = entry else { continue };
-            let Ok(target) = fs::read_link(entry.path()) else {
-                continue;
+        // A descriptor that vanishes while we look is skipped (the process closed it); one that cannot be read for any other reason
+        // (permission, an I/O error) leaves the answer unknown unless the socket is found anyway.
+        let mut unchecked: Option<io::Error> = None;
+        for entry in fs::read_dir(self.fd_dir())? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    unchecked = Some(error);
+                    continue;
+                }
+            };
+            let target = match fs::read_link(entry.path()) {
+                Ok(target) => target,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    unchecked = Some(error);
+                    continue;
+                }
             };
             let Some(inode) = socket_inode(&target.to_string_lossy()) else {
                 continue;
             };
-            if listening.contains(&inode)
+            if let Some(&(_, v6)) = candidates.iter().find(|(candidate, _)| *candidate == inode)
                 && let Some(fd) = entry
                     .file_name()
                     .to_str()
                     .and_then(|name| name.parse::<i32>().ok())
             {
-                return Ok(Some((fd, inode)));
+                return Ok(Some((fd, inode, v6)));
             }
         }
-        Ok(None)
+        match unchecked {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
     }
 }
 
@@ -169,45 +248,46 @@ pub(crate) fn socket_inode(link: &str) -> Option<u64> {
         .ok()
 }
 
-/// One LISTEN entry of `/proc/net/tcp{,6}`.
+/// One row of `/proc/net/tcp{,6}`.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ListenEntry {
+pub(crate) struct Row {
     pub(crate) port: u16,
-    /// Bound to an address a client connecting to `127.0.0.1` reaches (the IPv4 loopback address, a wildcard).
-    pub(crate) target: bool,
+    /// The socket is in the LISTEN state (`0A`).
+    pub(crate) listening: bool,
+    /// What it is bound to (family and address).
+    pub(crate) bind: Bind,
     pub(crate) inode: u64,
 }
 
-/// The LISTEN (`0A`) rows of `/proc/net/tcp` or `tcp6`. Columns: `sl local_address rem_address st tx:rx tr:tm->when retrnsmt uid timeout
-/// inode ...`; the address is the kernel's in-memory words in hex (so the bytes are those of `to_ne_bytes`), the port is in host order.
-pub(crate) fn parse_net_tcp(text: &str, v6: bool) -> Vec<ListenEntry> {
-    let mut entries = Vec::new();
-    for line in text.lines().skip(1) {
-        let columns: Vec<&str> = line.split_whitespace().collect();
-        if columns.len() < 10 || columns[3] != "0A" {
-            continue;
-        }
-        let Some((address, port)) = columns[1].split_once(':') else {
-            continue;
-        };
-        let (Ok(port), Some(bytes), Ok(inode)) = (
-            u16::from_str_radix(port, 16),
-            address_bytes(address, v6),
-            columns[9].parse::<u64>(),
-        ) else {
-            continue;
-        };
-        entries.push(ListenEntry {
-            port,
-            target: is_target_address(&bytes),
-            inode,
-        });
-    }
-    entries
+/// One row. Columns: `sl local_address rem_address st tx:rx tr:tm->when retrnsmt uid timeout inode ...`; the address is the kernel's
+/// in-memory words in hex (so the bytes are those of `to_ne_bytes`), the port is in host order. A row that does not parse is `None`.
+pub(crate) fn parse_row(line: &str, v6: bool) -> Option<Row> {
+    let mut columns = line.split_ascii_whitespace();
+    columns.next()?; // sl
+    let local = columns.next()?;
+    columns.next()?; // rem_address
+    let state = columns.next()?;
+    // tx_queue:rx_queue, tr:tm->when, retrnsmt, uid, timeout, then the inode
+    let inode = columns.nth(5)?.parse::<u64>().ok()?;
+    let (address, port) = local.split_once(':')?;
+    Some(Row {
+        port: u16::from_str_radix(port, 16).ok()?,
+        listening: state == "0A",
+        bind: bind_of(address, v6)?,
+        inode,
+    })
 }
 
-/// The 4 or 16 address bytes in network order from the hex words.
-fn address_bytes(hex: &str, v6: bool) -> Option<Vec<u8>> {
+/// The rows of a whole table (the header line is skipped), those that parse.
+pub(crate) fn parse_net_tcp(text: &str, v6: bool) -> Vec<Row> {
+    text.lines()
+        .skip(1)
+        .filter_map(|line| parse_row(line, v6))
+        .collect()
+}
+
+/// The address of a row: 8 hex digits (one word) for IPv4, 32 (four words) for IPv6.
+fn bind_of(hex: &str, v6: bool) -> Option<Bind> {
     let words = if v6 { 4 } else { 1 };
     if hex.len() != words * 8 {
         return None;
@@ -217,20 +297,13 @@ fn address_bytes(hex: &str, v6: bool) -> Option<Vec<u8>> {
         let value = u32::from_str_radix(hex.get(word * 8..word * 8 + 8)?, 16).ok()?;
         bytes.extend_from_slice(&value.to_ne_bytes());
     }
-    Some(bytes)
-}
-
-/// IPv4 `127.0.0.1` or `0.0.0.0`; IPv6 `::` (a dual-stack wildcard serves IPv4 too) or the mapped forms of those two.
-fn is_target_address(bytes: &[u8]) -> bool {
-    match bytes.len() {
-        4 => bytes == [127, 0, 0, 1] || bytes == [0, 0, 0, 0],
-        16 => {
-            let zero = bytes.iter().all(|byte| *byte == 0);
-            let mapped =
-                bytes[..10].iter().all(|byte| *byte == 0) && bytes[10] == 0xff && bytes[11] == 0xff;
-            zero || (mapped && (bytes[12..] == [127, 0, 0, 1] || bytes[12..] == [0, 0, 0, 0]))
-        }
-        _ => false,
+    if v6 {
+        let octets: [u8; 16] = bytes.try_into().ok()?;
+        // Nothing in the table says the socket is not IPV6_V6ONLY: no evidence of dual stack.
+        Some(Bind::v6(Ipv6Addr::from(octets), false))
+    } else {
+        let octets: [u8; 4] = bytes.try_into().ok()?;
+        Some(Bind::V4(Ipv4Addr::from(octets)))
     }
 }
 
@@ -241,6 +314,9 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    const LOOPBACK6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
 
     #[test]
     fn the_start_time_is_counted_from_the_last_parenthesis() {
@@ -279,79 +355,108 @@ mod tests {
         assert_eq!(socket_inode("socket:[x]"), None);
     }
 
+    /// One LISTEN row of `/proc/net/tcp`: the address as the kernel prints it on a little-endian host.
+    fn tcp_row(address: [u8; 4], port: u16, inode: u64) -> String {
+        tcp_row_in_state(address, port, inode, "0A")
+    }
+
+    fn tcp_row_in_state(address: [u8; 4], port: u16, inode: u64, state: &str) -> String {
+        format!(
+            "0: {:08X}:{port:04X} 00000000:0000 {state} 00000000:00000000 00:00000000 00000000  501        0 {inode} 1 0000000000000000 100 0 0 10 0\n",
+            u32::from_ne_bytes(address)
+        )
+    }
+
+    fn words(bytes: [u8; 16]) -> String {
+        bytes
+            .chunks(4)
+            .map(|word| {
+                format!(
+                    "{:08X}",
+                    u32::from_ne_bytes([word[0], word[1], word[2], word[3]])
+                )
+            })
+            .collect()
+    }
+
+    fn tcp6_row(bytes: [u8; 16], port: u16, inode: u64) -> String {
+        format!(
+            "0: {}:{port:04X} {}:0000 0A 00000000:00000000 00:00000000 00000000  501        0 {inode} 1 0000000000000000 100 0 0 10 0\n",
+            words(bytes),
+            words([0; 16])
+        )
+    }
+
+    const TCP_HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+
     /// Rows as the kernel prints them on a little-endian host: `0100007F` is 127.0.0.1, `00000000` the wildcard.
     #[test]
-    fn only_listening_rows_on_a_target_address_are_targets() {
-        let loopback = u32::from_ne_bytes([127, 0, 0, 1]);
-        let wildcard = 0_u32;
-        let elsewhere = u32::from_ne_bytes([10, 1, 2, 3]);
+    fn rows_say_state_address_port_and_inode() {
         let text = format!(
-            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
-             0: {loopback:08X}:1F98 00000000:0000 0A 00000000:00000000 00:00000000 00000000  501        0 111 1 0000000000000000 100 0 0 10 0\n\
-             1: {wildcard:08X}:1F99 00000000:0000 0A 00000000:00000000 00:00000000 00000000  501        0 222 1 0000000000000000 100 0 0 10 0\n\
-             2: {elsewhere:08X}:1F9A 00000000:0000 0A 00000000:00000000 00:00000000 00000000  501        0 333 1 0000000000000000 100 0 0 10 0\n\
-             3: {loopback:08X}:1F9B {loopback:08X}:C350 01 00000000:00000000 00:00000000 00000000  501        0 444 1 0000000000000000 100 0 0 10 0\n"
+            "{TCP_HEADER}{}{}{}{}",
+            tcp_row([127, 0, 0, 1], 0x1F98, 111),
+            tcp_row([0, 0, 0, 0], 0x1F99, 222),
+            tcp_row([10, 1, 2, 3], 0x1F9A, 333),
+            tcp_row_in_state([127, 0, 0, 1], 0x1F9B, 444, "01"),
         );
+        let rows = parse_net_tcp(&text, false);
+        let shown: Vec<_> = rows
+            .iter()
+            .map(|r| (r.port, r.listening, r.bind, r.inode))
+            .collect();
         assert_eq!(
-            parse_net_tcp(&text, false),
+            shown,
             vec![
-                ListenEntry {
-                    port: 0x1F98,
-                    target: true,
-                    inode: 111
-                },
-                ListenEntry {
-                    port: 0x1F99,
-                    target: true,
-                    inode: 222
-                },
-                ListenEntry {
-                    port: 0x1F9A,
-                    target: false,
-                    inode: 333
-                },
+                (0x1F98, true, Bind::V4(Ipv4Addr::LOCALHOST), 111),
+                (0x1F99, true, Bind::V4(Ipv4Addr::UNSPECIFIED), 222),
+                (0x1F9A, true, Bind::V4(Ipv4Addr::new(10, 1, 2, 3)), 333),
+                (0x1F9B, false, Bind::V4(Ipv4Addr::LOCALHOST), 444),
             ],
-            "the established row (state 01) is not listed"
+            "the established row (state 01) is listed, but not as listening"
         );
     }
 
     #[test]
-    fn ipv6_rows_use_four_words_and_a_dual_stack_wildcard_is_a_target() {
-        let words = |bytes: [u8; 16]| -> String {
-            bytes
-                .chunks(4)
-                .map(|word| {
-                    format!(
-                        "{:08X}",
-                        u32::from_ne_bytes([word[0], word[1], word[2], word[3]])
-                    )
-                })
-                .collect()
-        };
-        let any = words([0; 16]);
+    fn ipv6_rows_use_four_words_and_an_ipv6_wildcard_is_not_taken_for_dual_stack() {
         let mut loopback6 = [0_u8; 16];
         loopback6[15] = 1;
-        let loopback6 = words(loopback6);
         let mut mapped = [0_u8; 16];
         mapped[10] = 0xff;
         mapped[11] = 0xff;
         mapped[12..].copy_from_slice(&[127, 0, 0, 1]);
-        let mapped = words(mapped);
         let text = format!(
-            "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
-             0: {any}:1F98 {any}:0000 0A 00000000:00000000 00:00000000 00000000  501        0 11 1 0000000000000000 100 0 0 10 0\n\
-             1: {loopback6}:1F99 {any}:0000 0A 00000000:00000000 00:00000000 00000000  501        0 22 1 0000000000000000 100 0 0 10 0\n\
-             2: {mapped}:1F9A {any}:0000 0A 00000000:00000000 00:00000000 00000000  501        0 33 1 0000000000000000 100 0 0 10 0\n"
+            "{TCP_HEADER}{}{}{}",
+            tcp6_row([0; 16], 0x1F98, 11),
+            tcp6_row(loopback6, 0x1F99, 22),
+            tcp6_row(mapped, 0x1F9A, 33),
         );
-        let entries = parse_net_tcp(&text, true);
+        let rows = parse_net_tcp(&text, true);
+        let binds: Vec<_> = rows.iter().map(|r| (r.inode, r.bind)).collect();
         assert_eq!(
-            entries
-                .iter()
-                .map(|e| (e.inode, e.target))
-                .collect::<Vec<_>>(),
-            vec![(11, true), (22, false), (33, true)],
-            "`::` and the mapped loopback are targets, `::1` is not"
+            binds,
+            vec![
+                (
+                    11,
+                    Bind::V6 {
+                        addr: Ipv6Addr::UNSPECIFIED,
+                        v4_too: false
+                    }
+                ),
+                (
+                    22,
+                    Bind::V6 {
+                        addr: Ipv6Addr::LOCALHOST,
+                        v4_too: false
+                    }
+                ),
+                (33, Bind::V4(Ipv4Addr::LOCALHOST)),
+            ],
+            "`::` carries no evidence of dual stack, `::1` is IPv6 only, the mapped form is an IPv4 bind"
         );
+        // ... and that is what decides who a dial address reaches
+        assert!(!rows[0].bind.covers(LOOPBACK) && rows[0].bind.covers(LOOPBACK6));
+        assert!(!rows[1].bind.covers(LOOPBACK) && rows[1].bind.covers(LOOPBACK6));
+        assert!(rows[2].bind.covers(LOOPBACK) && !rows[2].bind.covers(LOOPBACK6));
     }
 
     /// A fake proc tree: `net/tcp{,6}`, and `<pid>/stat` with a symlink per descriptor.
@@ -359,16 +464,6 @@ mod tests {
         dir: tempfile::TempDir,
         pid: u32,
     }
-
-    /// One LISTEN row of `/proc/net/tcp`: the address as the kernel prints it on a little-endian host.
-    fn tcp_row(address: [u8; 4], port: u16, inode: u64) -> String {
-        format!(
-            "0: {:08X}:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  501        0 {inode} 1 0000000000000000 100 0 0 10 0\n",
-            u32::from_ne_bytes(address)
-        )
-    }
-
-    const TCP_HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
 
     impl FakeProc {
         fn new(pid: u32) -> Self {
@@ -415,85 +510,206 @@ mod tests {
         }
     }
 
-    const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+    const LO: [u8; 4] = [127, 0, 0, 1];
 
-    /// The watch follows a socket through the fast path, notices when the descriptor is closed, finds it again under another descriptor
-    /// number, notices that the descriptor now names a different socket, and notices a recycled pid.
+    /// The watch is scan-free to establish, finds its socket with a scan once, and then asks about it directly: the descriptor, **and the
+    /// table row** (still LISTEN, still an address the dial address reaches).
+    #[test]
+    fn establishing_scans_nothing_and_the_cheap_check_needs_the_descriptor_and_the_row() {
+        let fake = FakeProc::new(4242);
+        fake.stat(1_000);
+        // no net/tcp at all: establishing still works because it reads nothing but `stat`
+        let watch = establish_at(fake.root(), 4242, 8088, LOOPBACK).unwrap();
+        assert!(matches!(watch.quick(None), Quick::Scan));
+        fake.net("tcp", &tcp_row(LO, 8088, 555));
+        fake.fd(3, Some("socket:[555]"));
+        fake.fd(4, Some("/dev/null"));
+        let (probe, hint) = watch.scan(None);
+        assert_eq!((probe, hint), (Probe::Holds, Some((3, 555, false))));
+        assert!(matches!(
+            watch.quick(hint),
+            Quick::Answer(Probe::Holds, Some((3, 555, false)))
+        ));
+    }
+
+    /// **The descriptor is kept but the socket left LISTEN** (`shutdown(2)` on a listening socket): the inode is the same, the row is gone
+    /// or no longer in LISTEN state. The cheap check must not say "holds"; the scan then says nothing holds.
+    #[test]
+    fn a_kept_descriptor_whose_socket_left_listen_state_is_not_held() {
+        let fake = FakeProc::new(4242);
+        fake.stat(1_000);
+        fake.net("tcp", &tcp_row(LO, 8088, 555));
+        fake.fd(3, Some("socket:[555]"));
+        let watch = establish_at(fake.root(), 4242, 8088, LOOPBACK).unwrap();
+        let (_, hint) = watch.scan(None);
+        assert!(matches!(watch.quick(hint), Quick::Answer(Probe::Holds, _)));
+
+        // (a) the row is gone from the table (an unhashed socket is not listed), the descriptor still names the inode
+        fake.net("tcp", &tcp_row(LO, 9, 1));
+        assert!(matches!(watch.quick(hint), Quick::Scan));
+        assert_eq!(watch.scan(hint), (Probe::NotHolding, None));
+
+        // (b) the row is still listed but not in LISTEN state
+        fake.net("tcp", &tcp_row_in_state(LO, 8088, 555, "07"));
+        assert!(matches!(watch.quick(hint), Quick::Scan));
+        assert_eq!(watch.scan(hint), (Probe::NotHolding, None));
+
+        // (c) the row is listening again (on the same inode): holds again
+        fake.net("tcp", &tcp_row(LO, 8088, 555));
+        assert!(matches!(watch.quick(hint), Quick::Answer(Probe::Holds, _)));
+    }
+
+    /// The row decides the address too: the same inode listening on a port or an address the dial address does not reach is not held.
+    #[test]
+    fn the_row_must_be_on_this_port_and_cover_the_dial_address() {
+        let fake = FakeProc::new(7);
+        fake.stat(5);
+        fake.fd(3, Some("socket:[10]"));
+        fake.net("tcp", &tcp_row(LO, 8088, 10));
+        let watch = establish_at(fake.root(), 7, 8088, LOOPBACK).unwrap();
+        let (_, hint) = watch.scan(None);
+        assert!(hint.is_some());
+        fake.net("tcp", &tcp_row(LO, 9000, 10));
+        assert!(matches!(watch.quick(hint), Quick::Scan), "another port");
+        fake.net("tcp", &tcp_row([10, 1, 2, 3], 8088, 10));
+        assert!(matches!(watch.quick(hint), Quick::Scan), "another address");
+        fake.net("tcp", &tcp_row([0, 0, 0, 0], 8088, 10));
+        assert!(
+            matches!(watch.quick(hint), Quick::Answer(Probe::Holds, _)),
+            "a wildcard"
+        );
+    }
+
+    /// The watch follows a socket through descriptor changes, notices that the descriptor names another socket, finds it again under
+    /// another number, and notices a recycled pid.
     #[test]
     fn the_watch_follows_a_socket_through_a_fake_proc_tree() {
         let fake = FakeProc::new(4242);
         fake.stat(1_000);
-        fake.net("tcp", &tcp_row(LOOPBACK, 8088, 555));
+        fake.net("tcp", &tcp_row(LO, 8088, 555));
         fake.fd(3, Some("socket:[555]"));
         fake.fd(4, Some("/dev/null"));
 
-        let (watch, hint) = establish_at(fake.root(), 4242, 8088).unwrap();
-        assert_eq!(hint, Some((3, 555)));
-        assert_eq!(watch.check(hint), (Probe::Holds, Some((3, 555))));
+        let watch = establish_at(fake.root(), 4242, 8088, LOOPBACK).unwrap();
+        let (probe, hint) = watch.scan(None);
+        assert_eq!((probe, hint), (Probe::Holds, Some((3, 555, false))));
 
         // The descriptor now names another socket (the number was reused; that socket is not listening on the port), or something that is
-        // not a socket at all: the fast path does not believe the hint and the scan finds nothing.
+        // not a socket at all: the cheap check does not believe the hint and the scan finds nothing.
         fake.fd(3, Some("socket:[999]"));
-        assert_eq!(watch.check(hint), (Probe::NotHolding, None));
+        assert!(matches!(watch.quick(hint), Quick::Scan));
+        assert_eq!(watch.scan(hint), (Probe::NotHolding, None));
         fake.fd(3, Some("/dev/null"));
-        assert_eq!(watch.check(hint), (Probe::NotHolding, None));
+        assert!(matches!(watch.quick(hint), Quick::Scan));
+        assert_eq!(watch.scan(hint), (Probe::NotHolding, None));
         fake.fd(3, Some("socket:[555]"));
-        assert_eq!(watch.check(hint), (Probe::Holds, Some((3, 555))));
+        assert!(matches!(watch.quick(hint), Quick::Answer(Probe::Holds, _)));
 
         // The listener is closed.
         fake.fd(3, None);
-        fake.net("tcp", &tcp_row(LOOPBACK, 1, 0));
-        assert_eq!(watch.check(hint), (Probe::NotHolding, None));
+        fake.net("tcp", &tcp_row(LO, 1, 0));
+        assert!(matches!(watch.quick(hint), Quick::Scan));
+        assert_eq!(watch.scan(hint), (Probe::NotHolding, None));
 
         // The same process listens again, under another descriptor number and another inode.
-        fake.net("tcp", &tcp_row(LOOPBACK, 8088, 777));
+        fake.net("tcp", &tcp_row(LO, 8088, 777));
         fake.fd(9, Some("socket:[777]"));
-        assert_eq!(watch.check(None), (Probe::Holds, Some((9, 777))));
+        assert_eq!(watch.scan(None), (Probe::Holds, Some((9, 777, false))));
 
         // A different process under the same pid (another start time) that holds the very socket is not the engine; and when the process
         // is gone altogether there is nothing to hold.
         fake.stat(2_000);
-        assert_eq!(watch.check(Some((9, 777))).0, Probe::NotHolding);
+        assert!(matches!(
+            watch.quick(Some((9, 777, false))),
+            Quick::Answer(Probe::NotHolding, None)
+        ));
         fs::remove_dir_all(fake.root().join("4242")).unwrap();
-        assert_eq!(watch.check(Some((9, 777))).0, Probe::NotHolding);
+        assert!(matches!(
+            watch.quick(Some((9, 777, false))),
+            Quick::Answer(Probe::NotHolding, None)
+        ));
+        assert_eq!(watch.scan(Some((9, 777, false))).0, Probe::NotHolding);
 
         // Pids that cannot be an engine, even when a /proc entry exists for them, and a pid that is not there.
         for never in [0, 1] {
             let entry = FakeProc::new(never);
             entry.stat(5);
             assert!(
-                establish_at(entry.root(), never, 8088).is_none(),
+                establish_at(entry.root(), never, 8088, LOOPBACK).is_none(),
                 "pid {never}"
             );
         }
-        assert!(establish_at(fake.root(), 99_999, 8088).is_none());
+        assert!(establish_at(fake.root(), 99_999, 8088, LOOPBACK).is_none());
     }
 
-    /// Only a LISTEN row **on a target address and on the watched port** that belongs to a descriptor of **this process** counts.
+    /// Only a target listener of this process on the port counts: not another address, not another port, not another process's socket.
     #[test]
     fn only_a_target_listener_of_this_process_on_the_port_counts() {
         let fake = FakeProc::new(31);
         fake.stat(5);
-        // Port 8088 listens on another address (inode 888, held by this process): not the target address. Port 9000 listens on loopback
+        // Port 8088 listens on another address (inode 888, held by this process): not the dial address. Port 9000 listens on loopback
         // (inode 900, held by this process) but is another port. Inode 700 listens on loopback:8088 but belongs to another process.
         fake.net(
             "tcp",
             &format!(
                 "{}{}{}",
                 tcp_row([10, 1, 2, 3], 8088, 888),
-                tcp_row(LOOPBACK, 9000, 900),
-                tcp_row(LOOPBACK, 8088, 700)
+                tcp_row(LO, 9000, 900),
+                tcp_row(LO, 8088, 700)
             ),
         );
         fake.fd(5, Some("socket:[888]"));
         fake.fd(6, Some("socket:[900]"));
-        let (watch, hint) = establish_at(fake.root(), 31, 8088).unwrap();
-        assert_eq!(hint, None);
-        assert_eq!(watch.check(None), (Probe::NotHolding, None));
+        let watch = establish_at(fake.root(), 31, 8088, LOOPBACK).unwrap();
+        assert_eq!(watch.scan(None), (Probe::NotHolding, None));
         // The wildcard counts, once this process holds it.
         fake.net("tcp", &tcp_row([0, 0, 0, 0], 8088, 901));
         fake.fd(7, Some("socket:[901]"));
-        assert_eq!(watch.check(None), (Probe::Holds, Some((7, 901))));
+        assert_eq!(watch.scan(None), (Probe::Holds, Some((7, 901, false))));
+    }
+
+    /// **IPv6**: `/proc/net/tcp6` is read too. An IPv6 wildcard (`::`) is **not** taken for something that accepts IPv4: `/proc` does not
+    /// say whether the socket is `IPV6_V6ONLY`, and a server that binds `::` with it set (asyncio does) is not reached by a connection to
+    /// `127.0.0.1`. It covers an IPv6 dial address, as does `::1`; a host without IPv6 has no `tcp6` file.
+    #[test]
+    fn an_ipv6_wildcard_is_not_an_answer_for_an_ipv4_dial_address_but_is_for_an_ipv6_one() {
+        let mut loopback6 = [0_u8; 16];
+        loopback6[15] = 1;
+        // `::127.0.0.1` (the deprecated IPv4-compatible form, not the mapped one) is not an IPv4 bind either.
+        let mut compatible = [0_u8; 16];
+        compatible[12..].copy_from_slice(&[127, 0, 0, 1]);
+        let fake = FakeProc::new(77);
+        fake.stat(9);
+        fake.net("tcp", "");
+        fake.net(
+            "tcp6",
+            &(tcp6_row(loopback6, 8088, 61)
+                + &tcp6_row(compatible, 8088, 64)
+                + &tcp6_row([0; 16], 8088, 62)),
+        );
+        fake.fd(3, Some("socket:[61]"));
+        fake.fd(6, Some("socket:[64]"));
+        fake.fd(4, Some("socket:[62]"));
+        let ipv4 = establish_at(fake.root(), 77, 8088, LOOPBACK).unwrap();
+        assert_eq!(
+            ipv4.scan(None),
+            (Probe::NotHolding, None),
+            "`::1`, `::127.0.0.1` and an IPv6 wildcard are not reached by 127.0.0.1"
+        );
+        let ipv6 = establish_at(fake.root(), 77, 8088, LOOPBACK6).unwrap();
+        let (probe, hint) = ipv6.scan(None);
+        assert_eq!(probe, Probe::Holds);
+        assert!(
+            matches!(hint, Some((_, _, true))),
+            "found in the IPv6 table"
+        );
+        // the cheap check follows the IPv6 table too
+        assert!(matches!(ipv6.quick(hint), Quick::Answer(Probe::Holds, _)));
+        // No IPv6 table at all.
+        fs::remove_file(fake.root().join("net/tcp6")).unwrap();
+        fake.net("tcp", &tcp_row(LO, 8088, 63));
+        fake.fd(5, Some("socket:[63]"));
+        assert_eq!(ipv4.scan(None), (Probe::Holds, Some((5, 63, false))));
     }
 
     /// A process whose descriptor table cannot be read (another user's) is "cannot tell", not "does not hold". Skipped as root, which can
@@ -503,21 +719,56 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let fake = FakeProc::new(55);
         fake.stat(3);
-        fake.net("tcp", &tcp_row(LOOPBACK, 8088, 41));
+        fake.net("tcp", &tcp_row(LO, 8088, 41));
         fake.fd(3, Some("socket:[41]"));
-        let (watch, hint) = establish_at(fake.root(), 55, 8088).unwrap();
-        assert_eq!(hint, Some((3, 41)));
+        let watch = establish_at(fake.root(), 55, 8088, LOOPBACK).unwrap();
+        let (_, hint) = watch.scan(None);
+        assert_eq!(hint, Some((3, 41, false)));
         let fds = fake.root().join("55").join("fd");
         fs::set_permissions(&fds, fs::Permissions::from_mode(0o000)).unwrap();
         if fs::read_dir(&fds).is_ok() {
             fs::set_permissions(&fds, fs::Permissions::from_mode(0o755)).unwrap();
             return; // root
         }
-        // The fast path cannot read the link either (no search permission on the directory).
-        assert_eq!(watch.check(hint), (Probe::Unavailable, hint));
-        assert_eq!(watch.check(None), (Probe::Unavailable, None));
+        // The cheap check cannot read the link either (no search permission on the directory).
+        assert!(matches!(
+            watch.quick(hint),
+            Quick::Answer(Probe::Unavailable, _)
+        ));
+        assert_eq!(watch.scan(None), (Probe::Unavailable, None));
         fs::set_permissions(&fds, fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(watch.check(hint), (Probe::Holds, hint));
+        assert!(matches!(watch.quick(hint), Quick::Answer(Probe::Holds, _)));
+    }
+
+    /// **Descriptors that cannot be read during the scan** (the directory lists them, the link cannot be read: a restricted `/proc`): if the
+    /// socket is found among the descriptors that can be read, it holds; if it is not found and some could not be read, the answer is
+    /// "cannot tell" — never a "no". A descriptor that merely vanished (closed meanwhile) is skipped. Skipped as root.
+    #[test]
+    fn a_scan_that_could_not_read_some_descriptors_does_not_say_no() {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = FakeProc::new(66);
+        fake.stat(3);
+        fake.net("tcp", &tcp_row(LO, 8088, 41));
+        // the directory is readable but not searchable: the entries are listed, their links cannot be read
+        fake.fd(3, Some("socket:[41]"));
+        fake.fd(4, Some("/dev/null"));
+        let fds = fake.root().join("66").join("fd");
+        fs::set_permissions(&fds, fs::Permissions::from_mode(0o444)).unwrap();
+        if fs::read_link(fds.join("3")).is_ok() {
+            fs::set_permissions(&fds, fs::Permissions::from_mode(0o755)).unwrap();
+            return; // root, or a system that lets us through
+        }
+        let watch = establish_at(fake.root(), 66, 8088, LOOPBACK).unwrap();
+        assert_eq!(
+            watch.scan(None),
+            (Probe::Unavailable, None),
+            "the socket may be among the descriptors that could not be read"
+        );
+        fs::set_permissions(&fds, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(watch.scan(None), (Probe::Holds, Some((3, 41, false))));
+        // a dangling link (the descriptor was closed between listing and reading) is just skipped
+        fake.fd(3, None);
+        assert_eq!(watch.scan(None), (Probe::NotHolding, None));
     }
 
     /// A /proc without a TCP table cannot be asked: "cannot tell" (the caller asks the slow question), not "the process is gone".
@@ -526,58 +777,15 @@ mod tests {
         let fake = FakeProc::new(88);
         fake.stat(4);
         fake.fd(3, Some("socket:[41]"));
-        let (watch, hint) = establish_at(fake.root(), 88, 8088).unwrap();
-        assert_eq!(hint, None);
-        assert_eq!(watch.check(None), (Probe::Unavailable, None));
+        let watch = establish_at(fake.root(), 88, 8088, LOOPBACK).unwrap();
+        assert_eq!(watch.scan(None), (Probe::Unavailable, None));
+        // the cheap check with a hint cannot read the table either
+        assert!(matches!(
+            watch.quick(Some((3, 41, false))),
+            Quick::Answer(Probe::Unavailable, _)
+        ));
         // And a process that is gone is still gone.
         fs::remove_dir_all(fake.root().join("88")).unwrap();
-        assert_eq!(watch.check(None), (Probe::NotHolding, None));
-    }
-
-    /// `/proc/net/tcp6` is read too: an IPv6 dual-stack wildcard is a target (and `::1` is not); a host without IPv6 has no `tcp6` file.
-    #[test]
-    fn the_ipv6_table_is_read_too_and_a_missing_one_is_fine() {
-        let words = |bytes: [u8; 16]| -> String {
-            bytes
-                .chunks(4)
-                .map(|word| {
-                    format!(
-                        "{:08X}",
-                        u32::from_ne_bytes([word[0], word[1], word[2], word[3]])
-                    )
-                })
-                .collect()
-        };
-        let row = |bytes: [u8; 16], port: u16, inode: u64| {
-            format!(
-                "0: {}:{port:04X} {}:0000 0A 00000000:00000000 00:00000000 00000000  501        0 {inode} 1 0000000000000000 100 0 0 10 0\n",
-                words(bytes),
-                words([0; 16])
-            )
-        };
-        let fake = FakeProc::new(77);
-        fake.stat(9);
-        fake.net("tcp", "");
-        let mut loopback6 = [0_u8; 16];
-        loopback6[15] = 1;
-        // `::127.0.0.1` (the deprecated IPv4-compatible form, not the mapped one) is not a target either.
-        let mut compatible = [0_u8; 16];
-        compatible[12..].copy_from_slice(&[127, 0, 0, 1]);
-        fake.net(
-            "tcp6",
-            &(row(loopback6, 8088, 61) + &row(compatible, 8088, 64) + &row([0; 16], 8088, 62)),
-        );
-        fake.fd(3, Some("socket:[61]"));
-        fake.fd(6, Some("socket:[64]"));
-        let (watch, hint) = establish_at(fake.root(), 77, 8088).unwrap();
-        assert_eq!(hint, None, "`::1` and `::127.0.0.1` only");
-        assert_eq!(watch.check(None).0, Probe::NotHolding);
-        fake.fd(4, Some("socket:[62]"));
-        assert_eq!(watch.check(None), (Probe::Holds, Some((4, 62))));
-        // No IPv6 table at all.
-        fs::remove_file(fake.root().join("net/tcp6")).unwrap();
-        fake.net("tcp", &tcp_row(LOOPBACK, 8088, 63));
-        fake.fd(5, Some("socket:[63]"));
-        assert_eq!(watch.check(None), (Probe::Holds, Some((5, 63))));
+        assert_eq!(watch.scan(None), (Probe::NotHolding, None));
     }
 }

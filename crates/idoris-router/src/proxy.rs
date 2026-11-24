@@ -891,7 +891,17 @@ impl ChatProxy {
         } else {
             None
         };
-        let mut request = self.client.post(url);
+        // A governed endpoint is dialed at the address the guard verified (never the card's own spelling: `localhost`, `[::1]` are not
+        // what was verified), over a connection opened after the authorization (a client that keeps no idle connection): Codex focused
+        // review H1 and H6. An ungoverned endpoint is sent to as written.
+        let (client, send_url) = match &authorization {
+            Some(authorization) => (
+                authorization.client(&self.client),
+                authorization.dial_url(url),
+            ),
+            None => (self.client.clone(), url.to_owned()),
+        };
+        let mut request = client.post(&send_url);
         if let Some(key) = authorization
             .as_ref()
             .and_then(idoris_upstream::omlx::key::Authorization::key)

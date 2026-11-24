@@ -48,9 +48,12 @@ impl OmlxAdapter {
                 "oMLX admin login requires the main API key",
             ))
         })?;
-        let response = self
-            .client
-            .post(format!("{}/admin/api/login", self.base_url))
+        let response = credential
+            .client(&self.client)
+            .post(format!(
+                "{}/admin/api/login",
+                credential.base_url(&self.base_url)
+            ))
             .timeout(self.call_timeout)
             .json(&json!({"api_key": key}))
             .send()
@@ -149,9 +152,12 @@ impl OmlxAdapter {
                 .ok_or_else(|| {
                     AdminRequestError::Unknown(upstream_error("oMLX admin session unavailable"))
                 })?;
-            let mut request = self
-                .client
-                .request(method.clone(), format!("{}{path}", self.base_url))
+            let mut request = credential
+                .client(&self.client)
+                .request(
+                    method.clone(),
+                    format!("{}{path}", credential.base_url(&self.base_url)),
+                )
                 .timeout(self.call_timeout)
                 .header(COOKIE, cookie);
             if let Some(body) = body {

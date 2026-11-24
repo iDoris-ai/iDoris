@@ -591,16 +591,26 @@ pub async fn probe_resident_admitted(
         return Observation::Unavailable(None);
     }
     let url = format!("{}/v1/models", card.endpoint.trim_end_matches('/'));
-    let mut request = client.get(&url).timeout(timeout);
     let mut key_sent = false;
     // 持有到响应读完：端点上的一个在途操作。
-    let _authorization = if crate::models::is_loopback_omlx(card) {
+    let authorization = if crate::models::is_loopback_omlx(card) {
         let Ok(authorization) =
             idoris_upstream::omlx::key::authorize_omlx_request(&card.endpoint, admitted_generation)
                 .await
         else {
             return Observation::Unavailable(None);
         };
+        Some(authorization)
+    } else {
+        None
+    };
+    // 托管的端点：发往授权核验过的拨号地址（不是卡里写的别名），用不保留空闲连接的客户端（Codex 专项评审 H1、H6）。
+    let (client, send_url) = match &authorization {
+        Some(authorization) => (authorization.client(client), authorization.dial_url(&url)),
+        None => (client.clone(), url.clone()),
+    };
+    let mut request = client.get(&send_url).timeout(timeout);
+    let _authorization = if let Some(authorization) = authorization {
         if let Some(key) = authorization.key_os().filter(|key| !key.is_empty()) {
             // 非 UTF-8、放不进请求头的 key 是无效凭证，不是「没有凭证」（与 `GET /v1/models` 同口径）。
             let Some(mut header) = key

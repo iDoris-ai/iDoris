@@ -5,10 +5,12 @@
 //! 用的都是 [`super::ProcessInspector`]（`lsof` 找监听者，`ps` 读 uid，`codesign` 读进程正在运行的代码的签名团队），
 //! 没有任何 unsafe，也没有新依赖。
 //!
-//! # 判据（issue 的修法，原样）
+//! # 判据（issue 的修法；Codex 专项评审 M13 之后只数**能接这个连接的**）
 //!
-//! 1. 找出监听这个端口的**全部** pid（回环、通配、IPv6 的监听都算：连到 `127.0.0.1:<port>` 的请求可能落在其中任何一个）；
-//!    没有人监听不是通过（[`ListenerVerdict::NoListener`]）；
+//! 1. 找出监听这个端口、并且**绑的地址族与地址是拨号地址（`127.0.0.1`，[`super::MANAGED_DIAL`]）连得到的**全部 pid（绑在 `127.0.0.1`
+//!    或 IPv4 通配上的；IPv6 套接字只在有双栈证据时算）：连到 `127.0.0.1:<port>` 的请求可能落在其中任何一个。绑在别的地址上的监听者
+//!    （比如 `[::1]`、另一个具体的 IPv4 地址）这个连接到不了，**不在里面，也不影响校验**：之前端口上每个 pid 都得是「握着 IPv4
+//!    目标地址的」，一个同样合格的进程只服务 `::1`，守卫就永久拒绝每个请求。没有人能接这个连接不是通过（[`ListenerVerdict::NoListener`]）；
 //! 2. 每个 pid 的 uid 都等于 iDoris 的有效 uid（别的用户的进程不是我们的引擎）；
 //! 3. 每个 pid 正在运行的代码的签名团队都等于要求的那个（oMLX：`PSK5Q5T46L`；签名无效、没有签名、ad-hoc 都不算）；
 //! 4. 校验通过之前不发 key；校验结果按 **pid + 启动时间** 缓存，进程换了（pid 变了，或同一个 pid 的启动时间变了）就重查；
@@ -26,7 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::fsutil::effective_uid;
-use super::inspect::{InspectError, ProcessInspector};
+use super::inspect::{InspectError, MANAGED_DIAL, ProcessInspector};
 
 /// 校验要求什么：uid 与签名团队。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +90,7 @@ pub struct ListenerIdentity {
 /// [`ListenerVerifier::check`] 的结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListenerVerdict {
-    /// 监听这个端口的每个进程都通过了：uid 与签名团队都对。`listeners` 按 pid 升序，各带启动时间。
+    /// 每个**能接这个连接的**监听进程都通过了：uid 与签名团队都对。`listeners` 按 pid 升序，各带启动时间。
     Verified { listeners: Vec<ListenerIdentity> },
     /// 此刻没有人监听这个端口。
     NoListener,
@@ -158,14 +160,22 @@ impl ListenerVerifier {
             .insert(pid, started_at);
     }
 
-    /// 校验现在监听 `port` 的是不是合格的引擎进程。每个监听者先读启动时间：缓存里有同样的（pid、启动时间）就直接通过，
-    /// 否则校验 uid 与签名团队，并在**校验之后**再读一次启动时间：两次不同说明校验期间这个 pid 换了进程，不缓存、
+    /// 校验现在**能接 `127.0.0.1:<port>` 这个连接的**监听者是不是合格的引擎进程。每个监听者先读启动时间：缓存里有同样的（pid、启动时间）
+    /// 就直接通过，否则校验 uid 与签名团队，并在**校验之后**再读一次启动时间：两次不同说明校验期间这个 pid 换了进程，不缓存、
     /// 也不算通过（[`ListenerVerdict::Unverifiable`]）。
     pub async fn check(&self, port: u16) -> ListenerVerdict {
-        let pids = match self.inspector.listeners_on(port).await {
-            Ok(pids) => pids,
+        let sockets = match self.inspector.listening_sockets(port).await {
+            Ok(sockets) => sockets,
             Err(error) => return ListenerVerdict::Unverifiable(error),
         };
+        // 只有拨号地址连得到的套接字的主人要紧：绑在别的地址上的监听者（`[::1]`、别的 IPv4 地址）收不到发往 `127.0.0.1` 的连接。
+        let mut pids: Vec<u32> = sockets
+            .iter()
+            .filter(|socket| socket.bind.covers(MANAGED_DIAL))
+            .map(|socket| socket.pid)
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
         // 监听上的空档废弃通过记录（IDORIS-CORE S6，Codex 终审 L1）：`ps` 给的启动时间只到秒，同一秒内被回收、又绑上这个端口的
         // 同一个 pid，读出来的（pid、启动时间）与之前通过校验的那个一模一样，缓存会跳过 uid 与签名团队的复核。端口上没有这个
         // pid 的那一刻，它的通过记录就不再作数：它之后再出现，要重新过 uid 与签名团队。

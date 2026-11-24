@@ -122,15 +122,25 @@ async fn fetch_models_body(
     admitted_generation: Option<u64>,
 ) -> Result<Option<Value>, ModelsError> {
     let url = format!("{}/v1/models", card.endpoint.trim_end_matches('/'));
-    let mut request = client.get(&url).timeout(MODELS_TIMEOUT);
     // 持有到响应读完：这是端点上的一个在途操作，引擎管理器排空时等它。
-    let _authorization = if is_loopback_omlx(card) {
+    let authorization = if is_loopback_omlx(card) {
         let Ok(authorization) =
             idoris_upstream::omlx::key::authorize_omlx_request(&card.endpoint, admitted_generation)
                 .await
         else {
             return Ok(None);
         };
+        Some(authorization)
+    } else {
+        None
+    };
+    // 托管的端点：发往授权核验过的拨号地址（不是卡里写的别名），用不保留空闲连接的客户端（Codex 专项评审 H1、H6）。
+    let (client, send_url) = match &authorization {
+        Some(authorization) => (authorization.client(client), authorization.dial_url(&url)),
+        None => (client.clone(), url.clone()),
+    };
+    let mut request = client.get(&send_url).timeout(MODELS_TIMEOUT);
+    let _authorization = if let Some(authorization) = authorization {
         if let Some(key) = authorization.key_os().filter(|key| !key.is_empty()) {
             // A present non-UTF-8 key is invalid, never an absent credential.
             let mut header = key

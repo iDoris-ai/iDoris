@@ -14,7 +14,7 @@ use idoris_backend::load_fence::LoadFence;
 use idoris_upstream::engine::{
     DiscoveryError, EngineError, EngineInstance, EngineKey, EngineLaunch, EngineLaunchSpec,
     EngineProbe, EngineRecipe, ExternalListenerGuard, LaunchError, ListenerIdentity,
-    ListenerVerdict, ListenerVerifier, OwnedEngine, OwnedListenerGuard, Recovery,
+    ListenerVerdict, ListenerVerifier, MANAGED_DIAL, OwnedEngine, OwnedListenerGuard, Recovery,
     fresh_connection_client,
 };
 use idoris_upstream::omlx::key::{EndpointGuard, endpoint_flights};
@@ -138,10 +138,11 @@ impl Owned {
         key: Option<EngineKey>,
         inspector: Arc<dyn idoris_upstream::engine::ProcessInspector>,
     ) -> Self {
+        // 托管的引擎只监听 `127.0.0.1`，也只被拨 `127.0.0.1`：守卫验证的、授权结果带给发送端的，是这个地址（Codex 专项评审 H1）。
         let guard: Arc<dyn EndpointGuard> = Arc::new(OwnedListenerGuard::new(
             inspector,
             engine.pid(),
-            engine.port(),
+            std::net::SocketAddr::new(MANAGED_DIAL, engine.port()),
         ));
         Self { engine, key, guard }
     }
@@ -156,9 +157,11 @@ struct External {
 
 impl External {
     fn new(verifier: ListenerVerifier, port: u16, listeners: &[ListenerIdentity]) -> Self {
+        // `listeners` 是校验时**能接 `127.0.0.1:<port>` 这个连接的**监听者（绑在别的地址上的不在里面）；守卫验证、授权带出去的拨号
+        // 地址是 `127.0.0.1:<port>`。
         let guard: Arc<dyn EndpointGuard> = Arc::new(ExternalListenerGuard::new(
             verifier.clone(),
-            port,
+            std::net::SocketAddr::new(MANAGED_DIAL, port),
             listeners.to_vec(),
         ));
         Self { verifier, guard }

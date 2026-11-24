@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use idoris_upstream::engine::{OwnedListenerGuard, ProcessInspector, SystemInspector};
+use idoris_upstream::engine::{
+    MANAGED_DIAL, OwnedListenerGuard, ProcessInspector, SystemInspector,
+};
 use idoris_upstream::omlx::key::{
     EndpointGuard, EndpointKey, authorize_omlx_request, forget_endpoint, govern_endpoint,
     govern_endpoint_guarded,
@@ -193,8 +195,11 @@ async fn per_request_recheck_p50_p99_idle_and_under_load() {
 
     // The endpoint with the native guard, the same endpoint's baseline (no guard) is a second port.
     let inspector = Arc::new(SystemInspector::new());
-    let guard: Arc<dyn EndpointGuard> =
-        Arc::new(OwnedListenerGuard::new(inspector.clone(), pid, port));
+    let guard: Arc<dyn EndpointGuard> = Arc::new(OwnedListenerGuard::new(
+        inspector.clone(),
+        pid,
+        std::net::SocketAddr::new(MANAGED_DIAL, port),
+    ));
     let url = format!("http://127.0.0.1:{port}");
     let _governed = Governed(url.clone());
     govern_endpoint_guarded(&url, EndpointKey::Private("bench-key".into()), Some(guard));
@@ -211,7 +216,7 @@ async fn per_request_recheck_p50_p99_idle_and_under_load() {
     let fallback_guard: Arc<dyn EndpointGuard> = Arc::new(OwnedListenerGuard::new(
         Arc::new(SystemInspector::new().with_native_probe(false)),
         fallback_engine.child.id(),
-        fallback_engine.port,
+        std::net::SocketAddr::new(MANAGED_DIAL, fallback_engine.port),
     ));
     govern_endpoint_guarded(
         &fallback_url,

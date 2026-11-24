@@ -77,6 +77,21 @@ impl Hold {
     }
 }
 
+/// 引擎把端口放掉、但不退出的几种办法（[`FakeOmlx::release_port_as`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Release {
+    /// 关掉监听套接字（[`FakeOmlx::release_port`]）：端口空了。
+    Close,
+    /// 关掉监听套接字，随后在**同一个端口**上以 `IPV6_V6ONLY` 绑一个 IPv6 通配地址（`::`）并监听：进程还握着这个端口上的一个 LISTEN
+    /// 套接字，但连到 `127.0.0.1` 的连接到不了它（Codex 专项评审 H2）。
+    Ipv6Only,
+    /// 不关套接字，对它 `shutdown(SHUT_RD)`：Linux 上监听套接字离开 LISTEN 状态、描述符还开着（Codex 专项评审 H3）；别的系统拒绝这个调用
+    /// （结果是 `error <errno>`）。
+    ShutdownRead,
+    /// 关掉监听套接字，在**同一个进程、同一个端口**上重新监听（新的描述符）：进程自己重建了它的监听套接字（Codex 专项评审 M9：要重新定位）。
+    Relisten,
+}
+
 /// 一条 Admin 请求的记录（[`FakeOmlx::admin_requests`]）：`cookie` 是 `none`（没带）、`ok`（是这个进程签发的会话）、`bad`（别的进程签发的）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminRequest {
@@ -148,6 +163,38 @@ impl FakeOmlx {
     /// Codex 审计 H3：进程活着不等于端口还是它的）。已经接受的连接不受影响。
     pub fn release_port(&self) {
         std::fs::write(self.record_dir.join("release-port"), "1").unwrap();
+    }
+
+    /// 同 [`Self::release_port`]，但可以选办法（[`Release`]）。等引擎做完再返回，返回它报告的结果：`ok`，或者 `error <errno>`（这个系统不
+    /// 允许那一步：比如没有 IPv6，或者 macOS 上对监听套接字 `shutdown`）。
+    pub fn release_port_as(&self, how: Release) -> String {
+        let result = self.record_dir.join("release-result");
+        let _ = std::fs::remove_file(&result);
+        let mode = match how {
+            Release::Close => "1",
+            Release::Ipv6Only => "v6only",
+            Release::ShutdownRead => "shutdown",
+            Release::Relisten => "relisten",
+        };
+        // Atomic: the engine reads the mode the moment the file exists.
+        let flag = self.record_dir.join("release-port");
+        let temporary = self.record_dir.join("release-port.tmp");
+        std::fs::write(&temporary, mode).unwrap();
+        std::fs::rename(&temporary, &flag).unwrap();
+        if how == Release::Close {
+            return "ok".to_owned();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&result) {
+                return text.trim().to_owned();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the engine never reported how it let go of the port"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// 放开 [`Self::hold`] 的那一类请求：被扣着的请求这就回答。
@@ -284,7 +331,7 @@ pub fn spawn_retrying(command: &mut Command) -> std::io::Result<ChildGuard> {
 
 fn python_source(behavior: &Behavior, record_dir: &Path) -> String {
     format!(
-        r#"import http.server, json, os, signal, sys, threading, time
+        r#"import http.server, json, os, signal, socket, sys, threading, time
 
 RECORDS = {records}
 LISTEN_DELAY = {delay}
@@ -499,13 +546,56 @@ port = int(arg("--port"))
 server = http.server.ThreadingHTTPServer((host, port), Handler)
 server.daemon_threads = True
 
+KEEP = []
+
+def report(outcome):
+    # Atomic: the test polls for this file.
+    tmp = os.path.join(RECORDS, "release-result.tmp-%d" % os.getpid())
+    with open(tmp, "w") as f:
+        f.write(outcome)
+    os.rename(tmp, os.path.join(RECORDS, "release-result"))
+
 def release_port_on_request():
     # The test asked the engine to give the port back **without exiting**: the process lives on, the port is free.
+    global server
     flag = os.path.join(RECORDS, "release-port")
     while not os.path.exists(flag):
         time.sleep(0.02)
+    time.sleep(0.05)
+    with open(flag) as f:
+        mode = f.read().strip() or "1"
     server.shutdown()
+    if mode == "shutdown":
+        # Keep the descriptor, leave the LISTEN state (Linux: shutdown(SHUT_RD) on a listening socket does that; elsewhere it fails).
+        try:
+            server.socket.shutdown(socket.SHUT_RD)
+            report("ok")
+        except OSError as error:
+            report("error %s" % error.errno)
+        return
     server.server_close()
+    if mode == "v6only":
+        # Another socket on the same port: IPv6 only, so a connection to 127.0.0.1 cannot reach it.
+        try:
+            other = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            other.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            other.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            other.bind(("::", port))
+            other.listen(16)
+            KEEP.append(other)
+            report("ok")
+        except OSError as error:
+            report("error %s" % error.errno)
+    elif mode == "relisten":
+        # The same process listens again on the same port with a new descriptor.
+        try:
+            server = http.server.ThreadingHTTPServer((host, port), Handler)
+            server.daemon_threads = True
+            KEEP.append(server)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            report("ok")
+        except OSError as error:
+            report("error %s" % error.errno)
 
 threading.Thread(target=release_port_on_request, daemon=True).start()
 server.serve_forever()

@@ -216,12 +216,30 @@ pub struct OmlxAdapter {
 struct Credential {
     key: Option<String>,
     generation: Option<u64>,
-    _authorization: Option<key::Authorization>,
+    authorization: Option<key::Authorization>,
 }
 
 impl Credential {
     fn key(&self) -> Option<&str> {
         self.key.as_deref()
+    }
+
+    /// The base URL to send to: for an endpoint the engine manager governs, the **verified dial address** (the card's own spelling —
+    /// `localhost`, `[::1]` — is not what the guard verified); otherwise the adapter's own. Without a trailing slash.
+    fn base_url(&self, own: &str) -> String {
+        match &self.authorization {
+            Some(authorization) => authorization.dial_url(own).trim_end_matches('/').to_owned(),
+            None => own.to_owned(),
+        }
+    }
+
+    /// The client to send with: for a governed endpoint one that keeps no idle connection, so the request goes over a connection opened
+    /// **after** the authorization, never an earlier one to a process that has since been replaced (Codex focused review H6).
+    fn client(&self, own: &reqwest::Client) -> reqwest::Client {
+        match &self.authorization {
+            Some(authorization) => authorization.client(own),
+            None => own.clone(),
+        }
     }
 }
 
@@ -308,7 +326,7 @@ impl OmlxAdapter {
             return Ok(Credential {
                 key: self.api_key.clone(),
                 generation: None,
-                _authorization: None,
+                authorization: None,
             });
         }
         let authorization =
@@ -318,7 +336,7 @@ impl OmlxAdapter {
         Ok(Credential {
             key: authorization.key().map(str::to_owned),
             generation: Some(authorization.generation()),
-            _authorization: Some(authorization),
+            authorization: Some(authorization),
         })
     }
 
@@ -328,8 +346,8 @@ impl OmlxAdapter {
     async fn get(&self, path: &str) -> Result<serde_json::Value, BackendError> {
         let credential = self.credential().await?;
         http::get_json(
-            &self.client,
-            &self.base_url,
+            &credential.client(&self.client),
+            &credential.base_url(&self.base_url),
             path,
             credential.key(),
             self.call_timeout,
@@ -340,8 +358,8 @@ impl OmlxAdapter {
     async fn post(&self, path: &str) -> Result<(), BackendError> {
         let credential = self.credential().await?;
         http::post_empty(
-            &self.client,
-            &self.base_url,
+            &credential.client(&self.client),
+            &credential.base_url(&self.base_url),
             path,
             credential.key(),
             self.call_timeout,
@@ -357,8 +375,8 @@ impl OmlxAdapter {
     ) -> Result<serde_json::Value, BackendError> {
         let credential = self.credential().await?;
         http::post_and_parse(
-            &self.client,
-            &self.base_url,
+            &credential.client(&self.client),
+            &credential.base_url(&self.base_url),
             path,
             credential.key(),
             timeout,
@@ -404,8 +422,8 @@ impl OmlxAdapter {
         {
             let credential = self.credential().await?;
             http::post_load(
-                &self.client,
-                &self.base_url,
+                &credential.client(&self.client),
+                &credential.base_url(&self.base_url),
                 &self.encoded_path("/v1/models/", id, "/load"),
                 credential.key(),
                 self.load_timeout.unwrap_or(self.call_timeout),

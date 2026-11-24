@@ -14,9 +14,10 @@ mod child_guard;
 mod fake_omlx;
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -41,8 +42,8 @@ use idoris_router::runtime::RuntimeRegistry;
 use idoris_router::swap::SwapApp;
 use idoris_router::{AppState, build_app};
 use idoris_upstream::engine::{
-    CodesignPolicy, InspectError, ListenerPolicy, ListenerWatch, PidState, ProcessInspector,
-    StopOnExit, SystemInspector,
+    Bind, CodesignPolicy, InspectError, ListenerPolicy, ListenerWatch, ListeningSocket, PidState,
+    ProcessInspector, StopOnExit, SystemInspector,
 };
 use idoris_upstream::omlx::key::{
     EndpointKey, endpoint_generation, forget_endpoint, governed_endpoint,
@@ -112,6 +113,18 @@ struct Scripted {
     /// 套接字还在、另一个进程也在这个端口上监听——每个请求的确认看不见，管理器的监督节拍问的「唯一的监听者」看得见（`lose`）。要在管理器登记引擎
     /// **之前**打开（守卫建的时候问一次）。缺省 `false`：没有监视，守卫每个请求问一次 `listens_on`（H1 的那些用例就是这样）。
     native_always_holds: AtomicBool,
+    /// `watch_listener` 给一个永远「读不了这个进程」的原生监视（Codex 专项评审 M10、M11：权限、读不出来）：守卫这一次问那个贵的问题，
+    /// 不能就此拒绝。要在管理器登记引擎之前打开。
+    native_unreadable: AtomicBool,
+    /// 外部监听者的套接字（含绑的地址族与地址）：编排过的端口按它回答 `listening_sockets`；没编排的由 `listeners` 的 pid 推出（每个当作
+    /// 绑在 IPv4 通配地址上）。
+    sockets: Mutex<BTreeMap<u16, Vec<ListeningSocket>>>,
+    /// 每次被问 `watch_listener` 的（pid，拨号地址）。
+    watch_requests: Mutex<Vec<(u32, SocketAddr)>>,
+    /// `listens_on` 被问了几次（退路上的贵的问题）。
+    listens_asked: AtomicUsize,
+    /// 守卫在没有原生监视时，贵的问题的**肯定**答案重用多久（毫秒）；缺省 0：每个请求都问。
+    fallback_ttl_millis: AtomicUsize,
 }
 
 /// 永远说「还握着」的原生监视（[`Scripted::offer_a_native_watch_that_always_holds`]）。
@@ -122,6 +135,17 @@ struct StillHolds;
 impl ListenerWatch for StillHolds {
     async fn holds(&self) -> Result<bool, InspectError> {
         Ok(true)
+    }
+}
+
+/// 永远「读不了这个进程」的原生监视（[`Scripted::offer_a_native_watch_that_cannot_read`]）：既不是「是」也不是「不是」。
+#[derive(Debug)]
+struct CannotRead;
+
+#[async_trait]
+impl ListenerWatch for CannotRead {
+    async fn holds(&self) -> Result<bool, InspectError> {
+        Err(InspectError::NoAnswer)
     }
 }
 
@@ -136,7 +160,43 @@ impl Scripted {
             lost: Mutex::new(Vec::new()),
             unreadable: AtomicBool::new(false),
             native_always_holds: AtomicBool::new(false),
+            native_unreadable: AtomicBool::new(false),
+            sockets: Mutex::new(BTreeMap::new()),
+            watch_requests: Mutex::new(Vec::new()),
+            listens_asked: AtomicUsize::new(0),
+            fallback_ttl_millis: AtomicUsize::new(0),
         })
+    }
+
+    /// 从现在起建的守卫带一个永远「读不了这个进程」的原生监视（守卫退到 `listens_on`）。
+    fn offer_a_native_watch_that_cannot_read(&self) {
+        self.native_unreadable.store(true, Ordering::SeqCst);
+    }
+
+    /// 编排这个端口上的监听套接字（含地址族与地址）；校验看这些，不看 `external_listener` 给的 pid 列表。
+    fn sockets_on(&self, port: u16, sockets: Vec<ListeningSocket>) {
+        self.sockets.lock().unwrap().insert(port, sockets);
+    }
+
+    /// 给一个 pid 编排签名团队（它的套接字另行用 [`Self::sockets_on`] 编排）。
+    fn sign(&self, pid: u32, team: &str) {
+        self.teams.lock().unwrap().insert(pid, team.to_owned());
+    }
+
+    /// 守卫在没有原生监视时，贵的问题的肯定答案重用这么久。
+    fn reuse_fallback_for(&self, window: Duration) {
+        self.fallback_ttl_millis
+            .store(window.as_millis() as usize, Ordering::SeqCst);
+    }
+
+    /// `listens_on` 被问了几次。
+    fn listens_asked(&self) -> usize {
+        self.listens_asked.load(Ordering::SeqCst)
+    }
+
+    /// 每次被问 `watch_listener` 的（pid，拨号地址）。
+    fn watched(&self) -> Vec<(u32, SocketAddr)> {
+        self.watch_requests.lock().unwrap().clone()
     }
 
     /// 从现在起建的守卫带一个永远说「还握着」的原生监视。
@@ -204,6 +264,7 @@ impl ProcessInspector for Scripted {
         self.real.process_group(pid).await
     }
     async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
+        self.listens_asked.fetch_add(1, Ordering::SeqCst);
         if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(InspectError::NoAnswer);
         }
@@ -224,16 +285,34 @@ impl ProcessInspector for Scripted {
             .cloned()
             .unwrap_or_default())
     }
+    async fn listening_sockets(&self, port: u16) -> Result<Vec<ListeningSocket>, InspectError> {
+        if let Some(sockets) = self.sockets.lock().unwrap().get(&port) {
+            return Ok(sockets.clone());
+        }
+        Ok(self
+            .listeners_on(port)
+            .await?
+            .into_iter()
+            .map(ListeningSocket::any)
+            .collect())
+    }
     async fn uid_of(&self, pid: u32) -> Result<u32, InspectError> {
         self.real.uid_of(pid).await
     }
     async fn signing_team(&self, pid: u32) -> Result<Option<String>, InspectError> {
         Ok(self.teams.lock().unwrap().get(&pid).cloned())
     }
-    fn watch_listener(&self, _pid: u32, _port: u16) -> Option<Arc<dyn ListenerWatch>> {
+    fn watch_listener(&self, pid: u32, dial: SocketAddr) -> Option<Arc<dyn ListenerWatch>> {
+        self.watch_requests.lock().unwrap().push((pid, dial));
+        if self.native_unreadable.load(Ordering::SeqCst) {
+            return Some(Arc::new(CannotRead));
+        }
         self.native_always_holds
-            .load(std::sync::atomic::Ordering::SeqCst)
+            .load(Ordering::SeqCst)
             .then(|| Arc::new(StillHolds) as Arc<dyn ListenerWatch>)
+    }
+    fn fallback_ttl(&self) -> Duration {
+        Duration::from_millis(self.fallback_ttl_millis.load(Ordering::SeqCst) as u64)
     }
 }
 

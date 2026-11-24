@@ -197,6 +197,13 @@ pub enum Verification {
 #[async_trait]
 pub trait EndpointGuard: Send + Sync + std::fmt::Debug {
     async fn verify(&self) -> Verification;
+
+    /// **经过核验的拨号地址**：守卫验证的就是「登记时认的进程握着一个**这个地址**连得到的 LISTEN 套接字」，授权结果把它带给发送端，
+    /// 发送端只拨它（[`Authorization::dial_url`]），不拨卡里写的别名（`localhost`、`[::1]`、`127.0.0.2`：登记表把它们并成同一个端口
+    /// 身份，但它们不是同一个地址，各自可以有不同的监听者；Codex 专项评审 H1）。`None`：这个守卫不限定地址（测试里的假守卫）。
+    fn dial(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
 }
 
 /// 一个端点在登记表里的状态：此刻的口径（`None` = 没人管）、它的**代际**、校验守卫、在途的操作数。代际只增不减，口径（或守卫）
@@ -490,17 +497,61 @@ impl Drop for FlightGuard {
 pub struct Authorization {
     key: Option<OsString>,
     generation: u64,
+    /// 守卫核验过的拨号地址（托管的端点）；`None`：非托管的端点，请求照它自己的写法发。
+    dial: Option<std::net::SocketAddr>,
     _flight: Option<FlightGuard>,
 }
 
+/// 发往托管端点的、带凭证的请求用的 HTTP 客户端：**不保留空闲连接**（[`crate::engine::fresh_connection_client`]）。进程里只建一个。
+static FRESH_CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+
 impl Authorization {
     /// 没有登记的端点（非托管）、没有守卫：只是按 §2.9 的顺序取到的 key，没有在途登记。
-    fn unguarded(key: Option<OsString>, generation: u64, flight: Option<FlightGuard>) -> Self {
+    fn unguarded(
+        key: Option<OsString>,
+        generation: u64,
+        dial: Option<std::net::SocketAddr>,
+        flight: Option<FlightGuard>,
+    ) -> Self {
         Self {
             key,
             generation,
+            dial,
             _flight: flight,
         }
+    }
+
+    /// 守卫核验过的拨号地址（托管的端点）。
+    pub fn dial(&self) -> Option<std::net::SocketAddr> {
+        self.dial
+    }
+
+    /// 这个请求**必须发往**的地址：托管的端点把 `url` 的主机与端口换成核验过的拨号地址（路径、查询不动），所以卡里写的 `localhost`、
+    /// `[::1]` 之类的别名不会让请求落到守卫没验证过的那个监听者上（Codex 专项评审 H1）。非托管的端点原样返回。换不了（不是带主机的
+    /// URL，登记表认的 http(s) URL 不会）就返回空串：任何 HTTP 客户端都发不出去，宁可不发。
+    pub fn dial_url(&self, url: &str) -> String {
+        let Some(dial) = self.dial else {
+            return url.to_owned();
+        };
+        let Ok(mut parsed) = reqwest::Url::parse(url) else {
+            return String::new();
+        };
+        if parsed.set_ip_host(dial.ip()).is_err() || parsed.set_port(Some(dial.port())).is_err() {
+            return String::new();
+        }
+        parsed.into()
+    }
+
+    /// 发这个请求用的 HTTP 客户端：托管的端点一律用**不保留空闲连接**的客户端——带凭证的请求只走授权**之后**新开的连接，不会复用
+    /// 更早（引擎换代之前、监听者换主人之前）留在池里的、通往旧进程的连接（Codex 专项评审 H6）。非托管的端点用调用方给的那个。
+    pub fn client(&self, shared: &reqwest::Client) -> reqwest::Client {
+        if self.dial.is_none() {
+            return shared.clone();
+        }
+        FRESH_CLIENT
+            .get_or_init(|| crate::engine::fresh_connection_client().ok())
+            .clone()
+            .unwrap_or_else(|| shared.clone())
     }
 
     /// UTF-8 的 key（非 UTF-8 的环境变量当作没有，同 [`resolve_omlx_api_key_checked`]）。
@@ -542,6 +593,7 @@ pub async fn authorize_omlx_request(
         before.key,
         Some(EndpointKey::Private(_) | EndpointKey::External { .. })
     );
+    let mut dial = None;
     if guarded && let Some(guard) = &before.guard {
         match guard.verify().await {
             Verification::Verified => {}
@@ -555,9 +607,16 @@ pub async fn authorize_omlx_request(
                 current: after.generation,
             });
         }
+        // 守卫验证的地址，就是发送端要拨的地址。
+        dial = guard.dial();
     }
     let key = resolve_from_snapshot(base_url, before.key.as_ref());
-    Ok(Authorization::unguarded(key, before.generation, flight))
+    Ok(Authorization::unguarded(
+        key,
+        before.generation,
+        dial,
+        flight,
+    ))
 }
 
 /// 纯解析：在 [`resolve_from_for`] 之上加「端点被引擎管理器接管」的口径（`governed`）。
