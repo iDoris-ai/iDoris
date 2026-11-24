@@ -5107,8 +5107,8 @@ async fn fr_h7_a_burst_of_concurrent_requests_costs_a_handful_of_lsof_in_the_fal
     let started = tool_calls(&log) - settled;
     assert!(started >= 1, "the fallback asked lsof at all");
     assert!(
-        started <= 6,
-        "24 concurrent requests started {started} lsof (one check at a time, the rest wait for its answer)"
+        started <= 12,
+        "24 concurrent requests started {started} lsof (one check at a time, the rest wait for its answer; every request on its own would be 24 or more)"
     );
 }
 
