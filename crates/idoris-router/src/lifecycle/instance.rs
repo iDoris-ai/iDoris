@@ -2076,9 +2076,9 @@ impl Actor {
         // 面立刻 503），这一轮不发探测：发往那个端口的请求不再带私有 key。又确认了，把私有 key 登记回去，接着往下探测。
         // 检查（`lsof`，读不出来时还要按 `unverifiable_retries` 重读、每次隔一段）可能占掉很多秒：iDoris 在停时放手，引擎还握在手里，
         // 主循环马上带着期限收尾（Codex 复审四 H）。
-        let Some(confirmed) = self.unless_shutdown(self.owned_listener_confirmed()).await else {
-            return None;
-        };
+        let confirmed = self
+            .unless_shutdown(self.owned_listener_confirmed())
+            .await?;
         if !confirmed {
             self.revoke_owned_key();
             self.publish(UpstreamState::Unavailable, Some(UpstreamReason::PortInUse));
