@@ -83,6 +83,44 @@ pub async fn probe_http(
         .unwrap_or(EngineProbe::Unavailable)
 }
 
+/// 一次探测，**经登记表的授权路径**（IDORIS-CORE S6，Codex 复审 L2 的 M2'）。给引擎管理器**接管的端点**（已经登记过口径与守卫）用：外部引擎的接管与
+/// 监督，以及第 3 层引擎换代之后的探测。探测带着调用方**事先解析好**的 `bearer`，但发出去的路径与数据面的每个请求一样：
+///
+/// 1. 调用方先取 key（`bearer`），**之后**才有这里的核对：key 不是在核对之后才去读文件；
+/// 2. 守卫在发送它的这个任务里**重新确认监听者**（[`crate::omlx::key::authorize_omlx_request_without_key`]：代际、封上、守卫、在途登记），确认不了或已经不是
+///    登记时认的那个监听者就拒绝，什么都不发；
+/// 3. 探测只拨**核验过的地址**（[`crate::omlx::key::Authorization::dial_url`]，不是卡里写的 `localhost`、`[::1]`），走授权给的**不保留空闲连接**的客户端，所以带 key
+///    的请求只走授权之后新开的连接；
+/// 4. 发出之前再同步看一眼端点（[`crate::omlx::key::Authorization::ensure_current`]）；授权在探测读完之前一直握着，是端点上的一个在途操作，排空会等它。
+///
+/// 之前的做法是在别处核对监听者，再用裸的探测把 key 发给 `endpoint` 这个写法：核对与发送是两件事，探测拨的也不是核验过的那个地址。授权被拒绝时返回 `Err`
+/// （什么都没有发出去）：调用方把它当作「监听者此刻确认不了」。
+///
+/// **没有核验过的拨号地址就不发**（Codex 复审 L2 的终检）：端点没登记过、或登记时没带守卫，授权什么都没核验过（`Authorization::dial` 是 `None`），这时探测会照卡里写的 URL、
+/// 用调用方的客户端发出去，bearer 也跟着出去：帮手自己守住这条线，返回 `Err(KeyRefusal::Unverified)`，不管有没有 `bearer`，什么都不发。它只给被管理、带守卫的端点用。
+///
+/// **发出前的最后一眼在调配方之前，不在请求建好之后**：配方（[`super::EngineRecipe::probe_ready`]）自己建请求并发出，这里能做的是授权之后、调它之前同步看一眼端点（`ensure_current`）；
+/// 适配器、代理、模型列表、就绪探测那几条路径才是请求建好之后、发出前再看一眼。
+pub async fn probe_authorized(
+    recipe: &dyn super::EngineRecipe,
+    endpoint: &str,
+    shared_client: &reqwest::Client,
+    bearer: Option<&str>,
+    timeout: Duration,
+) -> Result<EngineProbe, crate::omlx::key::KeyRefusal> {
+    let authorization =
+        crate::omlx::key::authorize_omlx_request_without_key(endpoint, None).await?;
+    if authorization.dial().is_none() {
+        return Err(crate::omlx::key::KeyRefusal::Unverified);
+    }
+    let client = authorization.client(shared_client);
+    let base = authorization.dial_url(endpoint);
+    authorization.ensure_current()?;
+    let probe = recipe.probe_ready(&client, &base, bearer, timeout).await;
+    drop(authorization);
+    Ok(probe)
+}
+
 fn classify_transport_error(error: &reqwest::Error) -> EngineProbe {
     if error.is_timeout() {
         return EngineProbe::Unavailable;

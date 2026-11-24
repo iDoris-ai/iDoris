@@ -50,11 +50,12 @@
 //!
 //! 外部引擎（用户自己的 oMLX.app 之类）没有对应的类型，也就没有任何一条路径能给它发信号。
 //!
-//! 全部只在 unix 上编译。不加依赖：取别的进程的身份用 `ps` / `lsof` 子进程（workspace 禁 unsafe，
-//! 设计稿风险 R5），见 `inspect.rs`。
+//! 全部只在 unix 上编译。取别的进程的身份用 `ps` / `lsof` 子进程（workspace 禁 unsafe，设计稿风险 R5），见 `inspect.rs`；唯一的例外
+//! 是每个请求的监听者确认（要便宜：不起子进程），它用 `idoris-sockprobe`（libproc、`/proc`），见 `guard.rs`。
 
 mod discovery;
 mod fsutil;
+mod guard;
 mod inspect;
 mod instance;
 mod key;
@@ -75,7 +76,11 @@ pub use discovery::{
 // oMLX 配方建自己的私有目录（`crate::omlx::engine::prepare_base_dir`）用的是记录目录、日志目录那一套
 // 「0700、自己的真目录」规则：crate 内可见，不是公开 API。
 pub(crate) use fsutil::{DirError, effective_uid, ensure_private_dir};
-pub use inspect::{InspectError, PidState, ProcessInspector, SystemInspector};
+pub use guard::{ExternalListenerGuard, OwnedListenerGuard};
+pub use inspect::{
+    Bind, FALLBACK_TTL, InspectError, ListenerWatch, ListeningSocket, MANAGED_DIAL, PidState,
+    ProcessInspector, SystemInspector,
+};
 pub use instance::{ENGINES_OWNED_DIR, EngineInstance, InstanceError, LOGS_DIR, RECORD_EXTENSION};
 pub use key::{ENGINE_KEY_HEX_LEN, EngineKey, KeyError};
 pub use launch::{
@@ -83,14 +88,15 @@ pub use launch::{
     StopOnExit,
 };
 pub use listener::{
-    ListenerPolicy, ListenerRejection, ListenerVerdict, ListenerVerifier, fresh_connection_client,
+    ListenerIdentity, ListenerPolicy, ListenerRejection, ListenerVerdict, ListenerVerifier,
+    fresh_connection_client,
 };
 pub use logfile::{DEFAULT_KEEP, DEFAULT_MAX_BYTES, EngineLog};
 pub use owned::{
     DEFAULT_STOP_GRACE, EngineError, IdentityVerdict, MIN_CONFIRM, MIN_TERM_GRACE, MismatchReason,
     OwnedEngine, ReadyPolicy, Recovery, UnreadableReason, stop_windows, verify_identity,
 };
-pub use probe::{EngineProbe, probe_http};
+pub use probe::{EngineProbe, probe_authorized, probe_http};
 pub use recipe::{
     EngineKind, EngineKindError, EngineRecipe, LaunchInput, LaunchPlan, RESERVED_ENGINE_KINDS,
     UNKNOWN_ENGINE_KIND,

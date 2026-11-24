@@ -254,6 +254,10 @@ struct Job<'a> {
     capability: Capability,
     target: &'a str,
     started: Instant,
+    /// The engine generation of the selected card's endpoint, read **before** the state gate
+    /// ([`crate::managed_unavailable_response`]) so it can only be older than the state the gate saw, never newer
+    /// (IDORIS-CORE S6). The resident minimal request is bound to it: see [`ResidentRequest::run`].
+    generation: u64,
 }
 
 /// 一个 resident 预热的最小请求，连同它跑起来需要的一切。它在自己的任务里跑，所以拥有全部数据，不借用请求的任何东西。
@@ -270,13 +274,25 @@ struct ResidentRequest {
     attach_omlx_key: bool,
     /// 这个请求自己的响应头期限（`ChatProxy::warmup_header_timeout`），与调用方的 `timeout_ms` 无关。
     header_timeout: Duration,
+    /// 准入时这张卡的 endpoint 所在的引擎代际（[`Job::generation`]）。
+    generation: u64,
 }
 
 impl ResidentRequest {
     /// 经聊天用的同一个代理发出去，一直等到它收尾（成功、上游的错误，或响应头期限到点的 504）。并发许可由代理在发送之前拿，随
     /// 返回的结果一起带着，结果被丢掉时才还（等结果的 handler 用完了丢，handler 已经走了则在任务结束时丢）；熔断的准入由代理在
     /// 结果产生之前按既有规则结算（`claim.finish`）。不带幂等键。
+    ///
+    /// **绑定准入时的引擎代际**（IDORIS-CORE S6）：这个任务活得比调用方、比引擎的这一代都久（调用方放弃之后它照常跑，冷加载最长
+    /// 180 秒）。引擎在这期间被停止、重启、换了进程，代理在每一次发送（连接失败的重试也算）时按这个代际核对：端点被封上、或者
+    /// 代际已经不是准入时的，一个字节都不发——不带新一代的 key，请求体也不会发给新进程。已经发给旧引擎、在等回答的那一次随旧进程
+    /// 一起结束（连接被重置）。resident 的托管卡没有 Supervisor，没有关门与排空可言：这个绑定加上代理的封上检查就是它的「封住」。
     async fn run(self) -> ForwardOutcome {
+        let generation = self.generation;
+        idoris_backend::generation::scoped(Some(generation), self.forward()).await
+    }
+
+    async fn forward(self) -> ForwardOutcome {
         let opts = ForwardOpts {
             request_id: None,
             tenant_id: self.tenant_id.as_deref(),
@@ -361,6 +377,7 @@ async fn warm_resident(
         privacy: job.privacy,
         attach_omlx_key: models::is_loopback_omlx(&selected.card),
         header_timeout: state.proxy.warmup_header_timeout,
+        generation: job.generation,
     };
     let outcome = match tokio::spawn(request.run()).await {
         Ok(outcome) => outcome,
@@ -567,6 +584,8 @@ async fn handle(
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
     };
+    // 先读这张卡的 endpoint 的引擎代际，再看它的状态：状态检查通过时，读到的代际只可能不比那时的新（IDORIS-CORE S6）。
+    let generation = idoris_upstream::omlx::key::endpoint_generation(&selected.card.endpoint);
     // 门控降级放行、没就绪的托管卡：不碰引擎，和聊天一样 503 带原因。
     if let Some(response) = managed_unavailable_response(state, &selected) {
         return response;
@@ -596,6 +615,7 @@ async fn handle(
         capability,
         target: &target,
         started,
+        generation,
     };
     let work = async {
         if dispatch::is_resident_http_service(&selected.card) {

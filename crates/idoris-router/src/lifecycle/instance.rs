@@ -12,9 +12,11 @@ use std::time::{Duration, Instant};
 use idoris_backend::load_fence::LoadFence;
 use idoris_upstream::engine::{
     DiscoveryError, EngineError, EngineInstance, EngineKey, EngineLaunch, EngineLaunchSpec,
-    EngineProbe, EngineRecipe, LaunchError, ListenerVerdict, ListenerVerifier, OwnedEngine,
-    Recovery, fresh_connection_client,
+    EngineProbe, EngineRecipe, ExternalListenerGuard, LaunchError, ListenerIdentity,
+    ListenerVerdict, ListenerVerifier, MANAGED_DIAL, OwnedEngine, OwnedListenerGuard, Recovery,
+    fresh_connection_client, probe_authorized,
 };
+use idoris_upstream::omlx::key::EndpointGuard;
 use tokio::sync::{mpsc, oneshot};
 
 use super::backoff::{CrashWindow, restart_delay};
@@ -91,11 +93,51 @@ enum WaitFailure {
 struct Owned {
     engine: OwnedEngine,
     key: Option<EngineKey>,
+    /// 登记私有 key 时一起交给登记表的校验守卫：发往这个端点的每个请求，发出之前都让它重新确认监听这个端口的还是这个引擎的进程
+    /// （Codex 终审 H1）。**整个引擎的一生用同一个对象**：重新登记同一个口径时守卫是同一个，登记表的代际不动。
+    guard: Arc<dyn EndpointGuard>,
+}
+
+impl Owned {
+    fn new(
+        engine: OwnedEngine,
+        key: Option<EngineKey>,
+        inspector: Arc<dyn idoris_upstream::engine::ProcessInspector>,
+    ) -> Self {
+        // 托管的引擎只监听 `127.0.0.1`，也只被拨 `127.0.0.1`：守卫验证的、授权结果带给发送端的，是这个地址（Codex 专项评审 H1）。
+        let guard: Arc<dyn EndpointGuard> = Arc::new(OwnedListenerGuard::new(
+            inspector,
+            engine.pid(),
+            std::net::SocketAddr::new(MANAGED_DIAL, engine.port()),
+        ));
+        Self { engine, key, guard }
+    }
 }
 
 /// 接管的外部引擎：监听者通过了属主校验。
 struct External {
     verifier: ListenerVerifier,
+    /// 校验通过的监听者（pid 加启动时间）：监督每个周期拿新校验出来的集合与它比，不一样就是换了监听者（Codex 预审 L2 的 M1）。
+    expected: Vec<ListenerIdentity>,
+    /// 据 `expected` 建的守卫：发往这个端点的每个请求，发出之前都让它重新确认监听者还是它们。
+    guard: Arc<dyn EndpointGuard>,
+}
+
+impl External {
+    fn new(verifier: ListenerVerifier, port: u16, listeners: &[ListenerIdentity]) -> Self {
+        // `listeners` 是校验时**能接 `127.0.0.1:<port>` 这个连接的**监听者（绑在别的地址上的不在里面）；守卫验证、授权带出去的拨号
+        // 地址是 `127.0.0.1:<port>`。
+        let guard: Arc<dyn EndpointGuard> = Arc::new(ExternalListenerGuard::new(
+            verifier.clone(),
+            std::net::SocketAddr::new(MANAGED_DIAL, port),
+            listeners.to_vec(),
+        ));
+        Self {
+            verifier,
+            expected: listeners.to_vec(),
+            guard,
+        }
+    }
 }
 
 /// 实例任务 panic（一个 bug）时，不能让它无声地冻结在最后一个状态上（门控永远完不成，或者一个 `ready` 的谎话一直挂着）：
@@ -143,6 +185,9 @@ pub(super) struct Actor {
     reason: Option<UpstreamReason>,
     /// 当前发布的状态是不是终局（见 [`Status::terminal`]）。
     terminal: bool,
+    /// 自有引擎活着，但此刻监听这个端口的不是它（放掉了端口，或别的进程占了）：我们收回了它的私有 key（端点封上）。它又拥有
+    /// 端口时要把私有 key 重新登记回去（IDORIS-CORE S6，Codex 审计 H3）。
+    owned_key_revoked: bool,
     /// 等待期间收到、还没有处理的命令。
     pending: Option<Request>,
 }
@@ -166,6 +211,7 @@ impl Actor {
             state: UpstreamState::Starting,
             reason: None,
             terminal: false,
+            owned_key_revoked: false,
             pending: None,
         }
     }
@@ -330,6 +376,30 @@ impl Actor {
             .await
     }
 
+    /// 带 key 的探测，走登记表的授权路径（[`idoris_upstream::engine::probe_authorized`]；Codex 复审 L2 的 M2'）：key 由调用方**先**取好，授权负责监听者的重新确认、
+    /// 代际与封上、核验过的拨号地址、不保留空闲连接的客户端、发出前的最后一眼与端点上的在途登记。外部引擎的接管与监督用它，引擎换代之后的探测也该用它。
+    /// 授权被拒绝（监听者变了、读不出来、端点封上、代际变了、托管客户端建不出来）：这一轮没有结论（`Unavailable`），key 一个字节也没发出去，记一行日志。
+    async fn probe_authorized(&self, recipe: &Arc<dyn EngineRecipe>, key: &str) -> EngineProbe {
+        let Some(client) = &self.client else {
+            return EngineProbe::Unavailable;
+        };
+        match probe_authorized(
+            recipe.as_ref(),
+            &self.plan.endpoint,
+            client,
+            Some(key),
+            self.timings().probe_timeout,
+        )
+        .await
+        {
+            Ok(probe) => probe,
+            Err(refusal) => {
+                self.log(&format!("外部引擎的带凭证探测没有发出（{refusal}）"));
+                EngineProbe::Unavailable
+            }
+        }
+    }
+
     fn probe_instance(&self) -> Option<EngineInstance> {
         EngineInstance::new(
             self.plan.backend.probe_recipe(),
@@ -372,7 +442,7 @@ impl Actor {
     /// 闸慢的时候宽限还是原来那么长，总时间超过期限）。确认不了进程已经消失时所有权记录保留，下一个 iDoris 认回它再收尾
     /// （`OwnedEngine` 的停止只在确认消失之后才删记录）。
     async fn stop_engine_by(&self, owned: Owned, deadline: Option<tokio::time::Instant>) {
-        self.plan.backend.release(&self.plan.endpoint);
+        self.plan.backend.block(&self.plan.endpoint);
         let grace = self.timings().stop_grace;
         if let Err(error) = owned.engine.stop_until(grace, deadline).await {
             self.log(&format!("停止引擎失败（{}）", error.reason_code()));
@@ -475,7 +545,7 @@ impl Actor {
     /// iDoris 停止：收尾。`stop_engine` 为真才停自己拥有的引擎，在 `deadline` 之前（见 [`Command::Shutdown`]）。
     async fn shutdown(&mut self, stop_engine: bool, deadline: Option<tokio::time::Instant>) {
         self.external = None;
-        self.plan.backend.release(&self.plan.endpoint);
+        self.plan.backend.block(&self.plan.endpoint);
         // `stop_engine` 为假：让它继续跑（`StopOnExit::Never` 拉起的，句柄丢弃时不杀进程组），所有权记录留给下一个 iDoris。
         if let Some(owned) = self.engine.take()
             && stop_engine
@@ -570,7 +640,11 @@ impl Actor {
                         break None;
                     }
                     let key = engine.api_key().cloned();
-                    break Some(Owned { engine, key });
+                    break Some(Owned::new(
+                        engine,
+                        key,
+                        self.shared.config.inspector.clone(),
+                    ));
                 }
                 Ok(Recovery::Starting(engine)) => {
                     // 上一个 iDoris 在引擎启动途中被杀：它没有就绪过，什么都没加载，停掉重拉。
@@ -693,8 +767,8 @@ impl Actor {
             };
         };
         let verifier = ListenerVerifier::new(self.shared.config.inspector.clone(), policy);
-        match verifier.check(self.plan.port).await {
-            ListenerVerdict::Verified { .. } => {}
+        let listeners = match verifier.check(self.plan.port).await {
+            ListenerVerdict::Verified { listeners } => listeners,
             ListenerVerdict::NoListener => {
                 // 探测与校验之间监听者没了：再来一次。
                 return Attempt::Failure { reason: None };
@@ -704,7 +778,7 @@ impl Actor {
                     "endpoint 上的监听者不是这种引擎（{}）：不发 key，不接管",
                     rejection.code()
                 ));
-                backend.govern_external(&self.plan.endpoint, false);
+                backend.block(&self.plan.endpoint);
                 return Attempt::Terminal {
                     state: UpstreamState::Failed,
                     reason: Some(UpstreamReason::PortInUse),
@@ -712,15 +786,17 @@ impl Actor {
             }
             ListenerVerdict::Unverifiable(_) => {
                 self.log("读不出 endpoint 上监听者的身份：不发 key，不接管");
-                backend.govern_external(&self.plan.endpoint, false);
+                backend.block(&self.plan.endpoint);
                 return Attempt::Terminal {
                     state: UpstreamState::Failed,
                     reason: Some(UpstreamReason::PortInUse),
                 };
             }
-        }
-        // 通过：`settings.json` 的 key 现在可以发给它了（环境变量的 key 一直可以）。
-        backend.govern_external(&self.plan.endpoint, true);
+        };
+        let external = External::new(verifier.clone(), self.plan.port, &listeners);
+        // 通过：`settings.json` 的 key 现在可以发给它了（环境变量的 key 一直可以）。每个发往它的请求发出之前，守卫都重新确认监听者
+        // 还是刚才校验通过的这些（Codex 终审 H1）。
+        backend.govern_external(&self.plan.endpoint, external.guard.clone());
         let adopted = match first {
             EngineProbe::Ready => true,
             _ => {
@@ -732,7 +808,9 @@ impl Actor {
                             reason: Some(UpstreamReason::AuthRequired),
                         };
                     }
-                    Some(key) => match self.probe(recipe, Some(&key)).await {
+                    // key 先取好（上面），再经授权路径探测：守卫重新确认监听者、只拨核验过的地址、走新开的连接（Codex 复审 L2 的 M2'）。
+                    // 授权被拒绝（校验通过之后、发出之前监听者变了或确认不了）是 `Unavailable`：什么都没发，退避之后从头再来。
+                    Some(key) => match self.probe_authorized(recipe, &key).await {
                         EngineProbe::Ready => true,
                         EngineProbe::AuthRejected(_) => {
                             return Attempt::Terminal {
@@ -763,7 +841,7 @@ impl Actor {
                 reason: Some(UpstreamReason::FencePending),
             };
         }
-        self.external = Some(External { verifier });
+        self.external = Some(external);
         Attempt::Ready
     }
 
@@ -910,7 +988,7 @@ impl Actor {
             }
             None => return Attempt::Failure { reason: None },
         };
-        let mut owned = Owned { engine, key };
+        let mut owned = Owned::new(engine, key, self.shared.config.inspector.clone());
         match self.wait_owned_ready(&mut owned).await {
             Ok(()) => self.finish_owned(owned).await,
             Err(failure) => self.abandon(owned, failure).await,
@@ -925,21 +1003,20 @@ impl Actor {
         let recipe = owned.engine.instance().recipe().clone();
         let deadline = Instant::now() + t.startup_timeout;
         let mut interval = t.ready_initial_interval;
-        let mut listener_confirmed = false;
         let mut rejections = 0_u32;
         loop {
             // 读不出来（`Err`）不当作退出，下一轮再看。
             if let Ok(false) = owned.engine.is_running().await {
                 return Err(WaitFailure::Exited);
             }
-            if !listener_confirmed {
-                listener_confirmed = matches!(
-                    inspector
-                        .listens_on(owned.engine.pid(), owned.engine.port())
-                        .await,
-                    Ok(true)
-                );
-            }
+            // **每一次**带私有 key 的探测之前都重新确认监听这个端口的是这个进程，不缓存（Codex 审计 H3）：进程活着不等于端口还是
+            // 它的，引擎可以放掉端口而不退出，别的东西接着绑上来；之前确认过一次，不能让之后每一次探测都带着 key 出去。
+            let listener_confirmed = matches!(
+                inspector
+                    .listens_on(owned.engine.pid(), owned.engine.port())
+                    .await,
+                Ok(true)
+            );
             if listener_confirmed {
                 let key = owned.key.as_ref().map(EngineKey::expose);
                 match self.probe(&recipe, key).await {
@@ -982,8 +1059,11 @@ impl Actor {
             }
         }
         if let Some(key) = &owned.key {
-            self.plan.backend.govern_private(&self.plan.endpoint, key);
+            self.plan
+                .backend
+                .govern_private(&self.plan.endpoint, key, owned.guard.clone());
         }
+        self.owned_key_revoked = false;
         self.engine = Some(owned);
         Attempt::Ready
     }
@@ -1081,6 +1161,25 @@ impl Actor {
         if let Ok(false) = running {
             return Some(self.owned_engine_exited().await);
         }
+        // 进程活着不等于端口还是它的（Codex 审计 H3；预审 L2 的 H2：周期的探测原来不问这一句就带着私有 key 出去）：引擎可以放掉端口而不退出，
+        // 别的进程接着绑上来。**每个节拍**重新确认一次监听这个端口的此刻还是我们的进程（不缓存）；确认不了，先收回私有 key（端点封上）、发布
+        // `unavailable`（`port_in_use`，数据面立刻 503），这一轮不发探测：发往那个端口的请求不再带私有 key。又确认了，把私有 key 登记回去，
+        // 接着往下探测。
+        if !self.owned_listener_confirmed().await {
+            self.revoke_owned_key();
+            self.publish(UpstreamState::Unavailable, Some(UpstreamReason::PortInUse));
+            return None;
+        }
+        if self.owned_key_revoked {
+            if let Some(owned) = self.engine.as_ref()
+                && let Some(key) = owned.key.as_ref()
+            {
+                self.plan
+                    .backend
+                    .govern_private(&self.plan.endpoint, key, owned.guard.clone());
+            }
+            self.owned_key_revoked = false;
+        }
         if !probe_due {
             return None;
         }
@@ -1114,6 +1213,38 @@ impl Actor {
         None
     }
 
+    /// 自有引擎此刻还拥有它的端口吗：监听这个端口的就是它的进程（进程本身还在，由调用方先问过 `is_running`；认回的孤儿那一问还
+    /// 核对了身份）。**每个监督节拍、等就绪时每一次带私有 key 的探测之前**都要重新问，不缓存（数据面的每个请求只问守卫里原生的那一半：
+    /// 登记时认的进程还握着套接字，见 `engine::guard`；这一问是贵的那一半，`lsof`）。检查器读不出来（`lsof` 没答上来）按
+    /// `unverifiable_retries` 重读，仍读不出来就当作没有确认：宁可不发。
+    async fn owned_listener_confirmed(&self) -> bool {
+        let Some(owned) = self.engine.as_ref() else {
+            return false;
+        };
+        let (pid, port) = (owned.engine.pid(), owned.engine.port());
+        let inspector = self.shared.config.inspector.clone();
+        let mut unreadable = 0;
+        loop {
+            match inspector.listens_on(pid, port).await {
+                Ok(listening) => return listening,
+                Err(_) if unreadable < self.timings().unverifiable_retries => {
+                    unreadable += 1;
+                    tokio::time::sleep(self.timings().unverifiable_pause).await;
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// 收回自有引擎的私有 key：端点封上，之后什么凭证都不发（回退链不适用），旧一代还在飞的操作也拿不到任何东西。
+    fn revoke_owned_key(&mut self) {
+        if !self.owned_key_revoked {
+            self.log("自有引擎还活着，但此刻监听这个端口的不是它：收回私有 key，端点封上");
+        }
+        self.plan.backend.block(&self.plan.endpoint);
+        self.owned_key_revoked = true;
+    }
+
     /// 自有引擎的进程退出了。门控完成之前：计入熔断窗口，退避重启。门控完成之后：Supervisor 的账本已经过期，
     /// 进程内恢复不了（v0.6.1），通知 `bin` 以退出码 5 优雅停止。
     async fn owned_engine_exited(&mut self) -> Step {
@@ -1140,25 +1271,45 @@ impl Actor {
         let Some(external) = &self.external else {
             return;
         };
+        let guard = external.guard.clone();
+        let expected = external.expected.clone();
+        let verifier = external.verifier.clone();
         let backend = self.plan.backend.clone();
         // 每个周期先确认监听者还是校验过的那个（按 pid 加启动时间缓存，进程没换就是两次便宜的读）：之后才可能发 key。
-        match external.verifier.check(self.plan.port).await {
-            ListenerVerdict::Verified { .. } => {
-                backend.govern_external(&self.plan.endpoint, true);
+        match verifier.check(self.plan.port).await {
+            ListenerVerdict::Verified { listeners } if listeners == expected => {
+                backend.govern_external(&self.plan.endpoint, guard);
             }
+            // 通过了校验，但已经不是登记时认的那些（合法的外部重启：A 退出、B 起来；或者多了、少了一个）。用**新**校验出来的集合建一个新的守卫登记
+            // 进去（口径或守卫变了，登记表的代际前进：旧一代已经通过核对、还没发出的请求在发出前被拒绝），不能再拿着 A 的守卫继续对着 B 登记：
+            // 那样数据面的每个请求都对着 A 的集合验、一直被拒绝，或者集合里还有留下的成员时一直放行一个早已不是登记时的集合（Codex 预审 L2 的 M1）。
+            ListenerVerdict::Verified { listeners } => {
+                let fresh = External::new(verifier, self.plan.port, &listeners);
+                backend.govern_external(&self.plan.endpoint, fresh.guard.clone());
+                self.external = Some(fresh);
+                self.log("外部引擎的监听者换了：用新校验出来的监听者重新登记（旧的授权作废）");
+            }
+            // 没有监听者了：这一刻起什么凭证都不能再发给端口上之后出现的东西（它还没有通过校验），不等下一个周期的校验。
             ListenerVerdict::NoListener => {
+                backend.block(&self.plan.endpoint);
                 self.publish(UpstreamState::Unavailable, None);
                 return;
             }
             ListenerVerdict::Rejected(_) | ListenerVerdict::Unverifiable(_) => {
-                backend.govern_external(&self.plan.endpoint, false);
+                backend.block(&self.plan.endpoint);
                 self.publish(UpstreamState::Failed, Some(UpstreamReason::PortInUse));
                 return;
             }
         }
         let recipe = backend.probe_recipe();
+        // key 先取好，再经授权路径探测（守卫重新确认监听者、只拨核验过的地址、走新开的连接；Codex 复审 L2 的 M2'）。授权不过（监听者变了、读不出来）
+        // 就这一轮没有结论（`Unavailable`，记一行日志）：下一个周期的校验会把监听者的变化分清楚。
         let key = backend.current_key(&self.plan.endpoint);
-        let (state, reason) = match self.probe(&recipe, key.as_deref()).await {
+        let probed = match key.as_deref() {
+            Some(key) => self.probe_authorized(&recipe, key).await,
+            None => self.probe(&recipe, None).await,
+        };
+        let (state, reason) = match probed {
             EngineProbe::Ready => {
                 if self.supervisor_latched().await {
                     (

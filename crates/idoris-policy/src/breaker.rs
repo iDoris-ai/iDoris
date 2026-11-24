@@ -210,6 +210,23 @@ impl Breaker {
         self.on_failure_metadata(&ticket, now_ms);
     }
 
+    /// 放行了、却根本没有发出去（调用方在本地就拒绝了它：目标端点被封上、引擎已被换掉……）：既不是成功也不是失败，什么都不记。
+    /// 非探测的票据没有什么要还的；**探测的票据**把 HALF_OPEN 的「有探测在途」还回去，下一个请求可以接着探测（不然这个槽位就永远
+    /// 占着，断路器卡在 HALF_OPEN）。过期的票据（世代变了、别的实例签发的）什么也不做。
+    pub fn release_probe(&mut self, ticket: AdmissionTicket) {
+        let AdmissionTicket {
+            issuer,
+            generation,
+            probe,
+        } = ticket;
+        if issuer != self.issuer || generation != self.generation || !probe {
+            return;
+        }
+        if let State::HalfOpen { probing: true } = self.state {
+            self.state = State::HalfOpen { probing: false };
+        }
+    }
+
     fn on_failure_metadata(&mut self, ticket: &AdmissionTicket, now_ms: u64) {
         let AdmissionTicket {
             issuer,
@@ -418,6 +435,13 @@ impl<K: Eq + Hash + Clone> BreakerBook<K> {
         }
     }
 
+    /// See [`Breaker::release_probe`]: a send that was refused locally settles without an outcome.
+    pub fn release_probe(&mut self, key: &K, class: CredentialClass, ticket: AdmissionTicket) {
+        if let Some(breaker) = self.breakers.get_mut(&(class, key.clone())) {
+            breaker.release_probe(ticket);
+        }
+    }
+
     pub fn on_failure_with_retry_after(
         &mut self,
         key: &K,
@@ -442,6 +466,66 @@ impl<K: Eq + Hash + Clone> BreakerBook<K> {
         if let Some(breaker) = self.breakers.get_mut(&(class, key.clone())) {
             breaker.on_retry_after(ticket, now_ms, ms);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod release_probe_tests {
+    use super::*;
+
+    fn open_then_half_open(class: CredentialClass) -> Breaker {
+        let mut breaker = Breaker::new(class);
+        for _ in 0..class.failure_threshold() {
+            let ticket = breaker.admit(0).ticket.unwrap();
+            breaker.on_failure(ticket, 0);
+        }
+        assert!(matches!(breaker.state, State::Open { .. }));
+        breaker
+    }
+
+    /// A probe whose request was refused locally is handed back: the next request probes, nothing was counted.
+    #[test]
+    fn a_released_probe_frees_the_half_open_slot_and_counts_nothing() {
+        let mut breaker = open_then_half_open(CredentialClass::Local);
+        let after_window = CredentialClass::Local.recovery_ms();
+        let probe = breaker.admit(after_window);
+        assert_eq!(probe.admission, Admission::Probe);
+        // While the probe is out, nobody else is admitted.
+        assert_eq!(
+            breaker.admit(after_window).admission,
+            Admission::Rejected { retry_after_ms: 0 }
+        );
+        breaker.release_probe(probe.ticket.unwrap());
+        assert_eq!(breaker.state, State::HalfOpen { probing: false });
+        // The slot is free again: the next request probes, and a success closes the breaker as usual.
+        let next = breaker.admit(after_window);
+        assert_eq!(next.admission, Admission::Probe);
+        breaker.on_success(next.ticket.unwrap());
+        assert_eq!(breaker.state, State::Closed { failures: 0 });
+    }
+
+    /// A refused ordinary request leaves the failure count alone; a stale or foreign ticket does nothing.
+    #[test]
+    fn releasing_an_ordinary_stale_or_foreign_ticket_changes_nothing() {
+        let mut breaker = Breaker::new(CredentialClass::Local);
+        let ordinary = breaker.admit(0).ticket.unwrap();
+        breaker.release_probe(ordinary);
+        assert_eq!(breaker.state, State::Closed { failures: 0 });
+
+        let mut opened = open_then_half_open(CredentialClass::Local);
+        let probe = opened.admit(CredentialClass::Local.recovery_ms());
+        let ticket = probe.ticket.unwrap();
+        // Another breaker's ticket (a different issuer) must not free this one's slot.
+        let mut other = open_then_half_open(CredentialClass::Local);
+        let foreign = other
+            .admit(CredentialClass::Local.recovery_ms())
+            .ticket
+            .unwrap();
+        opened.release_probe(foreign);
+        assert_eq!(opened.state, State::HalfOpen { probing: true });
+        opened.release_probe(ticket);
+        assert_eq!(opened.state, State::HalfOpen { probing: false });
     }
 }
 

@@ -13,8 +13,8 @@ use idoris_contracts::ComponentCard;
 /// ready (a degraded gate skipped the card and never looked at the variable).
 ///
 /// Not in here, on purpose: the oMLX API key. It depends on the engine's state (a managed engine's private key is
-/// only registered after the engine is up) and is resolved when the adapter is constructed, so adapters themselves
-/// cannot be built early; only parameters that do not depend on the engine can be.
+/// only registered after the engine is up), so it is not resolved at construction at all: an eligible oMLX adapter
+/// looks it up on every request (IDORIS-CORE S6), and only parameters that do not depend on the engine are resolved here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdapterParams {
     /// Deadline of oMLX's `POST /v1/models/{id}/load` (`IDORIS_LOAD_TIMEOUT_S`, IDORIS-CORE S8).
@@ -52,46 +52,61 @@ pub fn create_adapter(card: &ComponentCard) -> Result<Arc<dyn RuntimeAdapter>, B
     }
 }
 
-/// [`create_adapter`] with already-resolved parameters: reads nothing from the environment except the oMLX API key
-/// (see [`AdapterParams`]).
+/// [`create_adapter`] with already-resolved parameters: reads nothing from the environment, and no credential either (see
+/// [`AdapterParams`]: an eligible oMLX adapter looks its key up on every request).
 pub fn create_adapter_with(
     card: &ComponentCard,
     params: &AdapterParams,
 ) -> Result<Arc<dyn RuntimeAdapter>, BackendError> {
-    build_adapter(card, params, true)
+    match card.provider.id.as_str() {
+        "omlx" => Ok(Arc::new(create_omlx_adapter_with(card, params)?)),
+        provider => Err(no_adapter(provider)),
+    }
 }
 
 /// [`create_adapter_with`] for a start-up **dry run**: the same provider check and the same construction (so a card that
-/// has no adapter, or whose parameters are refused, fails the same way), but **no credential is resolved**: the key is not
-/// read from the environment or from `~/.omlx/settings.json`. Credentials are resolved only when the adapter is really
-/// built (a managed engine's private key is registered only after the engine is up, and an engine that ends up degraded
-/// never needs an adapter at all), so the dry run must not touch the user's key file early.
+/// has no adapter, or whose parameters are refused, fails the same way), and **no credential is resolved**: the key is not
+/// read from the environment or from `~/.omlx/settings.json`. No adapter this factory builds reads a credential at
+/// construction (an eligible oMLX adapter looks its key up on every request, IDORIS-CORE S6), so this is the same
+/// construction as the real build; it stays a separate entry point because the dry run's contract is named and pinned by
+/// `startup_dry_run_reads_no_key`: credentials are resolved only when a request is really made (a managed engine's private
+/// key is registered only after the engine is up), never by the dry run.
 pub fn create_adapter_unkeyed(
     card: &ComponentCard,
     params: &AdapterParams,
 ) -> Result<Arc<dyn RuntimeAdapter>, BackendError> {
-    build_adapter(card, params, false)
+    create_adapter_with(card, params)
 }
 
-fn build_adapter(
+/// The production oMLX adapter for `card` (IDORIS-CORE S6, Codex audit H2), concrete so a caller can still chain builder
+/// calls on it. Reads the environment parameters itself, like [`create_adapter`]; start-up code that resolved them once uses
+/// [`create_omlx_adapter_with`].
+///
+/// **Whether it may carry a key at all is decided per card, by the same check the proxy uses**
+/// ([`super::omlx::key::card_may_carry_omlx_key`]) — not by `provider.id`, which a handwritten card can claim. An eligible
+/// card gets an adapter that looks the key up on **every request** and caches none (the engine manager may replace the
+/// engine behind this endpoint at any time). Any other card — a handwritten `provider.id = "omlx"` card that carries
+/// `extensions.idoris_upstream`, a non-loopback endpoint, a different product pin — gets an adapter with **no key and no
+/// registry lookup**: no key from the environment, from `settings.json` or from the engine manager is ever sent to it.
+pub fn create_omlx_adapter(card: &ComponentCard) -> Result<super::OmlxAdapter, BackendError> {
+    create_omlx_adapter_with(card, &AdapterParams::from_env()?)
+}
+
+/// [`create_omlx_adapter`] with already-resolved parameters (the load deadline, resolved once at start-up).
+pub fn create_omlx_adapter_with(
     card: &ComponentCard,
     params: &AdapterParams,
-    resolve_credentials: bool,
-) -> Result<Arc<dyn RuntimeAdapter>, BackendError> {
-    match card.provider.id.as_str() {
-        "omlx" => {
-            let config = if resolve_credentials {
-                super::OmlxAdapterConfig::for_base_url(card.endpoint.clone())
-            } else {
-                super::OmlxAdapterConfig::unkeyed_for_base_url(card.endpoint.clone())
-            };
-            // A load is not a management call (IDORIS-CORE S8): it gets its own, much longer deadline.
-            Ok(Arc::new(
-                super::OmlxAdapter::new(config)?.with_load_timeout(params.omlx_load_timeout),
-            ))
-        }
-        provider => Err(no_adapter(provider)),
-    }
+) -> Result<super::OmlxAdapter, BackendError> {
+    // No key is read at construction either way: an eligible adapter resolves it per request. A load is not a management
+    // call (IDORIS-CORE S8): it gets its own, much longer deadline, resolved at start-up (an invalid override is a start-up
+    // failure, not a silent default).
+    let config = super::OmlxAdapterConfig::unkeyed_for_base_url(card.endpoint.clone());
+    let adapter = super::OmlxAdapter::new(config)?.with_load_timeout(params.omlx_load_timeout);
+    Ok(if super::omlx::key::card_may_carry_omlx_key(card) {
+        adapter.with_per_request_key()
+    } else {
+        adapter
+    })
 }
 
 fn no_adapter(provider: &str) -> BackendError {
@@ -148,6 +163,95 @@ mod tests {
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
             ["qwen3-8b"]
+        );
+    }
+
+    fn omlx_card(
+        endpoint: &str,
+        pin: &str,
+        extensions: Option<serde_json::Value>,
+    ) -> ComponentCard {
+        let mut card = card("omlx", endpoint);
+        card.version_pin = pin.to_owned();
+        card.extensions = extensions.map(|value| value.as_object().unwrap().clone());
+        card
+    }
+
+    async fn authorizations(server: &MockServer) -> Vec<Option<String>> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                request
+                    .headers
+                    .get("authorization")
+                    .map(|value| value.to_str().unwrap().to_owned())
+            })
+            .collect()
+    }
+
+    /// IDORIS-CORE S6 (Codex audit H2a): whether the production adapter may carry a key is decided per card, by the proxy's
+    /// own check, not by `provider.id` (which a handwritten card can claim). Whatever key the engine manager has registered
+    /// for the endpoint, an adapter for any other card sends none.
+    #[tokio::test]
+    async fn only_a_card_the_proxy_would_give_a_key_gets_an_adapter_that_carries_one() {
+        use crate::omlx::key::{EndpointKey, forget_endpoint, govern_endpoint};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models/status"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": []})),
+            )
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+        govern_endpoint(&endpoint, EndpointKey::Private("engine-key".into()));
+
+        let eligible = create_adapter(&omlx_card(&endpoint, "omlx@0.6.4", None)).unwrap();
+        assert!(
+            eligible.engine_generation().is_some(),
+            "looked up per request"
+        );
+        eligible.list().await.unwrap();
+
+        let disguised = [
+            // a handwritten card that claims to be oMLX but is a custom upstream
+            omlx_card(
+                &endpoint,
+                "omlx@0.6.4",
+                Some(
+                    serde_json::json!({"idoris_upstream": {"kind": "openai_compat", "flavor": "omlx"}}),
+                ),
+            ),
+            // not an oMLX product pin
+            omlx_card(&endpoint, "openai_compat@unknown", None),
+        ];
+        for card in &disguised {
+            let adapter = create_adapter(card).unwrap();
+            // The endpoint is one the engine manager governs: the adapter is bound to its generation like any other (Codex pre-review of
+            // layer 2, H1: governed is decided by the endpoint, not the card) — it just never carries the key.
+            assert!(
+                adapter.engine_generation().is_some(),
+                "{}",
+                card.version_pin
+            );
+            adapter.list().await.unwrap();
+        }
+        forget_endpoint(&endpoint);
+
+        let sent = authorizations(&server).await;
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0].as_deref(), Some("Bearer engine-key"));
+        assert_eq!(
+            sent[1], None,
+            "a card with idoris_upstream never gets a key"
+        );
+        assert_eq!(
+            sent[2], None,
+            "a card that is not an oMLX product pin never gets a key"
         );
     }
 

@@ -4,7 +4,8 @@
 //!
 //! 怎么数「读了几次」：`idoris_upstream::omlx::key::resolutions()` 是进程里按环境与 `settings.json` 解析 oMLX key 的次数，所有读环境的入口都经过它。
 //! 它是进程全局的计数，所以这个文件只有这一条测试，而且在**自己的子进程**里数（本测试再起一次自己，环境是空的 `HOME`、没有
-//! `IDORIS_OMLX_API_KEY`）：既没有别的测试的读取来干扰计数，对照用的「真正建适配器」也读不到这台机器上真实的 `~/.omlx`。
+//! `IDORIS_OMLX_API_KEY`）：既没有别的测试的读取来干扰计数，对照用的「第一个请求」也读不到这台机器上真实的 `~/.omlx`。
+//! 适配器建出来时本来就不解析凭证（IDORIS-CORE S6：能带 key 的卡的适配器每个请求取此刻的口径），所以对照是第一个请求，不是建适配器。
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -84,11 +85,22 @@ fn the_start_up_adapter_dry_run_resolves_no_credential_and_a_real_build_does() {
         "the start-up dry run resolved a credential: it read the environment or the user's settings.json"
     );
 
-    // 对照（让上面那条「零次」不是因为计数器根本不动）：真正建适配器，凭证在这时解析。
+    // 对照（让上面那条「零次」不是因为计数器根本不动）。适配器建出来时也不解析凭证：能带 key 的卡的适配器每个请求取此刻的口径、不缓存
+    // （IDORIS-CORE S6：托管引擎随时可能被换），所以凭证在**第一个请求发出之前**才解析，计数器看得到它。
     let adapter = create_adapter_with(&cards[0], &params).unwrap();
-    drop(adapter);
+    assert_eq!(
+        idoris_upstream::omlx::key::resolutions(),
+        before,
+        "building the adapter resolves nothing either: the key is looked up per request"
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // 18765 上没有东西：请求以连接失败收场，但 key 在发出之前就解析过了。
+    let _ = runtime.block_on(adapter.list());
     assert!(
         idoris_upstream::omlx::key::resolutions() > before,
-        "building the adapter for real resolves the credential, and the counter sees it"
+        "the first request resolves the credential, and the counter sees it"
     );
 }

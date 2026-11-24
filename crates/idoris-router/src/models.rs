@@ -5,7 +5,7 @@
 //! Other failures are skipped, with three consecutive failures triggering a
 //! 30-second provider cooldown; a successful listing resets that state.
 
-use std::ffi::OsStr;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::health::HealthTracker;
@@ -98,56 +98,96 @@ fn auth_failure(card: &ComponentCard, field: &str, value: Value) -> ModelsError 
 /// （`setup upstream` 的卡必带 `idoris_upstream`）即使把 `flavor`、`version_pin` 写成 oMLX、端口写成 oMLX 的，
 /// 也不带 key。key 的来源不在这里（见 `idoris_upstream::omlx::key`），S5 换成私有 key 表时只改来源。
 pub(crate) fn is_loopback_omlx(card: &ComponentCard) -> bool {
-    if card.provider.family != idoris_contracts::provider::Family::Local
-        || card.provider.locality != Locality::Loopback
-        || !card.version_pin.starts_with("omlx@")
-        || card
-            .extensions
-            .as_ref()
-            .is_some_and(|ext| ext.contains_key(crate::engine_kind::UPSTREAM_EXTENSION))
-    {
-        return false;
-    }
-    let Ok(url) = reqwest::Url::parse(&card.endpoint) else {
-        return false;
-    };
-    matches!(url.scheme(), "http" | "https")
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.query().is_none()
-        && url.fragment().is_none()
-        && url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        })
+    // 唯一的实现在 `idoris-upstream`：生命周期适配器的工厂用的是同一个（IDORIS-CORE S6，Codex 审计 H2），所以一张手写的、伪装成
+    // oMLX 的卡在代理、模型列表、预热和适配器里得到同一个判决。
+    idoris_upstream::omlx::key::card_may_carry_omlx_key(card)
 }
 
+/// 这张卡被准入时它的端点的引擎代际（IDORIS-CORE S6，Codex 终审 M6）：**在状态检查之前读**，所以它只可能比状态检查那一刻的新引擎旧，不会
+/// 更新。有的是端点被引擎管理器接管的卡（能带 oMLX key 的卡，**和**同一个端口上不能带 key 的卡：由端点决定，不由卡决定，Codex 预审 L2 的
+/// H1）；别的卡的端点不归引擎管理器管。`GET /v1/models` 与 Admin 的模型来源把它一路带到发出请求的那一刻。
+pub(crate) fn admission_generation(card: &ComponentCard) -> Option<u64> {
+    (is_loopback_omlx(card) || idoris_upstream::omlx::key::is_governed_endpoint(&card.endpoint))
+        .then(|| idoris_upstream::omlx::key::endpoint_generation(&card.endpoint))
+}
+
+/// 每张卡被准入时的代际（按 `provider.id`），见 [`admission_generation`]。
+pub type AdmittedGenerations = BTreeMap<String, u64>;
+
+/// 读一张卡的 `/v1/models`。能带 oMLX key 的卡**在发出请求之前**经 [`idoris_upstream::omlx::key::authorize_omlx_request`]（IDORIS-CORE S6，
+/// Codex 终审 H1、M6）：同一个任务里、紧挨着发送，核对准入时的代际与封上、让引擎管理器的守卫重新确认监听者；**被拒绝就不发**，这张卡
+/// 算「不可用」（`Ok(None)`）。之前一个被封上的端点被当成「没有 key」、照样发一个匿名的 GET，未验证的监听者的回答还会被当成这张卡的
+/// 模型列表；换了代的端点则会用新一代的凭证。
 async fn fetch_models_body(
     client: &reqwest::Client,
     card: &ComponentCard,
-    api_key: Option<&OsStr>,
+    admitted_generation: Option<u64>,
 ) -> Result<Option<Value>, ModelsError> {
     let url = format!("{}/v1/models", card.endpoint.trim_end_matches('/'));
-    let mut request = client.get(&url).timeout(MODELS_TIMEOUT);
-    // 引擎管理器接管的端点（托管卡，接口规范 §2.7.7）：自有引擎只用它的私有 key，外部引擎的 settings.json key 要先过
-    // 端口属主校验；这个口径覆盖调用方传进来的 key。没有登记的端点沿用调用方的 key（行为不变）。
-    let governed = idoris_upstream::omlx::key::resolve_governed_os(&card.endpoint);
-    let api_key = governed.as_ref().map_or(api_key, |key| key.as_deref());
-    if is_loopback_omlx(card)
-        && let Some(key) = api_key.filter(|key| !key.is_empty())
+    // 持有到响应读完：这是端点上的一个在途操作，引擎管理器排空时等它。被管理的端点由端点决定（Codex 预审 L2 的 H1）：不能带 key 的卡
+    // （同一个端口上 `idoris_upstream` 的卡、映射写法的卡）也过同一道授权，只是不带凭证。
+    let carries_key = is_loopback_omlx(card);
+    let authorization = if carries_key {
+        let Ok(authorization) =
+            idoris_upstream::omlx::key::authorize_omlx_request(&card.endpoint, admitted_generation)
+                .await
+        else {
+            return Ok(None);
+        };
+        Some(authorization)
+    } else if idoris_upstream::omlx::key::is_governed_endpoint(&card.endpoint) {
+        let Ok(authorization) = idoris_upstream::omlx::key::authorize_omlx_request_without_key(
+            &card.endpoint,
+            admitted_generation,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        Some(authorization)
+    } else {
+        None
+    };
+    // 托管的端点：发往授权核验过的拨号地址（不是卡里写的别名），用不保留空闲连接的客户端（Codex 专项评审 H1、H6）。
+    let (client, send_url) = match &authorization {
+        Some(authorization) => (authorization.client(client), authorization.dial_url(&url)),
+        None => (client.clone(), url.clone()),
+    };
+    let mut request = client.get(&send_url).timeout(MODELS_TIMEOUT);
+    let held = if let Some(authorization) = authorization {
+        if let Some(key) = carries_key
+            .then(|| authorization.key_os())
+            .flatten()
+            .filter(|key| !key.is_empty())
+        {
+            // A present non-UTF-8 key is invalid, never an absent credential.
+            let mut header = key
+                .to_str()
+                .and_then(|key| HeaderValue::from_str(&format!("Bearer {key}")).ok())
+                .ok_or_else(|| {
+                    auth_failure(card, "reason", "invalid_authorization_header".into())
+                })?;
+            header.set_sensitive(true);
+            request = request.header(AUTHORIZATION, header);
+        }
+        Some(authorization)
+    } else {
+        None
+    };
+    // 授权是在 await 里取到的，请求头在它之后建：请求**建好之后**、发出前最后同步看一眼端点（Codex 预审 L2 的 H3；复审 L2 的 M1'）。
+    let (client, built) = request.build_split();
+    let Ok(built) = built else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    idoris_upstream::omlx::key::test_hooks::between_build_and_send(built.url().as_str());
+    if held
+        .as_ref()
+        .is_some_and(|authorization| authorization.ensure_current().is_err())
     {
-        // A present non-UTF-8 key is invalid, never an absent credential.
-        let mut authorization = key
-            .to_str()
-            .and_then(|key| HeaderValue::from_str(&format!("Bearer {key}")).ok())
-            .ok_or_else(|| auth_failure(card, "reason", "invalid_authorization_header".into()))?;
-        authorization.set_sensitive(true);
-        request = request.header(AUTHORIZATION, authorization);
+        return Ok(None);
     }
-    let Ok(resp) = request.send().await else {
+    let Ok(resp) = client.execute(built).await else {
         return Ok(None);
     };
     if matches!(resp.status().as_u16(), 401 | 403) {
@@ -165,13 +205,13 @@ async fn fetch_models_body(
 async fn list_one(
     client: &reqwest::Client,
     card: &ComponentCard,
-    api_key: Option<&OsStr>,
+    admitted_generation: Option<u64>,
     remote_kill_switch: bool,
 ) -> Result<OneList, ModelsError> {
     if suppress_untrusted_remote(card, remote_kill_switch) {
         return Ok(OneList::Suppressed);
     }
-    let Some(body) = fetch_models_body(client, card, api_key).await? else {
+    let Some(body) = fetch_models_body(client, card, admitted_generation).await? else {
         return Ok(OneList::Unavailable);
     };
     let Some(items) = body.get("data").and_then(|v| v.as_array()) else {
@@ -193,15 +233,13 @@ async fn list_one(
 pub(crate) async fn observe_http_models(
     client: &reqwest::Client,
     card: &ComponentCard,
+    admitted_generation: Option<u64>,
     remote_kill_switch: bool,
 ) -> Result<HttpModelObservation, ModelsError> {
     if suppress_untrusted_remote(card, remote_kill_switch) {
         return Ok(HttpModelObservation::Suppressed);
     }
-    // `fetch_models_body` attaches a key only to loopback oMLX cards, so the
-    // settings.json key (loopback-only) is safe to resolve here.
-    let api_key = idoris_upstream::omlx::key::resolve_omlx_api_key_os(true);
-    let Some(body) = fetch_models_body(client, card, api_key.as_deref()).await? else {
+    let Some(body) = fetch_models_body(client, card, admitted_generation).await? else {
         return Ok(HttpModelObservation::Unavailable);
     };
     let Some(items) = body.get("data").and_then(|value| value.as_array()) else {
@@ -231,9 +269,26 @@ pub async fn list_models(
     health: &HealthTracker,
     remote_kill_switch: bool,
 ) -> Result<ModelsResponse, ModelsError> {
-    // `fetch_models_body` attaches a key only to loopback oMLX cards, so the
-    // settings.json key (loopback-only) is safe to resolve here.
-    let api_key = idoris_upstream::omlx::key::resolve_omlx_api_key_os(true);
+    list_models_admitted(
+        client,
+        cards,
+        &AdmittedGenerations::new(),
+        health,
+        remote_kill_switch,
+    )
+    .await
+}
+
+/// 同 [`list_models`]，每张卡带着它被准入时的引擎代际（`admitted`，按 `provider.id`；没有的卡不绑定）：调用方在**挑选这批卡的状态检查
+/// 之前**读（[`admission_generation`]），所以状态检查之后换了代、或者被停掉的端点，逐卡请求发出前被拒绝（Codex 终审 M6）：先排的慢卡
+/// 阻塞列表期间，后面一张卡的引擎被停了，它的端点收不到任何请求。
+pub async fn list_models_admitted(
+    client: &reqwest::Client,
+    cards: &[ComponentCard],
+    admitted: &AdmittedGenerations,
+    health: &HealthTracker,
+    remote_kill_switch: bool,
+) -> Result<ModelsResponse, ModelsError> {
     // 每条 (端点, 条目)：端点相同的卡列出同一批上游模型（主卡与伴生卡），后面按规则去重。
     let mut listed: Vec<(String, ModelEntry)> = Vec::new();
     for card in cards {
@@ -248,7 +303,7 @@ pub async fn list_models(
         if !is_loopback_omlx(card) && health.is_cooling_down(id, Instant::now()) {
             continue;
         }
-        match list_one(client, card, api_key.as_deref(), remote_kill_switch).await? {
+        match list_one(client, card, admitted.get(id).copied(), remote_kill_switch).await? {
             OneList::Entries(entries) => {
                 health.record(id, true, Instant::now());
                 let endpoint = endpoint_key(&card.endpoint);
@@ -329,7 +384,28 @@ pub async fn list_models_with_subscriptions(
     subscriptions: &SubscriptionRuntimeRegistry,
     remote_kill_switch: bool,
 ) -> Result<ModelsResponse, ModelsError> {
-    let mut response = list_models(client, cards, health, remote_kill_switch).await?;
+    list_models_with_subscriptions_admitted(
+        client,
+        cards,
+        &AdmittedGenerations::new(),
+        health,
+        subscriptions,
+        remote_kill_switch,
+    )
+    .await
+}
+
+/// 同 [`list_models_with_subscriptions`]，每张卡带着被准入时的引擎代际（见 [`list_models_admitted`]）。
+pub async fn list_models_with_subscriptions_admitted(
+    client: &reqwest::Client,
+    cards: &[ComponentCard],
+    admitted: &AdmittedGenerations,
+    health: &HealthTracker,
+    subscriptions: &SubscriptionRuntimeRegistry,
+    remote_kill_switch: bool,
+) -> Result<ModelsResponse, ModelsError> {
+    let mut response =
+        list_models_admitted(client, cards, admitted, health, remote_kill_switch).await?;
     response.data.extend(
         subscriptions
             .discovery()
@@ -341,6 +417,67 @@ pub async fn list_models_with_subscriptions(
             }),
     );
     Ok(response)
+}
+
+#[cfg(test)]
+mod post_build_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    /// 复审 L2 终检：模型列表的逐卡请求**建好之后、最后一眼之前**换掉引擎（`test_hooks`）：不发，这张卡算「不可用」（`Ok(None)`）。授权是在 await 里取到的，
+    /// 请求头在它之后建；换代落在这两步之间时，之前（最后一眼在加请求头**之前**）能放过去一个已经通过代际核对的请求。
+    #[tokio::test]
+    async fn a_model_list_request_built_for_a_replaced_engine_is_not_sent() {
+        use idoris_upstream::omlx::key::test_hooks::between_build_and_send_for;
+        use idoris_upstream::omlx::key::{EndpointKey, forget_endpoint, govern_endpoint};
+
+        struct Governed(String);
+        impl Drop for Governed {
+            fn drop(&mut self) {
+                forget_endpoint(&self.0);
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+        let _governed = Governed(endpoint.clone());
+        govern_endpoint(&endpoint, EndpointKey::Private("first-engine".to_owned()));
+        let card = crate::tests::resident_component_card("omlx", &endpoint);
+        let admitted = admission_generation(&card);
+        assert!(
+            admitted.is_some(),
+            "bound to the governed endpoint's generation"
+        );
+
+        // 对照：没有换引擎，同一个请求发得出去。
+        let listed = fetch_models_body(&reqwest::Client::new(), &card, admitted).await;
+        assert!(matches!(listed, Ok(Some(_))), "{listed:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        let _hook = between_build_and_send_for(&format!("{endpoint}/v1/models"), {
+            let endpoint = endpoint.clone();
+            move || {
+                govern_endpoint(&endpoint, EndpointKey::Private("replacement".to_owned()));
+            }
+        });
+        let listed = fetch_models_body(&reqwest::Client::new(), &card, admitted).await;
+        assert!(matches!(listed, Ok(None)), "{listed:?}");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the request built for the replaced engine was sent"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -380,6 +517,58 @@ mod tests {
             load_policy: None,
             extensions: None,
         }
+    }
+
+    /// Codex 预审 L2 的 H1：不能带 key 的卡（这里的 `version_pin` 不是 oMLX）发往一个被管理的端点，模型列表走同一道授权：封上的端点一个请求都不发，这张卡算「不可用」，
+    /// 不会把占着端口的东西的回答当成它的模型列表；端点登记过、放开之后请求发出，**不带** bearer。
+    #[tokio::test]
+    async fn a_card_that_may_not_carry_the_key_is_not_listed_through_a_blocked_governed_endpoint() {
+        use idoris_upstream::omlx::key::{
+            EndpointKey, block_endpoint, forget_endpoint, govern_endpoint,
+        };
+
+        struct Governed(String);
+        impl Drop for Governed {
+            fn drop(&mut self) {
+                forget_endpoint(&self.0);
+            }
+        }
+
+        let server = models_server(&["secret-model"]).await;
+        let endpoint = server.uri();
+        let _governed = Governed(endpoint.clone());
+        let client = reqwest::Client::new();
+        let cards = vec![card("hand-written", &endpoint, Form::HttpService)];
+
+        govern_endpoint(&endpoint, EndpointKey::Private("engine-key".to_owned()));
+        let listed = list_models(&client, &cards, &HealthTracker::default(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            listed
+                .data
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["secret-model"]
+        );
+        let seen = server.received_requests().await.unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].headers.get("authorization").is_none(),
+            "the engine's private key went to a card that may not carry it"
+        );
+
+        block_endpoint(&endpoint);
+        let blocked = list_models(&client, &cards, &HealthTracker::default(), false).await;
+        if let Ok(response) = &blocked {
+            assert!(response.data.is_empty(), "{response:?}");
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the model list went to a blocked governed endpoint"
+        );
     }
 
     #[tokio::test]
