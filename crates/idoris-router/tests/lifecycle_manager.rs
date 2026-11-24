@@ -3117,7 +3117,7 @@ async fn m2b_supervising_an_external_engine_sends_its_key_only_when_the_guard_st
 
     gone.store(true, Ordering::SeqCst);
     wait_for("the supervision probe to be refused", || {
-        h.logged("外部引擎的探测没有发出")
+        h.logged("外部引擎的带凭证探测没有发出")
     })
     .await;
     h.until_state(UpstreamState::Unavailable).await;
