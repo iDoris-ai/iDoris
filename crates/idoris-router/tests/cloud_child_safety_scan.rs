@@ -25,6 +25,10 @@ mod fake_upstream;
 #[path = "support/cloud_harness.rs"]
 mod harness;
 
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+use state_isolation::IsolateState;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -180,6 +184,7 @@ fn run_inner() -> Scan {
         .env("TEMP", &tmp)
         .env_remove("RUST_BACKTRACE")
         .current_dir(&cwd)
+        .isolate_state()
         .output()
         .unwrap();
     let mut stdout_stderr = output.stdout.clone();
