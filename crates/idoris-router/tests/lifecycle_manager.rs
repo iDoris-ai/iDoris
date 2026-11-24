@@ -3630,7 +3630,8 @@ fn long_drain() -> Timings {
 /// 之后中止实例任务；`stop_on_exit:"never"` 拉起的引擎在句柄丢弃时不杀，成了没人管的孤儿。现在停止指令一到，排空立刻放手，引擎按指令在
 /// 期限里被停掉并回收记录。
 #[tokio::test]
-async fn a_shutdown_behind_a_restart_drain_interrupts_it_and_stops_the_never_engine_within_the_deadline() {
+async fn a_shutdown_behind_a_restart_drain_interrupts_it_and_stops_the_never_engine_within_the_deadline()
+ {
     let rig = Rig::new(&Behavior::default());
     let h = Harness::start(
         &rig,
@@ -3646,7 +3647,10 @@ async fn a_shutdown_behind_a_restart_drain_interrupts_it_and_stops_the_never_eng
     h.manager.restart_upstream("omlx").await.unwrap();
     h.until_state(UpstreamState::Restarting).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(pid_alive(pid), "still draining: the old engine is untouched");
+    assert!(
+        pid_alive(pid),
+        "still draining: the old engine is untouched"
+    );
 
     let begun = Instant::now();
     h.manager
@@ -3843,9 +3847,7 @@ impl idoris_backend::RuntimeAdapter for SlowFirstStatus {
     async fn unload(&self, id: &str) -> Result<(), idoris_backend::BackendError> {
         self.mock.unload(id).await
     }
-    async fn status(
-        &self,
-    ) -> Result<idoris_backend::BackendStatus, idoris_backend::BackendError> {
+    async fn status(&self) -> Result<idoris_backend::BackendStatus, idoris_backend::BackendError> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             tokio::time::sleep(self.first).await;
         }
@@ -3879,17 +3881,15 @@ async fn an_engine_failure_is_published_before_the_slow_cleanup_not_after_it() {
     );
     h.until_state(UpstreamState::Ready).await;
     assert!(h.manager.open_gate().is_some());
-    let registry = RuntimeRegistry::spawn_with_factory(
-        &[card("omlx", &rig.endpoint(), true)],
-        |_| {
+    let registry =
+        RuntimeRegistry::spawn_with_factory(&[card("omlx", &rig.endpoint(), true)], |_| {
             Ok(Arc::new(SlowFirstStatus {
                 mock: idoris_backend::MockAdapter::new(Vec::new()),
                 calls: AtomicUsize::new(0),
                 first: Duration::from_secs(4),
             }))
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     h.manager.attach_runtimes(registry);
 
     let _ = Command::new("kill")

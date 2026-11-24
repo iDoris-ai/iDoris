@@ -505,6 +505,10 @@ async fn a_reset_that_outlives_its_deadline_commits_nothing_and_fences_the_ledge
             "exact={exact}: an uncommitted reset leaves the ledger fenced"
         );
         rig.handle.engine_replaced(true).await.unwrap();
-        assert_eq!(rig.claimed(), 20.0, "exact={exact}: a reset in time commits");
+        assert_eq!(
+            rig.claimed(),
+            20.0,
+            "exact={exact}: a reset in time commits"
+        );
     }
 }

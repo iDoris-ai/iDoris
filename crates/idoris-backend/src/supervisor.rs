@@ -2019,10 +2019,9 @@ async fn handle_reset(
     let status = if sample {
         let adapter = env.adapter.clone();
         let ownership = env.load_fence.cloned();
-        let timeout = remaining(Instant::now())
-            .map_or(env.config.adapter_call_timeout, |left| {
-                left.min(env.config.adapter_call_timeout)
-            });
+        let timeout = remaining(Instant::now()).map_or(env.config.adapter_call_timeout, |left| {
+            left.min(env.config.adapter_call_timeout)
+        });
         // The same isolation as the startup sample: a panic in the adapter is a `JoinError` here, and the
         // timeout bounds a hanging engine.
         let sampled = tokio::spawn(async move {

@@ -841,17 +841,26 @@ mod tests {
         use UpstreamState::*;
         // 托管引擎在重启：别的上游就绪不能让 `phase` 成为 `ready`（修复前：Ready）。
         assert_eq!(
-            phase_of(&[status("cloud", Ready, None), managed_status("omlx", Restarting)]),
+            phase_of(&[
+                status("cloud", Ready, None),
+                managed_status("omlx", Restarting)
+            ]),
             Phase::Starting
         );
         // 托管引擎在启动：同上。
         assert_eq!(
-            phase_of(&[status("cloud", Ready, None), managed_status("omlx", Starting)]),
+            phase_of(&[
+                status("cloud", Ready, None),
+                managed_status("omlx", Starting)
+            ]),
             Phase::Starting
         );
         // 托管引擎就绪：别的上游还没第一次观测也不拉回 `starting`（修复前：Starting）。
         assert_eq!(
-            phase_of(&[status("cloud", Starting, None), managed_status("omlx", Ready)]),
+            phase_of(&[
+                status("cloud", Starting, None),
+                managed_status("omlx", Ready)
+            ]),
             Phase::Ready
         );
         // 托管的失败与另一个托管上游的启动并存：保持 `degraded`（Agent24 据此有界等待）。
