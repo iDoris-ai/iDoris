@@ -96,6 +96,12 @@ impl OmlxAdapter {
             if session.is_none() {
                 *session = Some(self.admin_login().await?);
             }
+            // 缓存的会话 cookie 不经过 `admin_login`，所以登录那一处的准入核对管不到它：每一次发送（含 401 之后的重试）
+            // 之前都要再核对一遍。否则加载的 POST 返回时引擎已被封上或换代，随后的钉住（PUT）仍会用旧 cookie 发出去。
+            // 没发出去的请求按「结果未知」归类：加载已被引擎接受，调用方据此保留加载围栏。
+            if self.per_request_key {
+                self.api_key().map_err(AdminRequestError::Unknown)?;
+            }
             let cookie = session.as_ref().ok_or_else(|| {
                 AdminRequestError::Unknown(upstream_error("oMLX admin session unavailable"))
             })?;

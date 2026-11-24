@@ -277,6 +277,27 @@ impl std::fmt::Display for KeyRefusal {
 
 impl std::error::Error for KeyRefusal {}
 
+/// 只做 [`resolve_omlx_api_key_checked`] 的准入核对（代际、封上），不解析凭证：不带 oMLX key 的请求（比如共用一个托管端点的别的
+/// resident 卡）同样不能发给已经换代或被封上的端点——请求体虽小，也不该发给一个没被核实的进程。
+pub fn check_endpoint_admission(
+    base_url: &str,
+    admitted_generation: Option<u64>,
+) -> Result<(), KeyRefusal> {
+    let (governed, generation) = governance_of(base_url);
+    if let Some(admitted) = admitted_generation
+        && admitted != generation
+    {
+        return Err(KeyRefusal::StaleGeneration {
+            admitted,
+            current: generation,
+        });
+    }
+    if governed == Some(EndpointKey::Blocked) {
+        return Err(KeyRefusal::Blocked);
+    }
+    Ok(())
+}
+
 /// 按请求取 key，并核对准入时的代际（IDORIS-CORE S6）：`admitted_generation` 是这个请求所属的操作被准入时端点的代际
 /// （`None` = 不绑定，按此刻的口径）。代际不是当前的、或端点被封上时拒绝（`Err`），什么凭证都不给；否则 `Ok(key)`
 /// （`None` = 不带 key）。口径与代际在同一次读里取，所以「核对通过」与「给出的 key」一致。

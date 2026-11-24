@@ -167,3 +167,75 @@ async fn an_adapter_with_a_fixed_key_has_no_generation_and_ignores_the_registry(
     assert_eq!(received(&server).await, 1);
     release_endpoint(&endpoint);
 }
+
+/// Codex 预审 H2：缓存的管理会话 cookie 不经过登录，登录那一处的核对管不到它。加载的 POST 返回时引擎被换代，随后的钉住（PUT）
+/// 不能带着旧 cookie 发给新引擎；加载按「结果未知」报告，调用方据此保留加载围栏。
+#[tokio::test]
+async fn a_cached_admin_session_is_not_used_after_the_engine_was_replaced_mid_load() {
+    let server = MockServer::start().await;
+    let endpoint = server.uri();
+    Mock::given(method("POST"))
+        .and(path("/v1/models/m/load"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/api/login"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("set-cookie", "omlx_admin_session=cached; HttpOnly")
+                .set_body_json(serde_json::json!({"success": true})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/admin/api/models/m/settings"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": [{"id": "m", "loaded": true, "pinned": true, "estimated_size": 1 << 30}]
+        })))
+        .mount(&server)
+        .await;
+    let adapter = adapter(&endpoint);
+    let resident = LoadPolicy {
+        mode: LoadMode::Resident,
+        keepalive: Keepalive::Pinned { pinned: true },
+        admission: Admission::Coexist,
+    };
+    govern_endpoint(&endpoint, EndpointKey::Private("first-engine".into()));
+    let admitted = adapter.engine_generation().unwrap();
+    // The first load logs in and caches the session cookie.
+    scoped(Some(admitted), adapter.load("m", Some(&resident)))
+        .await
+        .unwrap();
+    let puts = |requests: &[wiremock::Request]| {
+        requests
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .count()
+    };
+    assert_eq!(puts(&server.received_requests().await.unwrap()), 1);
+
+    // The second load's POST is in flight when the engine is replaced; its pin must not be sent.
+    let swap_endpoint = endpoint.clone();
+    let swap = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        govern_endpoint(&swap_endpoint, EndpointKey::Private("second-engine".into()));
+    });
+    let error = scoped(Some(admitted), adapter.load("m", Some(&resident)))
+        .await
+        .unwrap_err();
+    swap.await.unwrap();
+    assert_eq!(error.reason_code(), "load_unconfirmed", "{error}");
+    assert!(error.to_string().contains("was replaced"), "{error}");
+    assert_eq!(
+        puts(&server.received_requests().await.unwrap()),
+        1,
+        "the cached cookie was not sent to the replacement"
+    );
+    release_endpoint(&endpoint);
+}

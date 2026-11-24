@@ -875,6 +875,12 @@ impl ChatProxy {
             )
             .ok()?
         } else {
+            // 不带 oMLX key 的请求（共用托管端点的别的 resident 卡）也过准入核对：被封上或换代的端点什么都不发。
+            idoris_upstream::omlx::key::check_endpoint_admission(
+                url,
+                idoris_backend::pinned_generation(),
+            )
+            .ok()?;
             None
         };
         let mut request = self.client.post(url);
@@ -908,12 +914,12 @@ impl ChatProxy {
     /// provider. [`Self::outbound`] still decides at the moment of sending (a refusal there is the safety net for a
     /// change that lands in between, and for every retry).
     fn may_send(url: &str, omlx_key: bool) -> bool {
-        !omlx_key
-            || idoris_upstream::omlx::key::resolve_omlx_api_key_checked(
-                url,
-                idoris_backend::pinned_generation(),
-            )
-            .is_ok()
+        let generation = idoris_backend::pinned_generation();
+        if omlx_key {
+            idoris_upstream::omlx::key::resolve_omlx_api_key_checked(url, generation).is_ok()
+        } else {
+            idoris_upstream::omlx::key::check_endpoint_admission(url, generation).is_ok()
+        }
     }
 
     /// Creates a proxy. The injected `client` must have redirects disabled
@@ -1716,6 +1722,7 @@ impl ChatProxy {
         observer().await?;
         let mut retry_after_ms = None;
         let mut raw_auth_status = None;
+        let mut refused = false;
         let Ok(outcome) = self
             .send_buffered(
                 url,
@@ -1725,8 +1732,16 @@ impl ChatProxy {
                 uncertain,
                 &mut retry_after_ms,
                 &mut raw_auth_status,
+                &mut refused,
             )
             .await;
+        // 发送时（含连接失败重试之间）端点被封上、或引擎已换代：什么都没发出去，不是提供方的错，不能计入熔断。这里不结算而是
+        // 直接丢掉占位：没有占着半开探测名额的占位，丢掉不留痕迹；占着探测名额的，`Drop` 照旧按失败处理（熔断器没有「放弃探测」
+        // 的接口，不结算会让探测名额一直占着）。
+        if refused {
+            drop(claim);
+            return Ok(outcome);
+        }
         // An upstream 401/403 is recorded with its original status (not the
         // mapped 502), exactly like the stream path: auth rejections are not
         // breaker faults, so operators keep seeing `upstream_auth_failed`
@@ -1749,6 +1764,7 @@ impl ChatProxy {
         uncertain: &mut bool,
         retry_after_ms: &mut Option<u64>,
         raw_auth_status: &mut Option<u16>,
+        refused: &mut bool,
     ) -> Result<ForwardOutcome, std::convert::Infallible> {
         let mut attempt = 0usize;
         loop {
@@ -1757,6 +1773,7 @@ impl ChatProxy {
             // onto the new one.
             #[allow(clippy::cast_possible_truncation)]
             let Some(request) = self.outbound(url, payload, opts.attach_omlx_key) else {
+                *refused = true;
                 return Ok(Self::failure(503, attempt as u32));
             };
             // Keep the transport error until retry classification: only a

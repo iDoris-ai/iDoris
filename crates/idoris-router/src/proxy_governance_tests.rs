@@ -197,11 +197,45 @@ async fn a_request_bound_to_a_replaced_engine_is_refused_and_never_carries_the_n
 }
 
 #[tokio::test]
-async fn a_request_that_is_not_a_loopback_omlx_card_is_not_subject_to_the_registry() {
-    // `attach_omlx_key: false`（别的上游）：登记表里的口径与代际都与它无关，行为不变。
+async fn a_request_without_the_omlx_key_is_still_refused_by_a_blocked_endpoint() {
+    // `attach_omlx_key: false`（共用同一个托管端点的别的 resident 卡）：没有 key 可言，但端点被封上、或请求绑定的代际已经被换掉
+    // 时，请求体同样不发（Codex 预审 M1）；端点没有被接管时行为不变（见下一个用例）。
     let server = engine().await;
     let _governed = Governed(server.uri());
+    govern_endpoint(&server.uri(), EndpointKey::Private("first".into()));
+    let admitted = endpoint_generation(&server.uri());
+    let proxy = ChatProxy::new(reqwest::Client::new());
+    let mut plain = opts();
+    plain.attach_omlx_key = false;
+    // 引擎在，代际对：发出去，不带 key。
+    let outcome = generation::scoped(Some(admitted), async {
+        proxy.forward_buffered(&server.uri(), &body(), &plain).await
+    })
+    .await;
+    assert_eq!(outcome.status, 200);
+    assert_eq!(authorization(&received(&server).await[0]), None);
+    // 换代：绑定旧代际的请求什么都不发。
+    govern_endpoint(&server.uri(), EndpointKey::Private("second".into()));
+    let outcome = generation::scoped(Some(admitted), async {
+        proxy.forward_buffered(&server.uri(), &body(), &plain).await
+    })
+    .await;
+    assert_eq!(outcome.status, 503);
+    assert_eq!(outcome.execution, ExecutionDisposition::NotExecuted);
+    // 封上：不绑定也不发。
     block_endpoint(&server.uri());
+    let outcome = proxy.forward_buffered(&server.uri(), &body(), &plain).await;
+    assert_eq!(outcome.status, 503);
+    assert_eq!(
+        received(&server).await.len(),
+        1,
+        "only the first request was sent"
+    );
+}
+
+#[tokio::test]
+async fn a_request_to_an_endpoint_nobody_governs_is_not_subject_to_the_registry() {
+    let server = engine().await;
     let proxy = ChatProxy::new(reqwest::Client::new());
     let mut plain = opts();
     plain.attach_omlx_key = false;
@@ -210,6 +244,54 @@ async fn a_request_that_is_not_a_loopback_omlx_card_is_not_subject_to_the_regist
     let requests = received(&server).await;
     assert_eq!(requests.len(), 1);
     assert_eq!(authorization(&requests[0]), None);
+}
+
+/// Codex 预审 M2：重试的间隙里端点被封上，发送被本地拒绝（503，没发出去任何东西）——不是提供方的错，不能计入熔断。
+/// 连着发生比熔断上限（5 次）多的次数之后，端点恢复，下一个请求直接发出去，而不是 `provider_circuit_open`。
+#[tokio::test]
+async fn a_refusal_between_connection_retries_does_not_count_against_the_provider_breaker() {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let uri = format!("http://127.0.0.1:{port}");
+    let _governed = Governed(uri.clone());
+    govern_endpoint(&uri, EndpointKey::Private("old".into()));
+    let proxy = Arc::new(ChatProxy::with_config(
+        reqwest::Client::new(),
+        DEFAULT_WINDOW,
+        vec![Duration::from_millis(120)],
+    ));
+    for _ in 0..7 {
+        // 第一次发送连接被拒、在等重试；这时端点被封上，重试被本地拒绝。
+        govern_endpoint(&uri, EndpointKey::Private("old".into()));
+        let request = {
+            let (proxy, uri) = (Arc::clone(&proxy), uri.clone());
+            tokio::spawn(async move { proxy.forward_buffered(&uri, &body(), &opts()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        block_endpoint(&uri);
+        let outcome = request.await.unwrap();
+        assert_eq!(outcome.status, 503);
+        assert_eq!(outcome.execution, ExecutionDisposition::NotExecuted);
+        assert_eq!(
+            outcome.retries, 1,
+            "refused at the retry, not before the first send"
+        );
+    }
+    // 端点上起了一个新引擎：请求直接发出去。
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let server = MockServer::builder().listener(listener).start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"choices": []})))
+        .mount(&server)
+        .await;
+    govern_endpoint(&uri, EndpointKey::Private("new".into()));
+    let outcome = proxy.forward_buffered(&uri, &body(), &opts()).await;
+    assert_eq!(
+        outcome.status, 200,
+        "the breaker never heard of the refusals"
+    );
 }
 
 /// 一次连接失败的重试，落在引擎已经被换掉之后：不发。第一次发送（还是准入时的那一代）连接被拒；等重试的时候引擎换了，端口上
