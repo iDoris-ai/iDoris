@@ -2,6 +2,10 @@
 //! must ignore process proxy settings.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "../../idoris-router/tests/support/state_isolation.rs"]
+mod state_isolation;
+use state_isolation::IsolateState;
+
 use idoris_contracts::{
     LoadPolicy,
     load_policy::{Admission, Keepalive, LoadMode},
@@ -191,7 +195,7 @@ async fn admin_requests_ignore_http_proxy_environment() {
         } else {
             command.env_remove("IDORIS_OMLX_ADMIN_EGRESS_CONTROL");
         }
-        let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+        let output = tokio::task::spawn_blocking(move || command.isolate_state().output().unwrap())
             .await
             .unwrap();
         assert!(

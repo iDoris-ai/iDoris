@@ -1,5 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+use state_isolation::IsolateState;
+
 use std::process::Command;
 
 use axum::body::Body;
@@ -150,6 +154,7 @@ fn three_timezone_child_processes_return_fixed_monthly_answers() {
         let output = Command::new(&executable)
             .args(["--exact", "timezone_child_probe", "--nocapture", "--quiet"])
             .env("IDORIS_QUERY_ACCEPTANCE_CHILD_TZ", timezone)
+            .isolate_state()
             .output()
             .unwrap();
         assert!(output.status.success(), "{timezone}: {output:?}");

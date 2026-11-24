@@ -3,6 +3,7 @@
 // 起的真二进制用 `spawn_guarded`：断言失败或 panic 时守卫的 `Drop` 杀掉并收走子进程，不会留下占着端口的孤儿。
 #[path = "support/child_guard.rs"]
 mod child_guard;
+use child_guard::IsolateState;
 use child_guard::SpawnGuarded;
 
 use std::{
@@ -50,6 +51,7 @@ fn invalid_commands_fail_before_startup_with_usage() {
     for args in [vec!["nope"], vec!["serve", "extra"]] {
         let output = Command::new(env!("CARGO_BIN_EXE_idoris"))
             .args(args)
+            .isolate_state()
             .output()
             .unwrap();
         assert!(!output.status.success());
@@ -75,6 +77,7 @@ fn serve_reports_an_actionable_port_conflict() {
 
     let output = base_command(&repo, components.path())
         .env("IDORIS_PORT", port.to_string())
+        .isolate_state()
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -97,6 +100,7 @@ fn invalid_admin_port_fails_startup() {
         .env("IDORIS_PORT", free_port().to_string())
         .env("IDORIS_ADMIN_PORT", "invalid")
         .env("IDORIS_DB_PATH", state.path().join("state.sqlite3"))
+        .isolate_state()
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -398,6 +402,7 @@ fn same_data_and_admin_port_fails_cleanly() {
         .env("IDORIS_PORT", port.to_string())
         .env("IDORIS_ADMIN_PORT", port.to_string())
         .env("IDORIS_DB_PATH", state.path().join("state.sqlite3"))
+        .isolate_state()
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
