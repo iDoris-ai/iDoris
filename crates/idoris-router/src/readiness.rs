@@ -646,11 +646,7 @@ pub async fn probe_resident_admitted(
         None => (client.clone(), url.clone()),
     };
     let mut request = client.get(&send_url).timeout(timeout);
-    let _authorization = if let Some(authorization) = authorization {
-        // 发出前最后同步看一眼端点（Codex 预审 L2 的 H3）。
-        if authorization.ensure_current().is_err() {
-            return Observation::Unavailable(None);
-        }
+    let held = if let Some(authorization) = authorization {
         if let Some(key) = carries_key
             .then(|| authorization.key_os())
             .flatten()
@@ -671,7 +667,18 @@ pub async fn probe_resident_admitted(
     } else {
         None
     };
-    let Ok(response) = request.send().await else {
+    // 请求**建好之后**、发出前最后同步看一眼端点（Codex 预审 L2 的 H3；复审 L2 的 M1'）。
+    let (client, built) = request.build_split();
+    let Ok(built) = built else {
+        return Observation::Unavailable(None);
+    };
+    if held
+        .as_ref()
+        .is_some_and(|authorization| authorization.ensure_current().is_err())
+    {
+        return Observation::Unavailable(None);
+    }
+    let Ok(response) = client.execute(built).await else {
         return Observation::Unavailable(None);
     };
     let status = response.status();

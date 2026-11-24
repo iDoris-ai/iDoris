@@ -16,11 +16,9 @@ use idoris_upstream::engine::{
     DiscoveryError, EngineError, EngineInstance, EngineKey, EngineLaunch, EngineLaunchSpec,
     EngineProbe, EngineRecipe, ExternalListenerGuard, LaunchError, ListenerIdentity,
     ListenerVerdict, ListenerVerifier, MANAGED_DIAL, OwnedEngine, OwnedListenerGuard,
-    OwnershipRecord, Recovery, fresh_connection_client,
+    OwnershipRecord, Recovery, fresh_connection_client, probe_authorized,
 };
-use idoris_upstream::omlx::key::{
-    EndpointGuard, authorize_omlx_request_without_key, seal_endpoint_flights_if_idle,
-};
+use idoris_upstream::omlx::key::{EndpointGuard, seal_endpoint_flights_if_idle};
 use tokio::sync::{mpsc, oneshot};
 
 use super::backoff::{CrashWindow, restart_delay};
@@ -570,24 +568,28 @@ impl Actor {
             .await
     }
 
-    /// 带 key 的探测，走授权（[`authorize_omlx_request_without_key`]：key 由调用方给，授权只负责监听者的重新确认、代际、拨号地址与新开的连接）。
-    /// 授权被拒绝（监听者变了、读不出来、端点封上）：这一轮没有结论（`Unavailable`），key 一个字节也没发出去。
+    /// 带 key 的探测，走登记表的授权路径（[`idoris_upstream::engine::probe_authorized`]；Codex 复审 L2 的 M2'）：key 由调用方**先**取好，授权负责监听者的重新确认、
+    /// 代际与封上、核验过的拨号地址、不保留空闲连接的客户端、发出前的最后一眼与端点上的在途登记。外部引擎的接管与监督用它，引擎换代之后的探测也该用它。
+    /// 授权被拒绝（监听者变了、读不出来、端点封上、代际变了、托管客户端建不出来）：这一轮没有结论（`Unavailable`），key 一个字节也没发出去，记一行日志。
     async fn probe_authorized(&self, recipe: &Arc<dyn EngineRecipe>, key: &str) -> EngineProbe {
         let Some(client) = &self.client else {
             return EngineProbe::Unavailable;
         };
-        let Ok(authorization) = authorize_omlx_request_without_key(&self.plan.endpoint, None).await
-        else {
-            return EngineProbe::Unavailable;
-        };
-        recipe
-            .probe_ready(
-                &authorization.client(client),
-                &authorization.dial_url(&self.plan.endpoint),
-                Some(key),
-                self.timings().probe_timeout,
-            )
-            .await
+        match probe_authorized(
+            recipe.as_ref(),
+            &self.plan.endpoint,
+            client,
+            Some(key),
+            self.timings().probe_timeout,
+        )
+        .await
+        {
+            Ok(probe) => probe,
+            Err(refusal) => {
+                self.log(&format!("外部引擎的带凭证探测没有发出（{refusal}）"));
+                EngineProbe::Unavailable
+            }
+        }
     }
 
     fn probe_instance(&self) -> Option<EngineInstance> {
@@ -1561,7 +1563,8 @@ impl Actor {
                             reason: Some(UpstreamReason::AuthRequired),
                         };
                     }
-                    // 带 key 的重试走授权（监听者重新确认、拨号地址、新开连接），不是对着端口发裸的 bearer（Codex 复审五 H）。
+                    // key 先取好（上面），再经授权路径探测：守卫重新确认监听者、只拨核验过的地址、走新开的连接（Codex 复审 L2 的 M2'）。
+                    // 授权被拒绝（校验通过之后、发出之前监听者变了或确认不了）是 `Unavailable`：什么都没发，退避之后从头再来。
                     Some(key) => match self.probe_authorized(recipe, &key).await {
                         EngineProbe::Ready => true,
                         EngineProbe::AuthRejected(_) => {
@@ -2284,6 +2287,8 @@ impl Actor {
             }
         }
         let recipe = backend.probe_recipe();
+        // key 先取好，再经授权路径探测（守卫重新确认监听者、只拨核验过的地址、走新开的连接；Codex 复审 L2 的 M2'）。授权不过（监听者变了、读不出来）
+        // 就这一轮没有结论（`Unavailable`，记一行日志）：下一个周期的校验会把监听者的变化分清楚。
         let key = backend.current_key(&self.plan.endpoint);
         // 带 key 的周期探测走授权（监听者重新确认、代际、核验过的拨号地址与新开的连接），不是对着端口直接发一个裸的 bearer：换主人的窗口里
         // 它不会把 key 发给端口上的另一个进程（Codex 复审四 H）。授权不过（监听者变了、读不出来）就这一轮没有结论，下一个周期重新核对。

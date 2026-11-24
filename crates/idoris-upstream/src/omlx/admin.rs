@@ -12,7 +12,7 @@ use reqwest::header::{COOKIE, HeaderValue, SET_COOKIE};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use super::{OmlxAdapter, upstream_error};
+use super::{OmlxAdapter, http, upstream_error};
 
 /// A logged-in admin session: the cookie and the engine generation it was issued under (`None` = the adapter has no
 /// notion of generations: a fixed key).
@@ -48,7 +48,7 @@ impl OmlxAdapter {
                 "oMLX admin login requires the main API key",
             ))
         })?;
-        let response = credential
+        let (client, request) = credential
             .client(&self.client)
             .post(format!(
                 "{}/admin/api/login",
@@ -56,11 +56,18 @@ impl OmlxAdapter {
             ))
             .timeout(self.call_timeout)
             .json(&json!({"api_key": key}))
-            .send()
-            .await
-            .map_err(|_| {
-                AdminRequestError::Unknown(upstream_error("oMLX admin login transport failure"))
-            })?;
+            .build_split();
+        let request = request.map_err(|_| {
+            AdminRequestError::Definite(upstream_error(
+                "oMLX admin login could not be built: the request was not sent",
+            ))
+        })?;
+        // The last look, after the request (with the main key in its body) is built: a refusal means nothing was sent.
+        http::check_before_send(credential.authorization(), &request)
+            .map_err(|refusal| AdminRequestError::Definite(upstream_error(refusal.to_string())))?;
+        let response = client.execute(request).await.map_err(|_| {
+            AdminRequestError::Unknown(upstream_error("oMLX admin login transport failure"))
+        })?;
         admin_check_status(&response)?;
         let mut cookie = response
             .headers()
@@ -175,7 +182,18 @@ impl OmlxAdapter {
             if let Some(body) = body {
                 request = request.json(body);
             }
-            let response = request.send().await.map_err(|_| {
+            let (client, request) = request.build_split();
+            let request = request.map_err(|_| {
+                AdminRequestError::Definite(upstream_error(
+                    "oMLX admin request could not be built: the request was not sent",
+                ))
+            })?;
+            // The last look, after the request (with the session cookie) is built: a refusal means nothing was sent — a definite local
+            // refusal, so a settings change refused here is not reported as an unknown outcome.
+            http::check_before_send(credential.authorization(), &request).map_err(|refusal| {
+                AdminRequestError::Definite(upstream_error(refusal.to_string()))
+            })?;
+            let response = client.execute(request).await.map_err(|_| {
                 AdminRequestError::Unknown(upstream_error("oMLX admin request transport failure"))
             })?;
             if response.status() == StatusCode::UNAUTHORIZED {
