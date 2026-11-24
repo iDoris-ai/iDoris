@@ -180,12 +180,20 @@ static GOVERNED: RwLock<BTreeMap<String, Governance>> = RwLock::new(BTreeMap::ne
 
 /// 端点的规范标识 `scheme://host[:port]`（host 小写），不含路径、凭据、查询、片段；不是 http(s) URL 时没有。
 /// `http://127.0.0.1:19731`、`http://127.0.0.1:19731/` 与带路径的写法是同一个端点。
+///
+/// **loopback 的别名是同一个端点**：`localhost`、`localhost.`、`[::1]` 与 `127.0.0.1` 指向这台机器同一个端口，`localhost`
+/// 具体连到 IPv4 还是 IPv6 由解析器决定。登记在 `127.0.0.1:p` 上的引擎，卡写成 `localhost:p` 时也受它的口径约束（封上、
+/// 换代都管得到），而不是因为拼写不同绕开登记表（Codex 预审）。其他 127.0.0.0/8 地址（`127.0.0.2`）不并入。
 pub fn endpoint_identity(base_url: &str) -> Option<String> {
     let url = reqwest::Url::parse(base_url).ok()?;
     if !matches!(url.scheme(), "http" | "https") {
         return None;
     }
     let host = url.host_str()?.to_ascii_lowercase();
+    let host = match host.as_str() {
+        "localhost" | "localhost." | "[::1]" | "::1" => "127.0.0.1".to_owned(),
+        _ => host,
+    };
     Some(match url.port() {
         Some(port) => format!("{}://{host}:{port}", url.scheme()),
         None => format!("{}://{host}", url.scheme()),

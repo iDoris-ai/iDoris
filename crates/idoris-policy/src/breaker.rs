@@ -210,6 +210,24 @@ impl Breaker {
         self.on_failure_metadata(&ticket, now_ms);
     }
 
+    /// 票据对应的请求根本没有发出去（本地拒绝，不是提供方的回答）：既不算成功也不算失败。探测票据把占着的探测名额还回去
+    /// （`HalfOpen` 回到可再探测，不重新计冷却）；闭合态的票据本来就不占任何东西，什么也不改。过期的票据（别的实例、别的世代）
+    /// 一律忽略。
+    pub fn on_abandon(&mut self, ticket: AdmissionTicket) {
+        let AdmissionTicket {
+            issuer,
+            generation,
+            probe,
+        } = ticket;
+        if issuer == self.issuer
+            && generation == self.generation
+            && probe
+            && matches!(self.state, State::HalfOpen { probing: true })
+        {
+            self.state = State::HalfOpen { probing: false };
+        }
+    }
+
     fn on_failure_metadata(&mut self, ticket: &AdmissionTicket, now_ms: u64) {
         let AdmissionTicket {
             issuer,
@@ -403,6 +421,13 @@ impl<K: Eq + Hash + Clone> BreakerBook<K> {
     pub fn on_success(&mut self, key: &K, class: CredentialClass, ticket: AdmissionTicket) {
         if let Some(breaker) = self.breakers.get_mut(&(class, key.clone())) {
             breaker.on_success(ticket);
+        }
+    }
+
+    /// 见 [`Breaker::on_abandon`]。
+    pub fn on_abandon(&mut self, key: &K, class: CredentialClass, ticket: AdmissionTicket) {
+        if let Some(breaker) = self.breakers.get_mut(&(class, key.clone())) {
+            breaker.on_abandon(ticket);
         }
     }
 

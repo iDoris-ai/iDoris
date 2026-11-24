@@ -470,6 +470,25 @@ impl CapturedSendClaim<'_> {
     }
 }
 
+impl CapturedSendClaim<'_> {
+    /// 请求没有发出去（发送时被本地拒绝，不是提供方的回答）：不算成功也不算失败，占着的半开探测名额原样还回去，不重新计冷却。
+    fn abandon(mut self) {
+        if !self.gates.iter().any(|gate| gate.probe) {
+            return;
+        }
+        let mut book = self
+            .proxy
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for gate in self.gates.drain(..) {
+            if gate.probe {
+                book.on_abandon(&gate.key, gate.class, gate.ticket);
+            }
+        }
+    }
+}
+
 impl Drop for CapturedSendClaim<'_> {
     fn drop(&mut self) {
         if self.gates.iter().any(|gate| gate.probe) {
@@ -1735,11 +1754,10 @@ impl ChatProxy {
                 &mut refused,
             )
             .await;
-        // 发送时（含连接失败重试之间）端点被封上、或引擎已换代：什么都没发出去，不是提供方的错，不能计入熔断。这里不结算而是
-        // 直接丢掉占位：没有占着半开探测名额的占位，丢掉不留痕迹；占着探测名额的，`Drop` 照旧按失败处理（熔断器没有「放弃探测」
-        // 的接口，不结算会让探测名额一直占着）。
+        // 发送时（含连接失败重试之间）端点被封上、或引擎已换代：什么都没发出去，不是提供方的错，不能计入熔断，也不能让占着的
+        // 半开探测名额重新计一次冷却：放弃占位（`abandon`），不结算。
         if refused {
-            drop(claim);
+            claim.abandon();
             return Ok(outcome);
         }
         // An upstream 401/403 is recorded with its original status (not the
@@ -1991,9 +2009,10 @@ impl ChatProxy {
             });
         };
         observer().await?;
-        // The safety net for a change that landed after the check above: the claim is dropped, not finished (a
-        // refused send is not a provider fault).
+        // The safety net for a change that landed after the check above: the claim is abandoned, not finished (a
+        // refused send is not a provider fault, and a half-open probe slot it holds is handed back as it was).
         let Some(request) = self.outbound(&url, &payload, provider.omlx_key) else {
+            claim.abandon();
             return Ok(Self::stream_failure(503, ExecutionDisposition::NotExecuted));
         };
         let sent = match tokio::time::timeout(self.header_timeout, request.send()).await {

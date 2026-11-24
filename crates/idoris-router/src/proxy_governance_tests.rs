@@ -247,7 +247,7 @@ async fn a_request_to_an_endpoint_nobody_governs_is_not_subject_to_the_registry(
 }
 
 /// Codex 预审 M2：重试的间隙里端点被封上，发送被本地拒绝（503，没发出去任何东西）——不是提供方的错，不能计入熔断。
-/// 连着发生比熔断上限（5 次）多的次数之后，端点恢复，下一个请求直接发出去，而不是 `provider_circuit_open`。
+/// 连着发生比熔断上限（本地类 2 次）多的次数之后，端点恢复，下一个请求直接发出去，而不是 `provider_circuit_open`。
 #[tokio::test]
 async fn a_refusal_between_connection_retries_does_not_count_against_the_provider_breaker() {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -259,9 +259,10 @@ async fn a_refusal_between_connection_retries_does_not_count_against_the_provide
     let proxy = Arc::new(ChatProxy::with_config(
         reqwest::Client::new(),
         DEFAULT_WINDOW,
-        vec![Duration::from_millis(120)],
+        vec![Duration::from_millis(500)],
     ));
-    for _ in 0..7 {
+    // 本地类提供方的熔断上限是 2 次连续失败；4 次本地拒绝远超它。退避 500 ms、40 ms 处封上：给慢机器留 400 ms 以上的余量。
+    for _ in 0..4 {
         // 第一次发送连接被拒、在等重试；这时端点被封上，重试被本地拒绝。
         govern_endpoint(&uri, EndpointKey::Private("old".into()));
         let request = {

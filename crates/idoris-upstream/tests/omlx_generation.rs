@@ -220,16 +220,25 @@ async fn a_cached_admin_session_is_not_used_after_the_engine_was_replaced_mid_lo
     };
     assert_eq!(puts(&server.received_requests().await.unwrap()), 1);
 
-    // The second load's POST is in flight when the engine is replaced; its pin must not be sent.
-    let swap_endpoint = endpoint.clone();
-    let swap = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        govern_endpoint(&swap_endpoint, EndpointKey::Private("second-engine".into()));
-    });
-    let error = scoped(Some(admitted), adapter.load("m", Some(&resident)))
-        .await
-        .unwrap_err();
-    swap.await.unwrap();
+    // The second load's POST is in flight (its answer is delayed) when the engine is replaced; its pin must not be sent.
+    let load_posts = |requests: &[wiremock::Request]| {
+        requests
+            .iter()
+            .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/v1/models/m/load")
+            .count()
+    };
+    let swap = async {
+        // Replace the engine only once the second load's POST has reached it.
+        while load_posts(&server.received_requests().await.unwrap()) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        govern_endpoint(&endpoint, EndpointKey::Private("second-engine".into()));
+    };
+    let (result, ()) = tokio::join!(
+        scoped(Some(admitted), adapter.load("m", Some(&resident))),
+        swap
+    );
+    let error = result.unwrap_err();
     assert_eq!(error.reason_code(), "load_unconfirmed", "{error}");
     assert!(error.to_string().contains("was replaced"), "{error}");
     assert_eq!(
