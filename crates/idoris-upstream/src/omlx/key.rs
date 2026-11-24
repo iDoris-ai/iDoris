@@ -635,7 +635,8 @@ pub mod test_hooks {
         HookGuard(id)
     }
 
-    pub(crate) fn between_build_and_send(url: &str) {
+    /// 发送路径在建好请求之后、最后一眼之前调它（适配器的发送函数，以及路由里模型列表与就绪探测的发送；路由那两处只在它自己的单元测试里调）。
+    pub fn between_build_and_send(url: &str) {
         let matching: Vec<Hook> = HOOKS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

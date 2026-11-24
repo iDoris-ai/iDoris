@@ -185,10 +185,16 @@ async fn an_admin_login_built_for_a_replaced_engine_is_not_sent() {
     let _hook =
         replace_the_engine_between_build_and_send(&endpoint, format!("{endpoint}/admin/api/login"));
     // A resident load: the `POST` load goes out (it was built and checked before the engine was replaced...), then the pin needs a session.
-    let _ = adapter
+    // The pin step is refused at the login (a definite refusal, see `admin_tests`), and the follow-up read of the loaded state is refused too (the operation
+    // is pinned to the generation it began under): the load's own `POST` was answered, so the model may be resident: an **unconfirmed** load, never a success.
+    let error = adapter
         .load("m", Some(&policy(LoadMode::Resident)))
         .await
         .unwrap_err();
+    assert!(
+        matches!(error, BackendError::LoadUnconfirmed { .. }),
+        "{error:?}"
+    );
     let received = paths_received(&server).await;
     assert!(
         !received
@@ -210,10 +216,14 @@ async fn an_admin_request_built_for_a_replaced_engine_is_not_sent() {
         &endpoint,
         format!("{endpoint}/admin/api/models/"),
     );
-    let _ = adapter
+    let error = adapter
         .load("m", Some(&policy(LoadMode::Resident)))
         .await
         .unwrap_err();
+    assert!(
+        matches!(error, BackendError::LoadUnconfirmed { .. }),
+        "{error:?}"
+    );
     let received = paths_received(&server).await;
     assert!(
         !received

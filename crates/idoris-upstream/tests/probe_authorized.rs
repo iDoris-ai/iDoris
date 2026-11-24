@@ -212,3 +212,39 @@ async fn the_probe_is_an_in_flight_operation_until_it_has_been_answered() {
     assert_eq!(outstanding.await.unwrap(), Ok(EngineProbe::Ready));
     assert_eq!(endpoint_flights(&url), 0, "answered: no longer in flight");
 }
+
+/// **没有核验过的拨号地址就不发**（Codex 复审 L2 的终检）：端点没登记过、或登记了却没带守卫，授权什么都没核验过。帮手自己守住这条线：不管有没有 bearer，
+/// 一个请求都不发（之前它会照卡里写的 URL、用调用方的客户端把 bearer 发出去）。
+#[tokio::test]
+async fn an_endpoint_without_a_verified_dial_address_is_never_probed_with_or_without_a_key() {
+    // 没登记过的端点。
+    let unregistered = engine(None).await;
+    let url = unregistered.uri();
+    for bearer in [Some("external-key"), None] {
+        assert_eq!(
+            probe(&url, bearer).await,
+            Err(KeyRefusal::Unverified),
+            "an endpoint nobody governs: {bearer:?}"
+        );
+    }
+    assert_eq!(unregistered.received_requests().await.unwrap().len(), 0);
+
+    // 登记了，但没带守卫（没有核验过的拨号地址）。
+    let unguarded = engine(None).await;
+    let url = unguarded.uri();
+    let _forget = Forget(url.clone());
+    govern_endpoint_guarded(&url, external(), None);
+    for bearer in [Some("external-key"), None] {
+        assert_eq!(
+            probe(&url, bearer).await,
+            Err(KeyRefusal::Unverified),
+            "a registration without a guard: {bearer:?}"
+        );
+    }
+    assert_eq!(unguarded.received_requests().await.unwrap().len(), 0);
+    assert_eq!(
+        endpoint_flights(&url),
+        0,
+        "a refused probe leaves nothing in flight"
+    );
+}
