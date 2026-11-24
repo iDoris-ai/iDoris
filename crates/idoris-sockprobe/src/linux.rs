@@ -16,6 +16,7 @@
 //! ([`Bind::v6`] with `v4_too = false`).
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -182,42 +183,55 @@ impl Watch {
         if candidates.is_empty() {
             return Ok(None);
         }
-        // A descriptor that vanishes while we look is skipped (the process closed it); one that cannot be read for any other reason
-        // (permission, an I/O error) leaves the answer unknown unless the socket is found anyway.
-        let mut unchecked: Option<io::Error> = None;
-        for entry in fs::read_dir(self.fd_dir())? {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    unchecked = Some(error);
-                    continue;
-                }
-            };
-            let target = match fs::read_link(entry.path()) {
-                Ok(target) => target,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    unchecked = Some(error);
-                    continue;
-                }
-            };
-            let Some(inode) = socket_inode(&target.to_string_lossy()) else {
+        let entries = fs::read_dir(self.fd_dir())?.map(|entry| -> Listing {
+            let entry = entry?;
+            let target = fs::read_link(entry.path());
+            Ok((entry.file_name(), target))
+        });
+        find_socket(&candidates, entries)
+    }
+}
+
+/// One entry of the descriptor directory as the scan saw it: its name and what reading its link said (both can fail on their own).
+type Listing = io::Result<(OsString, io::Result<PathBuf>)>;
+
+/// Which descriptor holds one of the `candidates` (socket inode, found in the IPv6 table)? A descriptor that vanishes while the directory
+/// is read (the process closed it) is skipped; one that cannot be read for any other reason (permission, an I/O error) leaves the answer
+/// **unknown** unless the socket is found anyway — an unreadable descriptor might be the very socket, so "not found" would be a guess.
+fn find_socket(
+    candidates: &[(u64, bool)],
+    entries: impl IntoIterator<Item = Listing>,
+) -> io::Result<Option<Hint>> {
+    let mut unchecked: Option<io::Error> = None;
+    for entry in entries {
+        let (name, target) = match entry {
+            Ok(listed) => listed,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                unchecked = Some(error);
                 continue;
-            };
-            if let Some(&(_, v6)) = candidates.iter().find(|(candidate, _)| *candidate == inode)
-                && let Some(fd) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.parse::<i32>().ok())
-            {
-                return Ok(Some((fd, inode, v6)));
             }
+        };
+        let target = match target {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                unchecked = Some(error);
+                continue;
+            }
+        };
+        let Some(inode) = socket_inode(&target.to_string_lossy()) else {
+            continue;
+        };
+        if let Some(&(_, v6)) = candidates.iter().find(|(candidate, _)| *candidate == inode)
+            && let Some(fd) = name.to_str().and_then(|name| name.parse::<i32>().ok())
+        {
+            return Ok(Some((fd, inode, v6)));
         }
-        match unchecked {
-            Some(error) => Err(error),
-            None => Ok(None),
-        }
+    }
+    match unchecked {
+        Some(error) => Err(error),
+        None => Ok(None),
     }
 }
 
@@ -668,6 +682,94 @@ mod tests {
         fake.net("tcp", &tcp_row([0, 0, 0, 0], 8088, 901));
         fake.fd(7, Some("socket:[901]"));
         assert_eq!(watch.scan(None), (Probe::Holds, Some((7, 901, false))));
+    }
+
+    /// A process that exits while it is scanned (its descriptor directory is gone by the time it is read) holds nothing: a no, not "cannot
+    /// tell".
+    #[test]
+    fn a_process_whose_descriptor_directory_vanished_during_the_scan_holds_nothing() {
+        let fake = FakeProc::new(52);
+        fake.stat(5);
+        fake.net("tcp", &tcp_row(LO, 8088, 10));
+        // the process has a `stat` and the table lists a listening socket, but there is no `fd` directory (it was just removed)
+        let watch = establish_at(fake.root(), 52, 8088, LOOPBACK).unwrap();
+        assert_eq!(watch.scan(None), (Probe::NotHolding, None));
+    }
+
+    fn gone() -> io::Error {
+        io::Error::from(io::ErrorKind::NotFound)
+    }
+
+    fn denied() -> io::Error {
+        io::Error::from(io::ErrorKind::PermissionDenied)
+    }
+
+    fn link(inode: u64) -> io::Result<PathBuf> {
+        Ok(PathBuf::from(format!("socket:[{inode}]")))
+    }
+
+    /// A descriptor (or its link) that vanishes while the directory is read is skipped: the socket is found among the others, and when
+    /// it is not there at all that is a no, not "unknown".
+    #[test]
+    fn descriptors_that_vanish_while_the_directory_is_read_are_skipped() {
+        let candidates = [(900, false), (901, true)];
+        let listing = |socket: Option<u64>| -> Vec<Listing> {
+            let mut entries: Vec<Listing> = vec![
+                Err(gone()),
+                Ok((OsString::from("5"), Err(gone()))),
+                Ok((OsString::from("6"), link(1))),
+                Ok((OsString::from("not-a-number"), link(900))),
+            ];
+            if let Some(inode) = socket {
+                entries.push(Ok((OsString::from("7"), link(inode))));
+            }
+            entries
+        };
+        assert_eq!(
+            find_socket(&candidates, listing(Some(900))).unwrap(),
+            Some((7, 900, false))
+        );
+        assert_eq!(
+            find_socket(&candidates, listing(Some(901))).unwrap(),
+            Some((7, 901, true)),
+            "the table the socket was found in comes with it"
+        );
+        assert_eq!(
+            find_socket(&candidates, listing(None)).unwrap(),
+            None,
+            "nothing unreadable, nothing found: a no"
+        );
+    }
+
+    /// A descriptor that cannot be read for another reason leaves the answer **unknown** — unless the socket is found anyway.
+    #[test]
+    fn descriptors_that_cannot_be_read_leave_the_answer_unknown_unless_the_socket_is_found() {
+        let candidates = [(900, false)];
+        // the directory entry could not be read
+        let entries: Vec<Listing> = vec![Err(denied()), Ok((OsString::from("6"), link(1)))];
+        assert_eq!(
+            find_socket(&candidates, entries).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // its link could not be read
+        let entries: Vec<Listing> = vec![
+            Ok((OsString::from("5"), Err(denied()))),
+            Ok((OsString::from("6"), link(1))),
+        ];
+        assert_eq!(
+            find_socket(&candidates, entries).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // the socket is among the descriptors that could be read: the answer is known
+        let entries: Vec<Listing> = vec![
+            Err(denied()),
+            Ok((OsString::from("5"), Err(denied()))),
+            Ok((OsString::from("7"), link(900))),
+        ];
+        assert_eq!(
+            find_socket(&candidates, entries).unwrap(),
+            Some((7, 900, false))
+        );
     }
 
     /// **IPv6**: `/proc/net/tcp6` is read too. An IPv6 wildcard (`::`) is **not** taken for something that accepts IPv4: `/proc` does not

@@ -59,9 +59,20 @@ struct ReuseState {
     epoch: u64,
     /// 答出「是」的那个检查**开始**的时刻（窗口从这里起算）。
     yes_from: Option<Instant>,
-    /// 做完的检查数，和最近一个的结论：一个请求排队的时候又有一个检查做完了，那个检查的结论就是它的结论。
+    /// 做完的检查数，和最近一个的结论：一个请求排队的时候又有一个检查做完了，那个检查的结论就是它的结论——前提是那之后没有原生的「不握了」
+    /// 赶过它（`last_epoch` 是那个检查开始时的代数）。
     finished: u64,
     last: Verification,
+    last_epoch: u64,
+}
+
+impl ReuseState {
+    /// The conclusion of a check that finished while a caller that arrived when `arrived` checks were done sat in the queue — if the caller may
+    /// take it: it may not when no check finished since it arrived, or when a native "no" has overtaken that check (the conclusion is older
+    /// than the "no"; the caller asks for itself).
+    fn shared_since(&self, arrived: u64) -> Option<Verification> {
+        (self.finished != arrived && self.last_epoch == self.epoch).then_some(self.last)
+    }
 }
 
 impl Reuse {
@@ -73,6 +84,7 @@ impl Reuse {
                 yes_from: None,
                 finished: 0,
                 last: Verification::Unverifiable,
+                last_epoch: 0,
             }),
             one_at_a_time: tokio::sync::Mutex::new(()),
         }
@@ -106,9 +118,10 @@ impl Reuse {
         let _only_one = self.one_at_a_time.lock().await;
         let (started, epoch) = {
             let state = self.state();
-            if state.finished != arrived {
-                // 我们排队的时候有一个检查做完了：它就是这一次的检查（合并），不再各问各的。
-                return state.last;
+            if let Some(shared) = state.shared_since(arrived) {
+                // 我们排队的时候有一个检查做完了：它就是这一次的检查（合并），不再各问各的。那个结论之后若有一次原生的「不握了」赶过了它
+                // （检查做完到我们拿到锁之间），它就比那件事旧了：自己再问。
+                return shared;
             }
             (Instant::now(), state.epoch)
         };
@@ -138,6 +151,7 @@ impl Reuse {
         };
         state.finished += 1;
         state.last = verdict;
+        state.last_epoch = epoch;
         verdict
     }
 }
@@ -967,7 +981,10 @@ mod tests {
             let guard = guard.clone();
             tokio::spawn(async move { guard.verify().await })
         };
-        entered.notified().await; // A is inside the slow check, holding it
+        // A is inside the slow check, holding it (a bounded wait: a guard that never gets there fails the test instead of hanging it)
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .unwrap();
         assert_eq!(
             guard.verify().await,
             Verification::Mismatch,
@@ -1018,6 +1035,8 @@ mod tests {
         fake.each_question_takes(Duration::from_millis(100));
         fake.script_listens(vec![Ok(false)]);
         let guard = Arc::new(owned(&fake));
+        // an earlier native no: the generation is not the initial one, and the callers still share the check that starts after it
+        guard.reuse.invalidate();
         let tasks: Vec<_> = (0..8)
             .map(|_| {
                 let guard = guard.clone();
@@ -1034,6 +1053,37 @@ mod tests {
         assert_eq!(fake.listens_asked(), 2);
         assert_eq!(guard.verify().await, Verification::Verified);
         assert_eq!(fake.listens_asked(), 2);
+    }
+
+    /// **A native no that overtakes a finished check.** A caller queued behind a check may take its conclusion only while no native "no" has
+    /// overtaken it: the window between the check finishing and the caller getting the lock is a few microseconds wide, so the rule is
+    /// tested as the predicate it is.
+    #[test]
+    fn a_shared_conclusion_is_taken_only_while_no_native_no_has_overtaken_it() {
+        let mut state = ReuseState {
+            epoch: 3,
+            yes_from: None,
+            finished: 5,
+            last: Verification::Verified,
+            last_epoch: 3,
+        };
+        assert_eq!(
+            state.shared_since(4),
+            Some(Verification::Verified),
+            "a check finished while the caller was queued"
+        );
+        assert_eq!(
+            state.shared_since(5),
+            None,
+            "nothing finished since the caller arrived"
+        );
+        // a native no after that check started: the conclusion is older than it
+        state.epoch = 4;
+        assert_eq!(state.shared_since(4), None);
+        // a check that was itself overtaken while it ran (its conclusion is a refusal, but it was reached under the old epoch) is not shared
+        // either: the callers behind it ask for themselves
+        state.last = Verification::Mismatch;
+        assert_eq!(state.shared_since(4), None);
     }
 
     /// Cannot tell is shared the same way, and never stored.

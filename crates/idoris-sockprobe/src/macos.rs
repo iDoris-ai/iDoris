@@ -908,6 +908,20 @@ mod tests {
         );
     }
 
+    /// At the largest size that is read, a table that still comes back full is given up on at once: one read at that size, not the same
+    /// read again and again.
+    #[test]
+    fn a_table_that_is_full_at_the_largest_size_is_given_up_on_at_once() {
+        let fake = Fake::new();
+        fake.script_len(vec![Reply::Complete(usize::MAX)]);
+        fake.script_table_replies(vec![Reply::Complete(FdTable {
+            entries: Vec::new(),
+            full: true,
+        })]);
+        assert_eq!(read_fd_table(&fake, 4242), Err(Failure::Other));
+        assert_eq!(fake.table_reads(), vec![MAX_TABLE_ENTRIES]);
+    }
+
     /// A process whose table is bigger than the bound is "cannot tell", not "does not hold".
     #[test]
     fn a_table_that_never_stops_coming_back_full_is_cannot_tell() {
