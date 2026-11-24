@@ -4,7 +4,8 @@
 //! that cannot be built is a **local refusal** ([`KeyRefusal::TransportUnavailable`]): nothing is registered in flight, nothing is sent, and
 //! the failure is not cached (the next authorization tries again).
 //!
-//! The switch that makes the client unbuildable is process-global, so this file holds exactly one test and nothing else runs next to it.
+//! The switch that makes the client unbuildable is process-global, so this file holds exactly one test and nothing else runs next to it. It starts with a
+//! failed **first** build (the cache empty), then the healthy build, then a failure with the client already cached.
 #![allow(clippy::unwrap_used)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -83,6 +84,27 @@ async fn a_managed_client_that_cannot_be_built_is_a_local_refusal_that_sends_not
     .unwrap()
     .with_load_fence_path(idoris_backend::mock::temporary_load_fence_path())
     .with_per_request_key();
+
+    // The very first build fails, with the cache **empty** (nothing was ever built in this process): a local refusal, nothing in flight, not one
+    // connection (the caller's shared client is not quietly used instead), and the failure is not cached — the healthy phase below is the very next
+    // authorization once the client can be built, and it works (Codex re-review of layer 2: M4 had no test for a failed first build).
+    make_the_managed_client_unbuildable(true);
+    assert_eq!(
+        authorize_omlx_request(&url, None).await.unwrap_err(),
+        KeyRefusal::TransportUnavailable
+    );
+    assert_eq!(
+        endpoint_flights(&url),
+        0,
+        "a refused first authorization registers no flight"
+    );
+    assert!(adapter.list().await.is_err());
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        0,
+        "a request went out over the shared client although the managed one could not be built the first time"
+    );
+    make_the_managed_client_unbuildable(false);
 
     // Healthy: the managed client is built (and cached), the request reaches the engine.
     let authorization = authorize_omlx_request(&url, None).await.unwrap();

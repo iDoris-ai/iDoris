@@ -18,7 +18,10 @@
 //! 引擎 [`ListenerVerifier::check`]——而肯定的答案至多重用 [`ProcessInspector::fallback_ttl`]（真的检查器是 [`super::FALLBACK_TTL`]，
 //! 250 毫秒；测试里编排好的假检查器是 0，每个请求都问）。这个重用窗口：**同一时刻只有一个贵的检查在途**（别的请求排队等它，轮到时
 //! 直接拿它的结论：是、不、读不出来都一样，不各起各的 `lsof`）；窗口从那个检查**开始**时起算，不是它结束时；一次原生的「不握了」
-//! 让正在跑的检查答出的「是」作废（不会回填）；「不」与读不出来不进窗口。
+//! 让正在跑的检查答出的「是」作废（不会回填）；「不」与读不出来不进窗口。**每一个肯定的答案，不论谁用它，都受同一个年龄上限**（自检查开始起不超过 `ttl`）：
+//! 排队的请求不会因为那个检查是在它到达之后才开始的就拿一个已经过期的「是」；一次检查自己跑过了这个上限（单次 `lsof` 超过 250 毫秒），它的「是」谁也不用，
+//! 也不存：问的人再观察一次，又超了就是确认不了（[`Verification::Unverifiable`]，fail closed），排队的请求共用这个结论。`ttl` 为 0（没有窗口，每个请求自己问、
+//! 答案马上自己用）没有年龄上限。
 //!
 //! 确认不了（读不出来）就是 [`Verification::Unverifiable`]，调用方拒绝发送（fail closed）：读一次不行的立刻再问一遍，仍不行才算。
 //!
@@ -60,7 +63,8 @@ struct ReuseState {
     /// 答出「是」的那个检查**开始**的时刻（窗口从这里起算）。
     yes_from: Option<Instant>,
     /// 做完的检查数，和最近一个的结论：一个请求排队的时候又有一个检查做完了，那个检查的结论就是它的结论——前提是那之后没有原生的「不握了」
-    /// 赶过它（`last_epoch` 是那个检查开始时的代数），而且一个**肯定**的结论还在新鲜期内（`last_started` 是那个检查**开始**的时刻）。
+    /// 赶过它（`last_epoch` 是那个检查开始时的代数），而且一个**肯定**的结论还在新鲜期内（`last_started` 是那个检查**开始**的时刻，无论它是在这个请求
+    /// 到达之前还是之后开始的）。
     finished: u64,
     last: Verification,
     last_epoch: u64,
@@ -68,24 +72,15 @@ struct ReuseState {
 }
 
 impl ReuseState {
-    /// The conclusion of a check that finished while a caller that arrived when `arrived` checks were done (at `arrived_at`) sat in the queue — if
-    /// the caller may take it: it may not when no check finished since it arrived, when a native "no" has overtaken that check (the conclusion is
-    /// older than the "no"), or when the conclusion is a **yes that is too old**: the same freshness bound as on the fast path (`ttl`, counted
-    /// from when the check *started*), unless the check started after the caller arrived (then it vouches for a moment no earlier than the
-    /// caller's own arrival, which is as fresh as a check the caller would have started itself). A caller that may not take it asks for itself
-    /// — and the callers behind that one share *its* fresh check, so a slow check costs one more question, not one per caller. A "no" and a
-    /// "cannot tell" are refusals: older ones only err on the safe side, so they are shared however old they are (Codex pre-review of layer 2, M3:
-    /// the queued path used to hand out the last conclusion on the completion count and the epoch alone, so a caller scheduled long after the
-    /// window — or behind an inspection that itself took seconds — was served an approval that was no longer one).
-    fn shared_since(
-        &self,
-        arrived: u64,
-        arrived_at: Instant,
-        ttl: Duration,
-    ) -> Option<Verification> {
-        let fresh = self.last != Verification::Verified
-            || self.last_started >= arrived_at
-            || self.last_started.elapsed() < ttl;
+    /// The conclusion of a check that finished while a caller that arrived when `arrived` checks were done sat in the queue — if the caller may take
+    /// it: it may not when no check finished since it arrived, when a native "no" has overtaken that check (the conclusion is older than the "no"), or
+    /// when the conclusion is a **yes that is too old**: the same freshness bound as on the fast path (`ttl`, counted from when the check *started*),
+    /// **whenever the check started** (Codex re-review of layer 2, #4: a yes from a check that started after the caller arrived but ran past the window
+    /// used to be handed over as "as fresh as one the caller would have started itself"; but a check that outlasted the bound is exactly the case in
+    /// which its yes is no longer one, for the caller as for anybody). A caller that may not take it asks for itself. A "no" and a "cannot tell" are
+    /// refusals: older ones only err on the safe side, so they are shared however old they are. With no reuse at all (`ttl` 0) a yes is never handed over.
+    fn shared_since(&self, arrived: u64, ttl: Duration) -> Option<Verification> {
+        let fresh = self.last != Verification::Verified || self.last_started.elapsed() < ttl;
         (self.finished != arrived && self.last_epoch == self.epoch && fresh).then_some(self.last)
     }
 }
@@ -118,58 +113,73 @@ impl Reuse {
     }
 
     /// 贵的检查：窗口之内（上一次的「是」还没过 `ttl`；`ttl` 为 0 就从不重用：`elapsed() < 0` 永远是假）直接过；否则一次一个地问
-    /// （`ask`），「是」记进窗口；排队的时候有别的检查做完了，就用它的结论。
-    async fn verify<F, Fut>(&self, ask: F) -> Verification
+    /// （`ask`），「是」记进窗口；排队的时候有别的检查做完了，就用它的结论（肯定的结论要还在新鲜期内）。
+    ///
+    /// **一次检查自己跑过了新鲜期**（`ttl` > 0 而这一问从开始到答出来用了不止 `ttl`）：它的「是」比它被用上的时候已经老了（Codex 复审 L2 的 #4）：不用、不存，
+    /// 再观察一次；又超了就是 [`Verification::Unverifiable`]（fail closed），不存，排在后面的请求共用这个结论。
+    async fn verify<F, Fut>(&self, mut ask: F) -> Verification
     where
-        F: FnOnce() -> Fut,
+        F: FnMut() -> Fut,
         Fut: Future<Output = Slow>,
     {
-        let (arrived, arrived_at) = {
+        let arrived = {
             let state = self.state();
             if state.yes_from.is_some_and(|from| from.elapsed() < self.ttl) {
                 return Verification::Verified;
             }
-            (state.finished, Instant::now())
+            state.finished
         };
         let _only_one = self.one_at_a_time.lock().await;
-        let (started, epoch) = {
-            let state = self.state();
-            if let Some(shared) = state.shared_since(arrived, arrived_at, self.ttl) {
-                // 我们排队的时候有一个检查做完了：它就是这一次的检查（合并），不再各问各的。那个结论之后若有一次原生的「不握了」赶过了它
-                // （检查做完到我们拿到锁之间），它就比那件事旧了：自己再问；一个肯定的结论过了新鲜期也一样（预审 L2 的 M3）。
-                return shared;
-            }
-            (Instant::now(), state.epoch)
-        };
-        let answer = ask().await;
-        let mut state = self.state();
-        let verdict = if state.epoch != epoch {
-            // 它跑的时候有一次原生的「不握了」：这个答案比那件事旧，不存，「是」也不放行。
-            match answer {
-                Slow::Yes | Slow::No => Verification::Mismatch,
-                Slow::Unreadable => Verification::Unverifiable,
-            }
-        } else {
-            match answer {
-                Slow::Yes => {
-                    state.yes_from = Some(started);
-                    Verification::Verified
+        let mut observed_again = false;
+        loop {
+            let (started, epoch) = {
+                let state = self.state();
+                if !observed_again && let Some(shared) = state.shared_since(arrived, self.ttl) {
+                    // 我们排队的时候有一个检查做完了：它就是这一次的检查（合并），不再各问各的。那个结论之后若有一次原生的「不握了」赶过了它
+                    // （检查做完到我们拿到锁之间），它就比那件事旧了：自己再问；一个肯定的结论过了新鲜期也一样（预审 L2 的 M3 与复审的 #4）。
+                    return shared;
                 }
-                Slow::No => {
-                    state.yes_from = None;
-                    Verification::Mismatch
+                (Instant::now(), state.epoch)
+            };
+            let answer = ask().await;
+            let mut state = self.state();
+            let overran = !self.ttl.is_zero() && started.elapsed() >= self.ttl;
+            let verdict = if state.epoch != epoch {
+                // 它跑的时候有一次原生的「不握了」：这个答案比那件事旧，不存，「是」也不放行。
+                match answer {
+                    Slow::Yes | Slow::No => Verification::Mismatch,
+                    Slow::Unreadable => Verification::Unverifiable,
                 }
-                Slow::Unreadable => {
-                    state.yes_from = None;
-                    Verification::Unverifiable
+            } else {
+                match answer {
+                    Slow::Yes if overran => {
+                        state.yes_from = None;
+                        if !observed_again {
+                            observed_again = true;
+                            continue;
+                        }
+                        Verification::Unverifiable
+                    }
+                    Slow::Yes => {
+                        state.yes_from = Some(started);
+                        Verification::Verified
+                    }
+                    Slow::No => {
+                        state.yes_from = None;
+                        Verification::Mismatch
+                    }
+                    Slow::Unreadable => {
+                        state.yes_from = None;
+                        Verification::Unverifiable
+                    }
                 }
-            }
-        };
-        state.finished += 1;
-        state.last = verdict;
-        state.last_epoch = epoch;
-        state.last_started = started;
-        verdict
+            };
+            state.finished += 1;
+            state.last = verdict;
+            state.last_epoch = epoch;
+            state.last_started = started;
+            return verdict;
+        }
     }
 }
 
@@ -401,6 +411,8 @@ mod tests {
         hold: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
         /// How long every `listens_on` takes (the `lsof` it stands for).
         delay: Mutex<Duration>,
+        /// How long the **next** `listens_on` takes on top of that, once (a one-off slow `lsof`: cold start, a scheduling hiccup).
+        first_extra: Mutex<Option<Duration>>,
     }
 
     impl Fake {
@@ -416,6 +428,7 @@ mod tests {
                 listeners_asked: AtomicUsize::new(0),
                 hold: Mutex::new(None),
                 delay: Mutex::new(Duration::ZERO),
+                first_extra: Mutex::new(None),
             })
         }
 
@@ -437,6 +450,11 @@ mod tests {
 
         fn each_question_takes(&self, delay: Duration) {
             *self.delay.lock().unwrap() = delay;
+        }
+
+        /// Only the next question is slow, by `extra`.
+        fn the_next_question_takes_extra(&self, extra: Duration) {
+            *self.first_extra.lock().unwrap() = Some(extra);
         }
 
         /// The next `listens_on` waits: returns (entered, release).
@@ -488,7 +506,8 @@ mod tests {
                 entered.notify_one();
                 release.notified().await;
             }
-            let delay = *self.delay.lock().unwrap();
+            let extra = self.first_extra.lock().unwrap().take();
+            let delay = *self.delay.lock().unwrap() + extra.unwrap_or(Duration::ZERO);
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
@@ -1092,72 +1111,59 @@ mod tests {
         let now = Instant::now();
         let mut state = a_state(Verification::Verified, now);
         assert_eq!(
-            state.shared_since(4, now, ttl),
+            state.shared_since(4, ttl),
             Some(Verification::Verified),
             "a check finished while the caller was queued"
         );
         assert_eq!(
-            state.shared_since(5, now, ttl),
+            state.shared_since(5, ttl),
             None,
             "nothing finished since the caller arrived"
         );
         // a native no after that check started: the conclusion is older than it
         state.epoch = 4;
-        assert_eq!(state.shared_since(4, now, ttl), None);
+        assert_eq!(state.shared_since(4, ttl), None);
         // a check that was itself overtaken while it ran (its conclusion is a refusal, but it was reached under the old epoch) is not shared
         // either: the callers behind it ask for themselves
         state.last = Verification::Mismatch;
-        assert_eq!(state.shared_since(4, now, ttl), None);
+        assert_eq!(state.shared_since(4, ttl), None);
     }
 
-    /// Codex pre-review of layer 2, M3: a queued caller takes a **yes** only inside the freshness window, counted from when that check started
-    /// (the fast path's rule). A caller scheduled long after the window — or queued behind an inspection that itself ran past it — asks for itself.
-    /// A check that started after the caller arrived is always fresh enough (it vouches for a moment no earlier than the caller's arrival);
-    /// a refusal ("no", "cannot tell") is shared however old: it only errs on the safe side.
+    /// Codex pre-review of layer 2, M3, and the re-review's #4: a queued caller takes a **yes** only inside the freshness window, counted from when that check
+    /// started — **whenever it started**. A check that started after the caller arrived but ran past the window used to be handed over ("as fresh as one the
+    /// caller would have started itself"); a yes that old is not one, for the caller as for anybody. A refusal ("no", "cannot tell") is shared however old: it
+    /// only errs on the safe side.
     #[test]
     fn a_queued_caller_takes_a_yes_only_inside_the_freshness_window() {
         let ttl = Duration::from_millis(250);
         let now = Instant::now();
         let long_ago = now.checked_sub(Duration::from_secs(2)).unwrap();
-        let before_the_caller = now.checked_sub(Duration::from_secs(1)).unwrap();
-        // the caller arrived `before_the_caller`... the check started `long_ago`: older than the window, and it started before the caller came
+        // a yes from a check that started `long_ago`: older than the window, and that is that — the caller arrived before it started or after, it does not matter
         let old_yes = a_state(Verification::Verified, long_ago);
         assert_eq!(
-            old_yes.shared_since(4, before_the_caller, ttl),
+            old_yes.shared_since(4, ttl),
             None,
             "a yes older than the window is not handed to a caller that queued behind it"
         );
-        // the same check started after the caller arrived: as fresh as a check the caller would have started itself
-        let caller_arrived = long_ago.checked_sub(Duration::from_secs(1)).unwrap();
-        assert_eq!(
-            old_yes.shared_since(4, caller_arrived, ttl),
-            Some(Verification::Verified)
-        );
-        // a young yes is shared even though it started before the caller arrived
+        // a young yes is shared
         let young_yes = a_state(Verification::Verified, now);
-        assert_eq!(
-            young_yes.shared_since(4, now + Duration::from_millis(1), ttl),
-            Some(Verification::Verified)
-        );
-        // with no reuse at all (`ttl` 0) a yes that started before the caller came is never handed over
-        assert_eq!(
-            young_yes.shared_since(4, now + Duration::from_millis(1), Duration::ZERO),
-            None
-        );
+        assert_eq!(young_yes.shared_since(4, ttl), Some(Verification::Verified));
+        // with no reuse at all (`ttl` 0) a yes is never handed over
+        assert_eq!(young_yes.shared_since(4, Duration::ZERO), None);
         // refusals are shared however old
         for refusal in [Verification::Mismatch, Verification::Unverifiable] {
             assert_eq!(
-                a_state(refusal, long_ago).shared_since(4, before_the_caller, ttl),
+                a_state(refusal, long_ago).shared_since(4, ttl),
                 Some(refusal)
             );
         }
     }
 
-    /// The same through the guard, with real queueing: a check takes 300 ms against a 100 ms window. Callers that queued behind it find its yes
-    /// already stale when it ends: one of them asks for itself, and the rest share *that* fresh check — two questions, not one (the old queued
-    /// path handed the stale yes to everybody) and not one per caller.
+    /// The same through the guard, with real queueing: a check takes 300 ms against a 100 ms window. Its yes was already stale when it ended, so **nobody** uses it:
+    /// the asker observes once more (another 300 ms, stale again) and the answer is "cannot tell" — which the callers queued behind it share (a refusal is shared
+    /// however old), so a slow inspection costs two questions in all, not one per caller. Nothing is stored: the window stays closed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn callers_queued_behind_an_inspection_that_outlasted_the_window_do_not_inherit_its_stale_yes()
+    async fn an_inspection_that_outlasts_the_window_twice_is_cannot_tell_for_everybody_and_stores_nothing()
      {
         let fake = Fake::new();
         fake.reuse_for(Duration::from_millis(100));
@@ -1168,7 +1174,7 @@ mod tests {
             let guard = guard.clone();
             tokio::spawn(async move { guard.verify().await })
         };
-        // the others arrive while the first check runs (it started ~now, it ends ~300 ms later)
+        // the others arrive while the first check runs
         tokio::time::sleep(Duration::from_millis(50)).await;
         let queued: Vec<_> = (0..4)
             .map(|_| {
@@ -1176,15 +1182,51 @@ mod tests {
                 tokio::spawn(async move { guard.verify().await })
             })
             .collect();
-        assert_eq!(first.await.unwrap(), Verification::Verified);
+        assert_eq!(first.await.unwrap(), Verification::Unverifiable);
         for task in queued {
-            assert_eq!(task.await.unwrap(), Verification::Verified);
+            assert_eq!(task.await.unwrap(), Verification::Unverifiable);
         }
         assert_eq!(
             fake.listens_asked(),
             2,
-            "the first check's yes was stale when it ended: one queued caller asked for itself, the others shared that one"
+            "the first inspection and its one re-observation; the queued callers shared the refusal"
         );
+        // nothing was stored: once the inspection is quick enough, the next caller asks for itself and a yes opens the window
+        fake.each_question_takes(Duration::ZERO);
+        assert_eq!(guard.verify().await, Verification::Verified);
+        assert_eq!(fake.listens_asked(), 3);
+        assert_eq!(guard.verify().await, Verification::Verified);
+        assert_eq!(fake.listens_asked(), 3, "the fresh yes opened the window");
+    }
+
+    /// A one-off slow inspection (cold start, a scheduling hiccup) costs one more question, not a refusal: the first answer ran past the window and is not
+    /// used, the re-observation is quick and its yes is used and opens the window.
+    #[tokio::test]
+    async fn a_one_off_slow_inspection_is_observed_once_more_and_the_quick_answer_is_used() {
+        let fake = Fake::new();
+        fake.reuse_for(Duration::from_millis(100));
+        fake.the_next_question_takes_extra(Duration::from_millis(250));
+        fake.script_listens(vec![Ok(true)]);
+        let guard = owned(&fake);
+        assert_eq!(guard.verify().await, Verification::Verified);
+        assert_eq!(fake.listens_asked(), 2, "the slow answer was not used");
+        assert_eq!(guard.verify().await, Verification::Verified);
+        assert_eq!(
+            fake.listens_asked(),
+            2,
+            "the quick one was stored and opened the window"
+        );
+    }
+
+    /// With no reuse window (`ttl` 0: every request asks for itself and uses its own answer at once) there is no age bound: a slow inspection's yes is used.
+    #[tokio::test]
+    async fn without_a_reuse_window_a_requests_own_answer_has_no_age_bound() {
+        let fake = Fake::new();
+        fake.each_question_takes(Duration::from_millis(150));
+        fake.script_listens(vec![Ok(true)]);
+        let guard = owned(&fake);
+        assert_eq!(guard.verify().await, Verification::Verified);
+        assert_eq!(fake.listens_asked(), 1);
     }
 
     /// Cannot tell is shared the same way, and never stored.
