@@ -587,8 +587,11 @@ def release_port_on_request():
         except OSError as error:
             report("error %s" % error.errno)
     elif mode == "relisten":
-        # The same process listens again on the same port with a new descriptor.
+        # The same process listens again on the same port with a new descriptor: **another number** (the lowest free numbers are taken first,
+        # so the new socket would get the old one's; three open files in between move it), so whoever remembers the old number finds a file.
         try:
+            for _ in range(3):
+                KEEP.append(open(os.devnull))
             server = http.server.ThreadingHTTPServer((host, port), Handler)
             server.daemon_threads = True
             KEEP.append(server)
