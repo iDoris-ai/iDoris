@@ -39,7 +39,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::error::{LedgerError, sub};
 use super::period::period_bounds;
-use super::project::{load_config, pool_cap_micros};
+use super::project::{load_config, pool_cap_micros, pool_consumed_micros};
 use super::types::{FreeTierIssue, FreeTierOutcome};
 use crate::accounts::AccountStoreError;
 use crate::accounts::rows::{load_account, load_ancestors};
@@ -396,12 +396,9 @@ pub(super) fn pool_report_in(
         params![pool.as_str(), period],
         |row| row.get(0),
     )?;
-    let consumed: i64 = conn.query_row(
-        "SELECT COALESCE(SUM(held_micros + spent_micros), 0) FROM ledger_entries
-          WHERE account_id = ?1 AND window_at_ms >= ?2 AND window_at_ms < ?3",
-        params![pool.as_str(), start_ms, end_ms],
-        |row| row.get(0),
-    )?;
+    // 和准入的视图、额度窗口、速率窗口用同一条归属规则（旧格式 `settle` 里还没分出来的超出部分按结算时刻算，见 `project.rs` 的
+    // `LEGACY_OVERAGE_SQL`）：报表和闸门说的是同一个数
+    let consumed = pool_consumed_micros(conn, pool.as_str(), start_ms, end_ms)?;
     Ok(PoolReport {
         cap: Money::new(account.unit.clone(), cap),
         granted: Money::new(account.unit.clone(), granted),

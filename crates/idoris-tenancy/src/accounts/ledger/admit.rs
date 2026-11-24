@@ -42,7 +42,8 @@ use super::holds::{
 };
 use super::period::period_of;
 use super::project::{
-    SPENDABLE_PURPOSES, available_of, load_config, not_revoked_clause, owes_credit, project_chain,
+    Books, SPENDABLE_PURPOSES, available_of, load_config, not_revoked_clause, owes_credit,
+    project_chain_with_books,
 };
 use super::types::{AdmitInput, AlertKind, MODEL_COMPONENT};
 use crate::accounts::rows::{load_ancestors, load_credential};
@@ -179,19 +180,45 @@ fn provenance(
     )
 }
 
-/// 链上哪些账户靠授信放行（`CreditFloor` 是 `PassUsingCredit`）。
-fn credit_users(report: &AdmissionReport, chain: &[Account]) -> Vec<(usize, i64)> {
-    report
-        .results()
-        .iter()
-        .filter_map(|result| match (&result.check, &result.outcome) {
-            (CheckKind::CreditFloor, CheckOutcome::PassUsingCredit { overdraft }) => chain
-                .iter()
-                .position(|account| account.id == result.account)
-                .map(|index| (index, overdraft.micros)),
-            _ => None,
-        })
-        .collect()
+/// 链上哪些账户靠授信放行（`CreditFloor` 是 `PassUsingCredit`），以及 S0 算出的透支额（准入之后授信已占用的总额）。
+///
+/// S0 只看净头寸。走「分开记」的账户（`books` 是 `Some`）旧债未清时净头寸是负的，哪怕这一笔 `reserve` 完全落在额度剩余和
+/// 自有资金剩余里，`CreditFloor` 照样是 `PassUsingCredit`，但这一笔并没有动授信：担保人不该为它收到告警（issue #601：旧债 200、
+/// 新额度 100、花 50，旧代码记一条金额 150 的告警）。所以这些账户还要看 `reserve` 有没有超出不动授信能花的钱，没超出就不算。
+/// 不走「分开记」的账户（`None`）没有额度之外的钱可以先花，`PassUsingCredit` 就是动了授信，行为不变。
+///
+/// 金额 0 的预留（比如金额 0 的附加成本）不占任何钱，不可能动授信：账户欠着授信的钱时 S0 对它也是 `PassUsingCredit`（透支额就是已经
+/// 欠下的），不能再记一条重复的告警（Codex 复审 7c5a03fe Low）。
+fn credit_users(
+    report: &AdmissionReport,
+    chain: &[Account],
+    books: &[Option<Books>],
+    reserve: i64,
+) -> Result<Vec<(usize, i64)>, LedgerError> {
+    if reserve == 0 {
+        return Ok(Vec::new());
+    }
+    let mut users = Vec::new();
+    for result in report.results() {
+        let (CheckKind::CreditFloor, CheckOutcome::PassUsingCredit { overdraft }) =
+            (&result.check, &result.outcome)
+        else {
+            continue;
+        };
+        let Some(index) = chain
+            .iter()
+            .position(|account| account.id == result.account)
+        else {
+            continue;
+        };
+        if let Some(Some(books)) = books.get(index)
+            && reserve <= books.spendable_without_credit()?
+        {
+            continue;
+        }
+        users.push((index, overdraft.micros));
+    }
+    Ok(users)
 }
 
 /// 这个账户有没有被配置过：充值过，或者有过花费类额度（不管现在还生不生效，**但被撤销的不算**）。
@@ -270,7 +297,7 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
     }
 
     let full = reserve(input.policy, &input.sizing, input.price_rates)?;
-    let views = project_chain(conn, &chain, now_ms, &config)?;
+    let (views, books) = project_chain_with_books(conn, &chain, now_ms, &config)?;
     let report = evaluate_admission(&full.amount, &views)?;
     let period = period_of(now_ms, &config.billing_timezone)?;
 
@@ -319,10 +346,10 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
                         conn,
                         &chain,
                         &views,
+                        books.first().and_then(Option::as_ref),
                         &report,
                         &full.amount,
                         &period.to_string(),
-                        now_ms,
                     )?
                 } else {
                     None
@@ -378,7 +405,7 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
     Ok(AdmitPlan {
         decision,
         write: Some(HoldWrite {
-            credit_used: credit_users(&final_report, &chain),
+            credit_used: credit_users(&final_report, &chain, &books, price.micros())?,
             chain,
             unit: unit.clone(),
             reserved: price.micros(),
@@ -397,16 +424,17 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
 /// - 本账期这个账户还没用过宽限（没作废的）；
 /// - 账户没有透支（可用额度 >= 0），缺口不超过一次预留。后两条由 S0 的 [`check_grace`] 判定，
 ///   **不读 settle 的 overage**（评审 B4）；
-/// - 账户没有欠着授信的钱（[`owes_credit`]）：授信此刻有效时债务已经带在可用额度里，S0 自己会拒绝；授信关掉、过期之后
-///   债务不再往额度里扣（新额度不被旧债吃掉），可用额度可能恰好是 0，所以这里单独看一眼。
+/// - 账户没有欠着授信的钱（[`owes_credit`]，`payer_books` 是付款账户走「分开记」时的三本账）：没有新额度、授信此刻有效时债务
+///   已经带在可用额度里，S0 自己会拒绝；新额度比欠的债大，或者授信关掉、过期之后债务不再往额度里扣（新额度不被旧债吃掉），
+///   净头寸不是负的，S0 不会拒绝，所以这里单独看一眼。
 fn try_grace(
     conn: &Connection,
     chain: &[Account],
     views: &[idoris_compute_contracts::admission::AncestorView],
+    payer_books: Option<&Books>,
     report: &AdmissionReport,
     reserve_price: &Price,
     period: &str,
-    now_ms: i64,
 ) -> Result<Option<(i64, i64)>, LedgerError> {
     let (Some(payer_account), Some(payer_view)) = (chain.first(), views.first()) else {
         return Ok(None);
@@ -426,7 +454,7 @@ fn try_grace(
     if !is_provisioned(conn, &payer_account.id)? {
         return Ok(None);
     }
-    if owes_credit(conn, &payer_account.id, now_ms)? {
+    if owes_credit(payer_books) {
         return Ok(None);
     }
     let used = active_grace_uses(conn, &payer_account.id, period)?;
@@ -503,8 +531,30 @@ pub(super) fn apply(
             },
         )?;
     }
-    for (index, overdraft) in &write.credit_used {
-        let Some(account) = write.chain.get(*index) else {
+    insert_credit_used_alerts(
+        conn,
+        &write.chain,
+        &write.credit_used,
+        input.payment.credential().as_str(),
+        &hold_id,
+        &write.unit,
+        now_ms,
+    )
+}
+
+/// 给靠授信放行的账户各写一条 `credit_used` 告警（`credit_used` 是 [`credit_users`] 的结果：（链上的位置，透支额））。
+/// 主要预留和附加成本的预留都走这里：同一份规则、同一个事务（调用方已经开着的写事务）。
+pub(super) fn insert_credit_used_alerts(
+    conn: &Connection,
+    chain: &[Account],
+    credit_used: &[(usize, i64)],
+    credential: &str,
+    hold_id: &str,
+    unit: &Unit,
+    now_ms: i64,
+) -> Result<(), LedgerError> {
+    for (index, overdraft) in credit_used {
+        let Some(account) = chain.get(*index) else {
             continue;
         };
         insert_alert(
@@ -512,11 +562,11 @@ pub(super) fn apply(
             &NewAlert {
                 kind: AlertKind::CreditUsed,
                 account: account.id.as_str(),
-                guarantor: guarantor_of(*index),
-                credential: Some(input.payment.credential().as_str()),
-                hold: Some(&hold_id),
+                guarantor: chain.get(index + 1).map(|guarantor| guarantor.id.as_str()),
+                credential: Some(credential),
+                hold: Some(hold_id),
                 amount: *overdraft,
-                unit: &write.unit,
+                unit,
                 detail: "overdraft_within_credit",
                 at_ms: now_ms,
             },
@@ -525,28 +575,55 @@ pub(super) fn apply(
     Ok(())
 }
 
+/// [`check_extra`] 的结果。
+pub(super) struct ExtraCheck {
+    /// 付款账户链（`[付款账户, 父, ..., 根]`），通过就是要占的链。
+    pub chain: Vec<Account>,
+    /// 不通过的原因码（通过是 `None`）。
+    pub rejection: Option<ReasonCode>,
+    /// 通过时靠授信放行的账户：（链上的位置，透支额）。和主要预留同一条规则（[`credit_users`]），要通知担保人。
+    pub credit_used: Vec<(usize, i64)>,
+}
+
 /// 给附加成本（比如安全检查）用的单项准入：五项检查沿所有祖先，通过就返回要占的链，不降级、不宽限。
+///
+/// 动了授信的账户也要通知担保人：和主要预留一样，由 [`credit_users`] 判断哪些账户这一笔真的动了授信，调用方在**占预留的同一个
+/// 事务里**用 [`insert_credit_used_alerts`] 写告警（附加成本也是占付款账户额度的预留，担保人看到的授信用量不该因为它是
+/// 附加成本就少一块）。
 pub(super) fn check_extra(
     conn: &Connection,
     payer: &AccountId,
     amount: &Price,
     now_ms: i64,
     config: &super::types::LedgerConfig,
-) -> Result<(Vec<Account>, Option<ReasonCode>), LedgerError> {
+) -> Result<ExtraCheck, LedgerError> {
     let chain = load_ancestors(conn, payer)?;
     if chain.is_empty() {
-        return Ok((chain, Some(ReasonCode::PaymentContextInvalid)));
+        return Ok(ExtraCheck {
+            chain,
+            rejection: Some(ReasonCode::PaymentContextInvalid),
+            credit_used: Vec::new(),
+        });
     }
-    let views = project_chain(conn, &chain, now_ms, config)?;
+    let (views, books) = project_chain_with_books(conn, &chain, now_ms, config)?;
     let report = evaluate_admission(amount, &views)?;
     if report.passed() {
-        Ok((chain, None))
+        let credit_used = credit_users(&report, &chain, &books, amount.micros())?;
+        Ok(ExtraCheck {
+            chain,
+            rejection: None,
+            credit_used,
+        })
     } else {
         let code = report
             .blocking_codes()
             .first()
             .copied()
             .unwrap_or(ReasonCode::BudgetExhausted);
-        Ok((chain, Some(code)))
+        Ok(ExtraCheck {
+            chain,
+            rejection: Some(code),
+            credit_used: Vec::new(),
+        })
     }
 }

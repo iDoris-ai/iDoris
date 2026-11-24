@@ -366,3 +366,128 @@ pub fn scalar(db: &TempDb, sql: &str) -> i64 {
         .query_row(sql, [], |row| row.get(0))
         .unwrap()
 }
+
+/// 解冻一张凭证（平台损失会冻结凭证；账户库允许解冻，撤销才不可逆）。随机历史里损失之后接着走，要把凭证解冻。
+pub fn unfreeze_credential(db: &TempDb, credential: &str) {
+    let changed = rusqlite::Connection::open(db.path())
+        .unwrap()
+        .execute(
+            "UPDATE credentials SET status = 'active' WHERE credential_id = ?1 AND status = 'frozen'",
+            [credential],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "the credential {credential} was frozen");
+}
+
+/// 把一个预留的分录改回 **v0.5.0 写下的样子**：没迟到的结算里超出预留的部分和预留之内的部分一起记在一条 `settle` 里
+/// （已花是整笔，归属时刻是预留创建的时刻），不另记 `late_settle`。
+///
+/// v0.5.0 的库里没有 overage 的结算（夹具里所有结算都等于预留），所以测试用现在的代码写一笔，再用这个函数按旧写法改回去：
+/// 把 `late_settle` 的已花并回同一账户上的 `settle`，删掉 `late_settle`。要拆掉只追加的触发器（这个库只给这个测试用，
+/// 之后账本的代码照常读它）。迟到的结算（预留过期之后才结算）旧版本本来就写 `late_settle`，没有 `settle` 的预留不动。
+pub fn rewrite_overage_as_v0_5_0(db: &TempDb, hold_id: &str) {
+    rewrite_overage_partially(db, hold_id, 0);
+}
+
+/// 把一个预留的分录改成**超出的部分只搬了一半的中间形态**（Codex 三复审 Low）：每个账户上，`late_settle` 里只留 `keep_in_late`，
+/// 其余的并回同一账户上的 `settle`。`keep_in_late = 0` 就是 v0.5.0 的旧写法（`late_settle` 整条删掉）；`keep_in_late` 等于原来的
+/// `late_settle` 就是现在的写法（什么都不改）。例：预留 100、实际 100 + 100 超出：`settle` 已花 100 + `late_settle` 100 →
+/// `keep_in_late = 40`：`settle` 已花 160 + `late_settle` 40。
+///
+/// 要拆掉只追加的触发器（这个库只给这个测试用）。没有 `late_settle` 的预留（比如 main 上本来就是旧写法）不动。
+pub fn rewrite_overage_partially(db: &TempDb, hold_id: &str, keep_in_late: i64) {
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS ledger_entries_append_only_update;
+         DROP TRIGGER IF EXISTS ledger_entries_append_only_delete;",
+    )
+    .unwrap();
+    let late: Vec<(String, i64)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT account_id, spent_micros FROM ledger_entries
+                  WHERE hold_id = ?1 AND kind = 'late_settle'
+                    AND EXISTS (SELECT 1 FROM ledger_entries s
+                                 WHERE s.hold_id = ?1 AND s.account_id = ledger_entries.account_id AND s.kind = 'settle')",
+            )
+            .unwrap();
+        stmt.query_map([hold_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    for (account, spent) in late {
+        assert!(
+            spent >= keep_in_late,
+            "{hold_id} on {account}: only {spent} is booked as a settlement-time spend, cannot keep {keep_in_late}"
+        );
+        conn.execute(
+            "UPDATE ledger_entries SET spent_micros = spent_micros + ?3
+              WHERE hold_id = ?1 AND account_id = ?2 AND kind = 'settle'",
+            rusqlite::params![hold_id, account, spent - keep_in_late],
+        )
+        .unwrap();
+        if keep_in_late == 0 {
+            conn.execute(
+                "DELETE FROM ledger_entries WHERE hold_id = ?1 AND account_id = ?2 AND kind = 'late_settle'",
+                rusqlite::params![hold_id, account],
+            )
+            .unwrap();
+        } else {
+            conn.execute(
+                "UPDATE ledger_entries SET spent_micros = ?3
+                  WHERE hold_id = ?1 AND account_id = ?2 AND kind = 'late_settle'",
+                rusqlite::params![hold_id, account, keep_in_late],
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// 让一个预留在 `account` 上的净额变成 `-(release_more - reserved)`（库被改坏了的样子）：先拆掉「在途净额必须落在 [0, 预留额]」的触发器，
+/// 再多插一条 `release`，把预留 `reserved` 之外又放掉 `release_more - reserved`。账户、预留、币种、归属时刻抄这个预留的 `reserve` 那条。
+pub fn make_the_net_negative(db: &TempDb, account: &str, hold_id: &str, release_more: i64) {
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute_batch("DROP TRIGGER ledger_entries_held_bounds")
+        .unwrap();
+    let inserted = conn
+        .execute(
+            "INSERT INTO ledger_entries
+                 (account_id, hold_id, kind, unit, held_micros, spent_micros, funds_micros, liability_micros,
+                  window_at_ms, at_ms, idempotency_key)
+             SELECT account_id, hold_id, 'release', unit, ?3, 0, 0, 0, window_at_ms, at_ms, 'tampered-negative-' || hold_id
+               FROM ledger_entries WHERE hold_id = ?2 AND account_id = ?1 AND kind = 'reserve'",
+            rusqlite::params![account, hold_id, -release_more],
+        )
+        .unwrap();
+    assert_eq!(
+        inserted, 1,
+        "the reservation has one reserve entry on {account}"
+    );
+}
+
+/// 给一个预留在 `account` 上插一条负的 `late_settle`（结算那一刻才发生的花费的净额变成负数）：CHECK 要求 `spent >= 0`，所以这里把检查关掉。
+pub fn make_the_settlement_time_spend_negative(
+    db: &TempDb,
+    account: &str,
+    hold_id: &str,
+    spent: i64,
+) {
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+        .unwrap();
+    let inserted = conn
+        .execute(
+            "INSERT INTO ledger_entries
+                 (account_id, hold_id, kind, unit, held_micros, spent_micros, funds_micros, liability_micros,
+                  window_at_ms, at_ms, idempotency_key)
+             SELECT account_id, hold_id, 'late_settle', unit, 0, ?3, 0, 0, window_at_ms + 5, at_ms + 5, 'tampered-late-' || hold_id
+               FROM ledger_entries WHERE hold_id = ?2 AND account_id = ?1 AND kind = 'reserve'",
+            rusqlite::params![account, hold_id, spent],
+        )
+        .unwrap();
+    assert_eq!(
+        inserted, 1,
+        "the reservation has one reserve entry on {account}"
+    );
+}
