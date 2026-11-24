@@ -96,7 +96,7 @@ pub use owned::{
     DEFAULT_STOP_GRACE, EngineError, IdentityVerdict, MIN_CONFIRM, MIN_TERM_GRACE, MismatchReason,
     OwnedEngine, ReadyPolicy, Recovery, UnreadableReason, stop_windows, verify_identity,
 };
-pub use probe::{EngineProbe, probe_http};
+pub use probe::{EngineProbe, probe_authorized, probe_http};
 pub use recipe::{
     EngineKind, EngineKindError, EngineRecipe, LaunchInput, LaunchPlan, RESERVED_ENGINE_KINDS,
     UNKNOWN_ENGINE_KIND,

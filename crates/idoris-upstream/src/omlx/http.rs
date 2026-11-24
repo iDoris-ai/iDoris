@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use idoris_backend::BackendError;
 
+use super::key::Authorization;
 use super::upstream_error;
 
 /// Structured HTTP failure: method, path (may embed a caller-supplied model
@@ -30,6 +31,25 @@ impl std::fmt::Display for OmlxHttpError {
             "oMLX {} {} failed: HTTP {}",
             self.method, self.path, self.status
         )
+    }
+}
+
+/// The last synchronous look at the endpoint, **after the request has been built and right before it is sent** (Codex re-review of layer 2,
+/// M1'). The authorization was obtained at an `await`; building the request (headers, the JSON body) came after it, and in between a restart
+/// can have blocked the endpoint or advanced its generation — a request that had passed the generation check could then be dialed at the
+/// replacement. Past this point what is left is the few microseconds to the kernel's `connect`, the same known gap as "between the
+/// confirmation and the send". A refusal here is a **definite local refusal**: nothing was sent, so it is never reported as an unknown outcome (a
+/// load refused here is not a `LoadUnconfirmed`). `None` (an endpoint nobody governs) checks nothing.
+pub(super) fn check_before_send(
+    authorization: Option<&Authorization>,
+    request: &reqwest::Request,
+) -> Result<(), super::key::KeyRefusal> {
+    #[cfg(any(test, feature = "test-support"))]
+    super::key::test_hooks::between_build_and_send(request.url().as_str());
+    let _ = request;
+    match authorization {
+        Some(authorization) => authorization.ensure_current(),
+        None => Ok(()),
     }
 }
 
@@ -63,10 +83,11 @@ pub(super) async fn get_json(
     path: &str,
     api_key: Option<&str>,
     call_timeout: Duration,
+    authorization: Option<&Authorization>,
 ) -> Result<serde_json::Value, BackendError> {
     let url = format!("{base_url}{path}");
     let req = auth_header(client.get(&url), api_key);
-    send_and_parse("GET", path, req, call_timeout).await
+    send_and_parse("GET", path, req, call_timeout, authorization).await
 }
 
 /// `POST path` with no body, discarding the response body — used for the
@@ -80,10 +101,11 @@ pub(super) async fn post_empty(
     path: &str,
     api_key: Option<&str>,
     call_timeout: Duration,
+    authorization: Option<&Authorization>,
 ) -> Result<(), BackendError> {
     let url = format!("{base_url}{path}");
     let req = auth_header(client.post(&url), api_key);
-    send_and_discard("POST", path, req, call_timeout, None).await
+    send_and_discard("POST", path, req, call_timeout, None, authorization).await
 }
 
 /// Load mutates engine state: a missing response cannot prove rejection.
@@ -94,9 +116,18 @@ pub(super) async fn post_load(
     api_key: Option<&str>,
     call_timeout: Duration,
     model_id: &str,
+    authorization: Option<&Authorization>,
 ) -> Result<(), BackendError> {
     let req = auth_header(client.post(format!("{base_url}{path}")), api_key);
-    send_and_discard("POST", path, req, call_timeout, Some(model_id)).await
+    send_and_discard(
+        "POST",
+        path,
+        req,
+        call_timeout,
+        Some(model_id),
+        authorization,
+    )
+    .await
 }
 
 /// `POST path` with a JSON body, parsed as JSON — used for `/v1/chat/
@@ -110,10 +141,11 @@ pub(super) async fn post_and_parse(
     api_key: Option<&str>,
     call_timeout: Duration,
     body: &serde_json::Value,
+    authorization: Option<&Authorization>,
 ) -> Result<serde_json::Value, BackendError> {
     let url = format!("{base_url}{path}");
     let req = auth_header(client.post(&url), api_key).json(body);
-    send_and_parse("POST", path, req, call_timeout).await
+    send_and_parse("POST", path, req, call_timeout, authorization).await
 }
 
 async fn send_and_discard(
@@ -122,10 +154,17 @@ async fn send_and_discard(
     req: reqwest::RequestBuilder,
     call_timeout: Duration,
     load_id: Option<&str>,
+    authorization: Option<&Authorization>,
 ) -> Result<(), BackendError> {
     let attempt = async {
-        let resp = req
-            .send()
+        // Build, take the last look, then send. Neither a request that cannot be built nor one refused at the last look went out: both are
+        // definite refusals, not an unconfirmed load.
+        let (client, request) = req.build_split();
+        let request = request.map_err(|_| unbuilt(method, path))?;
+        check_before_send(authorization, &request)
+            .map_err(|refusal| upstream_error(refusal.to_string()))?;
+        let resp = client
+            .execute(request)
             .await
             .map_err(|err| unconfirmed_load_error(load_id, transport_error(method, path, &err)))?;
         let result = check_status(method, path, &resp);
@@ -148,6 +187,13 @@ async fn send_and_discard(
                 )),
             ))
         })
+}
+
+/// A request that could not even be built (an unusable URL): nothing was sent.
+fn unbuilt(method: &str, path: &str) -> BackendError {
+    upstream_error(format!(
+        "oMLX {method} {path} could not be built: the request was not sent"
+    ))
 }
 
 fn unconfirmed_load_error(load_id: Option<&str>, err: BackendError) -> BackendError {
@@ -186,10 +232,15 @@ async fn send_and_parse(
     path: &str,
     req: reqwest::RequestBuilder,
     call_timeout: Duration,
+    authorization: Option<&Authorization>,
 ) -> Result<serde_json::Value, BackendError> {
     let attempt = async {
-        let resp = req
-            .send()
+        let (client, request) = req.build_split();
+        let request = request.map_err(|_| unbuilt(method, path))?;
+        check_before_send(authorization, &request)
+            .map_err(|refusal| upstream_error(refusal.to_string()))?;
+        let resp = client
+            .execute(request)
             .await
             .map_err(|err| transport_error(method, path, &err))?;
         check_status(method, path, &resp)?;
@@ -252,9 +303,16 @@ mod tests {
         )
         .await;
         let client = reqwest::Client::new();
-        let body = get_json(&client, &server.uri(), "/ok", None, Duration::from_secs(1))
-            .await
-            .expect("must succeed");
+        let body = get_json(
+            &client,
+            &server.uri(),
+            "/ok",
+            None,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .expect("must succeed");
         assert_eq!(body["a"], 1);
     }
 
@@ -273,6 +331,7 @@ mod tests {
             "/secret",
             key,
             Duration::from_secs(1),
+            None,
         )
         .await
         .expect_err("4xx must fail");
@@ -300,9 +359,16 @@ mod tests {
         ] {
             let server = mock(p, resp).await;
             let client = reqwest::Client::new();
-            let err = get_json(&client, &server.uri(), p, None, Duration::from_secs(1))
-                .await
-                .expect_err("must fail, not panic or silently succeed");
+            let err = get_json(
+                &client,
+                &server.uri(),
+                p,
+                None,
+                Duration::from_secs(1),
+                None,
+            )
+            .await
+            .expect_err("must fail, not panic or silently succeed");
             assert!(err.to_string().contains(want));
         }
     }
@@ -327,6 +393,7 @@ mod tests {
             "/load",
             None,
             Duration::from_secs(1),
+            None,
         )
         .await
         .expect("POST 200 must succeed");
@@ -338,6 +405,7 @@ mod tests {
             "/pin",
             Some("do-not-leak-this-key"),
             Duration::from_secs(1),
+            None,
         )
         .await
         .expect_err("POST 401 must fail");
@@ -360,6 +428,7 @@ mod tests {
             "/slow",
             None,
             Duration::from_millis(50),
+            None,
         )
         .await
         .expect_err("must time out, not hang");
@@ -380,6 +449,7 @@ mod tests {
             "/slow",
             None,
             Duration::from_millis(50),
+            None,
         )
         .await
         .expect_err("must time out, not hang");
@@ -429,6 +499,7 @@ mod tests {
             "/status",
             None,
             Duration::from_millis(200),
+            None,
         )
         .await
         .expect_err("a stalled body must time out, not hang");

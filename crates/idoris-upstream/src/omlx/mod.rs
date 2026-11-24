@@ -236,6 +236,12 @@ impl Credential {
         self.key.as_deref()
     }
 
+    /// The authorization behind this credential (`None`: an endpoint nobody governs). The send helpers re-check it **after** the request is
+    /// built, right before it goes out (Codex re-review of layer 2, M1').
+    fn authorization(&self) -> Option<&key::Authorization> {
+        self.authorization.as_ref()
+    }
+
     /// The base URL to send to: for an endpoint the engine manager governs, the **verified dial address** (the card's own spelling —
     /// `localhost`, `[::1]` — is not what the guard verified); otherwise the adapter's own. Without a trailing slash.
     fn base_url(&self, own: &str) -> String {
@@ -396,6 +402,7 @@ impl OmlxAdapter {
             path,
             credential.key(),
             self.call_timeout,
+            credential.authorization(),
         )
         .await
     }
@@ -408,6 +415,7 @@ impl OmlxAdapter {
             path,
             credential.key(),
             self.call_timeout,
+            credential.authorization(),
         )
         .await
     }
@@ -426,6 +434,7 @@ impl OmlxAdapter {
             credential.key(),
             timeout,
             body,
+            credential.authorization(),
         )
         .await
     }
@@ -485,6 +494,7 @@ impl OmlxAdapter {
                 credential.key(),
                 self.load_timeout.unwrap_or(self.call_timeout),
                 id,
+                credential.authorization(),
             )
             .await?;
         }
