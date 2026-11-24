@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use fixture::*;
 use idoris_compute_contracts::admission::AdmissionDecision;
 use idoris_compute_contracts::attempt::AttemptEvent;
+use idoris_compute_contracts::credential::CredentialStatus;
 use idoris_compute_contracts::form::DeploymentForm;
 use idoris_compute_contracts::ids::{AttemptIndex, IdempotencyKey, PriceVersion, RequestId};
 use idoris_compute_contracts::permit::{Billing, DataClass};
@@ -844,6 +845,137 @@ fn an_input_check_reserved_before_the_first_attempt_is_released_at_close_if_nobo
     );
     assert_eq!(balance(&env, "emp", T0 + 400), 1_000 - 70);
     assert_clean(&env.accounts);
+}
+
+/// 附加成本在请求收尾时还没结算（Codex 三复审 High 2，main 上就有）：余额 200，主要预留 100（`max_tokens = 45`），附加成本预留 100；
+/// TTL 之内收尾，主要预留实际消费 200（输入 10 + 输出 95 = 10 + 190，超出预留 100），附加成本按 0 释放。
+///
+/// ```text
+/// 旧顺序（先结算主要预留，再放附加成本）：结算主要预留时附加成本的 100 还占着在途，
+///     余量 = 200 − 100（附加成本在途）− 100（主要预留预留之内的已花）= 0，超出的 100 全是平台损失，凭证冻结；
+/// 新顺序（先放掉这次收尾已经决定按 0 收尾的预留，再结算要收钱的那一次）：
+///     余量 = 200 − 100（主要预留预留之内的已花）= 100，超出的 100 由担保人 paid 吸收：担保人承担 100，平台损失 0，凭证不冻结。
+/// ```
+///
+/// 走真实的收尾入口（`AttemptStore::finalize_request`，账本钩子在同一个事务里结算），不直接调账本的结算。
+fn finalize_with_an_unsettled_extra_and_an_overage(extra_before_the_first_attempt: bool) {
+    let tag = if extra_before_the_first_attempt {
+        "input-check"
+    } else {
+        "in-attempt"
+    };
+    let env = env(&format!("attempts-extra-overage-{tag}"), 200);
+    let request_id = RequestId::new("ov-1").unwrap();
+    let (req, mut request, component) = if extra_before_the_first_attempt {
+        // S6 的输入检查在任何尝试之前预留，挂在 `<请求 id>#0~safety_input` 下
+        let ctx = payment(&env.accounts, "cred-e");
+        let reserved = env
+            .accounts
+            .reserve_request_component(&request_id, "safety_input", &ctx, &price(100), ts(T0))
+            .unwrap();
+        assert!(matches!(reserved, ComponentDecision::Reserved { .. }));
+        let (req, request) = start(&env, "ov-1", "cred-e", 45);
+        (req, request, "safety_input")
+    } else {
+        let (req, request) = start(&env, "ov-1", "cred-e", 45);
+        let reserved = env
+            .accounts
+            .reserve_component(&req.attempt, "safety_output", &price(100), ts(T0 + 50))
+            .unwrap();
+        assert!(matches!(reserved, ComponentDecision::Reserved { .. }));
+        (req, request, "safety_output")
+    };
+    assert_eq!(
+        balance(&env, "emp", T0 + 60),
+        0,
+        "{tag}: 200 - 100 (main) - 100 (extra) = 0, both reservations hold their 100"
+    );
+    apply(
+        &env,
+        &mut request,
+        0,
+        &[AttemptEvent::Dispatch, AttemptEvent::WireWriteStarted],
+        T0 + 100,
+    );
+    apply(
+        &env,
+        &mut request,
+        0,
+        &[AttemptEvent::UsageReported {
+            usage: Usage::new(10, 95, 0).unwrap(),
+        }],
+        T0 + 200,
+    );
+    publish(&env, &mut request, 0, T0 + 300);
+    finalize(&env, &mut request, T0 + 400).unwrap();
+
+    let main = env.accounts.hold(&req.attempt, "model").unwrap().unwrap();
+    assert_eq!(
+        (main.state, main.charged),
+        (HoldState::Settled, Some(thb(200))),
+        "{tag}"
+    );
+    let extra = env.accounts.hold(&req.attempt, component).unwrap().unwrap();
+    assert_eq!(
+        (extra.state, extra.charged),
+        (HoldState::Released, Some(thb(0))),
+        "{tag}"
+    );
+    assert_eq!(
+        env.accounts
+            .alerts(Some(AlertKind::ExtraUnsettled))
+            .unwrap()
+            .len(),
+        1,
+        "{tag}: the unsettled extra still leaves its alert"
+    );
+    // 担保人承担 100，没有平台损失，凭证没冻结
+    let sponsor: Vec<(String, i64)> = env
+        .accounts
+        .entries_of_hold(&req.attempt, "model")
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.kind == "sponsor_covered")
+        .map(|entry| (entry.account, entry.liability))
+        .collect();
+    assert_eq!(sponsor, [("paid".to_string(), 100)], "{tag}");
+    assert_eq!(
+        env.accounts.loss_total("platform_loss").unwrap(),
+        0,
+        "{tag}"
+    );
+    assert!(
+        env.accounts
+            .alerts(Some(AlertKind::PlatformLoss))
+            .unwrap()
+            .is_empty(),
+        "{tag}"
+    );
+    assert_eq!(
+        env.accounts
+            .get_credential(&cid("cred-e"))
+            .unwrap()
+            .unwrap()
+            .status(),
+        CredentialStatus::Active,
+        "{tag}: no platform loss, so the credential is not frozen"
+    );
+    assert_eq!(
+        balance(&env, "emp", T0 + 500),
+        0,
+        "{tag}: 200 - 100 inside the reservation - 100 overage"
+    );
+    assert_clean(&env.accounts);
+}
+
+#[test]
+fn an_unsettled_extra_reserved_inside_the_attempt_is_released_before_the_overage_is_split() {
+    finalize_with_an_unsettled_extra_and_an_overage(false);
+}
+
+#[test]
+fn an_unsettled_input_check_is_released_before_the_overage_is_split() {
+    finalize_with_an_unsettled_extra_and_an_overage(true);
 }
 
 #[test]

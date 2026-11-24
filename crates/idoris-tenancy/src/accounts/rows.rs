@@ -206,6 +206,41 @@ pub(super) fn load_principal(
         .transpose()
 }
 
+/// 主体 `id` 的归属范围是不是**全部**落在 `roots` 里：登记它的组织，和它每一个成员关系的资源范围（付款账户；管理员关系用所属组织）
+/// 都要在 `roots` 的某个子树内，并且至少有一项（没人登记过、也没有任何成员关系的主体不是任何组织的）。主体不存在是 `false`。
+/// 一条语句，和 [`within_roots`] 同一个用意：调用者管不到的已有主体和不存在的主体让数据库执行同样的语句。
+pub(super) fn principal_within_roots(
+    conn: &Connection,
+    id: &PrincipalId,
+    roots: &[AccountId],
+) -> Result<bool, AccountStoreError> {
+    let marks = root_marks(roots.len());
+    let sql = format!(
+        "WITH RECURSIVE \
+           points(kind, ident, node) AS ( \
+             SELECT 'registrant', principal_id, org_id FROM principal_registrations WHERE principal_id = ?1 \
+             UNION ALL \
+             SELECT 'membership', membership_id, COALESCE(account_id, org_id) FROM memberships WHERE principal_id = ?1), \
+           chain(kind, ident, node) AS ( \
+             SELECT kind, ident, node FROM points \
+             UNION \
+             SELECT c.kind, c.ident, a.parent_id FROM accounts a JOIN chain c ON a.account_id = c.node \
+              WHERE a.parent_id IS NOT NULL) \
+         SELECT EXISTS (SELECT 1 FROM principals WHERE principal_id = ?1) \
+            AND EXISTS (SELECT 1 FROM points) \
+            AND NOT EXISTS (SELECT 1 FROM points p WHERE NOT EXISTS ( \
+                  SELECT 1 FROM chain c WHERE c.kind = p.kind AND c.ident = p.ident AND c.node IN ({marks})))"
+    );
+    let found: i64 = conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(
+            std::iter::once(id.as_str()).chain(roots.iter().map(AccountId::as_str)),
+        ),
+        |row| row.get(0),
+    )?;
+    Ok(found != 0)
+}
+
 fn principal_from_raw(id: String, status: &str) -> Result<Principal, AccountStoreError> {
     Ok(Principal {
         id: PrincipalId::new(id)?,
@@ -275,6 +310,59 @@ pub(super) fn load_membership(
     .optional()?
     .map(RawMembership::into_membership)
     .transpose()
+}
+
+/// 探针：目标的资源范围有没有落在 `roots` 里任何一个账户的子树内。**一条语句**，目标存不存在、在不在范围里，数据库执行的语句
+/// 都一样：调用者管不到的已有 id 和不存在的 id 读出同样的 `false`，响应时间和数据库工作量没法把两种 id 区分开
+/// （issue #603 N7 残余，Codex 预审 H1 / M3，以及同一类的其余按 id 查的写操作）。
+///
+/// `start_select` 是调用方写死的一条 SELECT（不是用户输入）：用 `?1` 引用目标 id，取出目标的资源范围所在的账户（一列，可以是 NULL）；
+/// 从那里沿 `parent_id` 往上走，碰到 `roots` 里的任何一个账户就是 `true`。目标不存在、没有资源范围（NULL）、`roots` 为空，都是 `false`。
+pub(super) fn within_roots(
+    conn: &Connection,
+    start_select: &str,
+    id: &str,
+    roots: &[AccountId],
+) -> Result<bool, AccountStoreError> {
+    let marks = root_marks(roots.len());
+    let sql = format!(
+        "WITH RECURSIVE chain(id) AS ( {start_select} \
+             UNION \
+             SELECT a.parent_id FROM accounts a JOIN chain c ON a.account_id = c.id \
+              WHERE a.parent_id IS NOT NULL) \
+         SELECT EXISTS (SELECT 1 FROM chain WHERE id IN ({marks}))"
+    );
+    let found: i64 = conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(std::iter::once(id).chain(roots.iter().map(AccountId::as_str))),
+        |row| row.get(0),
+    )?;
+    Ok(found != 0)
+}
+
+/// `roots` 个占位符：`?2, ?3, ...`（`?1` 是目标 id）。
+fn root_marks(count: usize) -> String {
+    (0..count)
+        .map(|index| format!("?{}", index + 2))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// 成员关系的资源范围：它的付款账户；管理员关系没有付款账户，用所属组织。
+const MEMBERSHIP_SCOPE: &str =
+    "SELECT COALESCE(account_id, org_id) FROM memberships WHERE membership_id = ?1";
+
+/// 成员关系 `id`，**限定**在 `roots` 里任何一个账户的子树内。范围外的和不存在的一样返回 `None`，两种情形让数据库执行同样的语句序列；
+/// `roots` 为空时什么都读不到。
+pub(super) fn load_membership_within(
+    conn: &Connection,
+    id: &MembershipId,
+    roots: &[AccountId],
+) -> Result<Option<Membership>, AccountStoreError> {
+    if !within_roots(conn, MEMBERSHIP_SCOPE, id.as_str(), roots)? {
+        return Ok(None);
+    }
+    load_membership(conn, id)
 }
 
 pub(super) fn load_memberships_of(
@@ -370,6 +458,22 @@ pub(super) fn load_allocation_record(
     id: &AllocationId,
 ) -> Result<Option<AllocationRecord>, AccountStoreError> {
     load_record_where(conn, "allocation_id", id.as_str())
+}
+
+/// 额度的资源范围：授权方（父）账户。
+const ALLOCATION_SCOPE: &str = "SELECT parent_id FROM allocations WHERE allocation_id = ?1";
+
+/// 按 id 取一笔额度（不管有没有被撤销），**限定**在授权方（父）账户落在 `roots` 里任何一个账户的子树内。范围外的和不存在的
+/// 一样返回 `None`，两种情形让数据库执行同样的语句序列。
+pub(super) fn load_allocation_record_within(
+    conn: &Connection,
+    id: &AllocationId,
+    roots: &[AccountId],
+) -> Result<Option<AllocationRecord>, AccountStoreError> {
+    if !within_roots(conn, ALLOCATION_SCOPE, id.as_str(), roots)? {
+        return Ok(None);
+    }
+    load_allocation_record(conn, id)
 }
 
 /// 按幂等键取一笔额度，**不管有没有被撤销**（幂等重发要能认出「这个键已经用过」，包括用过之后被撤销的）。
@@ -530,4 +634,23 @@ pub(super) fn load_credential(
         expires_at.map(TimestampMs),
         admin_scopes,
     )?))
+}
+
+/// 凭证的资源范围：它绑定的账户（`Service` / `Node` 绑账户；`Member` 绑成员关系的付款账户，管理员关系没有付款账户，也就没有范围）。
+const CREDENTIAL_SCOPE: &str = "SELECT CASE c.binding_kind \
+         WHEN 'member' THEN (SELECT m.account_id FROM memberships m WHERE m.membership_id = c.membership_id) \
+         ELSE c.account_id END \
+     FROM credentials c WHERE c.credential_id = ?1";
+
+/// 按 id 取凭证，**限定**在它绑定的账户落在 `roots` 里任何一个账户的子树内。范围外的和不存在的一样返回 `None`，两种情形让数据库
+/// 执行同样的语句序列。
+pub(super) fn load_credential_within(
+    conn: &Connection,
+    id: &CredentialId,
+    roots: &[AccountId],
+) -> Result<Option<Credential>, AccountStoreError> {
+    if !within_roots(conn, CREDENTIAL_SCOPE, id.as_str(), roots)? {
+        return Ok(None);
+    }
+    load_credential(conn, id)
 }
