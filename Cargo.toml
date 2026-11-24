@@ -10,6 +10,7 @@ members = [
     "crates/idoris-recommender",
     "crates/idoris-policy",
     "crates/idoris-upstream",
+    "crates/idoris-sockprobe",
 ]
 
 [workspace.package]
@@ -102,6 +103,7 @@ idoris-tenancy = { path = "crates/idoris-tenancy" }
 idoris-recommender = { path = "crates/idoris-recommender" }
 idoris-policy = { path = "crates/idoris-policy" }
 idoris-upstream = { path = "crates/idoris-upstream" }
+idoris-sockprobe = { path = "crates/idoris-sockprobe" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

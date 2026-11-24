@@ -950,18 +950,109 @@ fn check_out_dir(
         return Ok(());
     }
     let entries = std::fs::read_dir(dir).map_err(|_| not_empty("out-dir 不是可读目录"))?;
-    let any = entries
+    let names: Vec<std::ffi::OsString> = entries
         .filter_map(Result::ok)
-        .any(|e| Some(e.file_name().as_os_str()) != own_stage);
+        .map(|e| e.file_name())
+        .filter(|name| Some(name.as_os_str()) != own_stage)
+        .collect();
     // 目录非空时：不带 `--force` 一律拒绝；带 `--force` 放行，替换的只有 `managed` 这些文件，目录里别的卡与文件
     // 原样保留（保留下来的卡是否与新卡相容，由暂存目录里的整体校验判定，#626）。
-    if !any || force {
+    if names.is_empty() {
         return Ok(());
     }
-    Err(not_empty(&format!(
-        "out-dir 非空；加 --force 只替换 {}，目录里别的卡原样保留",
-        managed.join(" / ")
-    )))
+    if !force {
+        return Err(not_empty(&format!(
+            "out-dir 非空；加 --force 只替换 {}，目录里别的卡原样保留",
+            managed.join(" / ")
+        )));
+    }
+    // 用户的文件不能和要生成的受管文件是同一个路径（见 `check_name_collisions`）。
+    check_name_collisions(dir, managed)?;
+    for name in &names {
+        let lossy = name.to_string_lossy();
+        let Some(target) = managed.iter().find(|m| **m == lossy) else {
+            continue;
+        };
+        // 受管名字上必须是普通文件：目录、符号链接等不替换，更不能挪走或删除（与 `setup upstream` 的 `check_add_target` 同口径）。
+        let regular =
+            std::fs::symlink_metadata(dir.join(name)).is_ok_and(|m| m.file_type().is_file());
+        if !regular {
+            return Err(not_empty(&format!(
+                "out-dir 里的 {target} 不是普通文件（目录或符号链接），不替换：请先移走它"
+            )));
+        }
+    }
+    // 目录非空、没有任何组件卡、也没有这次要替换的文件：多半是 `--out-dir` 写错了，`--force` 不放行。
+    let looks_like_a_component_dir = names.iter().any(|name| {
+        crate::components::is_card_file(Path::new(name))
+            || managed
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(&name.to_string_lossy()))
+    });
+    if !looks_like_a_component_dir {
+        return Err(not_empty(
+            "out-dir 非空，但里面没有任何组件卡（*.yaml / *.yml），也没有这次要替换的文件：这多半不是组件目录，请检查 --out-dir 是不是写错了",
+        ));
+    }
+    Ok(())
+}
+
+/// 目录里有没有和 `names`（这次要写的文件名）撞成同一个路径的、名字不同的条目：
+/// - 只差 ASCII 大小写：大小写不敏感的文件系统（macOS 默认的 APFS）上 `OMLX.yaml` 与 `omlx.yaml` 是同一个文件；
+///   大小写敏感的文件系统上是两个文件，也一样拒绝，让同一个目录在不同机器上行为一致；
+/// - 文件系统自己的折叠规则认为是同一个文件（APFS 把 `ſubscription.yaml` 与 `subscription.yaml` 当同一个文件，
+///   ASCII 比较抓不到）：直接比较两个路径背后的文件身份（设备与 inode），不依赖我们自己猜折叠规则。
+///
+/// 撞上了就 `validation_failed`，点名两个文件名；用户的文件不被替换、不被删除。
+/// （同一个文件的硬链接别名也会被这样拒绝：它们是同一个 inode，替换其中一个就改了另一个。）
+fn check_name_collisions(dir: &Path, names: &[&str]) -> Result<(), SetupError> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|_| SetupError::new("out_dir_not_empty", "out-dir 不是可读目录"))?;
+    let existing: Vec<std::ffi::OsString> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    for target in names {
+        let target_key = std::fs::symlink_metadata(dir.join(target))
+            .ok()
+            .and_then(|m| file_key(&m));
+        for name in &existing {
+            let lossy = name.to_string_lossy();
+            if lossy == *target {
+                continue;
+            }
+            let same_path = lossy.eq_ignore_ascii_case(target)
+                || target_key.is_some_and(|key| {
+                    std::fs::symlink_metadata(dir.join(name))
+                        .ok()
+                        .and_then(|m| file_key(&m))
+                        == Some(key)
+                });
+            if same_path {
+                return Err(SetupError::new(
+                    "validation_failed",
+                    format!(
+                        "out-dir 里的 {lossy} 与这次要写的 {target} 是同一个路径（大小写不同，或文件系统把它们当成同一个文件）：请先改名或移走 {lossy}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 文件身份（设备与 inode）；取不到（非 unix）就没有，调用方只按名字比。
+fn file_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
 }
 
 /// 在 `out_dir` 同级建一个暂存目录（`out_dir` 的父目录不存在就先建）。与 `out_dir` 同级，所以之后的改名是同一个
@@ -1138,9 +1229,11 @@ fn snapshot_cards(
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         let name = entry.file_name();
+        // 只排除真的会被替换的条目（名字完全相同）：别的名字即使「像」被替换的文件，也是被保留的卡，要参与校验。
         if !crate::components::is_card_file(&path) || skip.iter().any(|s| name == *s) {
             continue;
         }
+        reject_link_into_replaced_files(dir, &path, &name, skip)?;
         let (state, content) = read_entry(&path);
         if let Some(stage) = copy_to {
             let bytes = content.map_err(|e| {
@@ -1159,6 +1252,48 @@ fn snapshot_cards(
         snapshot.insert(name, state);
     }
     Ok(snapshot)
+}
+
+/// 被保留的符号链接若指向这次要替换或删除的文件（`skip`，例如 `alias.yaml -> omlx-embed.yaml`）：暂存目录里放的是
+/// 解引用后的内容，校验会通过，落盘之后目标没了或变了，链接要么悬空、要么指向没校验过的内容，所以整体失败。
+fn reject_link_into_replaced_files(
+    dir: &Path,
+    path: &Path,
+    name: &std::ffi::OsStr,
+    skip: &[&str],
+) -> Result<(), SetupError> {
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Ok(());
+    }
+    let (Ok(target), Ok(root)) = (std::fs::canonicalize(path), std::fs::canonicalize(dir)) else {
+        return Ok(());
+    };
+    // 只保证这个目录里的卡读得一致：指向目录之外的符号链接，外面那个目录的锁我们拿不到（与 serve 读卡同一条规则）。
+    if !target.starts_with(&root) {
+        return Err(SetupError::new(
+            "validation_failed",
+            format!(
+                "out-dir 里的 {} 是指向目录之外（{}）的符号链接：只保证这个目录里的卡读得一致，请把卡放进目录里，或去掉这个链接",
+                name.to_string_lossy(),
+                target.display()
+            ),
+        ));
+    }
+    let hits_replaced = target.parent() == Some(root.as_path())
+        && target
+            .file_name()
+            .is_some_and(|t| skip.iter().any(|s| t == *s));
+    if !hits_replaced {
+        return Ok(());
+    }
+    let target_name = target.file_name().unwrap_or_default().to_string_lossy();
+    Err(SetupError::new(
+        "validation_failed",
+        format!(
+            "out-dir 里的 {} 是指向 {target_name} 的符号链接，而这次 setup 会替换或删除 {target_name}：先移走这个链接再运行",
+            name.to_string_lossy(),
+        ),
+    ))
 }
 
 /// 落盘前的最后一次核对：被保留的卡与校验时相比，条目集合、文件身份、大小、mtime、内容哈希都没变。
@@ -1245,15 +1380,19 @@ pub fn write_validated_hooked(
             std::fs::write(stage.join(name), content).map_err(io)?;
         }
         // 说明里的暂存目录路径换成 `out_dir`：暂存目录里的文件名与 `out_dir` 里的一一对应，保留下来的卡出问题时点得到名。
-        let cards = crate::components::load_components(&stage, false).map_err(|e| {
-            SetupError::new(
-                "validation_failed",
-                e.to_string()
-                    .replace(&stage.display().to_string(), &out_dir.display().to_string()),
-            )
-        })?;
+        let cards =
+            crate::components::load_components(&stage, crate::components::allow_mock_from_env())
+                .map_err(|e| {
+                    SetupError::new(
+                        "validation_failed",
+                        e.to_string()
+                            .replace(&stage.display().to_string(), &out_dir.display().to_string()),
+                    )
+                })?;
         // 最终的集合（保留的加新的）里至多一张默认卡。
         check_at_most_one_default(&cards)?;
+        // serve 启动时还会做的纯配置校验（托管卡的计划、引擎种类）：在发布之前先过一遍，免得 setup 成功而 serve 起不来。
+        check_serve_preflight(&cards)?;
         fire(hook, CommitPhase::Validated, out_dir);
         check_out_dir(out_dir, force, stage.file_name(), &scope)?;
         if out_dir.exists() {
@@ -1415,6 +1554,7 @@ fn check_add_target(dir: &Path, force: bool, file: &str) -> Result<(), SetupErro
         Ok(_) if !dir.is_dir() => return Err(unreadable()),
         Ok(_) => {}
     }
+    check_name_collisions(dir, &[file])?;
     let conflict = |why: String| SetupError::new("id_conflict", why);
     match std::fs::symlink_metadata(dir.join(file)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1460,6 +1600,9 @@ pub fn write_added_hooked(
     let io = |e: std::io::Error| SetupError::new("write_failed", format!("写入失败：{e}"));
     check_card_file_name(file)?;
     let _lock = lock_out_dir(out_dir)?;
+    if out_dir.is_dir() {
+        check_name_collisions(out_dir, &[file])?;
+    }
     let stage = create_stage(out_dir)?;
     let result = (|| {
         let kept = if out_dir.is_dir() {
@@ -1468,9 +1611,11 @@ pub fn write_added_hooked(
             Snapshot::new()
         };
         std::fs::write(stage.join(file), content).map_err(io)?;
-        let cards = crate::components::load_components(&stage, false)
-            .map_err(|e| added_load_failure(e, &stage, out_dir, &card.provider.id))?;
+        let cards =
+            crate::components::load_components(&stage, crate::components::allow_mock_from_env())
+                .map_err(|e| added_load_failure(e, &stage, out_dir, &card.provider.id))?;
         check_at_most_one_default(&cards)?;
+        check_serve_preflight(&cards)?;
         fire(hook, CommitPhase::Validated, out_dir);
         if !out_dir.exists() {
             // 没有现有的卡可镜像，暂存目录里只有新卡。
@@ -1529,6 +1674,16 @@ fn added_load_failure(
             .to_string()
             .replace(&stage.display().to_string(), &out_dir.display().to_string()),
     )
+}
+
+/// serve 启动时对卡集合做的纯配置校验（[`crate::preflight`]）：不过就是 `validation_failed`，说明就是 serve 会报的那一句。
+fn check_serve_preflight(cards: &[ComponentCard]) -> Result<(), SetupError> {
+    crate::preflight::validate_card_set(cards).map_err(|why| {
+        SetupError::new(
+            "validation_failed",
+            format!("这个目录里的卡放在一起，iDoris 启动时会失败，所以没有写入：{why}"),
+        )
+    })
 }
 
 /// 最终的卡集合（保留的加新写的）里至多一张默认卡（规范 §2.12.3：至多一张卡带 `idoris_default`）。
@@ -1701,6 +1856,31 @@ mod tests {
             std::fs::read_to_string(out.join("omlx.yaml")).unwrap(),
             "old-omlx"
         );
+    }
+
+    /// 快照只排除名字完全相同的条目（真的会被替换的）：名字「像」被替换文件的卡（只差大小写）是被保留的卡，要进快照、
+    /// 复制进暂存目录参与校验，不能被悄悄漏掉（#633 评审）。大小写不敏感的文件系统上没有「只差大小写的两个文件」，
+    /// 这时用一个叫 `other.yaml` 的卡对照，同样要求它在快照里。
+    #[test]
+    fn the_snapshot_skips_only_exactly_named_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("LM.yaml"), "a: 1").unwrap();
+        std::fs::write(dir.path().join("other.yaml"), "b: 2").unwrap();
+        let snapshot = snapshot_cards(dir.path(), &["lm.yaml"], Some(stage.path())).unwrap();
+        let names: Vec<_> = snapshot
+            .keys()
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"other.yaml".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"LM.yaml".to_string()),
+            "名字不完全相同的条目不能被当成要替换的而漏掉：{names:?}"
+        );
+        assert!(stage.path().join("LM.yaml").exists());
+        // 名字完全相同的才被排除。
+        let snapshot = snapshot_cards(dir.path(), &["LM.yaml"], None).unwrap();
+        assert!(!snapshot.contains_key(std::ffi::OsStr::new("LM.yaml")));
     }
 
     #[test]

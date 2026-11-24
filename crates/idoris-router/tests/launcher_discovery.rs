@@ -537,6 +537,62 @@ async fn discovery_file_has_the_specified_fields_permissions_and_launch_snapshot
     assert_eq!(status.code(), Some(0), "{stderr}");
 }
 
+/// 勘误十二（5）：`IDORIS_COMPONENTS_DIR` 经符号链接或相对路径给出时，`launch.components_dir` 是**加载用的那个目录**的 canonical
+/// 路径（加载之前确定一次，发布时不再解析）：不是链接本身，也不是相对路径，更不是一个「退回的绝对路径」。
+#[tokio::test]
+async fn launch_components_dir_is_the_canonical_path_of_the_directory_that_was_actually_loaded() {
+    for via in ["symlink", "relative_through_symlink"] {
+        let env = Env::new();
+        let side = tempfile::tempdir().unwrap();
+        let link = side.path().join("components-link");
+        symlink(env.components.path(), &link).unwrap();
+        let mut command = env.command("0", "0");
+        match via {
+            "symlink" => {
+                command.env("IDORIS_COMPONENTS_DIR", &link);
+            }
+            _ => {
+                command
+                    .env("IDORIS_COMPONENTS_DIR", "components-link")
+                    .current_dir(side.path());
+            }
+        }
+        let mut child = command
+            .args(["serve", "--launcher-stdin"])
+            .spawn_guarded()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("{}\n", env.frame(json!({}))).as_bytes())
+            .unwrap();
+        let (file, _) = wait_discovery(&env.discovery_path(), &mut child);
+        let canonical = fs::canonicalize(env.components.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(file["launch"]["components_dir"], canonical, "{via}");
+        assert!(
+            !canonical.ends_with("components-link"),
+            "the published path is the real directory, not the link"
+        );
+        // 它确实是加载用的那个目录：目录里的那一张卡被加载了。
+        let data_port = file["data_port"].as_u64().unwrap();
+        let health: Value = http()
+            .get(format!("http://127.0.0.1:{data_port}/health"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["components"], 1, "{via}: {health}");
+        let (status, _, stderr) = sigterm_and_collect(&mut child);
+        assert_eq!(status.code(), Some(0), "{via}: {stderr}");
+    }
+}
+
 #[tokio::test]
 async fn health_upstreams_and_launch_engines_list_every_loopback_engine_card_with_its_kind() {
     let env = Env::new();

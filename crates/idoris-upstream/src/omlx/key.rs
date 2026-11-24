@@ -9,8 +9,9 @@
 //!   由调用方按原有口径判为无效凭证，而不是悄悄换成文件里的 key。环境变量的值不做 trim（保持 §2.7 原语义）。
 //! - 来自 `settings.json` 的 key 只发给 loopback 的 oMLX：非 loopback 的 base URL 下，文件 key 视为没有
 //!   （环境变量的 key 维持原行为，不受此限）。[`KeySource`] 标明 key 来自哪里。
-//! - `settings.json` 只从文件读取，最多读 64 KiB；必须是常规文件（符号链接、FIFO、设备一律不要，
-//!   用 `symlink_metadata` 判断，不跟随链接）；读不了、不是 JSON、没有 `auth.api_key`、值不是非空字符串
+//! - `settings.json` 只从文件读取，最多读 64 KiB；必须是常规文件（最后一段是符号链接、或是 FIFO、设备，一律不要）：
+//!   用 `O_NOFOLLOW|O_NONBLOCK` 打开后对句柄 `fstat`，不是先 `stat` 再 `open`（没有检查与打开之间的窗口）；
+//!   `O_NOFOLLOW` 只对最后一段成立，`~/.omlx` 本身是符号链接时仍被跟随；读不了、不是 JSON、没有 `auth.api_key`、值不是非空字符串
 //!   一律当作没有，往下走无鉴权，不报错、不记日志。返回的是 trim 后的值；trim 后含空白或控制字符同样当作没有。
 //! - 不打印、不写日志、不进 argv 或响应体；错误信息里不带文件内容。
 //! - 不硬编码任何默认 key。
@@ -59,6 +60,18 @@ pub fn is_loopback_base_url(base_url: &str) -> bool {
         })
 }
 
+static RESOLUTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 到目前为止，这个进程从环境与 `settings.json` 解析过几次 oMLX API key（每次读环境、可能读用户的密钥文件）。诊断与测试用：
+/// 启动时对适配器的干跑**不该**解析任何凭证（凭证只在真正建适配器时才解析），测试靠它数。
+pub fn resolutions() -> usize {
+    RESOLUTIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn note_resolution() {
+    RESOLUTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// 当前进程环境下、发往 `base_url` 的 key（UTF-8）。引擎管理器接管的端点按它登记的口径（[`EndpointKey`]）。
 pub fn resolve_omlx_api_key_for(base_url: &str) -> Option<String> {
     resolve_omlx_api_key_os_for(base_url)?.into_string().ok()
@@ -68,6 +81,7 @@ pub fn resolve_omlx_api_key_for(base_url: &str) -> Option<String> {
 /// 常驻代理、模型列表、就绪探测）都经这里，所以引擎管理器登记的私有 key 与「外部引擎的 settings.json key 要先过
 /// 端口属主校验」对它们同时生效。
 pub fn resolve_omlx_api_key_os_for(base_url: &str) -> Option<OsString> {
+    note_resolution();
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
     resolve_for_endpoint(
         std::env::var_os(OMLX_API_KEY_ENV),
@@ -80,6 +94,7 @@ pub fn resolve_omlx_api_key_os_for(base_url: &str) -> Option<OsString> {
 /// 只回答「`base_url` 是不是引擎管理器接管的端点」：是，给出发往它的 key（`None` = 不带 key）；不是，`None` 外面再包一层
 /// （调用方沿用自己原来的 key 来源）。
 pub fn resolve_governed_os(base_url: &str) -> Option<Option<OsString>> {
+    note_resolution();
     let governed = governed_endpoint(base_url)?;
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
     Some(resolve_for_endpoint(
@@ -189,6 +204,7 @@ pub fn resolve_for_endpoint(
 /// 同上，但直接给 `loopback`，并保留非 UTF-8 的环境变量，让调用方按「无效凭证」处理。
 /// `loopback` 为 false 时 `settings.json` 的 key 不会被返回。
 pub fn resolve_omlx_api_key_os(loopback: bool) -> Option<OsString> {
+    note_resolution();
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
     resolve_from_for(
         std::env::var_os(OMLX_API_KEY_ENV),
@@ -225,16 +241,38 @@ pub fn resolve_from(env: Option<OsString>, home: Option<&Path>) -> Option<OsStri
     resolve_from_for(env, home, true)
 }
 
+/// 打开 `settings.json`：先打开、再对**已打开的句柄** `fstat` 判类型，不是「先 `stat` 路径、再按路径 `open`」
+/// （那样检查与打开之间路径可以被换成符号链接或 FIFO，即 TOCTOU）。
+///
+/// `O_NOFOLLOW` 让最后一段是符号链接时直接失败（`ELOOP`），`O_NONBLOCK` 让打开 FIFO 不会阻塞等写端；
+/// 常规文件上两个标志都无效果。**`O_NOFOLLOW` 只管最后一段**：`~/.omlx` 本身是符号链接（例如指向别的盘）时
+/// 仍然会被跟随，这与此前 `symlink_metadata` 的行为一致，不在本规范的保证范围内。
+#[cfg(unix)]
+fn open_settings_file(path: &Path) -> Option<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let flags = nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags.bits())
+        .open(path)
+        .ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+#[cfg(not(unix))]
+fn open_settings_file(path: &Path) -> Option<fs::File> {
+    if !fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
 /// `<home>/.omlx/settings.json` 的 `auth.api_key`；任何问题都是 `None`。
 pub fn settings_api_key(home: &Path) -> Option<String> {
     let path = home.join(".omlx").join("settings.json");
-    // 先看类型再打开：FIFO / 设备文件一打开就可能阻塞；symlink_metadata 不跟随符号链接。
-    if !fs::symlink_metadata(&path).ok()?.is_file() {
-        return None;
-    }
     let mut raw = Vec::new();
-    fs::File::open(&path)
-        .ok()?
+    open_settings_file(&path)?
         .take(SETTINGS_MAX_BYTES + 1)
         .read_to_end(&mut raw)
         .ok()?;

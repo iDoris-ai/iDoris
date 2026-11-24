@@ -72,3 +72,8 @@ chrono-tz = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# `accounts` 的回归测试要看一个操作实际执行了哪些 SQL 语句（`Connection::trace_v2`）：成员关系 id 管得到 / 管不到 / 不存在时，
+# 失败路径上的语句序列要一样。`trace` 只是 rusqlite 的编译开关，不引入新依赖，只在编译测试时打开。
+rusqlite = { workspace = true, features = ["trace"] }

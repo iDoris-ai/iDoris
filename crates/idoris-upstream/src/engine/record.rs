@@ -42,15 +42,17 @@ pub const MAX_RECORD_BYTES: u64 = 8 * 1024;
 /// `command` 长度上限；更长的命令行不是我们拉起的那种引擎，封印时按失败处理。
 pub const MAX_COMMAND_BYTES: usize = 4096;
 const MAX_STARTED_AT_BYTES: usize = 128;
+const MAX_GENERATION_BYTES: usize = 128;
 const MAX_EXECUTABLE_BYTES: usize = 4096;
 const MAX_INSTANCE_BYTES: usize = 64;
 
-const FIELDS: [&str; 9] = [
+const FIELDS: [&str; 10] = [
     "schema",
     "engine_kind",
     "pid",
     "port",
     "started_at",
+    "generation",
     "command",
     "executable",
     "api_key",
@@ -92,6 +94,10 @@ pub struct OwnershipRecord {
     pub port: u16,
     /// `ps -o lstart=` 的原文（`TZ=UTC`、`LC_ALL=C` 下读的，换时区、换语言也读出同一个值）。
     pub started_at: String,
+    /// 平台给的进程「代」标识，比 `ps -o lstart=` 的秒更细（Linux：boot_id 加 starttime 节拍数；macOS：内核记的启动时刻，
+    /// 到微秒），所以同一秒内的 pid 复用也分得出。`None` = 旧记录，或拉起时读不出来：这条记录只有秒级身份。
+    /// 发任何信号之前，记录里有它就要先核对（[`super::owned`] 的身份闸）。
+    pub generation: Option<String>,
     /// `ps -o command=` 的原文；`None` = 尚未封印。
     pub command: Option<String>,
     pub executable: PathBuf,
@@ -108,6 +114,7 @@ impl std::fmt::Debug for OwnershipRecord {
             .field("pid", &self.pid)
             .field("port", &self.port)
             .field("started_at", &self.started_at)
+            .field("generation", &self.generation)
             .field("command", &self.command)
             .field("executable", &self.executable)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
@@ -143,6 +150,13 @@ impl OwnershipRecord {
                 .all(|b| b.is_ascii_graphic() || b == b' ')
         {
             return Err(RecordError::Invalid("started_at"));
+        }
+        if let Some(generation) = &self.generation
+            && (generation.is_empty()
+                || generation.len() > MAX_GENERATION_BYTES
+                || !generation.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            return Err(RecordError::Invalid("generation"));
         }
         if let Some(command) = &self.command
             && (command.is_empty()
@@ -184,6 +198,9 @@ impl OwnershipRecord {
         });
         // Absent, not `null`: no command until sealed, no key for an engine without private keys.
         if let Some(object) = value.as_object_mut() {
+            if let Some(generation) = &self.generation {
+                object.insert("generation".into(), generation.as_str().into());
+            }
             if let Some(command) = &self.command {
                 object.insert("command".into(), command.as_str().into());
             }
@@ -227,6 +244,11 @@ impl OwnershipRecord {
             Some(serde_json::Value::String(command)) => Some(command.clone()),
             Some(_) => return Err(RecordError::Invalid("command")),
         };
+        let generation = match object.get("generation") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(generation)) => Some(generation.clone()),
+            Some(_) => return Err(RecordError::Invalid("generation")),
+        };
         let api_key = match object.get("api_key") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(key)) => {
@@ -240,6 +262,7 @@ impl OwnershipRecord {
             pid: u32::try_from(uint("pid")?).map_err(|_| RecordError::Invalid("pid"))?,
             port: u16::try_from(uint("port")?).map_err(|_| RecordError::Invalid("port"))?,
             started_at: text("started_at")?,
+            generation,
             command,
             executable: PathBuf::from(text("executable")?),
             api_key,
@@ -476,6 +499,7 @@ mod tests {
             executable: "/opt/engines/fake/bin/fake-server".into(),
             api_key: Some(EngineKey::from_hex(&"ab".repeat(32)).unwrap()),
             launched_by_instance: "3f0c6a52-6a0e-4c0e-9a6e-0d2f1c7a9b11".into(),
+            generation: None,
         }
     }
 
@@ -782,6 +806,56 @@ mod tests {
         assert_eq!(keys(&keyless), without_key);
         let text = String::from_utf8(keyless.to_json_bytes().unwrap()).unwrap();
         assert!(!text.contains("null"), "{text}");
+    }
+
+    /// M6：可选的「代」标识 `generation`。有就原样往返并出现在文件里；没有（旧记录，或平台读不出来）就不写这个字段，读回来是 `None`；
+    /// 空串、过长、含空白或控制字符、不是字符串都是 `generation` 字段无效（不是被悄悄丢掉）。
+    #[test]
+    fn the_process_generation_round_trips_is_optional_and_is_validated() {
+        let state = tempfile::tempdir().unwrap();
+        let store = store(state.path());
+        let mut with = record();
+        with.generation = Some("darwin:1763622845.123456".into());
+        store.write(&with).unwrap();
+        let text = std::fs::read_to_string(store.path()).unwrap();
+        assert!(
+            text.contains("\"generation\":\"darwin:1763622845.123456\""),
+            "{text}"
+        );
+        assert_eq!(store.read().unwrap(), Some(with.clone()));
+
+        // 没有它：文件里没有这个字段（不写 null），读回来是 None。
+        let mut without = record();
+        without.generation = None;
+        store.write(&without).unwrap();
+        let text = std::fs::read_to_string(store.path()).unwrap();
+        assert!(!text.contains("generation"), "{text}");
+        assert_eq!(store.read().unwrap().unwrap().generation, None);
+
+        // 无效的值：写不进去，读到也被拒绝。
+        let too_long = "g".repeat(MAX_GENERATION_BYTES + 1);
+        for bad in ["", "has space", "tab\there", "控制", too_long.as_str()] {
+            let mut record = record();
+            record.generation = Some(bad.to_string());
+            assert_eq!(
+                store.write(&record),
+                Err(RecordError::Invalid("generation")),
+                "{bad:?}"
+            );
+        }
+        let exactly_max = "g".repeat(MAX_GENERATION_BYTES);
+        let mut at_the_limit = record();
+        at_the_limit.generation = Some(exactly_max);
+        store.write(&at_the_limit).unwrap();
+        let good = String::from_utf8(with.to_json_bytes().unwrap()).unwrap();
+        let wrong_type = good.replace(
+            "\"generation\":\"darwin:1763622845.123456\"",
+            "\"generation\":7",
+        );
+        assert_eq!(
+            OwnershipRecord::from_json_bytes(wrong_type.as_bytes()),
+            Err(RecordError::Invalid("generation"))
+        );
     }
 
     #[test]

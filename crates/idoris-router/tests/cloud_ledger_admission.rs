@@ -763,7 +763,17 @@ async fn concurrent_requests_never_exceed_the_rate_gate_while_all_reservations_a
             )
         })
         .collect();
-    let (l, upstream) = one_upstream(script, Wiring::new(10_000_000)).await;
+    // 上游延迟 500ms 只是「让十个预留同时在途」的重叠窗口。默认的 800ms 响应头超时会把负载下被拖慢的请求变成
+    // 504 并释放预留，让放行数偏离 3；这里把各项超时只当防挂死的上限，不让它们参与判定。
+    let upstream = FakeUpstream::start(script).await;
+    let l = build_with_ledger(
+        vec![Endpoint::adult("example-alpha", upstream.url())],
+        Options {
+            limits: "  total_deadline_ms: 120000\n  connect_timeout_ms: 30000\n  response_head_timeout_ms: 60000\n  body_timeout_ms: 60000\n  stream_idle_timeout_ms: 60000\n  stream_total_timeout_ms: 120000\n  max_attempts: 3\n".to_string(),
+            ..Options::default()
+        },
+        Wiring::new(10_000_000),
+    );
     l.accounts
         .set_account_limits(
             &aid(PAYER),

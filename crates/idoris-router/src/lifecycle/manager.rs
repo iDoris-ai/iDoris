@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
-use idoris_upstream::engine::{ProcessInspector, StopOnExit};
+use idoris_upstream::engine::{EngineKind, ProcessInspector, StopOnExit};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -107,43 +107,90 @@ impl std::error::Error for PlanError {}
 
 /// 从启动时读到的上游计划里取出托管的那些，生产的引擎种类到 [`EngineBackend`] 的对应（v0.6.0 只有 oMLX）。
 pub fn plan_managed(upstreams: &[UpstreamPlan]) -> Result<Vec<ManagedPlan>, PlanError> {
-    plan_managed_with(upstreams, |kind| match kind {
-        "omlx" => Some(Arc::new(OmlxBackend::from_env()) as Arc<dyn EngineBackend>),
-        _ => None,
-    })
+    plan_managed_with(upstreams, production_backend)
 }
 
-/// 同上，引擎种类到 backend 的对应由调用方给（测试里换假的 backend）。
-pub fn plan_managed_with(
+/// 生产的引擎种类到 backend 的对应：种类的认定只在 [`managed_backend_kind`] 一处，这里按它给出的种类构造 backend。
+fn production_backend(engine_kind: &str) -> Option<Arc<dyn EngineBackend>> {
+    match managed_backend_kind(engine_kind) {
+        Some(kind) if kind == EngineKind::OMLX => {
+            Some(Arc::new(OmlxBackend::from_env()) as Arc<dyn EngineBackend>)
+        }
+        _ => None,
+    }
+}
+
+/// 本版本能托管的引擎种类到 backend 种类的对应（v0.6.0 只有 oMLX）。纯函数：不构造 backend、不碰环境。
+/// `plan_managed` 与 `setup` 的落盘前校验（[`crate::preflight`]）共用它。
+pub fn managed_backend_kind(engine_kind: &str) -> Option<EngineKind> {
+    match engine_kind {
+        "omlx" => Some(EngineKind::OMLX),
+        _ => None,
+    }
+}
+
+/// 托管卡的**纯配置校验**（不构造 backend、不读环境、不碰文件系统）：endpoint 形状、引擎种类有对应的管理器、端口不重复、
+/// 每种引擎只有一个托管实例。`plan_managed_with`（serve 启动）与 `setup` 在落盘前对暂存目录做的校验用的是同一个函数，
+/// 所以 setup 放行的目录，serve 不会再因为这些原因退出 1。返回按卡顺序排列的 `(上游 id, 端口)`。
+pub fn validate_managed_plan(
     upstreams: &[UpstreamPlan],
-    backend_for: impl Fn(&str) -> Option<Arc<dyn EngineBackend>>,
-) -> Result<Vec<ManagedPlan>, PlanError> {
-    let mut plans: Vec<ManagedPlan> = Vec::new();
+    backend_kind_for: impl Fn(&str) -> Option<EngineKind>,
+) -> Result<Vec<(String, u16)>, PlanError> {
+    let mut seen: Vec<(String, u16, EngineKind)> = Vec::new();
     for upstream in upstreams.iter().filter(|plan| plan.identity.managed) {
         let id = upstream.id.clone();
         let port = managed_port(&upstream.card().endpoint)
             .ok_or_else(|| PlanError::EndpointNotManageable { id: id.clone() })?;
-        let backend =
-            backend_for(&upstream.identity.engine_kind).ok_or_else(|| PlanError::NoBackend {
+        let kind = backend_kind_for(&upstream.identity.engine_kind).ok_or_else(|| {
+            PlanError::NoBackend {
                 id: id.clone(),
                 engine_kind: upstream.identity.engine_kind.clone(),
-            })?;
-        if let Some(other) = plans.iter().find(|plan| plan.port == port) {
+            }
+        })?;
+        if let Some((other, _, _)) = seen.iter().find(|(_, seen_port, _)| *seen_port == port) {
             return Err(PlanError::PortShared {
                 id,
-                other: other.id.clone(),
+                other: other.clone(),
             });
         }
-        if let Some(other) = plans
-            .iter()
-            .find(|plan| plan.backend.kind() == backend.kind())
-        {
+        if let Some((other, _, _)) = seen.iter().find(|(_, _, seen_kind)| *seen_kind == kind) {
             return Err(PlanError::SecondOfKind {
                 id,
-                other: other.id.clone(),
+                other: other.clone(),
                 engine_kind: upstream.identity.engine_kind.clone(),
             });
         }
+        seen.push((id, port, kind));
+    }
+    Ok(seen.into_iter().map(|(id, port, _)| (id, port)).collect())
+}
+
+/// 同上，引擎种类到 backend 的对应由调用方给（测试里换假的 backend）。每张托管卡只解析一次 backend：先解析，再对解析出的
+/// 种类做 [`validate_managed_plan`]，保留下来的就是校验过的那一个。
+pub fn plan_managed_with(
+    upstreams: &[UpstreamPlan],
+    backend_for: impl Fn(&str) -> Option<Arc<dyn EngineBackend>>,
+) -> Result<Vec<ManagedPlan>, PlanError> {
+    let resolved: Vec<(&UpstreamPlan, Option<Arc<dyn EngineBackend>>)> = upstreams
+        .iter()
+        .filter(|plan| plan.identity.managed)
+        .map(|plan| (plan, backend_for(&plan.identity.engine_kind)))
+        .collect();
+    let kinds: BTreeMap<&str, EngineKind> = resolved
+        .iter()
+        .filter_map(|(plan, backend)| {
+            backend
+                .as_ref()
+                .map(|backend| (plan.identity.engine_kind.as_str(), backend.kind()))
+        })
+        .collect();
+    let checked = validate_managed_plan(upstreams, |kind| kinds.get(kind).cloned())?;
+    let mut plans: Vec<ManagedPlan> = Vec::with_capacity(checked.len());
+    for ((upstream, backend), (id, port)) in resolved.into_iter().zip(checked) {
+        let backend = backend.ok_or_else(|| PlanError::NoBackend {
+            id: id.clone(),
+            engine_kind: upstream.identity.engine_kind.clone(),
+        })?;
         plans.push(ManagedPlan {
             id,
             endpoint: format!("http://127.0.0.1:{port}"),
@@ -529,22 +576,36 @@ impl EngineManager {
     /// 删记录）；为假（`stop_on_exit:"never"` 的正常退出）就让引擎继续跑，所有权记录留给下一个 iDoris。
     /// 等各实例完成，至多 `stop_grace` 加一点余量；超时的实例任务被中止（`OwnedEngine` 的 `Drop` 仍会兜底）。
     pub async fn shutdown(&self, stop_engines: bool) {
-        let mut waits = Vec::new();
-        for sender in self.senders.values() {
-            let (reply, answer) = oneshot::channel();
-            let request = Request {
-                command: Command::Shutdown {
-                    stop_engine: stop_engines,
-                },
-                reply: Some(reply),
+        self.shutdown_by(stop_engines, None).await;
+    }
+
+    /// [`Self::shutdown`]，带整个停止必须完成的期限（iDoris 收到信号之后，launcher 在 17 秒时 SIGKILL 它）：停引擎的宽限只拿
+    /// 期限里剩下的（[`super::backoff::stop_windows`]：不到 2 秒就 SIGTERM 之后立刻 SIGKILL），等各实例的上限也跟着缩到期限
+    /// 之后一点余量。`None` 与 [`Self::shutdown`] 相同。
+    pub async fn shutdown_by(&self, stop_engines: bool, deadline: Option<tokio::time::Instant>) {
+        // 整个收尾（送达加等各实例答复）只有这**一个**结束时刻：实例自己在期限里收尾（宽限加确认窗口），这是外面的兜底。
+        let end = tokio::time::Instant::now()
+            + match deadline {
+                Some(deadline) => {
+                    deadline.saturating_duration_since(tokio::time::Instant::now())
+                        + super::backoff::MIN_CONFIRM
+                        + Duration::from_millis(100)
+                }
+                None => self.shared.config.timings.stop_grace + Duration::from_secs(3),
             };
-            if sender.send(request).await.is_ok() {
-                waits.push(answer);
-            }
+        let senders: Vec<(&str, &mpsc::Sender<Request>)> = self
+            .senders
+            .iter()
+            .map(|(id, sender)| (id.as_str(), sender))
+            .collect();
+        let delivered = deliver_shutdown(&senders, stop_engines, deadline, end).await;
+        for id in &delivered.undelivered {
+            self.shared.log(&format!(
+                "[idoris] 引擎 {id}：停止命令没能送到（命令队列一直是满的，直到收尾期限）：中止它的实例任务，所有权记录保留，下一个 iDoris 会认回并收尾"
+            ));
         }
-        let budget = self.shared.config.timings.stop_grace + Duration::from_secs(3);
-        let finished = tokio::time::timeout(budget, async {
-            for answer in waits {
+        let finished = tokio::time::timeout_at(end, async {
+            for answer in delivered.answers {
                 let _ = answer.await;
             }
         })
@@ -552,12 +613,60 @@ impl EngineManager {
         let tasks: Vec<JoinHandle<()>> =
             std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner));
         for task in tasks {
-            if finished.is_err() {
+            // 超时、或命令没送到的实例（它没有收到停止命令，不会自己结束）：中止；`OwnedEngine` 的 `Drop` 仍会兜底。
+            if finished.is_err() || !delivered.undelivered.is_empty() {
                 task.abort();
             }
             let _ = task.await;
         }
     }
+}
+
+/// [`deliver_shutdown`] 的结果。
+struct Delivered {
+    /// 已送到的实例的答复。
+    answers: Vec<oneshot::Receiver<Result<(), CommandError>>>,
+    /// 到 `end` 命令队列还是满的、没能送到的实例。
+    undelivered: Vec<String>,
+}
+
+/// 把 `Shutdown` **同时**送给每个实例（M9）：一个实例的命令队列满了（任务忙在一次长停止里、队列里还压着别的命令），不能让后面的实例也收不到停止命令
+/// （此前是逐个 `send().await`，队列一满就卡在那里，之后的实例收不到、送达这一步也没有时限）。每个送达各自受 `end` 约束；到 `end` 还没送到的记进
+/// `undelivered`（调用方点名写日志、中止那个实例任务）。实例任务已经结束（通道已关）的没有东西可停，既不等也不算没送到。
+async fn deliver_shutdown(
+    senders: &[(&str, &mpsc::Sender<Request>)],
+    stop_engine: bool,
+    deadline: Option<tokio::time::Instant>,
+    end: tokio::time::Instant,
+) -> Delivered {
+    let deliveries = senders.iter().map(|(id, sender)| async move {
+        let (reply, answer) = oneshot::channel();
+        let request = Request {
+            command: Command::Shutdown {
+                stop_engine,
+                deadline,
+            },
+            reply: Some(reply),
+        };
+        match tokio::time::timeout_at(end, sender.send(request)).await {
+            Ok(Ok(())) => (*id, Some(answer), false),
+            Ok(Err(_)) => (*id, None, false),
+            Err(_) => (*id, None, true),
+        }
+    });
+    let mut delivered = Delivered {
+        answers: Vec::new(),
+        undelivered: Vec::new(),
+    };
+    for (id, answer, undelivered) in futures_util::future::join_all(deliveries).await {
+        if let Some(answer) = answer {
+            delivered.answers.push(answer);
+        }
+        if undelivered {
+            delivered.undelivered.push(id.to_string());
+        }
+    }
+    delivered
 }
 
 impl Drop for EngineManager {
@@ -580,6 +689,88 @@ mod tests {
             owned: false,
             terminal,
         }
+    }
+
+    /// 引擎种类到 backend 的对应只在 `managed_backend_kind` 一处认定：生产的构造器与纯校验的种类认定同进同退。
+    /// M9：第一个实例的命令队列满了（没人在取），第二个是好的。停止命令是同时送的：好的那个**立刻**收到，不等第一个；第一个到期限还没送到，
+    /// 记进「没送到」（调用方点名写日志、中止它的实例任务）。逐个 `send().await` 时，第二个永远收不到。
+    #[tokio::test(start_paused = true)]
+    async fn one_full_command_queue_does_not_keep_the_stop_from_the_other_instances() {
+        let (blocked, _nobody_reads_it) = mpsc::channel::<Request>(1);
+        blocked
+            .send(Request {
+                command: Command::Start,
+                reply: None,
+            })
+            .await
+            .unwrap();
+        let (healthy, mut healthy_requests) = mpsc::channel::<Request>(8);
+        // 字典序里被堵住的排在前面：旧写法（按顺序逐个送）会先卡在它上面。
+        let senders = [("a-blocked", &blocked), ("b-healthy", &healthy)];
+        let begun = tokio::time::Instant::now();
+        let end = begun + Duration::from_secs(5);
+        let deadline = Some(begun + Duration::from_secs(4));
+        let delivery = deliver_shutdown(&senders, true, deadline, end);
+        tokio::pin!(delivery);
+        let request = tokio::select! {
+            request = healthy_requests.recv() => {
+                request.unwrap_or_else(|| panic!("the healthy instance gets the stop"))
+            }
+            _ = &mut delivery => panic!("the delivery cannot be over while one queue is still full"),
+        };
+        assert_eq!(
+            begun.elapsed(),
+            Duration::ZERO,
+            "the healthy instance had its command before any time passed"
+        );
+        match request.command {
+            Command::Shutdown {
+                stop_engine,
+                deadline: carried,
+            } => {
+                assert!(stop_engine);
+                assert_eq!(carried, deadline, "the deadline travels with the command");
+            }
+            _ => panic!("the healthy instance was sent something other than the stop"),
+        }
+        let delivered = delivery.await;
+        assert_eq!(delivered.undelivered, ["a-blocked"]);
+        assert_eq!(
+            delivered.answers.len(),
+            1,
+            "only the healthy one will answer"
+        );
+        assert_eq!(
+            begun.elapsed(),
+            Duration::from_secs(5),
+            "given up at the end, not before"
+        );
+    }
+
+    /// 实例任务已经结束（通道关了）：没有东西可停，既不等它的答复、也不算没送到。
+    #[tokio::test(start_paused = true)]
+    async fn an_instance_that_has_already_ended_is_neither_waited_for_nor_reported_undelivered() {
+        let (gone, receiver) = mpsc::channel::<Request>(8);
+        drop(receiver);
+        let senders = [("gone", &gone)];
+        let begun = tokio::time::Instant::now();
+        let delivered =
+            deliver_shutdown(&senders, false, None, begun + Duration::from_secs(5)).await;
+        assert!(delivered.answers.is_empty());
+        assert!(delivered.undelivered.is_empty());
+        assert_eq!(begun.elapsed(), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_production_backend_follows_the_single_kind_mapping() {
+        for kind in ["omlx", "lmstudio", "", "OMLX", "omlx "] {
+            assert_eq!(
+                production_backend(kind).map(|backend| backend.kind()),
+                managed_backend_kind(kind),
+                "{kind:?}"
+            );
+        }
+        assert!(production_backend("omlx").is_some());
     }
 
     fn table(list: &[Status]) -> BTreeMap<String, Status> {

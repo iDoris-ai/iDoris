@@ -1,5 +1,9 @@
 //! H6: exercise production constructors, with proxy environment isolated in a child process.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+use state_isolation::IsolateState;
+
 use idoris_contracts::{ComponentCard, common::PrivacyClass, provider::Locality};
 use idoris_router::{
     AppState, models,
@@ -229,9 +233,10 @@ async fn upstream_clients_ignore_system_proxy() {
             if control {
                 command.env("IDORIS_H6_CONTROL", "1");
             }
-            let output = tokio::task::spawn_blocking(move || command.output().unwrap())
-                .await
-                .unwrap();
+            let output =
+                tokio::task::spawn_blocking(move || command.isolate_state().output().unwrap())
+                    .await
+                    .unwrap();
             assert!(
                 output.status.success(),
                 "{}",

@@ -87,6 +87,10 @@ fn serve_command(tmp: &Path, comp: &Path, port: u16, admin_port: u16) -> Command
 
 /// 起 serve 加载 `comp`，期望它因为卡校验失败而退出；返回（退出码，stdout 加 stderr）。
 fn serve_expecting_failure(comp: &Path) -> (Option<i32>, String) {
+    serve_expecting_failure_with(comp, &[])
+}
+
+fn serve_expecting_failure_with(comp: &Path, extra_env: &[(&str, &str)]) -> (Option<i32>, String) {
     let tmp = TempDir::new().unwrap();
     let port = free_port();
     let admin = loop {
@@ -95,9 +99,9 @@ fn serve_expecting_failure(comp: &Path) -> (Option<i32>, String) {
             break candidate;
         }
     };
-    let mut child = serve_command(tmp.path(), comp, port, admin)
-        .spawn_guarded()
-        .unwrap();
+    let mut command = serve_command(tmp.path(), comp, port, admin);
+    command.envs(extra_env.iter().copied());
+    let mut child = command.spawn_guarded().unwrap();
     let limit = startup_wait::startup_observe_limit();
     let deadline = Instant::now() + limit;
     loop {
@@ -228,6 +232,103 @@ async fn serve_starts_with_a_consistent_upstream_card() {
         .find(|u| u["id"] == "lmstudio")
         .unwrap_or_else(|| panic!("{health}"));
     assert_eq!(upstream["engine_kind"], "lmstudio");
+}
+
+/// Codex #2：`form: bundled_binary` 的普通卡：serve 在构造运行时时确定地拒绝（与 setup 的预检同一句话）。
+#[test]
+fn serve_refuses_a_card_form_the_runtime_cannot_construct() {
+    let comp = TempDir::new().unwrap();
+    std::fs::write(
+        comp.path().join("odd.yaml"),
+        card("odd", "http://127.0.0.1:1", "openai_compat@unknown", "")
+            .replace("form: http_service", "form: bundled_binary"),
+    )
+    .unwrap();
+    let (status, text) = serve_expecting_failure(comp.path());
+    assert!(
+        matches!(status, Some(code) if code != 0),
+        "{status:?}\n{text}"
+    );
+    assert!(text.contains("no runtime constructor"), "{text}");
+}
+
+/// Codex #8：`IDORIS_COMPONENTS_LOCK_WAIT_MS` 不是毫秒数：启动错误，说明里点名变量与取值，不悄悄退回默认。
+#[test]
+fn serve_rejects_a_non_numeric_lock_wait_setting() {
+    let comp = TempDir::new().unwrap();
+    std::fs::write(
+        comp.path().join("plain.yaml"),
+        card("plain", "http://127.0.0.1:1", "somethingelse@9", ""),
+    )
+    .unwrap();
+    let (status, text) =
+        serve_expecting_failure_with(comp.path(), &[("IDORIS_COMPONENTS_LOCK_WAIT_MS", "soon")]);
+    assert!(
+        matches!(status, Some(code) if code != 0),
+        "{status:?}\n{text}"
+    );
+    assert!(
+        text.contains("IDORIS_COMPONENTS_LOCK_WAIT_MS") && text.contains("soon"),
+        "{text}"
+    );
+}
+
+/// #M2：`idoris setup` 持有组件目录的独占锁（落盘中）时 serve 启动：serve 等到上限，启动失败（退出码非 0），说明点出是
+/// setup 在改写这个目录；不会读到改了一半的卡。锁一放开，同样的 serve 正常起来。
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_waits_for_setup_then_fails_clearly_and_starts_once_the_lock_is_released() {
+    let server = fake_upstream().await;
+    let comp = TempDir::new().unwrap();
+    std::fs::write(
+        comp.path().join("plain.yaml"),
+        card("plain", &server.uri(), "somethingelse@9", ""),
+    )
+    .unwrap();
+    let held = idoris_router::setup_engine::lock_out_dir(comp.path()).unwrap();
+    let (status, text) =
+        serve_expecting_failure_with(comp.path(), &[("IDORIS_COMPONENTS_LOCK_WAIT_MS", "300")]);
+    assert!(
+        matches!(status, Some(code) if code != 0),
+        "{status:?}\n{text}"
+    );
+    assert!(text.contains("setup"), "{text}");
+    assert!(text.contains(&comp.path().display().to_string()), "{text}");
+    drop(held);
+    let health = start_and_read_health(comp.path()).await;
+    assert!(
+        health["upstreams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["id"] == "plain"),
+        "{health}"
+    );
+}
+
+/// #L1：组件目录的路径末尾带空格（`setup` 输出的 `next.env.IDORIS_COMPONENTS_DIR` 原样交给 serve）：serve 不能把环境变量
+/// 的值整个 `trim` 掉而去找另一个目录；它只用 `trim` 判断是不是整个都是空白。
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_uses_a_components_dir_path_with_a_trailing_space_as_is() {
+    let server = fake_upstream().await;
+    let parent = TempDir::new().unwrap();
+    let comp = parent.path().join("components ");
+    std::fs::create_dir(&comp).unwrap();
+    std::fs::write(
+        comp.join("plain.yaml"),
+        card("plain", &server.uri(), "somethingelse@9", ""),
+    )
+    .unwrap();
+    // 去掉空格之后的目录不存在：只有原样使用带空格的路径才找得到卡。
+    assert!(!parent.path().join("components").exists());
+    let health = start_and_read_health(&comp).await;
+    assert!(
+        health["upstreams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["id"] == "plain"),
+        "{health}"
+    );
 }
 
 /// 对照二：不带 `idoris_upstream` 的卡不受这条校验影响，`version_pin` 写成什么产品名都照旧。

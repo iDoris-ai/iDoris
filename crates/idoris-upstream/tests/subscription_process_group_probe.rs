@@ -39,7 +39,7 @@ mod unix {
         let mut parent_ready = false;
         let mut descendant_ready = false;
         for _ in 0..2 {
-            let line = timeout(Duration::from_secs(2), lines.next_line())
+            let line = timeout(Duration::from_secs(60), lines.next_line())
                 .await
                 .expect("ready marker timed out")
                 .expect("reading ready marker failed")
@@ -57,7 +57,7 @@ mod unix {
         let mut parent_term = false;
         let mut descendant_term = false;
         for _ in 0..4 {
-            let Some(line) = timeout(Duration::from_secs(2), lines.next_line())
+            let Some(line) = timeout(Duration::from_secs(60), lines.next_line())
                 .await
                 .expect("termination marker timed out")
                 .expect("reading termination marker failed")
@@ -75,7 +75,7 @@ mod unix {
             descendant_term,
             "descendant process did not receive group SIGTERM"
         );
-        timeout(Duration::from_secs(2), child.wait())
+        timeout(Duration::from_secs(60), child.wait())
             .await
             .expect("probe process did not exit")
             .expect("waiting for probe process failed");

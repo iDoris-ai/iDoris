@@ -5,6 +5,10 @@
 //! environment variable is actually wired into `main`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+use state_isolation::IsolateState;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -121,7 +125,7 @@ impl Fixture {
             .stderr(Stdio::piped());
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            match cmd.spawn() {
+            match cmd.isolate_state().spawn() {
                 Ok(child) => return Running(Some(child)),
                 Err(err)
                     if err.kind() == std::io::ErrorKind::ExecutableFileBusy

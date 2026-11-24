@@ -72,7 +72,7 @@ tower = { version = "0.5", features = ["util"] }
 # 让「校验 parent 之后的所有目录操作都相对已打开的 parent fd」可以在 `unsafe_code = "forbid"` 下用安全封装完成；
 # `user` 提供 `geteuid`（核对属主）。两个都是 nix 自己的 feature，`fs = []`、`user = ["feature"]`，没有任何可选依赖，
 # 所以也没有新增 crate、Cargo.lock 不变。
-nix = { workspace = true, features = ["poll", "resource", "fs", "user"] }
+nix = { workspace = true, features = ["poll", "resource", "fs", "user", "dir"] }
 
 [dev-dependencies]
 rusqlite = { workspace = true }
