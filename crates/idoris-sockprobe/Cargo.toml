@@ -1,0 +1,28 @@
+[package]
+name = "idoris-sockprobe"
+version = "0.5.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "A per-request, process-free check that one known process still holds a LISTEN TCP socket on a port (libproc on macOS, /proc on Linux). The only crate of the workspace that may contain unsafe code (the macOS FFI)."
+
+# Not `[lints] workspace = true`: the workspace sets `unsafe_code = "forbid"`, and a `forbid` cannot be lifted for one module. This crate
+# `deny`s it instead, and `src/macos.rs` — the only file with an FFI call — opts in with a narrow `#![allow(unsafe_code)]`. The rest of
+# the workspace lint set (no `unwrap`/`expect` in production code) is repeated here unchanged. Why a crate of its own: the other crates keep
+# their `forbid`, so a stray `unsafe` anywhere else is still a compile error (IDORIS-CORE S6, per-request listener check).
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Already in the lockfile (nix, tokio and others depend on it): no new package. `proc_pidinfo` / `proc_pidfdinfo` and the structs for
+# process and fd info come from it; the socket-info structs (`socket_fdinfo` and friends) it does not have are mirrored in `macos.rs`
+# and checked against the sizes the kernel reports.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

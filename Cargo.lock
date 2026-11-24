@@ -1241,6 +1241,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "idoris-sockprobe"
+version = "0.5.0"
+dependencies = [
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "idoris-tenancy"
 version = "0.5.0"
 dependencies = [
