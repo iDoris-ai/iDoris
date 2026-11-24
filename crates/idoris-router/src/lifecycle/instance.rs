@@ -17,7 +17,7 @@ use idoris_upstream::engine::{
     ListenerVerdict, ListenerVerifier, MANAGED_DIAL, OwnedEngine, OwnedListenerGuard, Recovery,
     fresh_connection_client,
 };
-use idoris_upstream::omlx::key::{EndpointGuard, endpoint_flights};
+use idoris_upstream::omlx::key::{EndpointGuard, seal_endpoint_flights_if_idle};
 use tokio::sync::{mpsc, oneshot};
 
 use super::backoff::{CrashWindow, restart_delay};
@@ -572,6 +572,12 @@ impl Actor {
     /// resident 的转发、后台预热、模型列表的读取、仍在输出的流式响应体……凡是经 `authorize_omlx_request` 发出去的请求，没有
     /// Supervisor 的托管卡也一样）。`true` = 排空了（Supervisor 读不出来也算：没有什么可等的）；`false` = 到点还有在途的。
     ///
+    /// **排空成功的那一刻，端点的在途登记同时封上**（[`seal_endpoint_flights_if_idle`]：「在途数为零」与「封上」是同一个原子操作；
+    /// IDORIS-CORE S6，Codex 预审 L3 的 M5）。分开读与封的话，一个早先抓到这张托管卡的请求（模型列表逐卡走，前面的慢卡让它停在门外）
+    /// 会在零与停进程之间挤进来，在进程的宽限期里登记新的在途、发往还在监听的引擎，随后被 SIGTERM 打断。封上之后到达的请求在授权处被
+    /// 拒绝（`KeyRefusal::Draining`），一个字节也不发；封上到进程确认消失、端点封上（代际前进，同时解开这一代的封）之间，已经登记的
+    /// 操作为零，所以没有谁需要「凭证继续有效」。到点还有在途的（`false`）走的是另一条路：调用方封上端点、切断旧一代的凭证。
+    ///
     /// **一个绝对的截止时间管每一次读**（Codex 终审 M5）：Supervisor 忙着的时候一次 `is_quiescent` 的 RPC 本身就可能等，不能到它返回之后才
     /// 发现已经过了截止时间。
     async fn drain(&self) -> bool {
@@ -595,7 +601,7 @@ impl Actor {
                     }
                 }
             };
-            if supervisor_quiet && endpoint_flights(&self.plan.endpoint) == 0 {
+            if supervisor_quiet && seal_endpoint_flights_if_idle(&self.plan.endpoint) {
                 return true;
             }
             let now = Instant::now();

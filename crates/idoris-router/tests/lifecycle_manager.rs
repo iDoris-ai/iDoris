@@ -42,7 +42,10 @@ use idoris_upstream::engine::{
     LaunchError, LaunchInput, LaunchPlan, ListenerPolicy, OwnedEngine, PidState, ProcessInspector,
     StopOnExit, SystemInspector, VersionError,
 };
-use idoris_upstream::omlx::key::{EndpointGuard, EndpointKey, forget_endpoint, governed_endpoint};
+use idoris_upstream::omlx::key::{
+    EndpointGuard, EndpointKey, KeyRefusal, authorize_omlx_request, endpoint_flights,
+    forget_endpoint, governed_endpoint,
+};
 use ports::free_port;
 
 const GIB: u64 = 1 << 30;
@@ -3500,4 +3503,103 @@ async fn m3_a_listener_that_changed_identity_is_decided_again_and_is_not_an_engi
     assert_eq!(h.logged_count("：restarting"), 0);
     assert!(h.logged_count("重新判断（不算失败）") >= 1);
     h.manager.shutdown(true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Codex 预审 L3 的 M5：排空成功之后、进程确认消失之前，端点不再放新的操作进来
+// ---------------------------------------------------------------------------------------------
+
+/// 一个早先抓到这张托管卡的请求（公共模型列表逐卡走，前面的慢卡让它晚到）在排空**之后**才走到授权处。之前排空读到「在途数为零」就去停进程，
+/// 两者之间没有封：这个请求登记新的在途、发往还在宽限期里监听的引擎，随后被 SIGTERM 打断。现在排空成功的那一刻在途登记同时封上，宽限期里
+/// 到达的请求在授权处被拒绝（`Draining`），引擎在 SIGTERM 之后没有收到任何请求；进程确认消失之后端点封上（`Blocked`），`restart` 的新引擎
+/// 登记它的私有 key 时封上解开，新引擎照常被服务。
+///
+/// 假引擎对 SIGTERM 记一行、然后照常服务（宽限期里它还在监听，正是那个窗口），`stop_grace` 之后才被 SIGKILL。
+#[tokio::test]
+async fn after_the_drain_has_succeeded_a_request_that_arrives_late_is_refused_for_the_whole_stop_grace()
+ {
+    for restart in [false, true] {
+        let case = if restart { "restart" } else { "stop" };
+        let rig = Rig::new(&Behavior {
+            on_sigterm: OnSigterm::Ignore,
+            ..Behavior::default()
+        });
+        let mut timings = fast();
+        timings.stop_grace = Duration::from_secs(3);
+        let h = Harness::start(
+            &rig,
+            default_backend(&rig),
+            Scripted::claiming(rig.port),
+            timings,
+            StopOnExit::Owned,
+        );
+        h.until_state(UpstreamState::Ready).await;
+        let (url, old, old_key) = (rig.endpoint(), rig.pid(0), rig.key(0));
+        // 起点：端点照常授权，在途的操作数是它持有的那一个。
+        let held = authorize_omlx_request(&url, None).await.unwrap();
+        assert_eq!(held.key(), Some(old_key.as_str()), "{case}");
+        assert_eq!(endpoint_flights(&url), 1, "{case}");
+        drop(held);
+
+        // 命令到来时没有任何在途的操作：排空立刻成功，随后 SIGTERM 发给引擎，它无视、继续监听（宽限期）。
+        if restart {
+            h.manager.restart_upstream("omlx").await.unwrap();
+        } else {
+            h.manager.stop_upstream("omlx").await.unwrap();
+        }
+        wait_for("the engine to receive its SIGTERM", || {
+            !rig.fake.sigterm_times().is_empty()
+        })
+        .await;
+        assert!(
+            pid_alive(old),
+            "{case}: the engine is alive in its grace (it ignores SIGTERM)"
+        );
+        let requests = rig.fake.requests().len();
+
+        // 宽限期里一个晚到的请求：被拒绝，什么也没登记，引擎什么也没收到。
+        let refused = authorize_omlx_request(&url, None).await.unwrap_err();
+        assert_eq!(refused, KeyRefusal::Draining, "{case}: {refused}");
+        assert_eq!(endpoint_flights(&url), 0, "{case}: nothing registered");
+        assert_eq!(
+            rig.fake.requests().len(),
+            requests,
+            "{case}: the engine heard nothing after its SIGTERM"
+        );
+        // 登记的口径仍是旧引擎的私有 key（进程还活着，G2）：封上的只是「新的操作」。
+        assert_eq!(
+            governed_endpoint(&url),
+            Some(EndpointKey::Private(old_key.clone())),
+            "{case}"
+        );
+
+        // 宽限到点、SIGKILL、确认消失：端点封上；`restart` 的新引擎登记之后封上解开，被服务。
+        wait_for("the old engine to be gone", || !pid_alive(old)).await;
+        if restart {
+            h.until("the replacement", |status| {
+                status.state == UpstreamState::Ready && status.owned
+            })
+            .await;
+            assert_eq!(rig.fake.launches(), 2, "{case}");
+            let served = authorize_omlx_request(&url, None).await.unwrap();
+            assert_eq!(served.key(), Some(rig.key(1).as_str()), "{case}");
+            assert_ne!(rig.key(1), old_key, "{case}: a new private key");
+        } else {
+            h.until("the stop to be complete", |status| {
+                status.state == UpstreamState::Stopped && !status.owned
+            })
+            .await;
+            assert_eq!(
+                governed_endpoint(&url),
+                Some(EndpointKey::Blocked),
+                "{case}"
+            );
+            assert_eq!(
+                authorize_omlx_request(&url, None).await.unwrap_err(),
+                KeyRefusal::Blocked,
+                "{case}"
+            );
+        }
+        h.manager.shutdown(true).await;
+    }
 }
