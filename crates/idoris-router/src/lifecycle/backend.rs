@@ -13,7 +13,7 @@ use idoris_upstream::engine::{
 };
 use idoris_upstream::omlx::engine::{OMLX_TEAM_ID, OmlxRecipe, base_path_in, prepare_base_dir};
 use idoris_upstream::omlx::key::{
-    EndpointKey, govern_endpoint, release_endpoint, resolve_omlx_api_key_for,
+    EndpointGuard, EndpointKey, block_endpoint, govern_endpoint_guarded, resolve_omlx_api_key_for,
 };
 
 use crate::readiness::UpstreamReason;
@@ -47,14 +47,19 @@ pub trait EngineBackend: Send + Sync + std::fmt::Debug {
     /// 这个 endpoint 上的加载围栏文件（`None` = 这种引擎没有围栏）。必须与它的适配器用的是同一个路径。
     fn fence_path(&self, state_dir: &Path, endpoint: &str) -> Option<PathBuf>;
 
-    /// 登记：这个 endpoint 上的引擎是 iDoris 自己拉起的，发往它的请求只用这个私有 key。
-    fn govern_private(&self, endpoint: &str, key: &EngineKey);
+    /// 登记：这个 endpoint 上的引擎是 iDoris 自己拉起的，发往它的请求只用这个私有 key。`guard` 一起登记：之后发往这个 endpoint 的
+    /// 每个请求，在发出之前都要让它**重新**确认监听这个端口的还是这个引擎（IDORIS-CORE S6，Codex 终审 H1）。
+    fn govern_private(&self, endpoint: &str, key: &EngineKey, guard: Arc<dyn EndpointGuard>);
 
-    /// 登记：这个 endpoint 上是外部引擎。`settings_key_verified` 为 true 时，才可以把读来的 `settings.json` key 发给它。
-    fn govern_external(&self, endpoint: &str, settings_key_verified: bool);
+    /// 登记：这个 endpoint 上是通过了属主校验的外部引擎，可以把读来的 `settings.json` key 发给它。`guard` 同上：每个请求发出之前重新
+    /// 确认监听者还是校验通过时的那个（pid 加启动时间都一样）。没有通过校验的不登记成外部，是 [`Self::block`]。
+    fn govern_external(&self, endpoint: &str, guard: Arc<dyn EndpointGuard>);
 
-    /// 撤销登记（引擎停了、换了、失效了）：旧的私有 key 不能留在进程里。
-    fn release(&self, endpoint: &str);
+    /// **封上**这个 endpoint：什么凭证都不发（私有 key、环境变量的 key、`settings.json` 的 key 都不发），直到下一个监听者通过校验、
+    /// 被登记成私有或外部的口径（IDORIS-CORE S6，Codex 预审 3）。托管的 endpoint 在管理器启动时就先封上；引擎停了、正在被替换、
+    /// 外部引擎的监听者没了、端口上换了别的东西的时候都回到它。**不是撤销登记**：撤销会让回退链（环境变量、`settings.json`）重新
+    /// 适用于这个 endpoint，把用户的 key 发给之后占着这个端口、还没通过校验的别的东西；旧的私有 key 也随封上被换掉，不留在进程里。
+    fn block(&self, endpoint: &str);
 
     /// 现在发往这个 endpoint 的 key（私有 key，或外部引擎按这种引擎自己的顺序解析出来的）。
     fn current_key(&self, endpoint: &str) -> Option<String>;
@@ -166,21 +171,26 @@ impl EngineBackend for OmlxBackend {
         idoris_upstream::omlx::load_fence_path_in(state_dir, endpoint).ok()
     }
 
-    fn govern_private(&self, endpoint: &str, key: &EngineKey) {
-        govern_endpoint(endpoint, EndpointKey::Private(key.expose().to_owned()));
-    }
-
-    fn govern_external(&self, endpoint: &str, settings_key_verified: bool) {
-        govern_endpoint(
+    fn govern_private(&self, endpoint: &str, key: &EngineKey, guard: Arc<dyn EndpointGuard>) {
+        govern_endpoint_guarded(
             endpoint,
-            EndpointKey::External {
-                settings_key_verified,
-            },
+            EndpointKey::Private(key.expose().to_owned()),
+            Some(guard),
         );
     }
 
-    fn release(&self, endpoint: &str) {
-        release_endpoint(endpoint);
+    fn govern_external(&self, endpoint: &str, guard: Arc<dyn EndpointGuard>) {
+        govern_endpoint_guarded(
+            endpoint,
+            EndpointKey::External {
+                settings_key_verified: true,
+            },
+            Some(guard),
+        );
+    }
+
+    fn block(&self, endpoint: &str) {
+        block_endpoint(endpoint);
     }
 
     fn current_key(&self, endpoint: &str) -> Option<String> {

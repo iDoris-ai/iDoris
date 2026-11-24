@@ -167,6 +167,19 @@ impl<'a> ProviderRef<'a> {
     }
 }
 
+/// The test-only sync point of [`ChatProxy`]: called with the url and the zero-based attempt number right before each send is
+/// authorized.
+#[cfg(test)]
+pub(crate) type BeforeOutbound =
+    Arc<dyn Fn(&str, usize) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// A request ready to send, and the engine manager's authorization for it (the in-flight registration: hold it until the
+/// response has been read — see [`ChatProxy::outbound`]).
+struct Outbound {
+    request: reqwest::RequestBuilder,
+    _authorization: Option<idoris_upstream::omlx::key::Authorization>,
+}
+
 impl<'a> From<&'a String> for ProviderRef<'a> {
     fn from(id: &'a String) -> Self {
         Self::from(id.as_str())
@@ -428,6 +441,26 @@ struct CapturedSendClaim<'a> {
 }
 
 impl CapturedSendClaim<'_> {
+    /// The send was refused **locally** before anything was written (the endpoint is blocked, its engine was replaced, its
+    /// listener could not be confirmed: IDORIS-CORE S6, Codex final review M4). That was never a call to the provider: it
+    /// settles without a fault, and a half-open probe's slot is handed back so the next request can probe, instead of the
+    /// refusal reopening the breaker for a healthy new engine.
+    fn release(mut self) {
+        if self.gates.is_empty() {
+            return;
+        }
+        let mut book = self
+            .proxy
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for gate in self.gates.drain(..) {
+            if gate.probe {
+                book.release_probe(&gate.key, gate.class, gate.ticket);
+            }
+        }
+    }
+
     fn finish(mut self, status: u16, retry_after_ms: Option<u64>) {
         if self.gates.is_empty() {
             return;
@@ -604,6 +637,12 @@ pub struct ChatProxy {
     pub(crate) stream_eof_observed: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)]
     pub(crate) stream_read_waiting: Option<Arc<tokio::sync::Notify>>,
+    /// Test-only sync point (IDORIS-CORE S6, Codex final review H3, M4): awaited right before each send is authorized (the
+    /// first attempt, every retry, the first streamed send), with the url and the zero-based attempt number. A test parks a
+    /// request here, replaces the engine behind the endpoint, and lets it go: the window between "admitted" and "sent"
+    /// reached without a wall clock.
+    #[cfg(test)]
+    pub(crate) before_outbound: Option<BeforeOutbound>,
     pub(crate) retry_delays: Vec<Duration>,
     pub(crate) cache: Mutex<IndexMap<String, CacheEntry>>,
     flights: Mutex<IndexMap<String, Arc<Flight>>>,
@@ -826,9 +865,47 @@ impl ChatProxy {
     /// loopback oMLX card (`omlx_key`, decided per card by
     /// [`crate::models::is_loopback_omlx`]) — from the env var, or from
     /// `~/.omlx/settings.json` only when `url` is loopback, and is never logged.
-    fn outbound(&self, url: &str, payload: &Value, omlx_key: bool) -> reqwest::RequestBuilder {
-        let mut request = self.client.post(url);
-        if omlx_key && let Some(key) = idoris_upstream::omlx::key::resolve_omlx_api_key_for(url) {
+    ///
+    /// **`None` — nothing is built and nothing is sent — when the endpoint is one the engine manager governs and
+    /// this request may not go there** (IDORIS-CORE S6): the endpoint is blocked (no verified engine is behind it: it
+    /// is stopped, being replaced, or its listener is gone), this call is bound to an engine generation
+    /// ([`idoris_backend::pinned_generation`]: the ordinary resident entrances and the resident warmup task bind the one
+    /// they were admitted under) that has since been replaced, or the listener could not be **re-verified right now**
+    /// ([`idoris_upstream::omlx::key::authorize_omlx_request`] asks the engine manager's guard on this very task, right
+    /// before the send; Codex final review H1, owner decision 2026-11-22). Neither the key nor the request body (the
+    /// user's prompt) may reach whatever is behind that port now. This is the one place the proxy resolves the key, so
+    /// every send — and every retry of one — is checked here.
+    ///
+    /// The returned [`Outbound`] carries the authorization: hold it until the response has been read (a stream: until the
+    /// body is done), it is an in-flight operation the engine manager's drain waits for (Codex final review M1).
+    async fn outbound(&self, url: &str, payload: &Value, omlx_key: bool) -> Option<Outbound> {
+        let authorization = if omlx_key {
+            Some(
+                idoris_upstream::omlx::key::authorize_omlx_request(
+                    url,
+                    idoris_backend::pinned_generation(),
+                )
+                .await
+                .ok()?,
+            )
+        } else {
+            None
+        };
+        // A governed endpoint is dialed at the address the guard verified (never the card's own spelling: `localhost`, `[::1]` are not
+        // what was verified), over a connection opened after the authorization (a client that keeps no idle connection): Codex focused
+        // review H1 and H6. An ungoverned endpoint is sent to as written.
+        let (client, send_url) = match &authorization {
+            Some(authorization) => (
+                authorization.client(&self.client),
+                authorization.dial_url(url),
+            ),
+            None => (self.client.clone(), url.to_owned()),
+        };
+        let mut request = client.post(&send_url);
+        if let Some(key) = authorization
+            .as_ref()
+            .and_then(idoris_upstream::omlx::key::Authorization::key)
+        {
             request = request.bearer_auth(key);
         }
         // Keep local runtimes byte-for-byte compatible; remote providers get
@@ -840,7 +917,7 @@ impl ChatProxy {
             decorrelated = decorrelate(payload);
             &decorrelated
         };
-        match serde_json::to_vec(payload) {
+        let request = match serde_json::to_vec(payload) {
             Ok(body) => {
                 self.egress.record(url, body.len());
                 request
@@ -849,7 +926,25 @@ impl ChatProxy {
             }
             // Unreachable for a `Value`; let reqwest report its own error.
             Err(_) => request.json(payload),
-        }
+        };
+        Some(Outbound {
+            request,
+            _authorization: authorization,
+        })
+    }
+
+    /// Whether [`Self::outbound`] would not refuse `url` right now on grounds of generation or a blocked endpoint. Asked
+    /// **before** the provider breaker is claimed and before the dispatched observation is written, so a request that is
+    /// refused because its engine was replaced (or is blocked) leaves neither a breaker fault nor an event behind: it
+    /// was never a call to the provider. [`Self::outbound`] still decides at the moment of sending (it also re-verifies
+    /// the listener, and a refusal there is the safety net for a change that lands in between, and for every retry).
+    fn may_send(url: &str, omlx_key: bool) -> bool {
+        !omlx_key
+            || idoris_upstream::omlx::key::check_endpoint_admission(
+                url,
+                idoris_backend::pinned_generation(),
+            )
+            .is_ok()
     }
 
     /// Creates a proxy. The injected `client` must have redirects disabled
@@ -889,6 +984,8 @@ impl ChatProxy {
             stream_eof_observed: None,
             #[cfg(test)]
             stream_read_waiting: None,
+            #[cfg(test)]
+            before_outbound: None,
             // TS default (`proxy.ts`'s `ProxyDeps.retryDelaysMs` default).
             retry_delays: vec![Duration::from_millis(250), Duration::from_secs(1)],
             cache: Mutex::new(IndexMap::new()),
@@ -917,6 +1014,31 @@ impl ChatProxy {
         proxy.retry_delays = retry_delays;
         proxy
     }
+
+    /// Test-only: install the [`BeforeOutbound`] sync point.
+    #[cfg(test)]
+    pub(crate) fn with_before_outbound(mut self, hook: BeforeOutbound) -> Self {
+        self.before_outbound = Some(hook);
+        self
+    }
+
+    /// Test-only: pin the breaker's clock (milliseconds), so a recovery window passes without waiting for it.
+    #[cfg(test)]
+    pub(crate) fn set_clock_ms_for_test(&self, now_ms: u64) {
+        self.test_clock_ms.store(now_ms, Ordering::SeqCst);
+    }
+
+    /// The [`BeforeOutbound`] sync point (a no-op outside tests).
+    #[cfg(test)]
+    async fn pause_before_outbound(&self, url: &str, attempt: usize) {
+        if let Some(hook) = &self.before_outbound {
+            hook(url, attempt).await;
+        }
+    }
+
+    #[cfg(not(test))]
+    #[allow(clippy::unused_async)]
+    async fn pause_before_outbound(&self, _url: &str, _attempt: usize) {}
 
     #[cfg(test)]
     fn cache_size_for_test(&self) -> usize {
@@ -1632,6 +1754,11 @@ impl ChatProxy {
             }
         }
 
+        // A blocked endpoint, or a request admitted for an engine that has since been replaced (IDORIS-CORE S6):
+        // nothing is sent, and the provider breaker is not involved (this was never a call to the provider).
+        if !Self::may_send(url, opts.attach_omlx_key) {
+            return Ok(Self::failure(503, 0));
+        }
         // Claim both gates before observation; either refusal sends nothing
         // (no dispatched observation, nothing executed).
         let Some(claim) = self.claim_send(opts.provider_id, url) else {
@@ -1644,6 +1771,7 @@ impl ChatProxy {
         observer().await?;
         let mut retry_after_ms = None;
         let mut raw_auth_status = None;
+        let mut refused_locally = false;
         let Ok(outcome) = self
             .send_buffered(
                 url,
@@ -1653,8 +1781,15 @@ impl ChatProxy {
                 uncertain,
                 &mut retry_after_ms,
                 &mut raw_auth_status,
+                &mut refused_locally,
             )
             .await;
+        // The send was refused before anything was written: not a call to the provider, so not a provider fault (Codex final
+        // review M4). One refused send still leaves its 503 for the caller.
+        if refused_locally {
+            claim.release();
+            return Ok(outcome);
+        }
         // An upstream 401/403 is recorded with its original status (not the
         // mapped 502), exactly like the stream path: auth rejections are not
         // breaker faults, so operators keep seeing `upstream_auth_failed`
@@ -1677,16 +1812,27 @@ impl ChatProxy {
         uncertain: &mut bool,
         retry_after_ms: &mut Option<u64>,
         raw_auth_status: &mut Option<u16>,
+        refused_locally: &mut bool,
     ) -> Result<ForwardOutcome, std::convert::Infallible> {
         let mut attempt = 0usize;
         loop {
+            // Every attempt, a retry included, resolves the key afresh: an engine replaced (or blocked) since the
+            // first attempt refuses it (IDORIS-CORE S6), so a request admitted for the old engine is never retried
+            // onto the new one.
+            self.pause_before_outbound(url, attempt).await;
+            #[allow(clippy::cast_possible_truncation)]
+            let Some(outbound) = self.outbound(url, payload, opts.attach_omlx_key).await else {
+                *refused_locally = true;
+                return Ok(Self::failure(503, attempt as u32));
+            };
+            // The authorization (the in-flight registration) lives until this attempt's response has been read.
+            let Outbound {
+                request,
+                _authorization,
+            } = outbound;
             // Keep the transport error until retry classification: only a
             // connection failure proves that this POST was not executed.
-            let sent = tokio::time::timeout(
-                header_timeout,
-                self.outbound(url, payload, opts.attach_omlx_key).send(),
-            )
-            .await;
+            let sent = tokio::time::timeout(header_timeout, request.send()).await;
             match sent {
                 Ok(Ok(resp)) => {
                     let status = resp.status().as_u16();
@@ -1884,6 +2030,11 @@ impl ChatProxy {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
         }
+        // A blocked endpoint, or a request admitted for an engine that has since been replaced (IDORIS-CORE S6):
+        // nothing is sent, and the provider breaker is not involved.
+        if !Self::may_send(&url, provider.omlx_key) {
+            return Ok(Self::stream_failure(503, ExecutionDisposition::NotExecuted));
+        }
         let Some(claim) = self.claim_send(provider_id, &url) else {
             let failure = Self::flight_failure(503, "provider_circuit_open");
             return Ok(StreamOutcome::Buffered {
@@ -1894,12 +2045,19 @@ impl ChatProxy {
             });
         };
         observer().await?;
-        let sent = match tokio::time::timeout(
-            self.header_timeout,
-            self.outbound(&url, &payload, provider.omlx_key).send(),
-        )
-        .await
-        {
+        // The safety net for a change that landed after the check above: the claim is dropped, not finished (a
+        // refused send is not a provider fault).
+        self.pause_before_outbound(&url, 0).await;
+        let Some(outbound) = self.outbound(&url, &payload, provider.omlx_key).await else {
+            // A refusal is not a provider fault: hand the claim back (a half-open probe's slot included).
+            claim.release();
+            return Ok(Self::stream_failure(503, ExecutionDisposition::NotExecuted));
+        };
+        let Outbound {
+            request,
+            _authorization: authorization,
+        } = outbound;
+        let sent = match tokio::time::timeout(self.header_timeout, request.send()).await {
             Ok(sent) => sent,
             Err(_) => {
                 claim.finish(504, None);
@@ -1935,7 +2093,10 @@ impl ChatProxy {
                     let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
                     let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
                     let producer_permit = Arc::clone(&permit);
+                    // The authorization is an in-flight registration for the endpoint's drain (Codex final review M1): it
+                    // lives as long as the engine is still sending this response, and ends with the producer task.
                     tokio::spawn(async move {
+                        let _authorization = authorization;
                         let mut resp = resp;
                         let mut terminal_error = None;
                         let mut reached_eof = false;
@@ -2169,6 +2330,10 @@ mod slow_reader_tests;
 mod path_tests;
 
 #[cfg(test)]
+#[path = "proxy_governance_tests.rs"]
+mod governance_tests;
+
+#[cfg(test)]
 #[path = "proxy_observation_tests.rs"]
 mod observation_tests;
 
@@ -2213,14 +2378,23 @@ mod tests {
         const LOCAL: &str = "http://127.0.0.1:8088/v1/chat/completions";
         if let Ok(case) = std::env::var(CASE) {
             let proxy = ChatProxy::new(reqwest::Client::new());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             let auth = |url: &str, omlx_key: bool| {
-                proxy
-                    .outbound(url, &serde_json::json!({"model": "m"}), omlx_key)
-                    .build()
-                    .unwrap()
-                    .headers()
-                    .get("authorization")
-                    .map(|v| v.to_str().unwrap().to_owned())
+                runtime.block_on(async {
+                    proxy
+                        .outbound(url, &serde_json::json!({"model": "m"}), omlx_key)
+                        .await
+                        .unwrap()
+                        .request
+                        .build()
+                        .unwrap()
+                        .headers()
+                        .get("authorization")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                })
             };
             match case.as_str() {
                 "file" => {

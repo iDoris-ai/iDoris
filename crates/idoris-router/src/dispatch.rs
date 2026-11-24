@@ -70,10 +70,11 @@ impl BoundSupervisor {
 
     /// Constructs the adapter from the same card used for the binding.
     pub fn spawn_omlx(card: &ComponentCard) -> Result<Self, String> {
-        let adapter = idoris_upstream::OmlxAdapter::new(
-            idoris_upstream::OmlxAdapterConfig::for_base_url(card.endpoint.clone()),
-        )
-        .map_err(|err| format!("无法构造 oMLX 适配器（{}）：{err}", card.provider.id))?;
+        // 与生产同一条构造路径（`idoris_upstream::factory`）：这张卡能不能带 key 按代理同一个判据（`models::is_loopback_omlx`）
+        // 定；能带的，每个请求按引擎管理器此刻的登记取 key，引擎换了、停了、端口换了主人，之前读到的 key 都不能再用；不能带的，
+        // 什么 key 都不发。
+        let adapter = idoris_upstream::factory::create_omlx_adapter(card)
+            .map_err(|err| format!("无法构造 oMLX 适配器（{}）：{err}", card.provider.id))?;
         let handle = idoris_backend::Supervisor::spawn(
             std::sync::Arc::new(adapter),
             idoris_backend::SupervisorConfig::default(),

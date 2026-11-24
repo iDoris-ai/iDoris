@@ -500,27 +500,58 @@ pub async fn probe_resident(
     card: &ComponentCard,
     timeout: Duration,
 ) -> Observation {
+    probe_resident_admitted(client, card, None, timeout).await
+}
+
+/// 同 [`probe_resident`]，带着这一轮观测开始时读到的这张卡的引擎代际（`crate::models::admission_generation`，先于状态检查读）：
+/// 能带 oMLX key 的卡**在发出请求之前**经 `authorize_omlx_request`（Codex 终审 H1、M6）：核对代际与封上、让引擎管理器的守卫重新确认
+/// 监听者，被拒绝就不发，这一轮的观测是「不可用」。之前被封上的端点会被当成「没有 key」照样发一个匿名的 GET。
+pub async fn probe_resident_admitted(
+    client: &reqwest::Client,
+    card: &ComponentCard,
+    admitted_generation: Option<u64>,
+    timeout: Duration,
+) -> Observation {
     if !idoris_upstream::omlx::key::is_loopback_base_url(&card.endpoint) {
         return Observation::Unavailable(None);
     }
     let url = format!("{}/v1/models", card.endpoint.trim_end_matches('/'));
-    let mut request = client.get(&url).timeout(timeout);
     let mut key_sent = false;
-    if crate::models::is_loopback_omlx(card)
-        && let Some(key) = idoris_upstream::omlx::key::resolve_omlx_api_key_os_for(&card.endpoint)
-            .filter(|key| !key.is_empty())
-    {
-        // 非 UTF-8、放不进请求头的 key 是无效凭证，不是「没有凭证」（与 `GET /v1/models` 同口径）。
-        let Some(mut authorization) = key
-            .to_str()
-            .and_then(|key| HeaderValue::from_str(&format!("Bearer {key}")).ok())
+    // 持有到响应读完：端点上的一个在途操作。
+    let authorization = if crate::models::is_loopback_omlx(card) {
+        let Ok(authorization) =
+            idoris_upstream::omlx::key::authorize_omlx_request(&card.endpoint, admitted_generation)
+                .await
         else {
-            return Observation::Unavailable(Some(UpstreamReason::AuthFailed));
+            return Observation::Unavailable(None);
         };
-        authorization.set_sensitive(true);
-        request = request.header(AUTHORIZATION, authorization);
-        key_sent = true;
-    }
+        Some(authorization)
+    } else {
+        None
+    };
+    // 托管的端点：发往授权核验过的拨号地址（不是卡里写的别名），用不保留空闲连接的客户端（Codex 专项评审 H1、H6）。
+    let (client, send_url) = match &authorization {
+        Some(authorization) => (authorization.client(client), authorization.dial_url(&url)),
+        None => (client.clone(), url.clone()),
+    };
+    let mut request = client.get(&send_url).timeout(timeout);
+    let _authorization = if let Some(authorization) = authorization {
+        if let Some(key) = authorization.key_os().filter(|key| !key.is_empty()) {
+            // 非 UTF-8、放不进请求头的 key 是无效凭证，不是「没有凭证」（与 `GET /v1/models` 同口径）。
+            let Some(mut header) = key
+                .to_str()
+                .and_then(|key| HeaderValue::from_str(&format!("Bearer {key}")).ok())
+            else {
+                return Observation::Unavailable(Some(UpstreamReason::AuthFailed));
+            };
+            header.set_sensitive(true);
+            request = request.header(AUTHORIZATION, header);
+            key_sent = true;
+        }
+        Some(authorization)
+    } else {
+        None
+    };
     let Ok(response) = request.send().await else {
         return Observation::Unavailable(None);
     };
@@ -596,7 +627,15 @@ impl ProberContext {
                 }
             }
             UpstreamKind::Resident => {
-                probe_resident(&self.client, plan.card(), self.timings.probe_timeout).await
+                // 这一轮观测准入时的引擎代际，先于状态检查读（Codex 终审 M6）。
+                let admitted = crate::models::admission_generation(plan.card());
+                probe_resident_admitted(
+                    &self.client,
+                    plan.card(),
+                    admitted,
+                    self.timings.probe_timeout,
+                )
+                .await
             }
         }
     }

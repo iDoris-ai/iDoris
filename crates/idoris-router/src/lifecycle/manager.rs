@@ -363,6 +363,9 @@ impl EngineManager {
         let mut senders = BTreeMap::new();
         let mut tasks = Vec::new();
         for plan in plans {
+            // 托管的端点从一开始就封上：在引擎管理器登记出一个通过校验的监听者之前，没有任何凭证发往它，环境变量与
+            // `settings.json` 的回退链从不适用于托管的端点（IDORIS-CORE S6，Codex 预审 3）。
+            plan.backend.block(&plan.endpoint);
             let (sender, receiver) = mpsc::channel(8);
             // 先登记 `starting`：门控判据与 `/health` 一开始就有这个实例。
             shared.publish(

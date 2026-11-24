@@ -37,7 +37,7 @@ use idoris_upstream::engine::{
     EngineRecipe, InspectError, ListenerPolicy, OwnedEngine, PidState, ProcessInspector,
     StopOnExit, SystemInspector,
 };
-use idoris_upstream::omlx::key::{EndpointKey, governed_endpoint};
+use idoris_upstream::omlx::key::{EndpointGuard, EndpointKey, forget_endpoint, governed_endpoint};
 
 const GIB: u64 = 1 << 30;
 const PATIENT: Duration = Duration::from_secs(60);
@@ -242,6 +242,9 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
+        // The key registry is process-global and the OS hands a freed port to another test of this process: leave nothing of
+        // this endpoint's registration (not even its generation) behind.
+        forget_endpoint(&self.endpoint());
         fake_omlx::kill_fake_engines_under(self.work.path());
         for launch in self.fake.all_launches() {
             let pid = launch["pid"].as_u64().unwrap();
@@ -337,14 +340,14 @@ impl EngineBackend for TestBackend {
     fn fence_path(&self, state_dir: &Path, endpoint: &str) -> Option<PathBuf> {
         self.inner.fence_path(state_dir, endpoint)
     }
-    fn govern_private(&self, endpoint: &str, key: &EngineKey) {
-        self.inner.govern_private(endpoint, key);
+    fn govern_private(&self, endpoint: &str, key: &EngineKey, guard: Arc<dyn EndpointGuard>) {
+        self.inner.govern_private(endpoint, key, guard);
     }
-    fn govern_external(&self, endpoint: &str, settings_key_verified: bool) {
-        self.inner.govern_external(endpoint, settings_key_verified);
+    fn govern_external(&self, endpoint: &str, guard: Arc<dyn EndpointGuard>) {
+        self.inner.govern_external(endpoint, guard);
     }
-    fn release(&self, endpoint: &str) {
-        self.inner.release(endpoint);
+    fn block(&self, endpoint: &str) {
+        self.inner.block(endpoint);
     }
     fn current_key(&self, _endpoint: &str) -> Option<String> {
         self.external_key.lock().unwrap().clone()
@@ -502,10 +505,14 @@ async fn an_engine_that_is_not_there_is_spawned_and_becomes_ready_and_owned_with
     // 引擎只认这个 key：就绪探测带着它，每个请求都是 ok。
     assert!(rig.fake.requests().iter().all(|(_, auth)| auth == "ok"));
     h.manager.shutdown(true).await;
-    // 停止之后：引擎没了，记录删了，私有 key 不再留在进程里。
+    // 停止之后：引擎没了，记录删了，私有 key 不再留在进程里；端点被封上（什么凭证都不发），不是撤销登记：撤销会让环境变量与
+    // `settings.json` 的回退链重新适用。
     assert!(!pid_alive(rig.pid(0)));
     assert_eq!(rig.records(), 0);
-    assert!(governed_endpoint(&rig.endpoint()).is_none());
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
 }
 
 #[tokio::test]
@@ -937,7 +944,10 @@ async fn stop_restart_and_start_act_only_on_an_engine_idoris_owns() {
     assert_eq!(stopped.reason, None);
     wait_for("the engine to die", || !pid_alive(first_pid)).await;
     assert_eq!(rig.records(), 0);
-    assert!(governed_endpoint(&rig.endpoint()).is_none());
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
     assert_eq!(
         h.health.view().phase,
         Phase::Degraded,
@@ -1101,9 +1111,10 @@ async fn an_external_engine_is_adopted_without_a_signal_and_survives_idoris_even
         "iDoris never signals an engine it does not own"
     );
     assert_eq!(rig.records(), 0);
-    assert!(
-        governed_endpoint(&rig.endpoint()).is_none(),
-        "released at shutdown"
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked),
+        "blocked at shutdown (not released: the fallback chain must not apply to a managed endpoint)"
     );
     // 引擎看到的只有匿名请求（它没要求 key）：没有带 key 的请求。
     assert!(
@@ -1699,9 +1710,10 @@ async fn an_engine_whose_port_turns_out_to_be_held_by_another_process_when_seale
         0,
         "no ownership record is left for an engine that was refused"
     );
-    assert!(
-        governed_endpoint(&rig.endpoint()).is_none(),
-        "its private key was never registered"
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked),
+        "its private key was never registered: the endpoint stayed blocked"
     );
     h.manager.shutdown(true).await;
 }
@@ -1813,10 +1825,8 @@ async fn an_external_listener_that_stops_passing_the_owner_check_is_failed_and_t
     assert!(!status.owned);
     assert_eq!(
         governed_endpoint(&rig.endpoint()),
-        Some(EndpointKey::External {
-            settings_key_verified: false
-        }),
-        "the settings.json key is off again for a listener that failed the check"
+        Some(EndpointKey::Blocked),
+        "no credential of any kind goes to a listener that failed the check (the env key included)"
     );
     let before = external.fake.requests().len();
     tokio::time::sleep(Duration::from_millis(400)).await;
