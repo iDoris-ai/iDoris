@@ -3,30 +3,31 @@
 
 use std::process::Command;
 
-/// 每个测试进程一个私有根目录（`<tmp>/idoris-test-state-<pid>`）。进程内线程共用它没有问题：这里只在首次调用时建目录，
+/// 每个测试进程一个私有根目录（`<tmp>/idoris-test-state/<pid>`）。进程内线程共用它没有问题：这里只在首次调用时建目录，
 /// 之后只读；各子进程的端点（端口）不同，围栏目录互不相干，需要固定状态目录的测试自己 `.env("IDORIS_STATE_DIR", …)`。
 /// 不设置进程环境（`std::env::set_var` 在 edition 2024 是 unsafe，工作区又禁了 unsafe；改环境对并行线程也不安全）。
 fn isolation_root() -> &'static std::path::Path {
     static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
-        let base = std::env::temp_dir();
-        // 顺手回收一天前的旧目录（上次崩掉的测试进程留下的）；只动自己命名模式的目录，出错一律忽略。
+        // 专用父目录：$TMPDIR 里常有几十万个别的条目，不能扫它；只扫我们自己的父目录。
+        let base = std::env::temp_dir().join("idoris-test-state");
+        let _ = std::fs::create_dir_all(&base);
+        // 顺手回收一天前的旧目录（上次崩掉的测试进程留下的）；出错一律忽略。
         if let Ok(entries) = std::fs::read_dir(&base) {
             let day = std::time::Duration::from_secs(24 * 3600);
             for entry in entries.flatten() {
-                let name = entry.file_name();
                 let old = entry
                     .metadata()
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.elapsed().ok())
                     .is_some_and(|age| age > day);
-                if old && name.to_string_lossy().starts_with("idoris-test-state-") {
+                if old {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
         }
-        let root = base.join(format!("idoris-test-state-{}", std::process::id()));
+        let root = base.join(std::process::id().to_string());
         std::fs::create_dir_all(&root).expect("create the test state root");
         root
     })
