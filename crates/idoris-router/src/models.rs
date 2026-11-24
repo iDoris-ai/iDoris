@@ -104,9 +104,11 @@ pub(crate) fn is_loopback_omlx(card: &ComponentCard) -> bool {
 }
 
 /// 这张卡被准入时它的端点的引擎代际（IDORIS-CORE S6，Codex 终审 M6）：**在状态检查之前读**，所以它只可能比状态检查那一刻的新引擎旧，不会
-/// 更新。能带 oMLX key 的卡才有（别的卡的端点不归引擎管理器管）。`GET /v1/models` 与 Admin 的模型来源把它一路带到发出请求的那一刻。
+/// 更新。有的是端点被引擎管理器接管的卡（能带 oMLX key 的卡，**和**同一个端口上不能带 key 的卡：由端点决定，不由卡决定，Codex 预审 L2 的
+/// H1）；别的卡的端点不归引擎管理器管。`GET /v1/models` 与 Admin 的模型来源把它一路带到发出请求的那一刻。
 pub(crate) fn admission_generation(card: &ComponentCard) -> Option<u64> {
-    is_loopback_omlx(card).then(|| idoris_upstream::omlx::key::endpoint_generation(&card.endpoint))
+    (is_loopback_omlx(card) || idoris_upstream::omlx::key::is_governed_endpoint(&card.endpoint))
+        .then(|| idoris_upstream::omlx::key::endpoint_generation(&card.endpoint))
 }
 
 /// 每张卡被准入时的代际（按 `provider.id`），见 [`admission_generation`]。
@@ -122,11 +124,23 @@ async fn fetch_models_body(
     admitted_generation: Option<u64>,
 ) -> Result<Option<Value>, ModelsError> {
     let url = format!("{}/v1/models", card.endpoint.trim_end_matches('/'));
-    // 持有到响应读完：这是端点上的一个在途操作，引擎管理器排空时等它。
-    let authorization = if is_loopback_omlx(card) {
+    // 持有到响应读完：这是端点上的一个在途操作，引擎管理器排空时等它。被管理的端点由端点决定（Codex 预审 L2 的 H1）：不能带 key 的卡
+    // （同一个端口上 `idoris_upstream` 的卡、映射写法的卡）也过同一道授权，只是不带凭证。
+    let carries_key = is_loopback_omlx(card);
+    let authorization = if carries_key {
         let Ok(authorization) =
             idoris_upstream::omlx::key::authorize_omlx_request(&card.endpoint, admitted_generation)
                 .await
+        else {
+            return Ok(None);
+        };
+        Some(authorization)
+    } else if idoris_upstream::omlx::key::is_governed_endpoint(&card.endpoint) {
+        let Ok(authorization) = idoris_upstream::omlx::key::authorize_omlx_request_without_key(
+            &card.endpoint,
+            admitted_generation,
+        )
+        .await
         else {
             return Ok(None);
         };
@@ -141,7 +155,15 @@ async fn fetch_models_body(
     };
     let mut request = client.get(&send_url).timeout(MODELS_TIMEOUT);
     let _authorization = if let Some(authorization) = authorization {
-        if let Some(key) = authorization.key_os().filter(|key| !key.is_empty()) {
+        // 授权是在 await 里取到的，请求体（这里没有）与请求头在它之后建：发出前最后同步看一眼端点（Codex 预审 L2 的 H3）。
+        if authorization.ensure_current().is_err() {
+            return Ok(None);
+        }
+        if let Some(key) = carries_key
+            .then(|| authorization.key_os())
+            .flatten()
+            .filter(|key| !key.is_empty())
+        {
             // A present non-UTF-8 key is invalid, never an absent credential.
             let mut header = key
                 .to_str()
@@ -425,6 +447,58 @@ mod tests {
             load_policy: None,
             extensions: None,
         }
+    }
+
+    /// Codex 预审 L2 的 H1：不能带 key 的卡（这里的 `version_pin` 不是 oMLX）发往一个被管理的端点，模型列表走同一道授权：封上的端点一个请求都不发，这张卡算「不可用」，
+    /// 不会把占着端口的东西的回答当成它的模型列表；端点登记过、放开之后请求发出，**不带** bearer。
+    #[tokio::test]
+    async fn a_card_that_may_not_carry_the_key_is_not_listed_through_a_blocked_governed_endpoint() {
+        use idoris_upstream::omlx::key::{
+            EndpointKey, block_endpoint, forget_endpoint, govern_endpoint,
+        };
+
+        struct Governed(String);
+        impl Drop for Governed {
+            fn drop(&mut self) {
+                forget_endpoint(&self.0);
+            }
+        }
+
+        let server = models_server(&["secret-model"]).await;
+        let endpoint = server.uri();
+        let _governed = Governed(endpoint.clone());
+        let client = reqwest::Client::new();
+        let cards = vec![card("hand-written", &endpoint, Form::HttpService)];
+
+        govern_endpoint(&endpoint, EndpointKey::Private("engine-key".to_owned()));
+        let listed = list_models(&client, &cards, &HealthTracker::default(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            listed
+                .data
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["secret-model"]
+        );
+        let seen = server.received_requests().await.unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].headers.get("authorization").is_none(),
+            "the engine's private key went to a card that may not carry it"
+        );
+
+        block_endpoint(&endpoint);
+        let blocked = list_models(&client, &cards, &HealthTracker::default(), false).await;
+        if let Ok(response) = &blocked {
+            assert!(response.data.is_empty(), "{response:?}");
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the model list went to a blocked governed endpoint"
+        );
     }
 
     #[tokio::test]

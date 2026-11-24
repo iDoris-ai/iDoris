@@ -150,8 +150,13 @@ async fn a_blocked_endpoint_is_sent_nothing_at_all() {
     forget_endpoint(&endpoint);
 }
 
+/// An adapter built with a fixed key (not per-request) is governed **by the endpoint it aims at, not by its own mode** (Codex
+/// pre-review of layer 2, H1; this test used to pin the opposite, "ignores the registry"). Nobody governs the endpoint: it is what it
+/// always was — no generation, no binding checked, the construction-time key goes out. The engine manager takes the endpoint over: the
+/// adapter now follows its generation, work admitted for a replaced engine and anything aimed at a blocked endpoint is refused before a
+/// byte is sent, and what does go out still carries the adapter's **own** key — the key the manager registered is never handed to it.
 #[tokio::test]
-async fn an_adapter_with_a_fixed_key_has_no_generation_and_ignores_the_registry() {
+async fn an_adapter_with_a_fixed_key_follows_the_endpoint_but_is_never_given_the_registered_key() {
     let server = server().await;
     let endpoint = server.uri();
     let fixed = OmlxAdapter::new(OmlxAdapterConfig {
@@ -161,11 +166,53 @@ async fn an_adapter_with_a_fixed_key_has_no_generation_and_ignores_the_registry(
     })
     .unwrap()
     .with_load_fence_path(idoris_backend::mock::temporary_load_fence_path());
+
+    // Not governed: no generation, a binding is not looked at, the fixed key is sent.
     assert_eq!(fixed.engine_generation(), None);
-    govern_endpoint(&endpoint, EndpointKey::Private("engine".into()));
-    block_endpoint(&endpoint);
-    // Not per-request: the construction-time key is what it always was, bound generation or not.
     scoped(Some(0), fixed.list()).await.unwrap();
-    assert_eq!(received(&server).await, 1);
+    scoped(Some(41), fixed.list()).await.unwrap();
+    assert_eq!(received(&server).await, 2);
+
+    // Governed: the adapter follows the endpoint's generation, and an admitted request goes out with its own key.
+    govern_endpoint(&endpoint, EndpointKey::Private("registered".into()));
+    let admitted = fixed.engine_generation().unwrap();
+    assert_eq!(admitted, endpoint_generation(&endpoint));
+    scoped(Some(admitted), fixed.list()).await.unwrap();
+    assert_eq!(received(&server).await, 3);
+
+    // The engine is replaced: the old work is refused (a list, a load, a chat), nothing reaches the new one.
+    govern_endpoint(&endpoint, EndpointKey::Private("second-engine".into()));
+    for result in [
+        scoped(Some(admitted), fixed.list()).await.map(|_| ()),
+        scoped(Some(admitted), fixed.load("m", Some(&policy()))).await,
+        scoped(Some(admitted), fixed.chat(chat(), CancellationToken::new()))
+            .await
+            .map(|_| ()),
+    ] {
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("was replaced"), "{error}");
+    }
+
+    // A blocked endpoint gets nothing, bound or not.
+    assert!(block_endpoint(&endpoint));
+    let current = endpoint_generation(&endpoint);
+    for bound in [None, Some(current)] {
+        let error = scoped(bound, fixed.list()).await.unwrap_err();
+        assert!(error.to_string().contains("blocked"), "{error}");
+    }
+    assert_eq!(received(&server).await, 3, "no refused request was sent");
+
+    // Never the registered key: every request that did go out carried the adapter's own.
+    for request in server.received_requests().await.unwrap() {
+        assert_eq!(
+            request
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer constructed"
+        );
+    }
     forget_endpoint(&endpoint);
 }

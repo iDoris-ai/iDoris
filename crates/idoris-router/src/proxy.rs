@@ -586,20 +586,16 @@ fn wall_clock_ms() -> u64 {
         })
 }
 
-/// `localhost` or a loopback IP literal. Anything else — other names
-/// included, since they may resolve off-host — counts as egress.
+/// `localhost` or a loopback IP literal (IPv4-mapped spellings included: they are the same socket). Anything else — other names
+/// included, since they may resolve off-host — counts as egress. The one classification of "loopback" the key registry uses too
+/// ([`idoris_upstream::omlx::key::is_loopback_host`]; IDORIS-CORE S6, Codex pre-review of layer 2, H1).
 fn is_loopback_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
-    parsed.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    })
+    parsed
+        .host_str()
+        .is_some_and(idoris_upstream::omlx::key::is_loopback_host)
 }
 
 pub struct ChatProxy {
@@ -643,6 +639,11 @@ pub struct ChatProxy {
     /// reached without a wall clock.
     #[cfg(test)]
     pub(crate) before_outbound: Option<BeforeOutbound>,
+    /// Test-only sync point (Codex pre-review of layer 2, H3): awaited inside [`Self::outbound`] after the request is authorized and
+    /// built, right before its last synchronous check. A test parks the request here, replaces the engine (blocks the endpoint,
+    /// registers a new key), and lets it go: the request that had passed the generation check, delayed before it is sent.
+    #[cfg(test)]
+    pub(crate) after_authorization: Option<BeforeOutbound>,
     pub(crate) retry_delays: Vec<Duration>,
     pub(crate) cache: Mutex<IndexMap<String, CacheEntry>>,
     flights: Mutex<IndexMap<String, Arc<Flight>>>,
@@ -866,6 +867,12 @@ impl ChatProxy {
     /// [`crate::models::is_loopback_omlx`]) — from the env var, or from
     /// `~/.omlx/settings.json` only when `url` is loopback, and is never logged.
     ///
+    /// **Governed is decided by the endpoint, not by the card** (IDORIS-CORE S6, Codex pre-review of layer 2, H1): a card that
+    /// may not carry the oMLX key (a resident card with `extensions.idoris_upstream`, an IPv4-mapped spelling of the port) but
+    /// whose endpoint is one the engine manager governs goes through the very same authorization (generation, blocked, listener
+    /// re-verified, verified dial address, in-flight registration); it just carries no credential. Card eligibility only decides
+    /// whether the key is attached.
+    ///
     /// **`None` — nothing is built and nothing is sent — when the endpoint is one the engine manager governs and
     /// this request may not go there** (IDORIS-CORE S6): the endpoint is blocked (no verified engine is behind it: it
     /// is stopped, being replaced, or its listener is gone), this call is bound to an engine generation
@@ -888,6 +895,16 @@ impl ChatProxy {
                 .await
                 .ok()?,
             )
+        } else if idoris_upstream::omlx::key::is_governed_endpoint(url) {
+            // The card may not carry the key, the endpoint is governed all the same: the gate, no credential.
+            Some(
+                idoris_upstream::omlx::key::authorize_omlx_request_without_key(
+                    url,
+                    idoris_backend::pinned_generation(),
+                )
+                .await
+                .ok()?,
+            )
         } else {
             None
         };
@@ -902,9 +919,11 @@ impl ChatProxy {
             None => (self.client.clone(), url.to_owned()),
         };
         let mut request = client.post(&send_url);
-        if let Some(key) = authorization
-            .as_ref()
-            .and_then(idoris_upstream::omlx::key::Authorization::key)
+        // Only a card that may carry the key gets one (a governed endpoint's authorization of any other card holds none).
+        if omlx_key
+            && let Some(key) = authorization
+                .as_ref()
+                .and_then(idoris_upstream::omlx::key::Authorization::key)
         {
             request = request.bearer_auth(key);
         }
@@ -927,6 +946,17 @@ impl ChatProxy {
             // Unreachable for a `Value`; let reqwest report its own error.
             Err(_) => request.json(payload),
         };
+        // The request is built (the body serialized: that took time): one last synchronous look at the endpoint right before it goes
+        // out. A restart that overtook a request which had already passed the generation check blocks the endpoint and moves the
+        // generation; the authorization held here is the old engine's and must not be used to dial whatever is behind the port now
+        // (Codex pre-review of layer 2, H3).
+        #[cfg(test)]
+        self.pause_after_authorization(url).await;
+        if let Some(authorization) = &authorization
+            && authorization.ensure_current().is_err()
+        {
+            return None;
+        }
         Some(Outbound {
             request,
             _authorization: authorization,
@@ -939,7 +969,7 @@ impl ChatProxy {
     /// was never a call to the provider. [`Self::outbound`] still decides at the moment of sending (it also re-verifies
     /// the listener, and a refusal there is the safety net for a change that lands in between, and for every retry).
     fn may_send(url: &str, omlx_key: bool) -> bool {
-        !omlx_key
+        !(omlx_key || idoris_upstream::omlx::key::is_governed_endpoint(url))
             || idoris_upstream::omlx::key::check_endpoint_admission(
                 url,
                 idoris_backend::pinned_generation(),
@@ -986,6 +1016,8 @@ impl ChatProxy {
             stream_read_waiting: None,
             #[cfg(test)]
             before_outbound: None,
+            #[cfg(test)]
+            after_authorization: None,
             // TS default (`proxy.ts`'s `ProxyDeps.retryDelaysMs` default).
             retry_delays: vec![Duration::from_millis(250), Duration::from_secs(1)],
             cache: Mutex::new(IndexMap::new()),
@@ -1020,6 +1052,20 @@ impl ChatProxy {
     pub(crate) fn with_before_outbound(mut self, hook: BeforeOutbound) -> Self {
         self.before_outbound = Some(hook);
         self
+    }
+
+    /// Test-only: install the sync point between authorizing a send and its last check (the attempt number is always 0).
+    #[cfg(test)]
+    pub(crate) fn with_after_authorization(mut self, hook: BeforeOutbound) -> Self {
+        self.after_authorization = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    async fn pause_after_authorization(&self, url: &str) {
+        if let Some(hook) = &self.after_authorization {
+            hook(url, 0).await;
+        }
     }
 
     /// Test-only: pin the breaker's clock (milliseconds), so a recovery window passes without waiting for it.

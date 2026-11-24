@@ -34,6 +34,11 @@
 //!   （[`Authorization::client`]），凭证只走授权之后新开的连接。守卫每个请求只问登记时认的那个进程此刻还握着一个拨号地址连得到的 LISTEN 套接字（原生，不起
 //!   子进程；读不了的那一次改问贵的），「端口上只有它一个监听者」由管理器的监督节拍问（`engine::guard`）。授权同时登记一个在途的操作（[`FlightGuard`]），
 //!   引擎管理器排空时等它们做完。
+//! - **由端点决定，不由卡决定**（Codex 预审 L2 的 H1）：一个端点是不是被管理的（[`is_governed_endpoint`]）看登记表里有没有它的规范化标识。同一个端口上不能带 key 的卡
+//!   （`idoris_upstream` 的 resident 卡、IPv4 映射写法的卡）发往它的请求照样过 [`authorize_omlx_request_without_key`]：同一套代际、封上、守卫、核验过的拨号地址、
+//!   在途登记，只是不带凭证。key 的资格（[`card_may_carry_omlx_key`]）与登记表用同一个 loopback 判据（[`is_loopback_host`]）。
+//! - **授权不是通行证**（预审 L2 的 H3）：授权之后到真的发出之间，调用方还要建请求、序列化请求体；发出前最后一刻同步地再看一眼端点
+//!   （[`Authorization::ensure_current`]），代际变了或端点封上了就拒绝。外部引擎的 `settings.json` 在最后的核对之前读好。
 //! - **端点的标识**（Codex 终审 H5）：loopback 的各种写法（`localhost`、`127.x.y.z`、`::1`）与协议不区分，同一个端口是同一个标识
 //!   （[`endpoint_identity`]）：管理器登记的是 `127.0.0.1:<port>`，卡里写成 `localhost:<port>` 的伴生卡也落在同一条登记上（继承它的
 //!   封上与失败），**不会**因为主机名的写法不同而逃出登记、落进 §2.9 的回退链。
@@ -65,7 +70,10 @@ pub enum KeySource {
     Settings,
 }
 
-/// `base_url` 的主机是否是 loopback（localhost / 127.0.0.0/8 / ::1）且协议是 http(s)、不带用户信息。
+/// `base_url` 的主机是否是 loopback（localhost / 127.0.0.0/8 / ::1，含 IPv4 映射的写法 `::ffff:127.x.y.z`）且协议是 http(s)、不带用户信息。
+/// 与端点标识（[`endpoint_identity`]）是同一个判据（[`is_loopback_host`]）：登记表把映射的写法并成同一个端口，key 的资格与「发往 loopback 才读
+/// `settings.json`」也必须这样认，否则一张映射写法的卡落在被管理的端点上，却被当成「不是 loopback、不带 key、不归登记表」（IDORIS-CORE S6，
+/// Codex 预审 L2 的 H1）。
 pub fn is_loopback_base_url(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
         return false;
@@ -73,13 +81,7 @@ pub fn is_loopback_base_url(base_url: &str) -> bool {
     matches!(url.scheme(), "http" | "https")
         && url.username().is_empty()
         && url.password().is_none()
-        && url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        })
+        && url.host_str().is_some_and(is_loopback_host)
 }
 
 /// 卡声明自己是自定义 OpenAI 兼容上游的扩展名（`setup upstream` 的卡必带）。与 `idoris-router` 的
@@ -112,13 +114,7 @@ pub fn card_may_carry_omlx_key(card: &idoris_contracts::ComponentCard) -> bool {
         && url.password().is_none()
         && url.query().is_none()
         && url.fragment().is_none()
-        && url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        })
+        && url.host_str().is_some_and(is_loopback_host)
 }
 
 static RESOLUTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -263,9 +259,12 @@ impl Governance {
 /// 按 URL 取凭证，没有一条共同的对象能把表传下去。没有登记的端点（非托管的卡）行为与以前完全一样。
 static GOVERNED: RwLock<BTreeMap<String, Governance>> = RwLock::new(BTreeMap::new());
 
-/// loopback 的主机写法：`localhost`、`127.0.0.0/8`、`::1`（含 IPv4 映射的写法）。
-fn is_loopback_host(host: &str) -> bool {
+/// loopback 的主机写法：`localhost`、`127.0.0.0/8`、`::1`（含 IPv4 映射的写法）。**唯一的判据**：端点标识、key 的资格（[`card_may_carry_omlx_key`]）、
+/// `settings.json` 只发往 loopback（[`is_loopback_base_url`]）、代理的出站统计都用它，所以同一个套接字的各种写法在每一处得到同一个答案。
+pub fn is_loopback_host(host: &str) -> bool {
+    // `localhost.`（带点的完全限定写法）是同一个名字（S8 的预审也发现了它）。
     host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("localhost.")
         || host
             .trim_matches(['[', ']'])
             .parse::<std::net::IpAddr>()
@@ -367,6 +366,13 @@ pub fn governed_endpoint(base_url: &str) -> Option<EndpointKey> {
     snapshot_of(base_url).key
 }
 
+/// 这个端点是不是引擎管理器接管的（登记过口径，封上也算）。**由端点（规范化的标识）决定，与哪张卡、卡能不能带 key 无关**（IDORIS-CORE S6，Codex 预审
+/// L2 的 H1）：同一个端口上的另一张卡（`extensions.idoris_upstream` 的 resident 卡、IPv4 映射写法的卡）不能带 key，但发往这个端口的请求照样要过
+/// 代际、封上、监听者的核对，照样发往核验过的拨号地址，照样登记在途。卡的资格（[`card_may_carry_omlx_key`]）只管凭证**带不带**。
+pub fn is_governed_endpoint(base_url: &str) -> bool {
+    snapshot_of(base_url).key.is_some()
+}
+
 /// 一个端点此刻的代际：口径每变一次加一，没登记过的端点是 0。
 pub fn endpoint_generation(base_url: &str) -> u64 {
     snapshot_of(base_url).generation
@@ -443,6 +449,9 @@ pub enum KeyRefusal {
     ListenerChanged,
     /// 发送前的重新校验读不出来（工具超时、出错）：确认不了就不发（fail closed）。
     Unverified,
+    /// 托管端点的专用 HTTP 客户端（不保留空闲连接）建不出来：不退到别的客户端（池里可能有通往旧进程的连接，调用方注入的客户端还可能有别的
+    /// 代理、重定向策略），什么都不发（Codex 预审 L2 的 M4）。
+    TransportUnavailable,
 }
 
 impl std::fmt::Display for KeyRefusal {
@@ -463,6 +472,9 @@ impl std::fmt::Display for KeyRefusal {
             ),
             Self::Unverified => f.write_str(
                 "what listens on this endpoint could not be confirmed right before sending: the request was not sent",
+            ),
+            Self::TransportUnavailable => f.write_str(
+                "the HTTP client for managed endpoints could not be built: the request was not sent",
             ),
         }
     }
@@ -558,33 +570,96 @@ impl Drop for FlightGuard {
 
 /// [`authorize_omlx_request`] 的结果：这个请求可以发了，凭证是 `key`（没有 = 不带），`generation` 是授权那一刻端点的代际，在途
 /// 登记（`_flight`）活到这个值被丢弃为止：**调用方要把它握到响应读完（流式的握到流结束）**。
-#[derive(Debug)]
 #[must_use = "hold the authorization until the response has been read"]
 pub struct Authorization {
     key: Option<OsString>,
     generation: u64,
+    /// 授权的端点（卡里写的 URL；[`Self::ensure_current`] 用它重新读登记）。
+    endpoint: String,
     /// 守卫核验过的拨号地址（托管的端点）；`None`：非托管的端点，请求照它自己的写法发。
     dial: Option<std::net::SocketAddr>,
+    /// 托管端点（有 `dial`）的专用客户端，授权的时候就取到了：取不到授权就失败（[`KeyRefusal::TransportUnavailable`]），发送端不会悄悄换成共用的
+    /// 客户端（Codex 预审 L2 的 M4）。
+    client: Option<reqwest::Client>,
     _flight: Option<FlightGuard>,
 }
 
-/// 发往托管端点的、带凭证的请求用的 HTTP 客户端：**不保留空闲连接**（[`crate::engine::fresh_connection_client`]）。进程里只建一个。
-static FRESH_CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+/// **没有 key 的 `Debug`**（Codex 预审 L2 的 L1）：派生的实现会把 bearer 原样打进诊断、断言失败的消息里。
+impl std::fmt::Debug for Authorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Authorization")
+            .field("key", &self.key.as_ref().map(|_| "[REDACTED]"))
+            .field("generation", &self.generation)
+            .field("endpoint", &"[omitted]")
+            .field("dial", &self.dial)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 发往托管端点的、带凭证的请求用的 HTTP 客户端：**不保留空闲连接**（[`crate::engine::fresh_connection_client`]）。进程里只建一个，建成了才缓存：
+/// 建失败的那一次不缓存（下一个授权再试），也不退到调用方给的客户端（Codex 预审 L2 的 M4）。
+static FRESH_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+/// 测试：让下一批授权取不到托管客户端（造「客户端建不出来」）。只在测试里用。
+#[cfg(any(test, feature = "test-support"))]
+static FRESH_CLIENT_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 测试：之后（直到再次调用 `false`）托管客户端建不出来。进程全局，所以只放在自己独占的测试二进制里用。
+#[cfg(any(test, feature = "test-support"))]
+pub fn make_the_managed_client_unbuildable(fails: bool) {
+    FRESH_CLIENT_FAILS.store(fails, Ordering::SeqCst);
+}
+
+fn fresh_client() -> Result<reqwest::Client, KeyRefusal> {
+    #[cfg(any(test, feature = "test-support"))]
+    if FRESH_CLIENT_FAILS.load(Ordering::SeqCst) {
+        return Err(KeyRefusal::TransportUnavailable);
+    }
+    if let Some(client) = FRESH_CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let built =
+        crate::engine::fresh_connection_client().map_err(|_| KeyRefusal::TransportUnavailable)?;
+    Ok(FRESH_CLIENT.get_or_init(|| built).clone())
+}
 
 impl Authorization {
     /// 没有登记的端点（非托管）、没有守卫：只是按 §2.9 的顺序取到的 key，没有在途登记。
     fn unguarded(
         key: Option<OsString>,
         generation: u64,
+        endpoint: &str,
         dial: Option<std::net::SocketAddr>,
+        client: Option<reqwest::Client>,
         flight: Option<FlightGuard>,
     ) -> Self {
         Self {
             key,
             generation,
+            endpoint: endpoint.to_owned(),
             dial,
+            client,
             _flight: flight,
         }
+    }
+
+    /// **发出前最后一刻**再核对一次（同步，不 await）：授权之后到真的发出之间，调用方还要做事（建请求、序列化请求体），端点可能已经被封上、换了代
+    /// （重启越过了一个已经通过代际核对的请求：Codex 预审 L2 的 H3）。代际不是授权那一刻的、或端点被封上了，拒绝，什么都不发。调用方在
+    /// `send()` 之前紧挨着调它。剩下的缝是从这一步到内核建立连接的几微秒，与「重新确认与发送之间」那个已知的间隙同级；而旧进程被停掉、新进程被拉起并绑上端口
+    /// 要几百毫秒，所以这几微秒里不会有一个被越过的请求拨到替代者。
+    pub fn ensure_current(&self) -> Result<(), KeyRefusal> {
+        let now = snapshot_of(&self.endpoint);
+        if now.generation != self.generation {
+            return Err(KeyRefusal::StaleGeneration {
+                admitted: self.generation,
+                current: now.generation,
+            });
+        }
+        if now.key == Some(EndpointKey::Blocked) {
+            return Err(KeyRefusal::Blocked);
+        }
+        Ok(())
     }
 
     /// 守卫核验过的拨号地址（托管的端点）。
@@ -611,13 +686,8 @@ impl Authorization {
     /// 发这个请求用的 HTTP 客户端：托管的端点一律用**不保留空闲连接**的客户端——带凭证的请求只走授权**之后**新开的连接，不会复用
     /// 更早（引擎换代之前、监听者换主人之前）留在池里的、通往旧进程的连接（Codex 专项评审 H6）。非托管的端点用调用方给的那个。
     pub fn client(&self, shared: &reqwest::Client) -> reqwest::Client {
-        if self.dial.is_none() {
-            return shared.clone();
-        }
-        FRESH_CLIENT
-            .get_or_init(|| crate::engine::fresh_connection_client().ok())
-            .clone()
-            .unwrap_or_else(|| shared.clone())
+        // 托管端点的专用客户端在授权的时候就取到了（取不到就没有授权）；这里不再有「建失败就换成共用的」那条路。
+        self.client.clone().unwrap_or_else(|| shared.clone())
     }
 
     /// UTF-8 的 key（非 UTF-8 的环境变量当作没有，同 [`resolve_omlx_api_key_checked`]）。
@@ -647,22 +717,51 @@ impl Authorization {
 /// 5. 取 key。
 ///
 /// 没有登记的端点（非托管的卡）没有守卫、没有代际，key 照 §2.9 的顺序取，行为与以前一样。
+///
+/// **key 在最后的核对之前取好**（Codex 预审 L2 的 H3）：外部引擎的 `settings.json` 是同步读文件，放在重读代际之后就是一段本来不必有的、
+/// 发出前的延迟；现在监听者的重新确认与代际的重读是授权的最后两步。
 pub async fn authorize_omlx_request(
     base_url: &str,
     admitted_generation: Option<u64>,
 ) -> Result<Authorization, KeyRefusal> {
+    authorize(base_url, admitted_generation, true).await
+}
+
+/// 同 [`authorize_omlx_request`]，但**不取任何 key**（`Authorization::key` 恒为 `None`，也不读环境变量与 `settings.json`）。给那些发往被管理的端点、
+/// 却不能带 oMLX key 的卡用（IDORIS-CORE S6，Codex 预审 L2 的 H1：同一个端口上的、`extensions.idoris_upstream` 的 resident 卡，IPv4 映射写法的卡）：
+/// 它们的请求照样要过代际、封上、监听者的重新确认，照样发往核验过的拨号地址、登记在途，只是不带凭证。
+pub async fn authorize_omlx_request_without_key(
+    base_url: &str,
+    admitted_generation: Option<u64>,
+) -> Result<Authorization, KeyRefusal> {
+    authorize(base_url, admitted_generation, false).await
+}
+
+async fn authorize(
+    base_url: &str,
+    admitted_generation: Option<u64>,
+    with_key: bool,
+) -> Result<Authorization, KeyRefusal> {
     let before = snapshot_of(base_url);
     refuse_stale_or_blocked(&before, admitted_generation)?;
+    let guarded = matches!(
+        before.key,
+        Some(EndpointKey::Private(_) | EndpointKey::External { .. })
+    );
+    // 托管端点的专用客户端先取：取不到就是本地拒绝，之前没有登记任何在途（Codex 预审 L2 的 M4）。
+    let client = if guarded { Some(fresh_client()?) } else { None };
+    // 登记口径一旦是私有或外部，key 在这里按这一次读到的口径取好；校验之后口径若变了，下面的代际重读会拒绝，key 不会被用。
+    let key = if with_key {
+        resolve_from_snapshot(base_url, before.key.as_ref())
+    } else {
+        None
+    };
     // 先登记在途、后校验：此刻开始排空的管理器要么等到这个请求，要么在下面的重读里让它被拒绝，不会两头都漏掉。排空成功的那一刻
     // 在途登记已经封上（零与封上是同一个原子操作）：之后到达的请求在这里就被拒绝，不会在进程的宽限期里挤进来（Codex 预审 L3 的 M5）。
     let flight = match before.flights.as_ref() {
         Some(flights) => Some(FlightGuard::enter(flights).ok_or(KeyRefusal::Draining)?),
         None => None,
     };
-    let guarded = matches!(
-        before.key,
-        Some(EndpointKey::Private(_) | EndpointKey::External { .. })
-    );
     let mut dial = None;
     if guarded && let Some(guard) = &before.guard {
         match guard.verify().await {
@@ -680,11 +779,14 @@ pub async fn authorize_omlx_request(
         // 守卫验证的地址，就是发送端要拨的地址。
         dial = guard.dial();
     }
-    let key = resolve_from_snapshot(base_url, before.key.as_ref());
+    // 没有守卫的托管端点（登记时没带守卫的口径，测试里有）没有核验过的拨号地址，也就不用专用客户端：照旧用调用方的。
+    let client = client.filter(|_| dial.is_some());
     Ok(Authorization::unguarded(
         key,
         before.generation,
+        base_url,
         dial,
+        client,
         flight,
     ))
 }
