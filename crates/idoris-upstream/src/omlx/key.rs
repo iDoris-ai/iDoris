@@ -223,6 +223,11 @@ pub trait EndpointGuard: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// 在途计数（[`Governance::flights`]）的最高位：这个端点的在途登记**封上**了（[`seal_endpoint_flights_if_idle`]）。封上之后不再有新的
+/// [`FlightGuard`]，已经持有的照常放掉。「在途数为零」与「封上」是同一个原子操作（对计数做一次 `compare_exchange(0, SEALED)`），所以排空的
+/// 管理器看到零的那一刻就封上，没有「看到零、还没封，一个新的请求挤进来」的间隙（IDORIS-CORE S6，Codex 预审 L3 的 M5）。
+const FLIGHTS_SEALED: usize = 1 << (usize::BITS - 1);
+
 /// 一个端点在登记表里的状态：此刻的口径（`None` = 没人管）、它的**代际**、校验守卫、在途的操作数。代际只增不减，口径（或守卫）
 /// 每变一次加一，所以「这个请求是在哪一代准入的」能和「现在是哪一代」比较。条目从不删除（撤销只是把口径清成 `None`，代际照加）：
 /// 同一个端点的代际永远不会重复。
@@ -231,7 +236,8 @@ struct Governance {
     generation: u64,
     key: Option<EndpointKey>,
     guard: Option<Arc<dyn EndpointGuard>>,
-    /// 此刻持有 [`FlightGuard`] 的操作数（[`endpoint_flights`]）。
+    /// 此刻持有 [`FlightGuard`] 的操作数（低位，[`endpoint_flights`]），加上最高位的「封上」标志（[`FLIGHTS_SEALED`]）。封上只活在
+    /// 一代之内：口径（或守卫）变了、代际前进的那一刻解开（[`Governance::advance`]）。
     flights: Arc<AtomicUsize>,
 }
 
@@ -243,6 +249,13 @@ impl Governance {
             guard: None,
             flights: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// 口径（或守卫）变了：代际前进，在途登记的封上解开。封上是给「这个引擎正在被停止」的那一代的（排空成功之后、进程确认消失之前，
+    /// 不再让新的请求进来）；下一代（封上的端点、新引擎的私有 key）有它自己的口径来决定放不放请求。
+    fn advance(&mut self) {
+        self.generation += 1;
+        self.flights.fetch_and(!FLIGHTS_SEALED, Ordering::SeqCst);
     }
 }
 
@@ -306,7 +319,7 @@ pub fn govern_endpoint_guarded(
     if slot.key.as_ref() != Some(&policy) || !same_guard {
         slot.key = Some(policy);
         slot.guard = guard;
-        slot.generation += 1;
+        slot.advance();
     }
     true
 }
@@ -328,7 +341,7 @@ pub fn release_endpoint(base_url: &str) {
             && (slot.key.take().is_some() || slot.guard.take().is_some())
         {
             slot.guard = None;
-            slot.generation += 1;
+            slot.advance();
         }
     }
 }
@@ -359,19 +372,37 @@ pub fn endpoint_generation(base_url: &str) -> u64 {
     snapshot_of(base_url).generation
 }
 
-/// 此刻有几个操作持有这个端点的 [`FlightGuard`]：引擎管理器排空时等它归零（IDORIS-CORE S6，Codex 终审 M1）。
+/// 此刻有几个操作持有这个端点的 [`FlightGuard`]：引擎管理器排空时等它归零（IDORIS-CORE S6，Codex 终审 M1）。不含「封上」标志。
 pub fn endpoint_flights(base_url: &str) -> usize {
-    snapshot_of(base_url)
-        .flights
-        .map_or(0, |flights| flights.load(Ordering::SeqCst))
+    snapshot_of(base_url).flights.map_or(0, |flights| {
+        flights.load(Ordering::SeqCst) & !FLIGHTS_SEALED
+    })
 }
 
-/// 一次读里的口径、代际、守卫与在途计数（彼此一致）。
+/// **在途数为零就封上**这个端点的在途登记，一个原子操作：返回 `true` = 此刻一个在途的操作也没有，并且从这一刻起不再有新的
+/// （之后的每个请求都被 [`authorize_omlx_request`] 以 [`KeyRefusal::Draining`] 拒绝，一个字节也不发给引擎）；`false` = 还有在途的
+/// （什么也没改，调用方接着等）。
+///
+/// 引擎管理器排空用它代替「读在途数、看见零」（IDORIS-CORE S6，Codex 预审 L3 的 M5）：分开读与封，中间一个早先抓到这张托管卡的请求
+/// （比如公共模型列表逐卡走到了它）会挤进来，在进程还在宽限期里监听时登记新的在途，并被随后的 SIGTERM 打断。封上只活在这一代之内：
+/// 口径（或守卫）变了、代际前进（进程确认消失之后端点封上，新引擎登记它的私有 key）的时候解开。没有登记的端点没有在途登记可封：`true`。
+pub fn seal_endpoint_flights_if_idle(base_url: &str) -> bool {
+    snapshot_of(base_url).flights.is_none_or(|flights| {
+        flights
+            .compare_exchange(0, FLIGHTS_SEALED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            // 已经封上了（前一轮的排空，同一代之内）而且一个在途的也没有：同样是「空的、封着的」。
+            || flights.load(Ordering::SeqCst) == FLIGHTS_SEALED
+    })
+}
+
+/// 一次读里的口径、代际、守卫与在途计数（彼此一致；`sealed` 是读那一刻在途登记有没有封上）。
 struct Snapshot {
     key: Option<EndpointKey>,
     generation: u64,
     guard: Option<Arc<dyn EndpointGuard>>,
     flights: Option<Arc<AtomicUsize>>,
+    sealed: bool,
 }
 
 fn snapshot_of(base_url: &str) -> Snapshot {
@@ -380,6 +411,7 @@ fn snapshot_of(base_url: &str) -> Snapshot {
         generation: 0,
         guard: None,
         flights: None,
+        sealed: false,
     };
     let Some(identity) = endpoint_identity(base_url) else {
         return empty;
@@ -392,6 +424,7 @@ fn snapshot_of(base_url: &str) -> Snapshot {
             key: slot.key.clone(),
             generation: slot.generation,
             guard: slot.guard.clone(),
+            sealed: slot.flights.load(Ordering::SeqCst) & FLIGHTS_SEALED != 0,
             flights: Some(slot.flights.clone()),
         })
 }
@@ -403,6 +436,9 @@ pub enum KeyRefusal {
     StaleGeneration { admitted: u64, current: u64 },
     /// 端点被封上了（[`EndpointKey::Blocked`]）：没有一个通过校验的引擎在它后面，什么都不发。
     Blocked,
+    /// 排空已经完成、这个引擎正要被停止（[`seal_endpoint_flights_if_idle`]）：不再接收新的操作，什么都不发（IDORIS-CORE S6，
+    /// Codex 预审 L3 的 M5）。进程确认消失之后端点会封上（[`Self::Blocked`]），新引擎登记之后才再放请求进来。
+    Draining,
     /// 发送前的重新校验说：此刻监听这个端口的已经不是登记时认的那个监听者了（Codex 终审 H1）。
     ListenerChanged,
     /// 发送前的重新校验读不出来（工具超时、出错）：确认不了就不发（fail closed）。
@@ -418,6 +454,9 @@ impl std::fmt::Display for KeyRefusal {
             ),
             Self::Blocked => f.write_str(
                 "no verified engine is behind this endpoint right now (it is blocked): the request was not sent",
+            ),
+            Self::Draining => f.write_str(
+                "the engine behind this endpoint is being stopped (its in-flight work has drained and no new work is admitted): the request was not sent",
             ),
             Self::ListenerChanged => f.write_str(
                 "what listens on this endpoint is no longer the engine it was verified for: the request was not sent",
@@ -455,6 +494,9 @@ fn refuse_stale_or_blocked(
     }
     if snapshot.key == Some(EndpointKey::Blocked) {
         return Err(KeyRefusal::Blocked);
+    }
+    if snapshot.sealed {
+        return Err(KeyRefusal::Draining);
     }
     Ok(())
 }
@@ -494,11 +536,17 @@ pub struct FlightGuard {
 }
 
 impl FlightGuard {
-    fn enter(flights: &Arc<AtomicUsize>) -> Self {
-        flights.fetch_add(1, Ordering::SeqCst);
-        Self {
-            flights: flights.clone(),
-        }
+    /// 登记一个在途的操作；在途登记已经封上了（[`seal_endpoint_flights_if_idle`]）就不登记，`None`。登记与「有没有封上」是同一个原子
+    /// 更新，不会在封上之后还让一个请求挤进去。
+    fn enter(flights: &Arc<AtomicUsize>) -> Option<Self> {
+        flights
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                (value & FLIGHTS_SEALED == 0).then_some(value + 1)
+            })
+            .ok()
+            .map(|_| Self {
+                flights: flights.clone(),
+            })
     }
 }
 
@@ -605,8 +653,12 @@ pub async fn authorize_omlx_request(
 ) -> Result<Authorization, KeyRefusal> {
     let before = snapshot_of(base_url);
     refuse_stale_or_blocked(&before, admitted_generation)?;
-    // 先登记在途、后校验：此刻开始排空的管理器要么等到这个请求，要么在下面的重读里让它被拒绝，不会两头都漏掉。
-    let flight = before.flights.as_ref().map(FlightGuard::enter);
+    // 先登记在途、后校验：此刻开始排空的管理器要么等到这个请求，要么在下面的重读里让它被拒绝，不会两头都漏掉。排空成功的那一刻
+    // 在途登记已经封上（零与封上是同一个原子操作）：之后到达的请求在这里就被拒绝，不会在进程的宽限期里挤进来（Codex 预审 L3 的 M5）。
+    let flight = match before.flights.as_ref() {
+        Some(flights) => Some(FlightGuard::enter(flights).ok_or(KeyRefusal::Draining)?),
+        None => None,
+    };
     let guarded = matches!(
         before.key,
         Some(EndpointKey::Private(_) | EndpointKey::External { .. })

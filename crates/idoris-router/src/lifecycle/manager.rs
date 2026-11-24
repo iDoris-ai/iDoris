@@ -344,6 +344,13 @@ impl Status {
     }
 }
 
+/// iDoris 停止的指令（与 [`Command::Shutdown`] 同样的两个参数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ShutdownOrder {
+    pub stop_engine: bool,
+    pub deadline: Option<Instant>,
+}
+
 /// 各实例任务共用的东西。
 pub(super) struct Shared {
     pub config: ManagerConfig,
@@ -366,6 +373,11 @@ pub(super) struct Shared {
     started: Instant,
     changed: watch::Sender<u64>,
     failure: watch::Sender<Option<EngineFailure>>,
+    /// iDoris 在停（[`EngineManager::shutdown_by`] 在送 `Shutdown` 命令**之前**先写）：实例任务忙在退役（排空、停进程、复位）里不去收命令时，
+    /// 靠它知道要立刻收尾，不必等邮箱里排队的 `Shutdown`（IDORIS-CORE S6，Codex 预审 H3）。只记第一个。
+    pub shutdown: watch::Sender<Option<ShutdownOrder>>,
+    /// 盖章与入队同属一把锁（[`EngineManager::command`]）：序号的先后就是邮箱里的先后。
+    stamp: Mutex<()>,
     /// 完整的 Router 创建之后挂上来的 Supervisor 表：门控完成之后，Supervisor 的启动错误粘滞要反映到 `/health`。
     pub runtimes: OnceLock<RuntimeRegistry>,
 }
@@ -501,6 +513,8 @@ impl EngineManager {
             started: Instant::now(),
             changed,
             failure,
+            shutdown: watch::channel(None).0,
+            stamp: Mutex::new(()),
             runtimes: OnceLock::new(),
         });
         if !plans.is_empty() {
@@ -710,24 +724,30 @@ impl EngineManager {
     async fn command(&self, id: &str, command: Command) -> Result<CommandAck, CommandError> {
         let sender = self.senders.get(id).ok_or(CommandError::NotFound)?;
         let (reply, answer) = oneshot::channel();
-        // 入队时盖章（先盖章、后入队）：序号不大于某次操作完成时的 `seq_now` 的 `restart`，都是在那次操作进行期间（或之前）到达的，
-        // 它们并进那次操作的结果，不再换第二次引擎（见 `Actor::restart_cover`）。
-        let seq = self.shared.next_seq(id);
         // 一个绝对的截止时间管入队、等回答两头（`Timings::command_timeout`，IDORIS-CORE S6，Codex 终审 M5）；同一个截止时间连同「有没有被
         // 受理」的决定（[`Expiry`]）也交给命令：实例任务在第一个副作用之前认领它，调用方到点放弃它，两边抢同一个决定（Codex 预审 L4 的
         // M3）。没被认领就过了期的命令不执行；已经认领的命令不会被说成「没有受理」。
         let deadline = Instant::now() + self.shared.config.timings.command_timeout;
         let expiry = Expiry::new(deadline);
         let call = async {
-            sender
-                .send(Request {
+            // 先占邮箱的位子（可能要等：邮箱满了），**占到之后**才盖章并入队，两步在同一把锁里（Codex 复审 M4）：序号的先后就是命令在邮箱里的先后。
+            // 先盖章、后入队时，一个盖了章的命令可以在入队之前被抢占，排在更晚盖章的 `stop` 后面，`stop` 的截断就盖不住它。序号不大于某次
+            // 操作完成时的 `seq_now` 的 `restart`，都是在那次操作进行期间（或之前）入队的，它们并进那次操作的结果（见 `Actor::restart_cover`）。
+            let permit = sender.reserve().await.map_err(|_| CommandError::Closed)?;
+            {
+                let _order = self
+                    .shared
+                    .stamp
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let seq = self.shared.next_seq(id);
+                permit.send(Request {
                     command,
                     reply: Some(reply),
                     seq,
                     deadline: Some(expiry.clone()),
-                })
-                .await
-                .map_err(|_| CommandError::Closed)?;
+                });
+            }
             answer.await.map_err(|_| CommandError::Closed)?
         };
         match tokio::time::timeout_at(deadline, call).await {
@@ -824,6 +844,18 @@ impl EngineManager {
     /// 期限里剩下的（[`super::backoff::stop_windows`]：不到 2 秒就 SIGTERM 之后立刻 SIGKILL），等各实例的上限也跟着缩到期限
     /// 之后一点余量。`None` 与 [`Self::shutdown`] 相同。
     pub async fn shutdown_by(&self, stop_engines: bool, deadline: Option<tokio::time::Instant>) {
+        // 先公告、后送命令（Codex 预审 H3）：实例任务可能正忙在一次要等 30 秒的排空里，邮箱里排在后面的 `Shutdown` 它看不到；公告让它的每一个
+        // 长等待立刻放手，改走收尾。
+        self.shared.shutdown.send_if_modified(|order| {
+            let first = order.is_none();
+            if first {
+                *order = Some(ShutdownOrder {
+                    stop_engine: stop_engines,
+                    deadline,
+                });
+            }
+            first
+        });
         // 整个收尾（送达加等各实例答复）只有这**一个**结束时刻：实例自己在期限里收尾（宽限加确认窗口），这是外面的兜底。
         let end = tokio::time::Instant::now()
             + match deadline {
@@ -1122,6 +1154,8 @@ mod tests {
             started: Instant::now(),
             changed: watch::channel(0_u64).0,
             failure: watch::channel(None).0,
+            shutdown: watch::channel(None).0,
+            stamp: Mutex::new(()),
             runtimes: OnceLock::new(),
         })
     }

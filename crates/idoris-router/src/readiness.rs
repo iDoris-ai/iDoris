@@ -240,6 +240,24 @@ fn gated_phase(upstreams: &[UpstreamStatus]) -> Phase {
 /// 门控已开（或没有门控）而仍有上游没有第一次观测时 `phase` 可以是 `starting`，这时数据面已经在服务（只有门控未开时才 503
 /// `idoris_starting`，规范 §2.11.1）。取值集合不变：`starting`、`ready`、`degraded`。
 pub fn phase_of(upstreams: &[UpstreamStatus]) -> Phase {
+    // 有托管上游时 `phase` 只反映托管上游（与 Agent24 商定的契约，IDORIS-CORE S6，Codex 预审 M1）：别的上游（resident、云）是否就绪、是否还没
+    // 第一次观测，既不能在托管引擎重启时把 `phase` 撑成 `ready`，也不能在托管引擎就绪时把它拉回 `starting`。次序：终态（`degraded`，哪怕另一个
+    // 托管上游还在启动：Agent24 据此做有界等待）> 启动或重启中（`starting`）> 全部就绪（`ready`）。
+    if upstreams.iter().any(|upstream| upstream.managed) {
+        let managed = || upstreams.iter().filter(|upstream| upstream.managed);
+        return if managed().any(|upstream| is_terminal(upstream.state)) {
+            Phase::Degraded
+        } else if managed().any(|upstream| {
+            matches!(
+                upstream.state,
+                UpstreamState::Starting | UpstreamState::Restarting
+            )
+        }) {
+            Phase::Starting
+        } else {
+            Phase::Ready
+        };
+    }
     if upstreams
         .iter()
         .any(|upstream| upstream.managed && is_terminal(upstream.state))
@@ -817,6 +835,55 @@ mod tests {
         }
     }
 
+    /// Codex 预审 M1：有托管上游时 `phase` 只反映托管上游。
+    #[test]
+    fn phase_reflects_only_the_managed_upstreams_when_there_are_any() {
+        use UpstreamState::*;
+        // 托管引擎在重启：别的上游就绪不能让 `phase` 成为 `ready`（修复前：Ready）。
+        assert_eq!(
+            phase_of(&[
+                status("cloud", Ready, None),
+                managed_status("omlx", Restarting)
+            ]),
+            Phase::Starting
+        );
+        // 托管引擎在启动：同上。
+        assert_eq!(
+            phase_of(&[
+                status("cloud", Ready, None),
+                managed_status("omlx", Starting)
+            ]),
+            Phase::Starting
+        );
+        // 托管引擎就绪：别的上游还没第一次观测也不拉回 `starting`（修复前：Starting）。
+        assert_eq!(
+            phase_of(&[
+                status("cloud", Starting, None),
+                managed_status("omlx", Ready)
+            ]),
+            Phase::Ready
+        );
+        // 托管的失败与另一个托管上游的启动并存：保持 `degraded`（Agent24 据此有界等待）。
+        assert_eq!(
+            phase_of(&[managed_status("a", Failed), managed_status("b", Starting)]),
+            Phase::Degraded
+        );
+        assert_eq!(
+            phase_of(&[managed_status("a", Failed), managed_status("b", Restarting)]),
+            Phase::Degraded
+        );
+        // 全部托管都在重启：不是 `degraded`（那是终态），是 `starting`。
+        assert_eq!(
+            phase_of(&[managed_status("a", Restarting)]),
+            Phase::Starting
+        );
+        // 没有托管上游：与 v0.5.0 一致。
+        assert_eq!(
+            phase_of(&[status("a", Ready, None), status("b", Starting, None)]),
+            Phase::Starting
+        );
+    }
+
     #[test]
     fn phase_is_starting_while_any_upstream_has_no_first_observation_then_ready_or_degraded() {
         use UpstreamState::*;
@@ -1111,14 +1178,19 @@ mod tests {
             ]),
             Phase::Degraded
         );
-        // 反过来：托管上游没有终局失败（就绪，或还在往前走）时，没有第一次观测的上游仍让 `phase` 停在 `starting`。
-        for state in [Ready, Starting, Restarting] {
+        // 反过来：托管上游没有终局失败时，`phase` 只看托管上游（Codex 预审 M1）：就绪就是 `ready`（别的上游还没有第一次观测不拉回
+        // `starting`），启动或重启中就是 `starting`。
+        for (state, phase) in [
+            (Ready, Phase::Ready),
+            (Starting, Phase::Starting),
+            (Restarting, Phase::Starting),
+        ] {
             assert_eq!(
                 phase_of(&[
                     managed_status("omlx", state),
                     status("lmstudio", Starting, None)
                 ]),
-                Phase::Starting,
+                phase,
                 "{state:?}"
             );
         }
@@ -1136,7 +1208,7 @@ mod tests {
         plain.apply("lmstudio", Observation::Ready);
         assert_eq!(plain.view().phase, Phase::Ready);
 
-        // 有托管卡，门控已开，托管引擎就绪，别的上游刚起探测器：`starting`，一次观测之后 `ready`。
+        // 有托管卡，门控已开，托管引擎就绪，别的上游刚起探测器：`phase` 只看托管上游，已经是 `ready`（Codex 预审 M1）。
         let managed = HealthState::with_upstreams(
             0,
             vec![
@@ -1146,7 +1218,7 @@ mod tests {
         );
         managed.set_gate(GateState::Open);
         let view = managed.view();
-        assert_eq!((view.phase, view.ready), (Phase::Starting, false));
+        assert_eq!((view.phase, view.ready), (Phase::Ready, true));
         managed.apply("lmstudio", Observation::Ready);
         let view = managed.view();
         assert_eq!((view.phase, view.ready), (Phase::Ready, true));
