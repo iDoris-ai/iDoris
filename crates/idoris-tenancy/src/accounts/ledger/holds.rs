@@ -573,11 +573,20 @@ fn blank_outcome(unit: &Unit, result: SettleResult, charged: i64, late: bool) ->
 /// 1. **宽限里平台承担的部分** `G`（只有宽限放行的预留有）：预留之内、超出放行时下限（账户自己的可用额度加授信）
 ///    的部分 `max(min(A, R) - 下限, 0)`。这是平台批准的一次例外，**不记到付款账户链上**（不扣用户和担保人的余额，
 ///    后续充值也不会先去填它），只在平台损失账户记一条 `grace_absorbed`。迟到的结算同样先分出 `G`。
-/// 2. **记到链上的** `A - G`：沿所有祖先各记一条已花（结算 / 迟到结算）。
+/// 2. **记到链上的** `A - G`：沿所有祖先各记已花。预留还活着时拆成两块：预留之内的部分 `A - G - overage` 记在预留创建的时刻上
+///    （`settle`，冲掉在途），超出预留的部分 overage 是结算这一刻才发生的新花费，单独记一条 `late_settle`，归属时刻是结算的
+///    这一刻、提交序号是这次结算自己的（和下面算担保人能吸收多少读的是同一刻的额度；见 `project.rs` 的「花费」）。预留已经过期
+///    的迟到结算整笔 `A - G` 都是 overage，记一条 `late_settle`。`late_settle` 这个种类名沿用 0001 的 CHECK，意思是「结算那一刻
+///    才发生的花费」，不一定是迟到的结算。
 /// 3. **overage**：预留还活着时是 `max(A - R, 0)`；预留已经过期（额度早已放回去）时，扣掉 `G` 之后的整笔
 ///    `A - G` 都在预留之外。链上「剩余额度加授信」还能吸收的由担保人承担（S0 的 [`split_overage`]），超出的记入
 ///    平台损失账户，告警，并冻结这张凭证。能吸收多少是事务里现读的整条链在「钱」这个维度上的余量（见 [`credit_headroom`]）。
 /// 4. 其余是**用户承担**：`user_borne = (A - G) - overage`。
+///
+/// **写读写的顺序**（Codex 复审 7c5a03fe High 2）：没迟到的结算先把预留之内的部分 `user_borne` 记账（`settle`：冲掉在途 `R`），**再**读整条链
+/// 的余量来分担 overage，最后才记 overage（`late_settle`）。预留还占着的时候，宽限里平台承担的那一块 `G` 也在在途里占着付款账户的余额 /
+/// 额度 / 授信，可结算之后它不会记到链上：先读余量就把担保人能吸收的算小了，TTL 之内充进来的钱本该吸收的 overage 变成平台损失、冻结凭证。
+/// 迟到的结算没有「预留之内」的部分（预留早已过期放回去），整笔都是 overage，读完余量再记。
 ///
 /// **不依赖扫描顺序**：读余量之前，在同一个事务里把整个账本里所有到期的预留都过期（和准入一样），所以别的到期预留
 /// 有没有被人扫过、谁先结算，都不会改变这一笔的余量。
@@ -688,7 +697,7 @@ pub(super) fn settle_hold_in(
         return Ok(blank_outcome(&hold.unit, SettleResult::Released, 0, false));
     }
 
-    // ---- 结算：先读（预留还占着或已放回去，正是 overage 要面对的状态），再写 ----
+    // ---- 结算：先记预留之内的部分，再读余量，最后才分担、记 overage ----
     let unit = hold.unit.clone();
     // 宽限里平台承担的部分：预留之内、超出放行时下限的那一块。先分出来，再对剩下的算 overage，所以同一块缺口不会算两遍。
     let within_reservation = charged.min(hold.reserved);
@@ -698,38 +707,21 @@ pub(super) fn settle_hold_in(
     };
     // 记到付款账户链上的金额：平台承担的宽限不进用户和担保人的账。
     let chain_charge = sub(charged, grace_absorbed)?;
-    let views = project_chain(conn, &chain, now_ms, config)?;
-    let headroom = credit_headroom(&views)?;
     let overage = if late {
         chain_charge
     } else {
         sub(charged, hold.reserved)?.max(0)
     };
-    // 整条链在「钱」这个维度上一点限制都没有（付款账户就是平台根）：没有谁需要承担，也没有损失。
-    let absorbable = headroom.map_or(overage, |room| room.max(0));
-    let split = split_overage(
-        &Price::from_micros(unit.clone(), overage)?,
-        &Price::from_micros(unit.clone(), absorbable)?,
-    )?;
-    let sponsor = split.sponsor.micros();
-    let loss = split.platform_loss.micros();
     // 用户承担：记到链上的部分里，不是 overage 的那一份（迟到的结算整笔都是 overage，所以是 0）。
     let user_borne = sub(chain_charge, overage)?;
 
-    if late {
-        post_chain(
-            conn,
-            &chain,
-            &hold,
-            &ChainPosting {
-                kind: "late_settle",
-                held: 0,
-                spent: chain_charge,
-                window_at_ms: now_ms,
-                at_ms: now_ms,
-            },
-        )?;
-    } else {
+    // 预留还活着：**先**把预留之内的部分记账（冲掉在途 `R`，已花 `user_borne` 照旧记在预留创建的时刻上，沿用预留自己的提交序号），
+    // **再**读整条链的余量。顺序要紧（Codex 复审 7c5a03fe High 2，main 上就有）：预留还占着的时候，宽限里平台承担的那一块 `G` 也在
+    // 在途里占着付款账户的余额 / 额度 / 授信，可结算之后它不会记到链上。先读余量，`G` 还占着，担保人能吸收的被算小了：
+    // 余额 20、宽限预留 210（下限 20，平台承担 190），TTL 之内充值 90，按 300 结算：超出 90 本该由刚充的 90 吸收，先读余量时余额
+    // 110 - 在途 210 = -100，能吸收 0，超出的 90 全成了平台损失，凭证被冻结。先记预留之内的 20，余额 110 - 20 = 90，正好吸收。
+    // 迟到的结算：预留早已过期放回去，没有「预留之内」的部分，整笔都是 overage，下面照旧先读余量再记。
+    if !late {
         let release = hold.reserved.checked_neg().ok_or(LedgerError::Overflow)?;
         post_chain(
             conn,
@@ -738,8 +730,43 @@ pub(super) fn settle_hold_in(
             &ChainPosting {
                 kind: "settle",
                 held: release,
-                spent: chain_charge,
+                spent: user_borne,
                 window_at_ms: hold.created_at,
+                at_ms: now_ms,
+            },
+        )?;
+    }
+
+    // 担保人能吸收多少：整条链在「钱」这个维度上的余量（读的是结算这一刻生效、此刻已经存在的额度）。没有 overage 用不着读。
+    // 整条链在「钱」这个维度上一点限制都没有（付款账户就是平台根）：没有谁需要承担，也没有损失。
+    let (sponsor, loss) = if overage > 0 {
+        let views = project_chain(conn, &chain, now_ms, config)?;
+        let headroom = credit_headroom(&views)?;
+        let absorbable = headroom.map_or(overage, |room| room.max(0));
+        let split = split_overage(
+            &Price::from_micros(unit.clone(), overage)?,
+            &Price::from_micros(unit.clone(), absorbable)?,
+        )?;
+        (split.sponsor.micros(), split.platform_loss.micros())
+    } else {
+        (0, 0)
+    };
+
+    // 超出预留的部分是结算这一刻才发生的新花费，不是预留的一部分：单独记一条 `late_settle`，归属时刻是结算的这一刻，
+    // 提交序号是这次结算自己的（迟到的结算整笔 `chain_charge` 都是这一种）。上面算「担保人能吸收多少」读的是结算这一刻生效、
+    // 此刻已经存在的额度，所以这块花费要用的也是这些额度；记回预留创建的时刻（旧写法），它就够不着在预留之后才开始或才发出的额度，
+    // 吸收的时候算过一次的额度会被之后的请求再花一次。迟到的结算**总是**记这一条，哪怕记到链上的金额是 0（宽限里平台承担了整笔）：
+    // v0.5.0 / main 就是这样，审计看分录靠它，重排结算顺序不能让它悄悄消失。
+    if late || overage > 0 {
+        post_chain(
+            conn,
+            &chain,
+            &hold,
+            &ChainPosting {
+                kind: "late_settle",
+                held: 0,
+                spent: overage,
+                window_at_ms: now_ms,
                 at_ms: now_ms,
             },
         )?;

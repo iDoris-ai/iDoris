@@ -103,7 +103,7 @@ fn the_two_stores_share_one_database_without_touching_each_others_schema() {
         assert_eq!(versions(db.path(), "account_schema_migrations"), [1, 2]);
         assert_eq!(
             versions(db.path(), "ledger_schema_migrations"),
-            [1, 2, 3, 4]
+            [1, 2, 3, 4, 5]
         );
         assert_eq!(
             versions(db.path(), "compute_attempt_schema_migrations"),
@@ -119,7 +119,7 @@ fn the_two_stores_share_one_database_without_touching_each_others_schema() {
         assert_eq!(versions(db.path(), "account_schema_migrations"), [1, 2]);
         assert_eq!(
             versions(db.path(), "ledger_schema_migrations"),
-            [1, 2, 3, 4]
+            [1, 2, 3, 4, 5]
         );
         assert_eq!(
             versions(db.path(), "compute_attempt_schema_migrations"),
