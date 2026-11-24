@@ -17,6 +17,9 @@
 mod child_guard;
 #[path = "support/fake_omlx.rs"]
 mod fake_omlx;
+// 托管卡的端口是事先挑好、过一会儿才由引擎去绑的：不能用 `bind(0)` 取号再放掉（见 `support/ports.rs`）。
+#[path = "support/ports.rs"]
+mod ports;
 
 use std::{
     fs,
@@ -35,6 +38,7 @@ use std::{
 
 use child_guard::{ChildGuard, IsolateState};
 use fake_omlx::{Behavior, FakeOmlx, OnSigterm, spawn_retrying};
+use ports::free_port;
 use serde_json::{Value, json};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -47,14 +51,6 @@ const FILE_NAME: &str = "idoris.json";
 const PATIENT: Duration = Duration::from_secs(60);
 /// oMLX 配方的启动超时是 90 秒；这里的测试都在它之内有结论。
 const GIB: u64 = 1 << 30;
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn lsof_available() -> bool {
     Path::new("/usr/sbin/lsof").is_file() || Path::new("/usr/bin/lsof").is_file()
@@ -219,7 +215,7 @@ struct Env {
     work: tempfile::TempDir,
     run_dir: PathBuf,
     _run: tempfile::TempDir,
-    /// 托管卡的端口（一个刚释放的本机端口）。
+    /// 托管卡的端口：`free_port()` 在内核临时端口范围之外事先挑好的一个（iDoris 自己的 `IDORIS_PORT=0` 监听器拿不到它）。
     port: u16,
     reaper: EngineReaper,
     /// 额外的环境变量（预算等）。
@@ -1817,15 +1813,9 @@ async fn a_sigterm_that_arrives_while_idoris_is_still_starting_up_is_handled_bef
     );
 }
 
-/// 两个不同的空闲端口（数据面与 Admin 的）。
+/// 两个不同的空闲端口（数据面与 Admin 的）：[`free_port`] 在本进程里从不发出重复的号码。
 fn two_free_ports() -> (u16, u16) {
-    let first = free_port();
-    loop {
-        let second = free_port();
-        if second != first {
-            return (first, second);
-        }
-    }
+    (free_port(), free_port())
 }
 
 /// 一个进程此刻打开的文件的名字（`lsof -Fn`：每行 `n<路径>`）。
