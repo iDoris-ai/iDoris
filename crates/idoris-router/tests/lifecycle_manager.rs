@@ -112,6 +112,8 @@ struct Scripted {
     identity_unreadable: std::sync::atomic::AtomicBool,
     /// 第一次签名团队检查（外部监听者的属主校验）做完之后，把这个端口上的监听者换成这个 pid（没有团队：不合格）：造「校验期间端口换了主人」。
     flip_after_first_team_check: Mutex<Option<(u16, u32)>>,
+    /// 读命令行（封印的第一步）之前先睡这么久：造「封印正在进行」。
+    seal_delay: Mutex<Duration>,
 }
 
 impl Scripted {
@@ -127,6 +129,7 @@ impl Scripted {
             slow: Mutex::new(Duration::ZERO),
             identity_unreadable: std::sync::atomic::AtomicBool::new(false),
             flip_after_first_team_check: Mutex::new(None),
+            seal_delay: Mutex::new(Duration::ZERO),
         })
     }
 
@@ -190,6 +193,10 @@ impl ProcessInspector for Scripted {
         self.real.generation(pid).await
     }
     async fn command(&self, pid: u32) -> Result<String, InspectError> {
+        let delay = *self.seal_delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         self.real.command(pid).await
     }
     async fn process_group(&self, pid: u32) -> Result<u32, InspectError> {
@@ -4439,4 +4446,102 @@ async fn the_key_of_an_initial_external_adoption_is_not_sent_to_a_listener_that_
     );
     assert_ne!(h.view().state, UpstreamState::Ready);
     h.manager.shutdown(true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Codex 复审六：封印与停止指令
+// ---------------------------------------------------------------------------------------------
+
+/// 复审五 M 的回归（此前没有）：封印正在进行（读命令行睡 6 秒）时 iDoris 要**停**引擎、期限 3 秒。封印不放手的话实例任务卡在里面，管理器按期限中止它，
+/// `stop_on_exit:"never"` 的子进程成了孤儿。
+#[tokio::test]
+async fn a_shutdown_that_must_stop_the_engine_interrupts_a_pending_seal() {
+    let rig = Rig::new(&Behavior::default());
+    let inspector = Scripted::claiming(rig.port);
+    *inspector.seal_delay.lock().unwrap() = Duration::from_secs(6);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector,
+        fast(),
+        StopOnExit::Never,
+    );
+    wait_for("the engine to be ready and the seal to be pending", || {
+        rig.fake.launches() >= 1 && rig.fake.requests().iter().any(|(_, auth)| auth == "ok")
+    })
+    .await;
+    let pid = rig.pid(0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_ne!(
+        h.view().state,
+        UpstreamState::Ready,
+        "the seal is still pending"
+    );
+
+    let begun = Instant::now();
+    h.manager
+        .shutdown_by(
+            true,
+            Some(tokio::time::Instant::now() + Duration::from_secs(3)),
+        )
+        .await;
+    wait_for("the engine to die", || !pid_alive(pid)).await;
+    assert!(
+        begun.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        begun.elapsed()
+    );
+    assert_eq!(rig.records(), 0);
+}
+
+/// 复审六 M：`stop_on_exit:"never"` 的正常退出（引擎要留）到来时封印还在进行。此前封印被取消，留下一条没封印的记录，下一个 iDoris 把它当作「启动途中被杀」
+/// 停掉重拉，暖着的引擎丢了。现在封印做完（在期限里），记录是封印的，下一个 iDoris 认回同一个引擎。
+#[tokio::test]
+async fn a_clean_never_shutdown_lets_a_pending_seal_finish_so_the_next_idoris_adopts_the_engine() {
+    let rig = Rig::new(&Behavior::default());
+    let inspector = Scripted::claiming(rig.port);
+    *inspector.seal_delay.lock().unwrap() = Duration::from_millis(1500);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        fast(),
+        StopOnExit::Never,
+    );
+    wait_for("the engine to be ready and the seal to be pending", || {
+        rig.fake.launches() >= 1 && rig.fake.requests().iter().any(|(_, auth)| auth == "ok")
+    })
+    .await;
+    let pid = rig.pid(0);
+    assert_ne!(
+        h.view().state,
+        UpstreamState::Ready,
+        "the seal is still pending"
+    );
+    h.manager
+        .shutdown_by(
+            false,
+            Some(tokio::time::Instant::now() + Duration::from_secs(8)),
+        )
+        .await;
+    assert!(pid_alive(pid), "never + clean exit: the engine is kept");
+
+    // 下一个 iDoris：认回同一个引擎，不是「没有封印」停掉重拉。
+    *inspector.seal_delay.lock().unwrap() = Duration::ZERO;
+    let next = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector,
+        fast(),
+        StopOnExit::Owned,
+    );
+    next.until_state(UpstreamState::Ready).await;
+    assert!(!next.logged("没有封印"), "the record was sealed");
+    assert_eq!(
+        rig.fake.launches(),
+        1,
+        "the warm engine was adopted, not replaced"
+    );
+    assert!(pid_alive(pid));
+    next.manager.shutdown(true).await;
 }

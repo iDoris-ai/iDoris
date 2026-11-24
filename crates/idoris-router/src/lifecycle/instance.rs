@@ -893,6 +893,27 @@ impl Actor {
         }
     }
 
+    /// 封印该被放弃的那一刻：停止指令到了而且要停引擎（非零退出、被要求停止）就是现在；要留引擎（`stop_on_exit:"never"` 的正常退出）就等到停止期限
+    /// （没有期限就等一个停止宽限）。没有停止指令就永远不到。
+    async fn seal_cancel_point(&self) {
+        let mut order = self.shared.shutdown.subscribe();
+        let ordered = loop {
+            if let Some(ordered) = *order.borrow_and_update() {
+                break ordered;
+            }
+            if order.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        if ordered.stop_engine {
+            return;
+        }
+        match ordered.deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => tokio::time::sleep(self.timings().stop_grace).await,
+        }
+    }
+
     /// 暂存的命令是 `stop` 或 `restart` 吗。
     fn pending_is_stop_or_restart(&self) -> bool {
         matches!(
@@ -1821,13 +1842,20 @@ impl Actor {
 
     /// 引擎就绪之后：封印所有权记录（读它此刻的命令行、确认监听端口的就是这个 pid），登记私有 key。
     async fn finish_owned(&mut self, mut owned: Owned) -> Attempt {
-        // 封印要再问一次 `lsof`，也会占着停止的预算：iDoris 在停时放手，引擎放回手里按停止指令收尾（Codex 复审五 M）。
-        let sealed = match self.unless_shutdown(owned.engine.seal()).await {
-            Some(sealed) => sealed,
-            None => {
-                self.engine = Some(owned);
-                return Attempt::Interrupted;
+        // 封印要再问一次 `lsof`，也会占着停止的预算：iDoris 要**停**这个引擎时放手，引擎放回手里按停止指令收尾（Codex 复审五 M）。要**留**它
+        // （`stop_on_exit:"never"` 的正常退出）时让封印做完，至多到停止期限：取消封印会留下一条没封印的记录，下一个 iDoris 把它当作「启动途中被杀」停掉重拉，
+        // 暖着的引擎白白丢了（Codex 复审六 M）。
+        let sealed = {
+            let seal = owned.engine.seal();
+            tokio::select! {
+                biased;
+                sealed = seal => Some(sealed),
+                () = self.seal_cancel_point() => None,
             }
+        };
+        let Some(sealed) = sealed else {
+            self.engine = Some(owned);
+            return Attempt::Interrupted;
         };
         match sealed {
             Ok(()) => {}
