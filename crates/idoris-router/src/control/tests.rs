@@ -3329,6 +3329,54 @@ fn answer_without_the_correlation_id(reply: &Reply) -> (StatusCode, Vec<(String,
     (reply.status, headers, body)
 }
 
+/// 正文里去掉随机的关联 id（`error.request_id`）后的原文：随机 id 可能碰巧含有 `dead` 之类的子串，
+/// 不能拿来做「有没有回显主体 id」的子串检查。其余内容（原因码、文案、其他字段）原样保留。
+fn body_without_the_correlation_id(reply: &Reply) -> String {
+    let mut body = reply.json.clone();
+    if let Some(error) = body.get_mut("error").and_then(Value::as_object_mut)
+        && error.contains_key("request_id")
+    {
+        error.insert("request_id".into(), Value::Null);
+    }
+    body.to_string()
+}
+
+fn assert_no_principal_id_echoed(label: &str, reply: &Reply) {
+    let body = body_without_the_correlation_id(reply);
+    for name in ["kid1", "dead", "ghost"] {
+        assert!(
+            !body.contains(name),
+            "{label}: the answer must not echo a principal id: {}",
+            reply.raw
+        );
+    }
+}
+
+fn reply_with(request_id: &str, message: &str) -> Reply {
+    let json = json!({"error": {"reason_code": "forbidden", "message": message, "request_id": request_id}});
+    Reply {
+        status: StatusCode::FORBIDDEN,
+        headers: HeaderMap::new(),
+        raw: json.to_string(),
+        json,
+    }
+}
+
+#[test]
+fn a_random_correlation_id_that_happens_to_spell_a_principal_id_is_not_an_echo() {
+    // 随机 request_id 恰好含 dead / kid1 / ghost：不是回显，不能让用例失败（之前按原文做子串检查，偶发红）。
+    let reply = reply_with("req-dead-kid1-ghost-0f", "forbidden");
+    assert_no_principal_id_echoed("fixed id", &reply);
+}
+
+#[test]
+#[should_panic(expected = "must not echo a principal id")]
+fn a_principal_id_in_any_other_field_is_still_an_echo() {
+    // 断言本身没有放松：id 出现在 request_id 之外的任何地方仍然失败。
+    let reply = reply_with("req-0f", "principal dead is revoked");
+    assert_no_principal_id_echoed("echo", &reply);
+}
+
 #[tokio::test]
 async fn an_outsider_gets_the_same_http_answer_for_an_active_a_revoked_and_a_missing_principal() {
     // PR #600 第四轮复审新问题 2：外部组织（school-b）建成员关系时，
@@ -3403,13 +3451,7 @@ async fn an_outsider_gets_the_same_http_answer_for_an_active_a_revoked_and_a_mis
                 "{label} {principal}: {}",
                 reply.raw
             );
-            for name in ["kid1", "dead", "ghost"] {
-                assert!(
-                    !reply.raw.contains(name),
-                    "{label} {principal}: the answer must not echo a principal id: {}",
-                    reply.raw
-                );
-            }
+            assert_no_principal_id_echoed(&format!("{label} {principal}"), &reply);
             answers.push(answer_without_the_correlation_id(&reply));
         }
         assert!(

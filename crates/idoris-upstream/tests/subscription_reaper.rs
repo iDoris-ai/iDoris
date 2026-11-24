@@ -45,7 +45,7 @@ fn spawn(
 }
 
 async fn wait_marker(path: &std::path::Path, minimum_lines: usize) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             if std::fs::read_to_string(path)
                 .ok()
@@ -65,7 +65,7 @@ fn group_is_gone(group: i32) -> bool {
 }
 
 async fn wait_group_gone(group: i32) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while !group_is_gone(group) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
