@@ -3959,3 +3959,175 @@ async fn an_external_reset_that_failed_does_not_let_the_old_process_back_on_the_
     );
     h.manager.shutdown(true).await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Codex 复审（S6c 修复）：H1、H2、M5、M6
+// ---------------------------------------------------------------------------------------------
+
+/// 复审 H1：退役里的停进程已经开始（SIGTERM 发出，引擎无视，宽限 10 秒），这时 iDoris 停止、带 3 秒的期限。停进程的任务是按没有期限算的，
+/// 只缩短外面的等待就会在 SIGKILL 之前中止它：`stop_on_exit:"never"` 的句柄丢弃时不杀，引擎活下来。现在到期限之前留出升级的时间，
+/// 中止任务之后认回它、SIGTERM 之后立刻 SIGKILL。
+#[tokio::test]
+async fn a_shutdown_in_the_middle_of_a_retirement_stop_still_gets_the_never_engine_killed_in_time()
+{
+    let rig = Rig::new(&Behavior {
+        on_sigterm: OnSigterm::Ignore,
+        ..Behavior::default()
+    });
+    let mut timings = fast();
+    timings.stop_grace = Duration::from_secs(10);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        timings,
+        StopOnExit::Never,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    let pid = rig.pid(0);
+    h.manager.restart_upstream("omlx").await.unwrap();
+    wait_for("the retirement's SIGTERM", || {
+        !rig.fake.sigterm_times().is_empty()
+    })
+    .await;
+    assert!(
+        pid_alive(pid),
+        "it ignores SIGTERM: the stop is in its grace"
+    );
+
+    let begun = Instant::now();
+    h.manager
+        .shutdown_by(
+            true,
+            Some(tokio::time::Instant::now() + Duration::from_secs(3)),
+        )
+        .await;
+    let took = begun.elapsed();
+    wait_for("the engine to die", || !pid_alive(pid)).await;
+    assert!(
+        took < Duration::from_secs(5),
+        "the 10 s grace did not hold the 3 s deadline: {took:?}"
+    );
+    assert_eq!(
+        rig.records(),
+        0,
+        "its record was reclaimed once it was gone"
+    );
+}
+
+/// 复审 H2：退役没能确认之后，认回同一个进程时的重试停止也走有期限、可被停止指令打断的路。此前它是一个内联的、拿满宽限的停止：iDoris 在停的时候
+/// 打断不了，管理器中止任务，认回的引擎（没有子进程句柄、丢弃不杀）活下来。
+#[tokio::test]
+async fn a_shutdown_during_the_retry_of_an_unconfirmed_retirement_still_gets_the_engine_stopped() {
+    let rig = Rig::new(&Behavior {
+        on_sigterm: OnSigterm::Ignore,
+        ..Behavior::default()
+    });
+    let inspector = Scripted::claiming(rig.port);
+    let old = leave_an_orphan(&rig, &inspector).await;
+    let mut timings = fast();
+    timings.stop_grace = Duration::from_secs(10);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        timings,
+        StopOnExit::Never,
+    );
+    h.until_state(UpstreamState::Ready).await;
+
+    inspector.set_identity_unreadable(true);
+    h.manager.restart_upstream("omlx").await.unwrap();
+    wait_for("the unconfirmed stop", || h.logged("停止引擎失败")).await;
+    assert!(rig.fake.sigterm_times().is_empty(), "nothing was signalled");
+    inspector.set_identity_unreadable(false);
+    // 下一轮启动决策认回同一个进程，重试停止：SIGTERM 发出，它无视。
+    wait_for("the retry's SIGTERM", || {
+        !rig.fake.sigterm_times().is_empty()
+    })
+    .await;
+    assert!(pid_alive(old));
+
+    let begun = Instant::now();
+    h.manager
+        .shutdown_by(
+            true,
+            Some(tokio::time::Instant::now() + Duration::from_secs(3)),
+        )
+        .await;
+    wait_for("the engine to die", || !pid_alive(old)).await;
+    assert!(
+        begun.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        begun.elapsed()
+    );
+    assert_eq!(rig.records(), 0);
+}
+
+/// 复审 M5：`restart` 的新引擎正在启动（拉起了、还没听）时来第二个 `restart`：并进它，不去杀刚拉起的替身再拉一个。
+#[tokio::test]
+async fn a_second_restart_while_the_replacement_is_starting_joins_it_and_does_not_kill_it() {
+    let rig = Rig::new(&Behavior {
+        listen_delay_secs: 1.5,
+        ..Behavior::default()
+    });
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        Scripted::claiming(rig.port),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    h.manager.restart_upstream("omlx").await.unwrap();
+    wait_for("the replacement to be launched", || {
+        rig.fake.launches() >= 2
+    })
+    .await;
+    let replacement = rig.pid(1);
+    h.manager.restart_upstream("omlx").await.unwrap();
+    h.until("ready", |s| s.state == UpstreamState::Ready && s.owned)
+        .await;
+    assert_eq!(
+        rig.fake.launches(),
+        2,
+        "the second restart did not replace the replacement"
+    );
+    assert!(pid_alive(replacement));
+    h.manager.shutdown(true).await;
+}
+
+/// 复审 M6：退役没能确认的进程，所有权记录被删（认回的路走不通）之后，端口上它还在听，外部校验通过——也不能当作外部引擎接管回来。
+#[tokio::test]
+async fn a_condemned_process_does_not_come_back_as_an_external_engine() {
+    let rig = Rig::new(&Behavior::default());
+    let inspector = Scripted::claiming(rig.port);
+    let old = leave_an_orphan(&rig, &inspector).await;
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    inspector.set_identity_unreadable(true);
+    h.manager.restart_upstream("omlx").await.unwrap();
+    wait_for("the unconfirmed stop", || h.logged("停止引擎失败")).await;
+    // 记录没了：认回的路没有东西可认。端口上那个进程还在听，并且看起来是合格的外部监听者。
+    for entry in std::fs::read_dir(rig.record_dir()).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    inspector.external_listener(rig.port, u32::try_from(old).unwrap(), Some(TEAM));
+    inspector.set_identity_unreadable(false);
+    wait_for("the condemned process to be refused as external", || {
+        h.logged("不当作外部引擎接管")
+    })
+    .await;
+    assert_ne!(h.view().state, UpstreamState::Ready);
+    h.manager.shutdown(true).await;
+    let _ = Command::new("kill")
+        .args(["-KILL", &old.to_string()])
+        .stderr(Stdio::null())
+        .status();
+}
