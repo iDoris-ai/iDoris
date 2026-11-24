@@ -1557,7 +1557,7 @@ mod tests {
             tokio::spawn(async move { watch.holds().await })
         };
         // The scan is running (blocked) on the blocking pool ...
-        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(30)).unwrap())
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(10)).unwrap())
             .await
             .unwrap();
         // ... and this single-threaded runtime is still alive: a timer fires and another task completes while the scan is blocked.
@@ -1583,6 +1583,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_requests_on_one_watch_share_one_scan() {
         let (native, release, entered) = slow_native(native::Probe::Holds);
+        // A safety net: scans that are not merged would wait for releases that never come; let them all go after a while so the assertion
+        // below fails instead of the test hanging.
+        let safety = release.sender();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(5));
+            for _ in 0..64 {
+                let _ = safety.send(());
+            }
+        });
         let watch = Arc::new(NativeWatch::new(native.clone()));
         let tasks: Vec<_> = (0..16)
             .map(|_| {
@@ -1590,7 +1599,7 @@ mod tests {
                 tokio::spawn(async move { watch.holds().await })
             })
             .collect();
-        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(30)).unwrap())
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(10)).unwrap())
             .await
             .unwrap();
         // Give the other fifteen time to queue up behind the scan.
