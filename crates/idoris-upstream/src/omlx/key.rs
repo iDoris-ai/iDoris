@@ -548,6 +548,59 @@ impl std::fmt::Debug for Authorization {
     }
 }
 
+/// 测试钩子：一个请求**建好之后、发出前最后一道核对（[`Authorization::ensure_current`]）之前**调用，让测试在这个确切的位置换掉引擎（Codex 复审 L2 的 M1'）。
+/// 只在测试里存在；按请求 URL 的前缀匹配，进程里别的用例的请求不触发。
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    static HOOKS: Mutex<Vec<(u64, String, Hook)>> = Mutex::new(Vec::new());
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    /// 钩子活到它被丢弃为止。
+    #[must_use = "the hook is removed when this is dropped"]
+    pub struct HookGuard(u64);
+
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            HOOKS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(id, _, _)| *id != self.0);
+        }
+    }
+
+    /// 请求的 URL 以 `url_prefix` 开头时，在它建好之后、发出前最后一道核对之前调 `hook`。
+    pub fn between_build_and_send_for(
+        url_prefix: &str,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> HookGuard {
+        let id = NEXT.fetch_add(1, Ordering::SeqCst);
+        HOOKS.lock().unwrap_or_else(PoisonError::into_inner).push((
+            id,
+            url_prefix.to_owned(),
+            Arc::new(hook),
+        ));
+        HookGuard(id)
+    }
+
+    pub(crate) fn between_build_and_send(url: &str) {
+        let matching: Vec<Hook> = HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(_, prefix, _)| url.starts_with(prefix.as_str()))
+            .map(|(_, _, hook)| hook.clone())
+            .collect();
+        for hook in matching {
+            hook();
+        }
+    }
+}
+
 /// 发往托管端点的、带凭证的请求用的 HTTP 客户端：**不保留空闲连接**（[`crate::engine::fresh_connection_client`]）。进程里只建一个，建成了才缓存：
 /// 建失败的那一次不缓存（下一个授权再试），也不退到调用方给的客户端（Codex 预审 L2 的 M4）。
 static FRESH_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
