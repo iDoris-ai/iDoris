@@ -59,6 +59,10 @@ fn the_docs_carry_the_corrected_contract_of_the_write_endpoints() {
                 // L1、M3。
                 "400 `invalid_upstream_id`",
                 "没有被实例任务认领是 503 `idoris_stopping`",
+                // 复审 L3'：迟到的 202 与认领的生效时刻；未确认的停止之后 `start` 做什么。
+                "回 **202**（不是 503）",
+                "认领与截止时间在同一把锁里比较",
+                "不会把它放回服务",
             ],
         ),
         (
@@ -80,6 +84,10 @@ fn the_docs_carry_the_corrected_contract_of_the_write_endpoints() {
                 "只在第一次操作**进行期间**成立",
                 "400 `invalid_upstream_id`",
                 "一条审计只占一行",
+                // 复审 L1'、L3'、M1'：生效的时刻；未确认的停止之后的 `start`；并入只对真的换自有引擎的 `restart`。
+                "**生效的时刻**是实例任务拿到决定锁的那一刻",
+                "把那个没能确认停掉的进程停掉",
+                "真的在换 iDoris 自己引擎的 `restart`",
             ],
         ),
     ] {

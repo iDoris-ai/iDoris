@@ -18,10 +18,11 @@
 //! 停进程、换新引擎），也还会收下排在后面的命令，事后去读，`restart` 的 202 可能说 `stopped`，或者快到新引擎已经就绪、`restarting`
 //! 被盖掉。幂等的情形里它就是当前状态。唯一的例外：实例任务已经**认领**了命令（受理了、会执行），但第一步（关 Supervisor 的门）等得比
 //! 命令的截止时间（`command_timeout`）还久、没来得及回答——命令是受理的，不能回 503「没有受理」，也没有受理那一刻的快照可给：回 202，
-//! 体是回答那一刻读到的元素，可能还是命令之前的状态，调用方照常轮询 `GET`（202 本来就不是完成）。
+//! 体是回答那一刻读到的元素，可能还是命令之前的状态，调用方照常轮询 `GET`（202 本来就不是完成）。**生效的时刻**是实例任务拿到决定锁的那一刻：截止时间的检查与决定
+//! 在同一把锁里做（[`crate::lifecycle`] 里的 `Expiry`），认领成功当且仅当它读到的时钟还没到截止时间，所以到点时还没被认领的命令绝不会被受理。
 //!
-//! 幂等：目标已达成时重复请求仍是 202 加当前状态。**`restart` 的幂等只在第一次操作进行期间成立**：并发的、或在第一次 `start`、`restart`
-//! 进行期间到达的重复 `restart` 并入它（只换一次引擎）；第一次已经做完（新引擎就绪）之后到达的重传是一次**新的** `restart`，再换一次引擎。
+//! 幂等：目标已达成时重复请求仍是 202 加当前状态。**`restart` 的幂等只在第一次操作进行期间成立**：并发的、或在第一次操作员发起的、真的在换自有引擎的
+//! `restart` 进行期间到达的重复 `restart` 并入它（只换一次引擎）；第一次已经做完（新引擎就绪）之后到达的重传是一次**新的** `restart`，再换一次引擎。
 //! 丢了第一个 202 的调用方要确认的话，去读 `GET`（`pid` 变了、状态回到 `ready`），不要重发。
 //!
 //! 错误（体是统一的 `{error:{type,rule_id,reason_code,evidence,remediation}}`）：
@@ -33,15 +34,15 @@
 //! | 409 | `upstream_not_owned` | `not_managed` | 卡没有声明托管（resident、`setup upstream` 的卡、伴生卡），三个动作都是 |
 //! | 409 | `upstream_not_owned` | `not_owned` | 托管卡，但引擎不是 iDoris 拉起的（外部引擎、没有引擎）：`stop`、`restart` |
 //! | 409 | `restart_required` | `restart_required` | 放行时没就绪的上游（降级放行，完整的 Router 里没有它的 Supervisor）的 `start`（见 [`crate::lifecycle`]） |
-//! | 503 | `idoris_stopping` | `idoris_stopping` | 引擎管理器已经在停止，或命令没有在截止时间之前被实例任务认领（命令没有受理，事后也不会执行） |
+//! | 503 | `idoris_stopping` | `idoris_stopping` | 引擎管理器已经在停止，或命令没有在截止时间之前被实例任务认领（实例任务忙在排空、复位里；命令没有受理，事后也不会执行，可以重发） |
 //!
 //! 判定的先后：先看 id，再看 `managed`，再看归属（`stop`、`restart` 要 `owned`；已经 `stopped` 的 `stop` 是幂等，不报错），
 //! 最后交给管理器（它回答 `restart_required`）。所以 `owned` 为 false 的上游，`restart` 一律是 `upstream_not_owned`
 //! （规范 §2.11.4「一律」；冻结的上游没有进程，`owned` 恒为 false），`restart_required` 只出现在冻结上游的 `start` 上；冻结的上游要不要
 //! 重启 iDoris，读 `GET` 元素的 `restart_required` 字段。归属在这里只是**预检**（读的是 `/health` 同源的快照，读完到命令被收下之间它可以变）：
 //! 状态是 `starting`、`restarting` 的上游，`restart` 放行到实例任务，由它把「归属」与「并入进行中的操作」**一起**决定（Codex 预审 L4 的
-//! M2）——并入的只有操作员发起的 `start`、`restart`；外部引擎换了进程时的自动重新同步也发布 `restarting`，那里的 `restart` 是 409
-//! `upstream_not_owned`，不是一个没有任何东西跟在后面的 202。
+//! M2、复审 M1'）——并入的只有操作员发起的、真的在换 iDoris 自己引擎的 `restart`（进行中的，或刚做完而且换了自有引擎的）；接管外部引擎的 `start`、
+//! 外部引擎换了进程时的自动重新同步（也发布 `restarting`）都没有可并入的结果，那里的 `restart` 是 409 `upstream_not_owned`，不是一个没有任何东西跟在后面的 202。
 //!
 //! # `stop` 什么时候算做完
 //!
@@ -49,7 +50,8 @@
 //! 此刻**握不握着**一个它拉起的（或认回的）引擎进程，不是「进程一定不在了」：没能确认进程已经消失（读不出它的身份、不能给它发信号）时，
 //! 句柄已经交出去收尾、不再握着，`owned` 也是 false，但收尾的状态是 `unavailable` + `port_in_use`——这是**未确认**，进程可能还占着端口，
 //! 所有权记录与围栏原样保留、端点保持封上。只看 `owned: false` 就收工会把它当成停好了。未确认之后：`stop` 是 409 `not_owned`（没有句柄可
-//! 停），`start` 重新走启动决策、先重读所有权记录（身份此刻读得出就认回它，是同一个进程就继续用，读不出仍是 `port_in_use`）。
+//! 停），`start` 重新走启动决策、先重读所有权记录：身份此刻读得出，就是**那个之前没能确认停掉的进程**——它被判了「停」，不能因为 `start` 又成了服务中的
+//! 引擎，所以先把它停掉、确认消失，再拉起一个新的（第 3 层的 `condemned`）；读不出仍是 `unavailable` + `port_in_use`。
 
 use axum::{
     Json,
@@ -370,7 +372,7 @@ fn idoris_stopping() -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         "idoris_stopping",
         "idoris_stopping",
-        "iDoris is shutting down its engines; the command was not accepted".to_owned(),
+        "the command was not accepted and nothing was done (it will not run later): either iDoris is shutting down its engines, or this engine's instance task did not take the command before its deadline because it was busy (draining in-flight work, rebuilding the ledger); GET /admin/api/v1/upstreams shows when the upstream has settled, then send the command again".to_owned(),
     )
 }
 

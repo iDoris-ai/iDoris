@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use idoris_backend::BackendError;
@@ -70,11 +70,17 @@ impl Request {
     }
 }
 
-const UNDECIDED: u8 = 0;
-const CLAIMED: u8 = 1;
-const ABANDONED: u8 = 2;
+/// 一个命令的「有没有被受理」的三态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Undecided,
+    /// 实例任务认领了：命令是受理的，调用方从此不能再把它说成「没有受理」。
+    Claimed,
+    /// 调用方放弃了（或截止时间已过时有人替它放弃）：命令作废，之后认领不成。
+    Abandoned,
+}
 
-/// 命令的绝对截止时间，连同调用方与实例任务对「这个命令有没有被受理」的**共同决定**（IDORIS-CORE S6，Codex 预审 L4 的 M3）。
+/// 命令的绝对截止时间，连同调用方与实例任务对「这个命令有没有被受理」的**共同决定**（IDORIS-CORE S6，Codex 预审 L4 的 M3、复审的 L1'）。
 ///
 /// 只比较时间不够：实例任务在截止时间之前收下命令、做完第一个有副作用的步骤（关 Supervisor 的门……），那一步可以等得比截止时间还久，
 /// 调用方这时已经回了「没有受理」（503），命令却照样被执行。所以两边抢同一个三态的决定，谁先到谁定：
@@ -82,24 +88,34 @@ const ABANDONED: u8 = 2;
 /// - 实例任务在**第一个副作用之前**[`Self::claim`]：成功就是受理了，调用方从此不能再把它说成「没有受理」；
 /// - 调用方到了截止时间[`Self::abandon`]：成功就是命令作废，实例任务之后认领会失败、什么都不做；失败就是命令已经被受理，只是回答晚了。
 ///
+/// **生效的时刻是实例任务拿到决定锁的那一刻**：截止时间的检查与决定在同一把锁里做（[`Self::claim`] 在锁里读时钟），所以认领成功**当且仅当**它读到的时钟还没到截止时间；
+/// 到了截止时间，哪怕调用方的计时器还没来得及调 [`Self::abandon`]，认领也一律失败（并替它放弃）。一个到点时还没被认领的命令因此绝不会被受理；
+/// 一个在截止时间之前被认领的命令一定是受理的，回答多晚都是。（之前时钟与比较交换是两步，认领可以在截止时间过了之后赢下比较交换。）
+///
 /// 没有副作用的回答（幂等的、被拒绝的）不用认领：它们迟到也不改变任何东西。
 #[derive(Debug, Clone)]
 pub(super) struct Expiry {
     at: tokio::time::Instant,
-    decision: Arc<AtomicU8>,
+    decision: Arc<std::sync::Mutex<Decision>>,
 }
 
 impl Expiry {
     pub(super) fn new(at: tokio::time::Instant) -> Self {
         Self {
             at,
-            decision: Arc::new(AtomicU8::new(UNDECIDED)),
+            decision: Arc::new(std::sync::Mutex::new(Decision::Undecided)),
         }
+    }
+
+    fn decision(&self) -> std::sync::MutexGuard<'_, Decision> {
+        self.decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// 调用方已经放弃了这个命令。
     fn abandoned(&self) -> bool {
-        self.decision.load(Ordering::SeqCst) == ABANDONED
+        *self.decision() == Decision::Abandoned
     }
 
     /// 没有人认领、而且调用方放弃了，或者截止时间已过：不再有人等它。
@@ -107,30 +123,35 @@ impl Expiry {
         self.abandoned() || tokio::time::Instant::now() >= self.at
     }
 
-    /// 实例任务：在第一个有副作用的步骤之前认领。`true` = 命令从此是受理的；`false` = 调用方已经放弃（或截止时间已过：这里替它放弃，
-    /// 省得调用方的计时器与这一步各说各的），什么都不要做。
+    /// 实例任务：在第一个有副作用的步骤之前认领。`true` = 命令从此是受理的；`false` = 调用方已经放弃，或者锁里读到的时钟已经到了截止时间（这里替它放弃，
+    /// 省得调用方的计时器与这一步各说各的），什么都不要做。重复认领一个已经认领的命令还是 `true`。
     pub(super) fn claim(&self) -> bool {
-        if tokio::time::Instant::now() >= self.at {
-            let _ = self.abandon();
-            return false;
+        let mut decision = self.decision();
+        match *decision {
+            Decision::Claimed => true,
+            Decision::Abandoned => false,
+            Decision::Undecided => {
+                if tokio::time::Instant::now() >= self.at {
+                    *decision = Decision::Abandoned;
+                    false
+                } else {
+                    *decision = Decision::Claimed;
+                    true
+                }
+            }
         }
-        self.decision
-            .compare_exchange(UNDECIDED, CLAIMED, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
     }
 
     /// 调用方：到了截止时间。`true` = 没有人认领，命令从此作废；`false` = 实例任务已经认领，命令是受理的（回答晚了）。
     pub(super) fn abandon(&self) -> bool {
-        match self.decision.compare_exchange(
-            UNDECIDED,
-            ABANDONED,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => true,
-            // 自己（或实例任务）已经放弃过了：同样是「作废」。
-            Err(ABANDONED) => true,
-            Err(_) => false,
+        let mut decision = self.decision();
+        match *decision {
+            Decision::Claimed => false,
+            Decision::Abandoned => true,
+            Decision::Undecided => {
+                *decision = Decision::Abandoned;
+                true
+            }
         }
     }
 }
@@ -1245,8 +1266,10 @@ impl Actor {
                 self.redecide_since = None;
                 match self.sync_supervisor().await {
                     Synced::Done => {
-                        self.publish(UpstreamState::Ready, None);
+                        // 水位与操作的结束**先于**发布 `ready`（Codex 复审 L4 的 L4'）：发布之后客户端就看得见 `ready`，紧接着发的 `restart` 盖的章要比水位大，
+                        // 是一次新的重启；先发布、后记水位，发布时写日志的那段时间里到达的 `restart` 会被并进刚做完的这一次。
                         self.finish_op();
+                        self.publish(UpstreamState::Ready, None);
                         Step::Supervise
                     }
                     // Supervisor 的账本没能跟上：这个引擎不能放行，停掉它（`sync_supervisor` 已经停了），按一次失败算，退避之后重来。
@@ -1259,20 +1282,20 @@ impl Actor {
                     // Supervisor 没有了：不会自己好，要重启 iDoris。
                     Synced::Permanent => {
                         self.revoke_external_authorization();
+                        self.finish_op();
                         self.publish_terminal(
                             UpstreamState::Failed,
                             Some(UpstreamReason::StartupLatched),
                         );
-                        self.finish_op();
                         Step::Idle(Idle::Terminal)
                     }
                 }
             }
             Attempt::Terminal { state, reason } => {
                 self.redecide_since = None;
-                // 终局的失败之后端点保持封上（Codex 审计 H1）：上面那条对每一条非 `Ready` 的出口统一做了。
-                self.publish_terminal(state, reason);
+                // 终局的失败之后端点保持封上（Codex 审计 H1）：上面那条对每一条非 `Ready` 的出口统一做了。水位先于发布（L4'）。
                 self.finish_op();
+                self.publish_terminal(state, reason);
                 Step::Idle(Idle::Terminal)
             }
             Attempt::Failure { reason } => {
@@ -1284,7 +1307,8 @@ impl Actor {
         }
     }
 
-    /// 一次 `start`、`restart` 操作做完了（就绪，或者不会再往前走）：之前入队的 `restart` 都并进它的结果（[`Self::restart_cover`]）。
+    /// 一次 `start`、`restart` 操作做完了（就绪，或者不会再往前走）：之前入队的 `restart` 都并进它的结果（[`Self::restart_cover`]）。**要在发布做完的状态之前调**
+    /// （Codex 复审 L4 的 L4'）：发布之后客户端就看得见它，紧接着发来的 `restart` 盖的章必须比这里记下的水位大。
     fn finish_op(&mut self) {
         if self.op.take().is_some() {
             // 这一轮走的是外部监听者那条路：结果是接管了一个外部引擎，不是我们换了一个自有引擎，之前入队的 `restart` 没有可并入的结果
@@ -1302,11 +1326,11 @@ impl Actor {
         if started.elapsed() >= self.timings().startup_timeout {
             self.redecide_since = None;
             // 重判耗尽直接发布终态，不经 `Attempt::Terminal`；端点已经在 `attempt_cycle` 里随这一轮的出口封上了（Codex 终审 H2）。
+            self.finish_op();
             self.publish_terminal(
                 UpstreamState::Unavailable,
                 Some(UpstreamReason::StartupTimeout),
             );
-            self.finish_op();
             return Step::Idle(Idle::Terminal);
         }
         self.log("端口上的情况在判断期间变了：重新判断（不算失败）");
@@ -1327,13 +1351,14 @@ impl Actor {
             Count::Edge
         };
         if self.window.tripped(now) {
+            // `count` 已经按操作算好了（上面）：结束操作先于发布（L4'）。
+            self.finish_op();
             self.emit(
                 UpstreamState::Failed,
                 Some(UpstreamReason::CrashLoop),
                 true,
                 count,
             );
-            self.finish_op();
             return Step::Idle(Idle::CrashLoop);
         }
         self.emit(UpstreamState::Restarting, reason, false, count);

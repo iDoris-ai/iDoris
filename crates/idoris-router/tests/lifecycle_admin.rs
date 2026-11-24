@@ -29,7 +29,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use child_guard::IsolateState;
-use fake_omlx::{Behavior, FakeOmlx, Hold, Release, spawn_retrying};
+use fake_omlx::{Behavior, FakeOmlx, Hold, OnSigterm, Release, spawn_retrying};
 use http_body_util::BodyExt;
 use idoris_contracts::{ComponentCard, load_policy::LoadMode};
 use idoris_router::admin::{AdminSessionToken, SharedAdminToken, build_admin_app_with_engines};
@@ -124,6 +124,25 @@ struct Scripted {
     fallback_ttl_millis: AtomicUsize,
     /// 一个答案由测试编排的原生监视（[`Scripted::script_native`]）：所有守卫共用这一个。
     native_script: Mutex<Option<Arc<ScriptedWatch>>>,
+    /// `signing_team` 停在这里（外部引擎的属主校验停住：实例任务忙在 `start` 接管外部引擎的那一步，不去收命令），见 [`Scripted::hold_team_checks`]。
+    team_gate: Mutex<Option<Arc<TeamGate>>>,
+}
+
+/// 让属主校验里的 `signing_team` 停住的开关：先记下「已经到了」，再等测试放开。
+#[derive(Debug, Default)]
+struct TeamGate {
+    entered: AtomicBool,
+    released: AtomicBool,
+}
+
+impl TeamGate {
+    fn entered(&self) -> bool {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+    }
 }
 
 /// 永远说「还握着」的原生监视（[`Scripted::offer_a_native_watch_that_always_holds`]）。
@@ -186,7 +205,15 @@ impl Scripted {
             listens_asked: AtomicUsize::new(0),
             fallback_ttl_millis: AtomicUsize::new(0),
             native_script: Mutex::new(None),
+            team_gate: Mutex::new(None),
         })
+    }
+
+    /// 从现在起，`signing_team` 停住，直到返回的开关被放开。
+    fn hold_team_checks(&self) -> Arc<TeamGate> {
+        let gate = Arc::new(TeamGate::default());
+        *self.team_gate.lock().unwrap() = Some(gate.clone());
+        gate
     }
 
     /// 从现在起建的守卫带一个答案由测试编排的原生监视（按顺序，最后一个重复）；之后再调一次只是换掉它的答案，已经建好的守卫也跟着变。要在管理器登记引擎
@@ -333,6 +360,13 @@ impl ProcessInspector for Scripted {
         self.real.uid_of(pid).await
     }
     async fn signing_team(&self, pid: u32) -> Result<Option<String>, InspectError> {
+        let gate = self.team_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.entered.store(true, Ordering::SeqCst);
+            while !gate.released.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
         Ok(self.teams.lock().unwrap().get(&pid).cloned())
     }
     fn watch_listener(&self, pid: u32, dial: SocketAddr) -> Option<Arc<dyn ListenerWatch>> {
@@ -621,6 +655,35 @@ impl World {
         timings: Timings,
         wait_settled: bool,
     ) -> Self {
+        Self::start_with_sink(rig, executable, inspector, timings, wait_settled, None).await
+    }
+
+    /// 同 [`Self::start`]，日志的出口多带一个钩子（[`LogGate::sink`]）：实例任务写某一行日志时可以被测试扣住。
+    async fn start_gated(engine: Engine, timings: Timings, gate: &Arc<LogGate>) -> Self {
+        let (rig, executable) = match &engine {
+            Engine::Fake(behavior) => {
+                let rig = Rig::new(behavior);
+                let executable = rig.fake.executable.clone();
+                (rig, executable)
+            }
+            Engine::Missing => {
+                let rig = Rig::new(&Behavior::default());
+                let executable = rig.work.path().join("no-such-omlx-cli");
+                (rig, executable)
+            }
+        };
+        let inspector = Scripted::claiming(rig.port);
+        Self::start_with_sink(rig, executable, inspector, timings, true, Some(gate.sink())).await
+    }
+
+    async fn start_with_sink(
+        rig: Rig,
+        executable: PathBuf,
+        inspector: Arc<dyn ProcessInspector>,
+        timings: Timings,
+        wait_settled: bool,
+        extra_sink: Option<LineHook>,
+    ) -> Self {
         let health = HealthState::with_upstreams(
             0,
             vec![
@@ -631,7 +694,12 @@ impl World {
         let log: Arc<Mutex<Vec<String>>> = Arc::default();
         let sink: LogSink = {
             let log = log.clone();
-            Arc::new(move |line| log.lock().unwrap().push(line.to_owned()))
+            Arc::new(move |line| {
+                log.lock().unwrap().push(line.to_owned());
+                if let Some(extra) = &extra_sink {
+                    extra(line);
+                }
+            })
         };
         let manager = Arc::new(EngineManager::start(
             ManagerConfig {
@@ -5589,7 +5657,8 @@ async fn m4_an_unconfirmed_stop_reads_unavailable_and_port_in_use_with_owned_fal
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(error_of(&body), ("upstream_not_owned", "not_owned"));
 
-    // 身份读得出了：`start` 先重读所有权记录，认回同一个进程。
+    // 身份读得出了：`start` 先重读所有权记录。读到的是之前没能确认停掉的那个进程（它被判了「停」，只是没能确认），所以**不认回、不放行**：先把它停掉、确认消失，
+    // 再拉起一个新的（第 3 层的 `condemned`）；一个操作员要它停的进程不能因为 `start` 就又成了服务中的引擎。
     inspector.unreadable.store(false, Ordering::SeqCst);
     let (status, body) = admin_call(
         &admin,
@@ -5599,19 +5668,17 @@ async fn m4_an_unconfirmed_stop_reads_unavailable_and_port_in_use_with_owned_fal
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    let adopted = admin_until(
-        &admin,
-        &secret,
-        "the same process to be taken back",
-        |element| element["state"] == "ready" && element["owned"] == true,
-    )
+    let replacement = admin_until(&admin, &secret, "a fresh engine to be serving", |element| {
+        element["state"] == "ready" && element["owned"] == true
+    })
     .await;
-    assert_eq!(
-        adopted["pid"],
+    assert_ne!(
+        replacement["pid"],
         json!(pid),
-        "the very same process: {adopted}"
+        "the process whose stop was never confirmed is not put back into service: {replacement}"
     );
-    assert_eq!(rig.fake.launches(), 1, "nothing new was launched");
+    wait_for("the condemned process to be gone", || !pid_alive(pid)).await;
+    assert_eq!(rig.fake.launches(), 2, "a fresh engine was launched");
 
     // 这一次停得成：`stopped` 并且 `owned: false`——判据满足，进程确实没了。
     let (status, body) =
@@ -5619,7 +5686,10 @@ async fn m4_an_unconfirmed_stop_reads_unavailable_and_port_in_use_with_owned_fal
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     let done = admin_until(&admin, &secret, "the stop to be done", stop_is_done).await;
     assert!(done.get("pid").is_none(), "{done}");
-    wait_for("the process to be gone", || !pid_alive(pid)).await;
+    wait_for("the replacement to be gone", || {
+        !pid_alive(replacement["pid"].as_u64().unwrap())
+    })
+    .await;
     manager.shutdown(true).await;
 }
 
@@ -5661,4 +5731,346 @@ async fn l4_a_restart_that_arrives_after_the_first_one_finished_is_a_new_restart
         "a retransmission after completion is a new restart"
     );
     world.manager.shutdown(true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Codex 复审（第 4 层的修复，044da0c8..da0d38fa）：M1'、L2'、L4'
+// ---------------------------------------------------------------------------------------------
+
+/// M1'：操作员的 `start` 在接管一个外部引擎，不是在拉起或替换 iDoris 自己的引擎：它做完是 `ready`、`owned: false`，没有任何自有引擎会被重启。这时到达的 `restart`
+/// 不能回 202（一个没有任何东西跟在后面的受理），要回 409 `upstream_not_owned`（规范 §2.11.4：外部引擎一律如此）。这一条：`start` 正在等外部引擎答话
+/// （它的 `GET /v1/models` 被扣着）的时候到达的 `restart`。
+#[tokio::test]
+async fn m1b_a_restart_during_a_start_that_is_waiting_on_an_external_engine_is_not_owned_and_never_a_false_202()
+ {
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start_on(work.path(), "external-a", &stateful(), free_port());
+    let port = external.port;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let inspector = Scripted::new();
+    inspector.external_listener(port, external.pid(), Some(TEAM));
+    let full = Full::start(rig, inspector).await;
+    full.wait_open().await;
+    let element = full.element("omlx").await;
+    assert_eq!(element["state"], "ready", "{element}");
+    assert_eq!(element["owned"], false, "{element}");
+
+    // 外部引擎不再答话：监督说 `unavailable`；操作员的 `start` 重新走启动决策、等它答话。
+    external.fake.hold(Hold::Models);
+    full.until("the external engine to be unavailable", |element| {
+        element["state"] == "unavailable"
+    })
+    .await;
+    let (status, body) = full.post_command("start").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["state"], "starting", "{body}");
+
+    // `start` 在等外部引擎答话；这时没有任何自有引擎可重启。
+    let (status, body) = full.post_command("restart").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(error_of(&body), ("upstream_not_owned", "not_owned"));
+
+    // 外部引擎答话了：`start` 接管它，做完是 `ready`、`owned: false`；没有拉起任何自有引擎，没有给外部引擎发任何信号。
+    external.fake.release(Hold::Models);
+    let element = full
+        .until("the start to adopt the external engine", |element| {
+            element["state"] == "ready"
+        })
+        .await;
+    assert_eq!(element["owned"], false, "{element}");
+    assert_eq!(full.rig.fake.launches(), 0);
+    assert!(
+        pid_alive(u64::from(external.pid())),
+        "an external engine is never signalled"
+    );
+    full.manager.shutdown(true).await;
+}
+
+/// M1'：同上，但 `restart` 是在 `start` 的实例任务忙着、不去收命令的时候入队的：接管外部引擎的属主校验停在那里（`signing_team` 被扣着）。`start` 做完（`ready`、
+/// `owned: false`）之后实例任务才收下它：接管外部引擎的操作不记 `restart` 的水位，所以它不并入，按各自到达时的状态回答（没有自有引擎：409）。
+/// 之前水位记在每一次 `start`、`restart` 做完时，这个 `restart` 被当成并入了「刚做完的操作」，回了 202，没有任何引擎被重启。
+#[tokio::test]
+async fn m1b_a_restart_queued_behind_a_start_that_adopts_an_external_engine_is_not_owned_and_never_a_false_202()
+ {
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start_on(work.path(), "external-a", &stateful(), free_port());
+    let port = external.port;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let inspector = Scripted::new();
+    inspector.external_listener(port, external.pid(), Some(TEAM));
+    let full = Arc::new(Full::start(rig, inspector.clone()).await);
+    full.wait_open().await;
+
+    external.fake.hold(Hold::Models);
+    full.until("the external engine to be unavailable", |element| {
+        element["state"] == "unavailable"
+    })
+    .await;
+    let (status, body) = full.post_command("start").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // 外部引擎一答话，`start` 就去接管它，属主校验停在 `signing_team`：实例任务忙着，不收命令。
+    let gate = inspector.hold_team_checks();
+    external.fake.release(Hold::Models);
+    wait_for("the ownership check of the adoption", || gate.entered()).await;
+    let restart = {
+        let full = full.clone();
+        tokio::spawn(async move { full.post_command("restart").await })
+    };
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    gate.release();
+
+    let (status, body) = restart.await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(error_of(&body), ("upstream_not_owned", "not_owned"));
+    let element = full
+        .until("the start to have adopted the external engine", |element| {
+            element["state"] == "ready"
+        })
+        .await;
+    assert_eq!(element["owned"], false, "{element}");
+    assert_eq!(full.rig.fake.launches(), 0);
+    assert!(
+        pid_alive(u64::from(external.pid())),
+        "an external engine is never signalled"
+    );
+    full.manager.shutdown(true).await;
+}
+
+/// L2'（`stop`）：认领在第一个副作用（关 Supervisor 的门）**之前**，真的经 HTTP 钉住。Supervisor 起来之后先做启动采样（`GET /api/status`，这里被引擎扣着），
+/// 采样完成之前它不收任何消息，`close_admission` 的回答就一直不来：实例任务已经认领了 `stop`（受理了、会执行），第一步却等得比 `command_timeout`（这里 400 毫秒）
+/// 还久。Admin 回 **202**，不是 503「没有受理」，体是回答那一刻读到的元素（还是命令之前的状态）；采样放开之后 `stop` 照常做完。如果认领被挪到 `close_admission`
+/// 之后，到点时调用方先放弃、拿到 503，实例任务随后才发现命令已经作废：一个没有受理、门却已经关了的 `stop`。
+#[tokio::test]
+async fn l2b_a_stop_whose_first_step_outlasts_the_deadline_is_accepted_late_and_still_runs() {
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    // 引擎一起来，Supervisor 的启动采样就被扣着（门控放行之后 Supervisor 才起）。
+    rig.fake.hold(Hold::Status);
+    let mut timings = fast();
+    timings.command_timeout = Duration::from_millis(400);
+    let full = Full::start_with(rig, Scripted::claiming(port), timings).await;
+    full.wait_open().await;
+    let old = full.rig.pid(0);
+    assert_eq!(full.element("omlx").await["state"], "ready");
+
+    let started = Instant::now();
+    let (status, body) = full.post_command("stop").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(350),
+        "the answer came after the deadline: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        (body["state"].as_str(), body["owned"].as_bool()),
+        (Some("ready"), Some(true)),
+        "the late answer reads the element as it is then, not as of the acceptance: {body}"
+    );
+
+    // 采样放开：Supervisor 开始收消息，`close_admission` 有了回答，`stop` 照常做完。
+    full.rig.fake.release(Hold::Status);
+    full.until("the stop to be done", stop_is_done).await;
+    wait_for("the engine process to be gone", || !pid_alive(old)).await;
+    assert_eq!(
+        full.logged("收到命令 stop，已受理（实例任务在期限内没有回答"),
+        1,
+        "the late acceptance is audited as such"
+    );
+    full.manager.shutdown(true).await;
+}
+
+/// L2'（`restart`）：同上，`restart` 的第一步也是关门。迟到的 202 之后，放开采样，旧引擎退役、新引擎拉起、回到 `ready`（pid 换了）。
+#[tokio::test]
+async fn l2b_a_restart_whose_first_step_outlasts_the_deadline_is_accepted_late_and_still_runs() {
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    rig.fake.hold(Hold::Status);
+    let mut timings = fast();
+    timings.command_timeout = Duration::from_millis(400);
+    let full = Full::start_with(rig, Scripted::claiming(port), timings).await;
+    full.wait_open().await;
+    let old = full.rig.pid(0);
+
+    let started = Instant::now();
+    let (status, body) = full.post_command("restart").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(350),
+        "the answer came after the deadline: {:?}",
+        started.elapsed()
+    );
+
+    full.rig.fake.release(Hold::Status);
+    full.until("the replacement", |element| {
+        element["state"] == "ready" && element["pid"] != json!(old)
+    })
+    .await;
+    assert_eq!(full.rig.fake.launches(), 2);
+    assert_eq!(
+        full.logged("收到命令 restart，已受理（实例任务在期限内没有回答"),
+        1,
+        "the late acceptance is audited as such"
+    );
+    full.manager.shutdown(true).await;
+}
+
+/// 日志出口上多挂的钩子：每一行日志写进去之后调用一次。
+type LineHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// 让实例任务在写某一行日志的时候停住：发布状态之后、`ready` 的那一行日志是同步写的（日志的出口是测试的），这个窗口里状态已经对外可见，实例任务还没有回到命令循环。
+struct LogGate {
+    needle: &'static str,
+    armed: AtomicBool,
+    entered: AtomicBool,
+    released: AtomicBool,
+}
+
+impl LogGate {
+    fn new(needle: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            needle,
+            armed: AtomicBool::new(false),
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        })
+    }
+
+    /// 从现在起，第一条含 `needle` 的日志停在这里，直到 [`Self::release`]。
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn entered(&self) -> bool {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+    }
+
+    fn sink(self: &Arc<Self>) -> LineHook {
+        let gate = self.clone();
+        Arc::new(move |line| {
+            if line.contains(gate.needle) && gate.armed.swap(false, Ordering::SeqCst) {
+                gate.entered.store(true, Ordering::SeqCst);
+                // 扣住的是实例任务所在的运行时线程：`block_in_place` 让运行时把别的任务（含测试自己的定时器）交给另一个线程，不然这个线程一扣，
+                // 测试这一头也跟着停了。有界：测试出了岔子也不会把它永远扣在这里。
+                tokio::task::block_in_place(|| {
+                    let give_up = Instant::now() + Duration::from_secs(30);
+                    while !gate.released.load(Ordering::SeqCst) && Instant::now() < give_up {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                });
+            }
+        })
+    }
+}
+
+/// L4'：客户端一看到 `ready` 就发下一个 `restart`，那是一次**新的**重启。实例任务发布 `ready` 之后还要写一行日志，才去记 `restart` 的水位：这个窗口里一个已经看到
+/// `ready` 的客户端发来的 `restart` 盖的章比水位小，被当成并入了「刚做完」的那一次，回了 202，没有换引擎。水位在发布 `ready` **之前**记，窗口就没有了：日志的出口在这里
+/// 被扣住，状态已经对外可见，第二个 `restart` 照样是新的重启（引擎换第三次）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l4b_a_restart_sent_the_moment_ready_is_visible_is_a_new_restart_even_while_the_log_line_is_still_being_written()
+ {
+    let gate = LogGate::new("引擎 omlx：ready");
+    let world = World::start_gated(Engine::Fake(Behavior::default()), fast(), &gate).await;
+    let first = world.rig.pid(0);
+    gate.arm();
+    let (status, body) = world.post("omlx", "restart").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    // 新引擎就绪、`ready` 已经发布；实例任务停在紧跟着的那一行日志里。
+    wait_for(
+        "the instance task to be inside the log line of `ready`",
+        || gate.entered(),
+    )
+    .await;
+    let element = world.element("omlx").await;
+    assert_eq!(element["state"], "ready", "{element}");
+    let second = element["pid"].clone();
+    assert_ne!(second, json!(first), "{element}");
+    assert_eq!(world.rig.fake.launches(), 2);
+
+    // 看到 `ready` 的客户端马上又发一个 `restart`：实例任务还停在日志里，它排在邮箱里。
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        gate.release();
+    };
+    let ((status, body), ()) = tokio::join!(world.post("omlx", "restart"), release);
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    world
+        .until("the second replacement", |element| {
+            element["state"] == "ready" && element["pid"] != second
+        })
+        .await;
+    assert_eq!(
+        world.rig.fake.launches(),
+        3,
+        "a restart sent after `ready` was visible is a new restart"
+    );
+    world.manager.shutdown(true).await;
+}
+
+/// M5（第 4 层的 HTTP 视角）：公共模型列表逐卡走，慢卡让它停在托管卡前面；`stop` 到来时托管端点上没有任何在途的操作，排空立刻成功、SIGTERM 发给引擎，
+/// 引擎无视它、整个宽限期里照常监听。慢卡放开之后，列表走到托管的那张卡：在途登记已经封上，授权处拒绝，**引擎在 SIGTERM 之后没有收到这次列表的任何请求**。
+/// 之前排空读到零就去停进程，两者之间没有封：这个请求登记新的在途、发往还在监听的引擎，随后被 SIGTERM 打断。监督的节拍拉到小时级，所以引擎收到的
+/// `GET /v1/models` 只可能来自这次列表。
+#[tokio::test]
+async fn m5_a_model_list_that_reaches_the_managed_card_during_the_stop_grace_sends_nothing_to_the_stopping_engine()
+ {
+    let rig = Rig::new(&Behavior {
+        on_sigterm: OnSigterm::Ignore,
+        ..stateful()
+    });
+    let port = rig.port;
+    let slow = SlowUpstream::start().await;
+    let cards = vec![
+        upstream_card(&slow.endpoint()),
+        managed_card(&rig.endpoint()),
+    ];
+    let full = Arc::new(
+        Full::start_with_card_order(rig, Scripted::claiming(port), supervision_paused(), cards)
+            .await,
+    );
+    full.wait_open().await;
+    let listing = {
+        let full = full.clone();
+        tokio::spawn(async move { full.data("GET", "/v1/models", None).await })
+    };
+    // 列表已经在第一张卡（慢卡）的请求里：托管的那张卡还没轮到，端点上没有在途的操作。
+    slow.reached.notified().await;
+    let old = full.rig.pid(0);
+    let (status, body) = full.post_command("stop").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for("the engine to receive its SIGTERM", || {
+        !full.rig.fake.sigterm_times().is_empty()
+    })
+    .await;
+    assert!(
+        pid_alive(old),
+        "the engine ignores SIGTERM: it is still listening in its grace"
+    );
+    let asked = full.rig.fake.requests_of("/v1/models");
+
+    // 慢卡放开：列表走到托管的那张卡。
+    slow.release.notify_one();
+    let (status, body) = listing.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        full.rig.fake.requests_of("/v1/models"),
+        asked,
+        "the late model list reached the engine while it was being stopped"
+    );
+    let listed: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, vec!["slow-model"], "{body}");
+    // 宽限到点、SIGKILL：停止照常做完。
+    full.until_gone().await;
+    wait_for("the process to be gone", || !pid_alive(old)).await;
 }

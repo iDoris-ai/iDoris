@@ -1399,6 +1399,33 @@ mod tests {
         );
     }
 
+    /// 复审 L1'：截止时间的检查与决定是一步。认领成功**当且仅当**锁里读到的时钟还没到截止时间：恰好到了截止时间的认领失败（调用方的计时器此刻在同一时刻触发，
+    /// 但认领不等它），而且替它放弃；截止时间之前一刻的认领成功，之后调用方放弃不成（命令是受理的）。
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_is_valid_only_before_the_deadline_whether_or_not_the_callers_timer_has_run() {
+        let at = Instant::now() + Duration::from_secs(5);
+        // 截止时间之前一刻：认领成功，调用方的放弃不成。
+        let just_in_time = Expiry::new(at);
+        tokio::time::advance(Duration::from_millis(4999)).await;
+        assert!(just_in_time.claim());
+        assert!(!just_in_time.abandon());
+        // 恰好到了截止时间（时钟读数 == at），调用方的计时器还没调 `abandon`：认领失败，命令作废。
+        let on_the_dot = Expiry::new(at);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(Instant::now(), at);
+        assert!(!on_the_dot.claim(), "a claim at the deadline is too late");
+        assert!(
+            on_the_dot.abandon(),
+            "and it abandoned the command for the caller"
+        );
+        // 重复认领是幂等的；已经放弃的命令不会因为再认领一次又活过来。
+        let again = Expiry::new(at + Duration::from_secs(60));
+        assert!(again.claim());
+        assert!(again.claim());
+        assert!(!again.abandon());
+        assert!(!on_the_dot.claim());
+    }
+
     /// L3：审计日志一条只占一行。id 来自卡的配置，契约允许它含控制字符：照原样写进日志，一条记录能裂成几行、伪造出别的记录。控制字符转义，
     /// id 本身没变（还能被寻址）。
     #[tokio::test(start_paused = true)]
