@@ -6,6 +6,10 @@
 // 测试进程整个被 SIGKILL 时 `Drop` 不会跑；这个文件走旧的 `--admin-token-stdin`，没有 launcher 帧，加不了孤儿计时兜底。
 #[path = "support/child_guard.rs"]
 mod child_guard;
+// 数据面与 Admin 的端口是事先挑好、过一会儿才由 iDoris 去绑的，五个用例并行地各挑两个：不能用 `bind(0)` 取号再放掉，否则两个用例
+// 可能拿到同一个号码、后绑的那个 iDoris 以 `Address already in use` 退出码 1 退出（见 `support/ports.rs`）。
+#[path = "support/ports.rs"]
+mod ports;
 
 use std::{
     fs,
@@ -16,16 +20,9 @@ use std::{
 };
 
 use child_guard::{ChildGuard, SpawnGuarded};
+use ports::free_port;
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 struct Env {
     repo: std::path::PathBuf,
@@ -80,14 +77,17 @@ impl Env {
             .args(["serve", "--admin-token-stdin"])
             .spawn_guarded()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(format!("{SECRET}\n").as_bytes())
-            .unwrap();
+        write_token(&mut child);
         child
     }
+}
+
+/// 把 Admin token 写给子进程的 stdin（写完关掉）。写不进去（`BrokenPipe`）是正常的：第二个实例抢不到实例锁、坏的锁文件，都在读 stdin
+/// 之前就以 3 或 1 退出，测试线程恰好在子进程退出之后才写时管道已经没有读端；这不是这里要断言的事。不影响后面的断言：该活着的实例
+/// 拿不到 token 就起不来，`wait_health` 会带着它的 stderr 报 `server exited early`；该退出的实例的退出码与 stderr 照样逐字断言。
+fn write_token(child: &mut Child) {
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(format!("{SECRET}\n").as_bytes());
 }
 
 async fn wait_health(child: &mut Child, port: u16) {
@@ -103,7 +103,11 @@ async fn wait_health(child: &mut Child, port: u16) {
         {
             return;
         }
-        assert!(child.try_wait().unwrap().is_none(), "server exited early");
+        // 子进程已经退出：把退出状态和它的 stderr 一并报出来（启动失败的原因都在那里，例如 `Address already in use`）。
+        if let Some(status) = child.try_wait().unwrap() {
+            let stderr = child.stderr.take().map(read_all).unwrap_or_default();
+            panic!("server exited early ({status}), port {port}: {stderr}");
+        }
         assert!(Instant::now() < deadline, "health readiness timed out");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -144,7 +148,12 @@ async fn sigterm_and_sigint_take_the_graceful_path() {
         send(signal, &child);
         let status = wait_exit(&mut child, Duration::from_secs(12));
         let stdout = read_all(child.stdout.take().unwrap());
-        assert_eq!(status.code(), Some(0), "{signal}: {status:?}\n{stdout}");
+        let stderr = read_all(child.stderr.take().unwrap());
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{signal}: {status:?} (ports {port}/{admin})\n{stdout}\nstderr: {stderr}"
+        );
         assert!(stdout.contains("idoris: 已停止"), "{signal}: {stdout}");
     }
 }
@@ -238,12 +247,7 @@ async fn symlinked_db_path_shares_the_same_instance_lock() {
             .args(["serve", "--admin-token-stdin"])
             .spawn_guarded()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(format!("{SECRET}\n").as_bytes())
-            .unwrap();
+        write_token(&mut child);
         child
     };
     let mut first = spawn(&real, port, admin);

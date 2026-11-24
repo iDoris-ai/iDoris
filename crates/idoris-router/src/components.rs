@@ -65,6 +65,8 @@ pub enum LoadError {
         dir: String,
         waited_ms: u64,
     },
+    /// 等锁的时候被取消了（停止信号到了，H1）：不是加载失败，没有读卡。
+    Cancelled,
 }
 
 impl std::fmt::Display for LoadError {
@@ -89,6 +91,7 @@ impl std::fmt::Display for LoadError {
                 f,
                 "组件目录 \"{dir}\" 正被 `idoris setup` 改写，等了 {waited_ms} 毫秒仍没有放开：为了不读到改了一半的卡，启动失败；等 setup 结束后重试"
             ),
+            LoadError::Cancelled => write!(f, "等组件目录的锁时收到停止信号，没有读卡"),
         }
     }
 }
@@ -226,13 +229,26 @@ pub fn load_components_locked_with_hook(
     wait: std::time::Duration,
     hook: Option<&LoadHook<'_>>,
 ) -> Result<Vec<ComponentCard>, LoadError> {
+    load_components_locked_cancellable(canonical, allow_mock_env, wait, hook, &|| false)
+}
+
+/// 同上，等锁的时候可以被取消（H1）：`cancel()` 在每次发现目录还锁着的时候看一次（每 [`DIR_LOCK_POLL`] 一次），为真就返回
+/// [`LoadError::Cancelled`]，不再等到 `wait` 用完。`idoris serve` 用它：启动期间收到的 SIGTERM 不能等 `setup` 放开锁（最长 30 秒，
+/// 可配到 10 分钟），而 launcher 17 秒就 SIGKILL。拿到锁之后读卡是几个文件的事，不再看 `cancel`（读到一半放弃没有意义）。
+pub fn load_components_locked_cancellable(
+    canonical: &Path,
+    allow_mock_env: bool,
+    wait: std::time::Duration,
+    hook: Option<&LoadHook<'_>>,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<ComponentCard>, LoadError> {
     #[cfg(unix)]
     {
-        locked_load_unix(canonical, allow_mock_env, wait, hook)
+        locked_load_unix(canonical, allow_mock_env, wait, hook, cancel)
     }
     #[cfg(not(unix))]
     {
-        let _ = (wait, hook);
+        let _ = (wait, hook, cancel);
         load_components(canonical, allow_mock_env)
     }
 }
@@ -243,6 +259,7 @@ fn locked_load_unix(
     allow_mock_env: bool,
     wait: std::time::Duration,
     hook: Option<&LoadHook<'_>>,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<ComponentCard>, LoadError> {
     use nix::errno::Errno;
     use nix::fcntl::{Flock, FlockArg};
@@ -272,6 +289,9 @@ fn locked_load_unix(
         match Flock::lock(file, FlockArg::LockSharedNonblock) {
             Ok(flock) => break flock,
             Err((back, Errno::EWOULDBLOCK)) => {
+                if cancel() {
+                    return Err(LoadError::Cancelled);
+                }
                 let remaining = wait.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
                     return Err(LoadError::DirLocked {

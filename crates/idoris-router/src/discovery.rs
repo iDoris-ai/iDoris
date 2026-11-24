@@ -297,6 +297,14 @@ mod fallback_impl {
             RemoveOutcome::Failed
         }
 
+        pub fn remove_if_owner_within(
+            &self,
+            _instance_id: &str,
+            _wait: std::time::Duration,
+        ) -> RemoveOutcome {
+            RemoveOutcome::Failed
+        }
+
         pub fn inspect(&self, _instance_id: &str) -> InspectOutcome {
             InspectOutcome::Failed
         }
@@ -661,7 +669,14 @@ mod unix_impl {
         /// 优雅退出时调用：**仅当文件里的 `instance_id` 等于自己**才删；读、比对、unlink 都在旁路锁下完成。
         /// SIGKILL、panic、掉电不会走到这里（崩溃残留，由下一个拿到实例锁的实例覆盖）。
         pub fn remove_if_owner(&self, instance_id: &str) -> RemoveOutcome {
-            let Ok(_lock) = self.lock_sidecar(REMOVE_LOCK_WAIT) else {
+            self.remove_if_owner_within(instance_id, REMOVE_LOCK_WAIT)
+        }
+
+        /// [`Self::remove_if_owner`]，等旁路锁的上限由调用方给：整个退出共用一个期限（`stop::StopBudgets`），这一段只拿到它分到的那份，
+        /// 所以实际的上限是 `min(wait, REMOVE_LOCK_WAIT)`；`wait` 为零就只试一次。等不到锁就不删：文件保留，成为崩溃残留，
+        /// 由下一个拿到实例锁的实例覆盖（[`RemoveOutcome::LockUnavailable`]）。
+        pub fn remove_if_owner_within(&self, instance_id: &str, wait: Duration) -> RemoveOutcome {
+            let Ok(_lock) = self.lock_sidecar(wait.min(REMOVE_LOCK_WAIT)) else {
                 return RemoveOutcome::LockUnavailable;
             };
             match self.probe(instance_id) {
@@ -1231,6 +1246,54 @@ mod tests {
         consumer.unlock().unwrap();
         assert_eq!(target.remove_if_owner(INSTANCE_ID), RemoveOutcome::Removed);
         assert!(lock_path.exists(), "the lock file itself is never deleted");
+    }
+
+    /// H2：等旁路锁的上限由调用方给（总期限里留给删文件的那一份），不是固定的 2 秒：锁一直被占着，等够预算就放弃、文件原样保留；
+    /// 预算为零只试一次，立即返回；锁一放开，同一个预算里就删得掉。
+    #[test]
+    fn the_removal_waits_for_the_sidecar_lock_only_as_long_as_the_budget_it_was_given() {
+        let (_temp, dir) = private_dir();
+        let path = dir.join("idoris.json");
+        let target = DiscoveryTarget::open(&path).unwrap();
+        target.publish(&record()).unwrap();
+        let consumer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("idoris.json.lock"))
+            .unwrap();
+        consumer.lock().unwrap();
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            target.remove_if_owner_within(INSTANCE_ID, Duration::from_millis(150)),
+            RemoveOutcome::LockUnavailable
+        );
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        assert!(
+            waited < Duration::from_millis(1500),
+            "the 150 ms budget, not the 2 s default: {waited:?}"
+        );
+        assert!(path.exists(), "left for the next generation to overwrite");
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            target.remove_if_owner_within(INSTANCE_ID, Duration::ZERO),
+            RemoveOutcome::LockUnavailable
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a zero budget is one attempt: {:?}",
+            started.elapsed()
+        );
+        assert!(path.exists());
+
+        consumer.unlock().unwrap();
+        assert_eq!(
+            target.remove_if_owner_within(INSTANCE_ID, Duration::ZERO),
+            RemoveOutcome::Removed,
+            "a free lock needs no waiting at all"
+        );
     }
 
     #[test]
