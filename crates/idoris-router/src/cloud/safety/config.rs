@@ -62,6 +62,9 @@
 //!   回答都会发到那里。只能是回环地址，或者这个供应商核验过的 API 主机；没有登记主机的供应商标签、主机没核实的供应商不能配置到任何
 //!   非回环地址。云上游配置加载时对 `endpoints:` 里的每一行已经查过一遍；检查器自己的构造（`build_judge`）**不依赖那一步**，
 //!   自己再查一次（单测直接构造它），失败即启动失败。
+//! - **LLM 检查端点的 `extra_body` 同样走白名单**（和主上游同一张表，issue #603 N6 的后续）：顶层只收 `provider`，里面只收布尔值的
+//!   `zdr`、`allow_fallbacks`。同样在 `build_judge` 里自己再查一次：白名单外的键在构造请求时会被丢掉，运维以为在生效的参数
+//!   实际没发出去，所以加载时就报错，写明是哪一个键。
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -73,7 +76,9 @@ use idoris_compute_contracts::permit::{
     Billing, CapabilityNeeds, DataClass, PermitTable, Retention, RouteRequirements,
     TenantDataPolicy, select_compliant,
 };
-use idoris_upstream::cloud::{CloudEndpointClient, CloudEndpointSettings};
+use idoris_upstream::cloud::{
+    CloudEndpointClient, CloudEndpointSettings, disallowed_extra_body_field,
+};
 use serde::Deserialize;
 
 use super::extract::{CheckedInput, Origin, Segment, TrustedOperatorText};
@@ -571,6 +576,15 @@ fn build_judge(config: &JudgeConfig, inputs: &BuildInputs<'_>) -> Result<LlmJudg
     check_provider_host(&key, &endpoint.base_url).map_err(|error| {
         format!("{error}（这是 safety.llm_judge 的检查端点：孩子的原文和模型的回答会发到这个主机）")
     })?;
+    // `extra_body` 走白名单，和主上游同一张表（`disallowed_extra_body_field`）。云上游配置加载时对 `endpoints:` 的每一行已经查过，
+    // 这里自己再查一次，不依赖那一步（和上面的主机绑定同一个规矩）。白名单外的键在构造请求时会被丢掉：运维写进去以为在生效的
+    // 路由 / 留存参数（比如 `provider.data_collection`）实际没发出去，孩子的原文照样发了，所以加载时就报错，写明是哪一个键。
+    if let Some(field) = disallowed_extra_body_field(&endpoint.extra_body) {
+        return Err(bad(format!(
+            "LLM 检查端点 {key} 的 extra_body 不能包含 {field}：extra_body 是白名单，只收 provider: {{zdr: bool, allow_fallbacks: bool}}，\
+             models / route / plugins / provider.order 等路由与能力参数，以及协议 / 计费 / 身份 / 留存字段，写在这里不会发给检查模型"
+        )));
+    }
 
     // ---- 用许可表校验：对每一个儿童调用方都必须合规 ----
     let synthetic;
@@ -865,6 +879,15 @@ mod tests {
     /// 直接用 `build` 构造一个只有检查器的 `safety:` 段（绕过云上游配置里对 `endpoints:` 逐行的校验）：
     /// 检查端点的 `base_url` 是孩子的原文要发去的地方，这里自己必须证明主机是核验过的。
     fn build_judge_setup(provider: &str, base_url: &str) -> Result<SafetySetup, String> {
+        build_judge_setup_with(provider, base_url, "{}")
+    }
+
+    /// 同 [`build_judge_setup`]，检查端点另带一个 `extra_body`（YAML 流式映射）。
+    fn build_judge_setup_with(
+        provider: &str,
+        base_url: &str,
+        extra_body: &str,
+    ) -> Result<SafetySetup, String> {
         let model = "example-org/judge-8b";
         let permits = Arc::new(
             PermitTable::from_yaml_str(&format!(
@@ -873,7 +896,7 @@ mod tests {
             .unwrap(),
         );
         let endpoint: EndpointConfig = serde_yaml::from_str(&format!(
-            "provider: {provider}\nmodel: {model}\nendpoint: openai-compat\nbase_url: {base_url}\napi_key_env: EXAMPLE_JUDGE_API_KEY\nprice_version: pv-judge\ncost: {{unit: USD, input_per_mtok: \"0.26\", output_per_mtok: \"0.38\"}}\nprices:\n  - {{unit: THB, input_per_mtok: \"10\", output_per_mtok: \"40\"}}\n"
+            "provider: {provider}\nmodel: {model}\nendpoint: openai-compat\nbase_url: {base_url}\napi_key_env: EXAMPLE_JUDGE_API_KEY\nextra_body: {extra_body}\nprice_version: pv-judge\ncost: {{unit: USD, input_per_mtok: \"0.26\", output_per_mtok: \"0.38\"}}\nprices:\n  - {{unit: THB, input_per_mtok: \"10\", output_per_mtok: \"40\"}}\n"
         ))
         .unwrap();
         let config: SafetyConfig = serde_yaml::from_str(&format!(
@@ -916,6 +939,46 @@ mod tests {
         assert!(error.contains("没有核实"), "{error}");
         // 错误里是配置里的主机和供应商标签，没有任何密钥或内容
         assert!(!error.contains("sk-"));
+    }
+
+    /// issue #603 N6 的后续（PR-Daemon 在 #608 评审里指出）：检查端点的 `extra_body` 和主上游一样是白名单。云上游配置加载时对
+    /// `endpoints:` 的每一行已经查过，但检查器自己的构造不依赖那一步（和主机绑定同一个规矩，单测直接构造它）：
+    /// 以前这里只是把 `extra_body` 原样交给客户端，构造请求时白名单外的键被**悄悄**丢掉（含 `provider.data_collection: "deny"`、
+    /// `provider.order` 这类运维以为在生效的路由 / 留存参数），孩子的原文照样发出去。现在加载时就报错，写明是哪一个键。
+    #[test]
+    fn the_judge_endpoint_extra_body_is_an_allow_list_like_the_main_upstreams() {
+        let url = "http://127.0.0.1:9/v1";
+        // 白名单内：`provider` 里布尔值的 `zdr` / `allow_fallbacks`；没写
+        for allowed in [
+            "{}",
+            "{provider: {zdr: true}}",
+            "{provider: {zdr: true, allow_fallbacks: false}}",
+        ] {
+            build_judge_setup_with("example-judge", url, allowed)
+                .unwrap_or_else(|error| panic!("{allowed}: {error}"));
+        }
+        // 白名单外：顶层的路由 / 能力参数、`provider` 里的别的键或非布尔值、协议 / 计费 / 身份字段
+        for (denied, field) in [
+            ("{models: [a, b]}", "models"),
+            ("{route: fallback}", "route"),
+            ("{provider: {order: [x]}}", "provider.order"),
+            ("{provider: {only: [x]}}", "provider.only"),
+            (
+                "{provider: {data_collection: deny}}",
+                "provider.data_collection",
+            ),
+            ("{provider: {zdr: \"yes\"}}", "provider.zdr"),
+            ("{model: other-model}", "model"),
+            ("{max_tokens: 1}", "max_tokens"),
+        ] {
+            let error = build_judge_setup_with("example-judge", url, denied)
+                .expect_err(&format!("{denied} must not load"));
+            assert!(
+                error.contains("extra_body") && error.contains(field),
+                "{denied}: {error}"
+            );
+            assert!(error.contains("LLM 检查端点"), "{denied}: {error}");
+        }
     }
 
     #[test]

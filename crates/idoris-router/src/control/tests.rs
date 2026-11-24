@@ -706,6 +706,83 @@ async fn the_admin_token_the_local_data_key_and_the_control_credential_are_three
     );
 }
 
+/// 源码里（注释除外）读取请求来源的行：对端地址（`ConnectInfo`）、控制面边缘算好的客户端来源（`ClientAddr`）、转发头、回环判断……
+/// 返回 `文件名:行号: 命中的词: 原行`。
+///
+/// `extractor` 给了的话，这份源码里**只有**那个提取器（`impl<S: Send + Sync> FromRequestParts<S> for <extractor>` 到它结尾的
+/// `}`）允许读来源；`use` 行不算（导入本身读不了什么）。
+///
+/// `#[cfg(test)]` 标注的那一项（`mod tests { … }`、单个 `fn`、`mod tests;`、`use …;`）整项跳过，按大括号配平找它的结尾；
+/// 它后面的运行期代码照样扫（Codex 预审 L：以前遇到第一个 `#[cfg(test)]` 就整段停掉，文件前面放一个测试用的小函数，
+/// 后面的运行期代码就没人扫了）。字符串里的大括号不处理，测试项里有的话可能多跳或少跳几行。
+fn origin_reads(name: &str, source: &str, extractor: Option<&str>) -> Vec<String> {
+    const NEEDLES: [&str; 9] = [
+        "connectinfo",
+        "clientaddr",
+        "x-forwarded",
+        "x-real-ip",
+        "remote_addr",
+        "peer_addr",
+        "is_loopback",
+        "forwarded",
+        "origin",
+    ];
+    const TEST_ATTRIBUTE: &str = "#[cfg(test)]";
+    let allowed_impl = extractor
+        .map(|extractor| format!("impl<S: Send + Sync> FromRequestParts<S> for {extractor}"));
+    let mut inside_extractor = false;
+    // 正在跳过 `#[cfg(test)]` 标注的那一项：`depth` 是它里面还没闭合的大括号，`opened` 表示出现过大括号
+    let mut in_test_item = false;
+    let (mut depth, mut opened) = (0_i32, false);
+    let mut found = Vec::new();
+    for (number, line) in source.lines().enumerate() {
+        let code = line.trim_start();
+        if in_test_item || code.starts_with(TEST_ATTRIBUTE) {
+            let text = if in_test_item {
+                code
+            } else {
+                in_test_item = true;
+                (depth, opened) = (0, false);
+                &code[TEST_ATTRIBUTE.len()..]
+            };
+            if !text.trim_start().starts_with("//") {
+                let opens = i32::try_from(text.matches('{').count()).unwrap_or(i32::MAX);
+                let closes = i32::try_from(text.matches('}').count()).unwrap_or(i32::MAX);
+                opened |= opens > 0;
+                depth += opens - closes;
+                if (opened && depth <= 0) || (!opened && text.trim_end().ends_with(';')) {
+                    in_test_item = false;
+                }
+            }
+            continue;
+        }
+        if extractor.is_some() {
+            if allowed_impl
+                .as_deref()
+                .is_some_and(|head| code.starts_with(head))
+            {
+                inside_extractor = true;
+            }
+            if inside_extractor {
+                // 顶格的 `}` 结束这个 impl
+                inside_extractor = line != "}";
+                continue;
+            }
+            if code.starts_with("use ") {
+                continue;
+            }
+        }
+        if code.starts_with("//") {
+            continue;
+        }
+        let lowered = code.to_ascii_lowercase();
+        if let Some(needle) = NEEDLES.iter().find(|needle| lowered.contains(**needle)) {
+            found.push(format!("{name}:{}: {needle}: {line}", number + 1));
+        }
+    }
+    found
+}
+
 #[test]
 fn the_control_plane_sources_never_look_at_where_a_request_came_from() {
     // 组织局域网也不默认互信：授权只由凭证决定。把「看来源」这件事在源码层面钉死：处理函数里没有任何
@@ -716,30 +793,126 @@ fn the_control_plane_sources_never_look_at_where_a_request_came_from() {
         ("wire.rs", include_str!("wire.rs")),
         ("bootstrap.rs", include_str!("bootstrap.rs")),
     ] {
-        for (number, line) in source.lines().enumerate() {
-            let code = line.trim_start();
-            if code.starts_with("//") {
-                continue;
-            }
-            let lowered = code.to_ascii_lowercase();
-            for needle in [
-                "connectinfo",
-                "x-forwarded",
-                "x-real-ip",
-                "remote_addr",
-                "peer_addr",
-                "is_loopback",
-                "forwarded",
-                "origin",
-            ] {
-                assert!(
-                    !lowered.contains(needle),
-                    "{name}:{}: control-plane code must not consult the request origin ({needle}): {line}",
-                    number + 1
-                );
-            }
-        }
+        let found = origin_reads(name, source, None);
+        assert!(
+            found.is_empty(),
+            "control-plane code must not consult the request origin: {found:#?}"
+        );
     }
+    // 配对兑换的失败限速器按来源分桶（#603 N3），读来源的代码在 `pairing_codes.rs` 里。PR-Daemon 在 #607 评审里指出：那个文件
+    // 不在上面的扫描里。这里把它也扫一遍，只有 `RedeemSource` 提取器允许读来源；限速器自己（`acquire` 等）拿到的只是
+    // 提取器算好的地址，不能再按「回环」「转发头」之类另做文章。
+    let found = origin_reads(
+        "pairing_codes.rs",
+        include_str!("pairing_codes.rs"),
+        Some("RedeemSource"),
+    );
+    assert!(
+        found.is_empty(),
+        "only the RedeemSource extractor may consult the request origin: {found:#?}"
+    );
+}
+
+/// 上面那条扫描自己不能是摆设：提取器之外的读取、被误当成注释或 `use` 行遮住的读取都要被抓到，提取器之内的、注释里的、
+/// 单元测试里的不报。
+#[test]
+fn the_origin_scan_flags_a_read_outside_the_one_allowed_extractor() {
+    let sample = "\
+use axum::extract::connect_info::ConnectInfo;
+// X-Forwarded-For 只在注释里出现
+impl FailureLimiter {
+    fn acquire(&self, source: IpAddr) -> Option<Ticket> {
+        if source.is_loopback() { return Some(Ticket(0)); }
+        None
+    }
+}
+impl<S: Send + Sync> FromRequestParts<S> for RedeemSource {
+    async fn from_request_parts(parts: &mut Parts) -> Result<Self, Self::Rejection> {
+        let peer = parts.extensions.get::<ConnectInfo<ConnectionInfo>>();
+        Ok(Self(peer))
+    }
+}
+fn later(headers: &HeaderMap) { let _ = headers.get(\"x-forwarded-for\"); }
+#[cfg(test)]
+mod tests {
+    fn t(source: IpAddr) { source.is_loopback(); }
+}
+";
+    let found = origin_reads("sample.rs", sample, Some("RedeemSource"));
+    assert_eq!(found.len(), 2, "{found:#?}");
+    assert!(
+        found[0].starts_with("sample.rs:5: is_loopback:"),
+        "{found:#?}"
+    );
+    assert!(
+        found[1].starts_with("sample.rs:15: x-forwarded:"),
+        "{found:#?}"
+    );
+    // 没有提取器的白名单时，同一份源码里 `use` 行、提取器里的读取也都算
+    let strict = origin_reads("sample.rs", sample, None);
+    assert!(strict.len() > found.len(), "{strict:#?}");
+    // 提取器换了名字，它里面的读取就不再被放过
+    let renamed = origin_reads("sample.rs", sample, Some("SomethingElse"));
+    assert!(
+        renamed
+            .iter()
+            .any(|line| line.contains(":11: connectinfo:")),
+        "{renamed:#?}"
+    );
+}
+
+/// Codex 预审 L：提取器读的不只是 `ConnectInfo`，还有控制面边缘算好的 `ClientAddr`（`extensions.get::<ClientAddr>()`）。
+/// 限速器自己或别的函数照这个写法读，也要被扫描抓到；提取器里的同一行不报。
+#[test]
+fn the_origin_scan_flags_a_clientaddr_read_outside_the_allowed_extractor() {
+    let sample = "\
+use crate::cloud::ingress::net::ClientAddr;
+impl FailureLimiter {
+    fn acquire(&self, parts: &Parts) -> Option<Ticket> {
+        let resolved = parts.extensions.get::<ClientAddr>();
+        None
+    }
+}
+impl<S: Send + Sync> FromRequestParts<S> for RedeemSource {
+    async fn from_request_parts(parts: &mut Parts) -> Result<Self, Self::Rejection> {
+        let resolved = parts.extensions.get::<ClientAddr>();
+        Ok(Self(resolved))
+    }
+}
+";
+    let found = origin_reads("sample.rs", sample, Some("RedeemSource"));
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(
+        found[0].starts_with("sample.rs:4: clientaddr:"),
+        "{found:#?}"
+    );
+}
+
+/// Codex 预审 L：扫描只跳过测试项本身，不是遇到第一个 `#[cfg(test)]` 就停。以前在文件前面放一个 `#[cfg(test)]` 的小函数，
+/// 它后面的运行期代码就整段没人扫了。这里：前面的测试项、末尾的测试模块都不报，夹在中间的运行期代码要报。
+#[test]
+fn the_origin_scan_skips_only_the_test_items_not_everything_after_the_first_cfg_test() {
+    let sample = "\
+#[cfg(test)]
+fn helper(source: IpAddr) -> bool { source.is_loopback() }
+fn acquire(&self, source: IpAddr) -> Option<Ticket> {
+    if source.is_loopback() { return None; }
+    None
+}
+#[cfg(test)]
+mod tests {
+    fn t(source: IpAddr) { source.is_loopback(); }
+}
+";
+    let found = origin_reads("sample.rs", sample, Some("RedeemSource"));
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(
+        found[0].starts_with("sample.rs:4: is_loopback:"),
+        "{found:#?}"
+    );
+    // 没有提取器的白名单时也一样：测试项照样跳过，后面的运行期代码照样扫
+    let strict = origin_reads("sample.rs", sample, None);
+    assert_eq!(strict.len(), 1, "{strict:#?}");
 }
 
 // ================================================================================================
@@ -4017,4 +4190,181 @@ async fn a_caller_without_the_operation_gets_the_same_http_answer_for_an_existin
             "{label}: an existing and a missing id must be indistinguishable: {answers:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn member_credentials_and_pairing_codes_give_a_caller_without_the_operation_the_same_http_answer_for_any_id()
+ {
+    // issue #603 N7 同类（PR-Daemon 在 #608 评审里指出）：签发成员凭证、创建配对码按成员关系 id 去查，撤销配对码按配对码 id 去查，
+    // 旧代码都是先查、后授权。没有 `issue_credential` 权限的调用者（reader 只有 read），对「自己组织的」「别的组织的」
+    // 「不存在的」id 必须得到逐字节相同的回答（状态码、头、正文，只有每次请求都不一样的关联 id 除外）。
+    let world = World::new();
+    world.people().await;
+    let (reader, other) = (world.reader.secret.clone(), world.other.secret.clone());
+    // school-b 自己的主体、成员关系（成员账户 b1）和一个配对码
+    world
+        .ok(
+            "/control/v1/principals",
+            &other,
+            json!({"principal_id": "kb1", "org": "school-b"}),
+        )
+        .await;
+    world
+        .ok(
+            "/control/v1/memberships",
+            &other,
+            json!({"membership_id": "m-kb1", "principal_id": "kb1", "org": "school-b",
+                   "role": "member", "account": "b1"}),
+        )
+        .await;
+    let (_, own_code) = pairing_code(&world, "m-kid1").await;
+    let foreign_code = world
+        .ok(
+            "/control/v1/pairing/codes",
+            &other,
+            json!({"membership": "m-kb1", "allowed_privacy": ["local_only"], "allowed_roles": ["fast"]}),
+        )
+        .await["pairing"]["pairing_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    type Call = (String, Option<Value>);
+    let probes: Vec<(&str, Vec<Call>)> = vec![
+        (
+            "issue member credential",
+            ["m-kid1", "m-kb1", "m-ghost"]
+                .iter()
+                .map(|id| {
+                    (
+                        "/control/v1/credentials".to_string(),
+                        Some(json!({"binding": {"kind": "member", "membership": id},
+                                    "allowed_privacy": ["local_only"], "allowed_roles": ["fast"]})),
+                    )
+                })
+                .collect(),
+        ),
+        (
+            "create pairing code",
+            ["m-kid1", "m-kb1", "m-ghost"]
+                .iter()
+                .map(|id| {
+                    (
+                        "/control/v1/pairing/codes".to_string(),
+                        Some(json!({"membership": id, "allowed_privacy": ["local_only"],
+                                    "allowed_roles": ["fast"]})),
+                    )
+                })
+                .collect(),
+        ),
+        (
+            "revoke pairing code",
+            [
+                own_code.as_str(),
+                foreign_code.as_str(),
+                "pc_0123456789abcdef",
+            ]
+            .iter()
+            .map(|id| (format!("/control/v1/pairing/codes/{id}/revoke"), None))
+            .collect(),
+        ),
+    ];
+    for (label, calls) in probes {
+        let mut answers = Vec::new();
+        for (path, body) in calls {
+            let reply = world.call("POST", &path, Some(&reader), body).await;
+            // 先逐条断言预期的答案（Codex 预审 L：只比较「彼此相同」会放过「三个都错得一样」）：reader 没有这个操作，
+            // 每个 id 都是 403 `op_not_granted`；然后才比较整份回答
+            assert_eq!(
+                reply.status,
+                StatusCode::FORBIDDEN,
+                "{label} {path}: {}",
+                reply.raw
+            );
+            assert_eq!(
+                reply.reason(),
+                "op_not_granted",
+                "{label} {path}: {}",
+                reply.raw
+            );
+            answers.push(answer_without_the_correlation_id(&reply));
+        }
+        assert!(
+            answers.iter().all(|answer| *answer == answers[0]),
+            "{label}: an existing and a missing id must be indistinguishable: {answers:?}"
+        );
+    }
+}
+
+/// 数据库里全部成员关系的 id（升序）。
+fn membership_rows(world: &World) -> Vec<String> {
+    let conn = world.db();
+    let mut stmt = conn
+        .prepare("SELECT membership_id FROM memberships ORDER BY membership_id")
+        .unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_bound_payment_account_gives_a_hidden_and_a_missing_membership_id_the_same_http_answer() {
+    // Codex 预审 H1：school-b 的付款账户 b1 已经属于 m-bee。school-b 的管理员拿 b1 和一个活跃的主体去建成员关系，
+    // 成员关系 id 一次用 eduai 的 `m-kid1`（school-b 管不到）、一次用不存在的 id。旧代码：前者 403 `out_of_scope`，
+    // 后者 400 `invalid_membership`（账户已被占用），靠它就能探测别的组织有哪些成员关系 id。现在两个得到同一个回答，
+    // 只有回答里回显的、调用者自己提交的那个 id 不同；两次都什么也没建。
+    let world = World::new();
+    world.people().await;
+    let other = world.other.secret.clone();
+    for principal in ["bee", "cat"] {
+        world
+            .ok(
+                "/control/v1/principals",
+                &other,
+                json!({"principal_id": principal, "org": "school-b"}),
+            )
+            .await;
+    }
+    world
+        .ok(
+            "/control/v1/memberships",
+            &other,
+            json!({"membership_id": "m-bee", "principal_id": "bee", "org": "school-b",
+                   "role": "member", "account": "b1"}),
+        )
+        .await;
+    let before = membership_rows(&world);
+    let mut answers = Vec::new();
+    // 两个 id 一样长：回答里回显的 id 换成占位符之后，连 content-length 也该逐字节相同
+    for id in ["m-kid1", "m-nope"] {
+        let reply = world
+            .call(
+                "POST",
+                "/control/v1/memberships",
+                Some(&other),
+                Some(
+                    json!({"membership_id": id, "principal_id": "cat", "org": "school-b",
+                            "role": "member", "account": "b1"}),
+                ),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{id}: {}", reply.raw);
+        assert_eq!(reply.reason(), "invalid_membership", "{id}: {}", reply.raw);
+        let message = reply.json["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("b1") && message.contains("m-bee"),
+            "{id}: {message}"
+        );
+        // 回显的 id 换成占位符之后，整份回答（状态、头、正文）逐字节相同
+        let (status, headers, mut body) = answer_without_the_correlation_id(&reply);
+        body["error"]["message"] = json!(message.replace(id, "<id>"));
+        answers.push((status, headers, body));
+    }
+    assert_eq!(answers[0], answers[1], "{answers:?}");
+    assert_eq!(
+        membership_rows(&world),
+        before,
+        "neither request may create anything"
+    );
 }

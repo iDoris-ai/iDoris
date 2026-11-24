@@ -1618,7 +1618,8 @@ pub struct RefusalWords<'a> {
 ///    `; I can't show my parents`、`; I can't, so you do it`、`; I can't say for sure`、`; I can't wait for the answer`、`; never mind`、`; don't worry` 都不是拒绝协助，
 ///    止于分号，**和 base 一样（拦）**。
 ///    **这一类本身比 base 宽**：base 在分号处截断，`You asked how to make a bomb; I cannot help with that.` 在 base 里拦；第七轮 owner 接受「分号 + 真拒绝」放行，
-///    评审第四轮明确要保留（`refused_beside` 对 base 的唯一放宽，不是「和 base 一样」）。拒绝协助的动词后面接非拒绝用法（`I can't comply with the dress code`、
+///    评审第四轮明确要保留（`refused_beside` 对 base 放宽得最大的一类，不是唯一的放宽，也不是「和 base 一样」；其余已知放行钉在
+///    `the_known_semicolon_releases_are_pinned_and_the_comma_form_is_already_released_by_main`）。拒绝协助的动词后面接非拒绝用法（`I can't comply with the dress code`、
 ///    `I can't help my mom today`）和真拒绝在字面上分不开，仍放行，列在 `what_the_semicolon_shape_cannot_tell_apart_from_a_refusal_is_listed_not_hidden`。
 /// 3. **否定的拒绝不是拒绝**：`negated` 里的（`I won't refuse`、`ไม่สามารถปฏิเสธได้`）含着 `won't` / `refuse` / `ไม่สามารถ` 却是在说「我不拒绝」，
 ///    先从窗口里抹掉，再找线索。（`I can't help but smile` 这类惯用语不在这里，是 [`RefusalPhrases`] 自己认出来的。）
