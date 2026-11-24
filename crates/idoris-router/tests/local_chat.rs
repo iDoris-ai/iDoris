@@ -165,6 +165,17 @@ async fn only_role_chat_is_supported_and_everything_else_is_400_unsupported_role
         "/v1/recommendation?role=chat&role=chat",
         "/v1/recommendation?role=chat&role=vision",
         "/v1/recommendation?x=chat",
+        // 解码之后才比较：解码后重复、大小写不对、带空白或坏转义的都不算（#609）。
+        "/v1/recommendation?role=ch%61t&role=chat",
+        "/v1/recommendation?role=Ch%61t",
+        "/v1/recommendation?role=chat%20",
+        "/v1/recommendation?role=chat+",
+        "/v1/recommendation?role=ch%zzat",
+        "/v1/recommendation?role=chat%00",
+        // 编码后重复的 `role`（键被编码）仍是重复；`%25` 只解码一次，得到字面的 `ch%61t`，不是 `chat`。
+        "/v1/recommendation?role=chat&r%6Fle=chat",
+        "/v1/recommendation?role=ch%2561t",
+        "/v1/recommendation?r%6Fle%00=chat",
     ] {
         // 数据源在不在都一样：角色先于数据源判断。
         for local_chat in [None, Some(source(&home.models_dir(), 16 * GIB, None))] {
@@ -181,6 +192,20 @@ async fn only_role_chat_is_supported_and_everything_else_is_400_unsupported_role
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    // 百分号编码的 `role=chat`（值或键被编码）等价于字面写法（#609）。
+    for uri in [
+        "/v1/recommendation?role=ch%61t",
+        "/v1/recommendation?r%6Fle=chat",
+        "/v1/recommendation?%72ole=%63%68%61%74",
+    ] {
+        let (status, _) = get(
+            app_with(Some(source(&home.models_dir(), 16 * GIB, None))),
+            uri,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+    }
 }
 
 #[tokio::test]

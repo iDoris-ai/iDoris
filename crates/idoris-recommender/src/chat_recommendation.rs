@@ -9,7 +9,9 @@
 //!   （8B 4_623_791_053、27B 20_681_935_545、35B-A3B 24_693_954_499 字节），取到兆字节精度；35B-A3B 向上取整
 //!   （偏保守）。目录估算（35B 曾为 22.13 GB）少算约 2.5 GB，故改用实测值，未安装时 `size_bytes` 也是预计下载体积。
 //! - `fits` = 估算内存不超过预算，且真实物理 RAM 不低于目录里的 `min_ram_gb`（§2.4 的 min_ram 门）。
-//!   预算：设置了额度按额度，否则按调用方给的可用 GPU 内存（[`probed_gpu_available_bytes`]）。
+//!   预算：设置了额度时，额度要**先扣 1 GB 余量**（[`HEADROOM_BYTES`]，与加载准入同一个常量：估算落在
+//!   (额度 − 1 GB, 额度] 的模型加载时会 503 `headroom_confirmation_required`，不能报 `fits: true`）；
+//!   没有额度时按调用方给的可用 GPU 内存（[`probed_gpu_available_bytes`]，加载准入对它没有余量要求）。
 //! - `alternatives[].reason` 取该档位行自己的代码。
 //! - 第一行（`[0, 16 GiB)`）放不下时 `model_id` 为 `null`，`reason` 仍是该行的 `tier_below_16gib`；其余行
 //!   全部放不下才是 `insufficient_memory`。
@@ -23,6 +25,10 @@ use crate::probe::{FactsSource, HostFacts};
 use crate::recommend::{RecommenderPolicy, budget_breakdown};
 
 pub const GIB: u64 = 1_073_741_824;
+
+/// 设置了额度时，加载准入在额度之内保留的余量（十进制 1 GB）：估算内存超过「额度 − 余量」的加载需要调用方用
+/// `X-iDoris-Headroom-Breach: confirmed` 确认。router 的加载准入与这里的 `fits` 共用这一个常量。
+pub const HEADROOM_BYTES: u64 = 1_000_000_000;
 const BYTES_PER_GB: f64 = 1_000_000_000.0;
 
 /// 估算内存用的上下文长度与 KV 精度（规范的实测口径：8k 上下文、全注意力 fp16 KV 上界）。
@@ -226,9 +232,11 @@ fn assess(omlx_id: &str, input: &RecommendInput<'_>) -> Result<Assessed, Recomme
     )
     .map_err(|_| missing())?;
     let est_memory_bytes = gb_to_bytes(footprint);
-    let budget_bytes = input
-        .allocated_budget_bytes
-        .unwrap_or(input.gpu_available_bytes);
+    // 额度要先扣余量（加载准入就是这么算的）；自探的 GPU 可用内存没有余量要求。
+    let budget_bytes = match input.allocated_budget_bytes {
+        Some(allocated) => allocated.saturating_sub(HEADROOM_BYTES),
+        None => input.gpu_available_bytes,
+    };
     let ram_gb = input.ram_bytes as f64 / GIB as f64;
     let fits = est_memory_bytes <= budget_bytes && ram_gb >= model.min_ram_gb;
     let local = input
