@@ -15,25 +15,29 @@
 //! 能花的   = 此刻有效的额度剩余 + 授信可用    同一笔花费先用额度（先到期的先用），用完才动授信
 //! ```
 //!
-//! 这个文件有一个**独立于被测代码**的模型（[`model`]）：只读原始表（`allocations`、`allocation_revocations`、
+//! 这个文件有两个**独立于被测代码**的模型（`support/ledger_books.rs`）：[`model`] 只读原始表（`allocations`、`allocation_revocations`、
 //! `ledger_allocation_marks`、`ledger_entries`），把「额度创建」「额度撤销」「一笔花费」当成同一条时间线上的事件，按提交先后
 //! 逐件回放「先额度后授信」，不经过被测的投影函数，也不共用被测实现里「这笔额度能不能覆盖这笔花费」的判断（被测实现拿花费的第一条
-//! 分录号和额度的序号直接比，模型靠事件顺序维护「此刻已经存在、没被撤销的额度」），所以两边对不上就是实现有 bug。
+//! 分录号和额度的序号直接比，模型靠事件顺序维护「此刻已经存在、没被撤销的额度」）；[`Sim`] 不读库，只吃测试自己做过的事
+//! （发额度、撤销、预留、释放、结算），随机历史的期望从它来。两个模型也不照抄被测实现的时间假设（读钟更早时不把已提交的花费压到
+//! 读钟上，预留和它超出预留的部分按种类分、不按毫秒合并），所以两边对不上就是实现有 bug。
 //! 所有场景都核对金额守恒：额度覆盖的 + 授信承担的 = 分录里的已花，授信承担的永远不超过授信额度。
+//! 「Codex 复审（2026-11-22）」那一节的测试不用任何模型，期望数字全部手算。
 //!
 //! 数字约定见 `support/ledger_fixture.rs`：`10` 个输入 token 加 `max_tokens = M` 的预留是 `10 + 2M` 微泰铢，
 //! 所以 `max_tokens = 45` 的预留正好是 100，`max_tokens = 10` 是最低有用的预留 30。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/ledger_books.rs"]
+mod books;
 #[path = "support/ledger_fixture.rs"]
 mod fixture;
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
 
+use books::*;
 use fixture::*;
 use idoris_compute_contracts::account::Allocation;
 use idoris_compute_contracts::admission::{AdmissionDecision, AncestorView};
@@ -42,7 +46,7 @@ use idoris_compute_contracts::grant::Purpose;
 use idoris_compute_contracts::ids::{AllocationId, IdempotencyKey};
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_tenancy::accounts::ledger::{
-    CreditLineSetting, FreeTierIssue, FreeTierOutcome, LedgerError,
+    CreditLineSetting, FreeTierIssue, FreeTierOutcome, LedgerError, SettleOutcome,
 };
 use idoris_tenancy::accounts::{AccountStore, GrantAllocation, Meta, Who};
 
@@ -201,163 +205,8 @@ fn prepaid(store: &AccountStore, id: &str, micros: i64, from: i64, until: i64, c
 }
 
 // ------------------------------------------------------------------------------------------
-// 独立于被测代码的模型
+// 独立于被测代码的模型（`support/ledger_books.rs`）：读原始表回放的 `model`，和不读库、只吃测试自己做过的事的 `Sim`
 // ------------------------------------------------------------------------------------------
-
-/// 一个账户上「先额度后授信」的账。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Books {
-    /// 此刻还能花的额度：没被撤销、此刻生效的额度，扣掉它们已经覆盖的花费之后的剩余。
-    allowance_left: i64,
-    /// 已花（含在途预留）里被额度覆盖的部分。
-    covered: i64,
-    /// 已花（含在途预留）里由授信承担的部分：累计授信债务。
-    credit_debt: i64,
-    /// 分录里 `Σ (held + spent)`：已花加在途。
-    spent: i64,
-}
-
-/// 读原始表，按事件逐笔回放（不经过被测代码）：
-///
-/// * 事件按**提交先后**排：分录号是提交的先后；额度创建 / 撤销的序号 `after_entry` 是「它提交那一刻账本里最后一条分录的号」，
-///   所以它排在这个号的分录之后、下一个号的分录之前；毫秒只用来判断额度自己的窗口 `[valid_from, valid_until)`；
-/// * 一笔花费 = 一个预留在这个账户上、同一个归属时刻上的 `held + spent` 净额（结算、释放、过期都折算进去了），先后看它第一条分录的号；
-/// * 回放时维护「此刻已经创建、没被撤销的额度」：一笔花费先用其中窗口包含它的归属时刻的额度里**先到期**的（同时到期的先创建的先用），
-///   用完才记成授信债务；
-/// * 额度剩余只算此刻（毫秒 `now`）窗口内、没被撤销的。
-fn model(db_path: &Path, account: &str, now: i64) -> Books {
-    struct Bucket {
-        from: i64,
-        until: i64,
-        left: i64,
-        revoked: bool,
-    }
-    // 事件在时间线上的位置：`(分录号, 种类, 下标)`。种类 0 = 一笔花费（排在它第一条分录的号上），1 = 额度创建，2 = 额度撤销。
-    // 同一个号上花费排在额度事件之前：创建序号 c 的额度只覆盖号大于 c 的花费，撤销序号 r 的额度仍然覆盖号不大于 r 的花费。
-    let mut buckets: Vec<Bucket> = Vec::new();
-    let mut events: Vec<(i64, u8, usize)> = Vec::new();
-    let mut spends: Vec<(i64, i64)> = Vec::new(); // (归属时刻, 净额)
-    {
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        conn.busy_timeout(Duration::from_secs(10)).unwrap();
-        // 一个读事务里读完所有表：竞争测试里采样者线程读的时候别的线程还在写，分开读会读到不一致的快照
-        conn.execute_batch("BEGIN").unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT a.valid_from_ms, a.valid_until_ms, a.ceiling_micros,
-                        (SELECT m.after_entry FROM ledger_allocation_marks m
-                          WHERE m.allocation_id = a.allocation_id AND m.event = 'created'),
-                        (SELECT m.after_entry FROM ledger_allocation_marks m
-                          WHERE m.allocation_id = a.allocation_id AND m.event = 'revoked')
-                   FROM allocations a
-                  WHERE a.child_id = ?1 AND a.purpose IN ('free_tier', 'prepaid', 'org_quota')
-                    AND a.valid_from_ms <= ?2 AND a.ceiling_micros > 0
-                  ORDER BY a.rowid",
-            )
-            .unwrap();
-        let rows = stmt
-            .query_map(rusqlite::params![account, now], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                ))
-            })
-            .unwrap();
-        for row in rows {
-            let (from, until, cap, created_after, revoked_after) = row.unwrap();
-            let index = buckets.len();
-            buckets.push(Bucket {
-                from,
-                until,
-                left: cap,
-                revoked: false,
-            });
-            events.push((
-                created_after.expect("every allocation has a creation mark"),
-                1,
-                index,
-            ));
-            if let Some(after) = revoked_after {
-                events.push((after, 2, index));
-            }
-        }
-        drop(stmt);
-        let mut stmt = conn
-            .prepare(
-                "SELECT MIN(entry_id), window_at_ms, SUM(held_micros + spent_micros) FROM ledger_entries
-                  WHERE account_id = ?1 AND hold_id IS NOT NULL
-                  GROUP BY hold_id, window_at_ms
-                 HAVING SUM(held_micros + spent_micros) <> 0",
-            )
-            .unwrap();
-        let rows = stmt
-            .query_map([account], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .unwrap();
-        for row in rows {
-            let (first_entry, at, amount) = row.unwrap();
-            assert!(amount > 0, "a hold never nets to a negative amount");
-            // 读的是比这笔花费更早的某一刻（排队乱序时取到的时间比前面已经提交的花费更早）：往后的花费按读的那一刻算，
-            // 也就是用读的那一刻此刻生效的额度
-            events.push((first_entry, 0, spends.len()));
-            spends.push((at.min(now), amount));
-        }
-        drop(stmt);
-        conn.execute_batch("COMMIT").unwrap();
-    }
-    events.sort_unstable();
-
-    let mut known: Vec<usize> = Vec::new();
-    let (mut covered, mut credit_debt, mut spent) = (0_i64, 0_i64, 0_i64);
-    for (_, kind, index) in events {
-        match kind {
-            // 额度创建：此后的花费才可能用它
-            1 => known.push(index),
-            // 额度撤销：此后的花费不再用它，剩下的额度作废
-            2 => buckets[index].revoked = true,
-            _ => {
-                let (at, amount) = spends[index];
-                spent += amount;
-                let mut rest = amount;
-                let mut usable: Vec<usize> = known
-                    .iter()
-                    .copied()
-                    .filter(|i| {
-                        !buckets[*i].revoked && buckets[*i].from <= at && at < buckets[*i].until
-                    })
-                    .collect();
-                // 先到期的先用；同时到期的先创建的先用
-                usable.sort_by_key(|i| (buckets[*i].until, *i));
-                for i in usable {
-                    let take = rest.min(buckets[i].left);
-                    buckets[i].left -= take;
-                    rest -= take;
-                    covered += take;
-                }
-                credit_debt += rest;
-            }
-        }
-    }
-    let allowance_left = buckets
-        .iter()
-        .filter(|bucket| !bucket.revoked && bucket.from <= now && now < bucket.until)
-        .map(|bucket| bucket.left)
-        .sum();
-    Books {
-        allowance_left,
-        covered,
-        credit_debt,
-        spent,
-    }
-}
 
 /// 视图和模型对得上，并且金额守恒。返回模型的账。
 ///
@@ -1432,6 +1281,808 @@ fn an_allocation_that_lost_its_order_mark_fails_admission_closed() {
     }
 }
 
+/// 往 `account` 上这个预留里插一条金额 0 的分录（库被改坏了的样子，插入不用拆触发器）：账户、预留、币种抄预留那一条，
+/// 种类和归属时刻自己给。
+fn insert_zero_entry(db: &TempDb, account: &str, hold_id: &str, kind: &str, window_at: i64) {
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let inserted = conn
+        .execute(
+            "INSERT INTO ledger_entries
+                 (account_id, hold_id, kind, unit, held_micros, spent_micros, funds_micros, liability_micros,
+                  window_at_ms, at_ms, idempotency_key)
+             SELECT account_id, hold_id, ?3, unit, 0, 0, 0, 0, ?4, at_ms, 'tampered-' || ?3 || '-' || ?4
+               FROM ledger_entries WHERE hold_id = ?2 AND account_id = ?1 AND kind = 'reserve'",
+            rusqlite::params![account, hold_id, kind, window_at],
+        )
+        .unwrap();
+    assert_eq!(
+        inserted, 1,
+        "the reservation has one reserve entry on {account}"
+    );
+}
+
+#[test]
+fn a_hold_whose_entries_disagree_on_their_attribution_moment_fails_the_books_closed() {
+    // 一个预留在一个账户上的预留 / 结算 / 释放 / 过期分录都记在预留创建的时刻（T0 + 9），结算那一刻才发生的花费（`late_settle`）整个预留
+    // 只有一个归属时刻（结算的时刻 T0 + 10）。同一类里出现第二个时刻就是库被改坏了（插一条金额 0 的分录就够）：失败即关闭，不能随便挑一个
+    // 来读（挑错了，一笔花费落进不该覆盖它的额度窗口，授信被白白空出来）。
+    //
+    // 账户：授信 100、额度 100 的窗口从 T0 + 10 起；T0 + 9 预留 100，T0 + 10 按 200 结算（超出 100，由额度覆盖）。改坏之前：预留之内的 100 在
+    // T0 + 9（额度够不着，授信债务 100），超出的 100 在 T0 + 10（额度覆盖，剩 0）：净头寸 0 - 100 = -100。
+    for (what, kind, window_at) in [
+        ("the reservation", "release", T0 + 8),
+        ("the settlement-time spend", "late_settle", T0 + 11),
+    ] {
+        let db = TempDb::new(&format!("books-two-moments-{kind}"));
+        let store = credit_only_world(&db);
+        credit_line(&store, "emp", 100, T0);
+        prepaid(&store, "emp-new", 100, T0 + 10, T0 + 10 + 30 * DAY, T0 + 5);
+        let first = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 9);
+        assert_eq!(
+            admit(&store, &first)
+                .admitted()
+                .map(|a| a.reservation.price.micros()),
+            Some(100),
+            "{what}"
+        );
+        settle_at(&store, &first, 200, T0 + 10);
+        assert_eq!(
+            view(&store, T0 + 11).ceiling_remaining,
+            Some(thb(-100)),
+            "{what}: the books are sound before the tampering"
+        );
+        let hold = store
+            .hold(&first.attempt, "model")
+            .unwrap()
+            .unwrap()
+            .hold_id;
+        drop(store);
+        insert_zero_entry(&db, "emp", &hold, kind, window_at);
+
+        let store = AccountStore::open(db.path()).unwrap();
+        let next = Req::new(&store, "r-2", 0, "cred-e", M30).at(T0 + 12);
+        let error = store
+            .admit_attempt(&next.input())
+            .expect_err("admission must fail closed");
+        assert!(
+            matches!(error, LedgerError::Corrupt(_)),
+            "{what}: {error:?}"
+        );
+        assert!(
+            store.hold(&next.attempt, "model").unwrap().is_none(),
+            "{what}: nothing was reserved"
+        );
+        assert!(
+            store.account_view(&aid("emp"), ts(T0 + 12)).is_err(),
+            "{what}: the view fails closed too"
+        );
+    }
+}
+
+#[test]
+fn a_settle_entry_on_a_hold_that_is_neither_being_settled_nor_settled_on_time_fails_the_books_closed()
+ {
+    // `settle` 只写在没迟到的结算里：预留要么正在这个事务里结算（状态还是 open），要么已经结算且没迟到。挂在放掉了的预留、迟到结算了的预留
+    // 上的 `settle` 是库被改坏了：失败即关闭。读不出「超出了多少」不能当成「没有超出」（当成没有，旧格式里超出的部分就按预留创建的时刻读）。
+    //
+    // 账户：授信 100、额度 100 的窗口 [T0, T0 + 30 天)（没有任何额度时不回放花费，也就读不到这条 `settle`）；T0 + 1 000 预留 100，
+    //   放掉：债务 0，额度一分没动，净头寸 100 - 0 = 100；
+    //   过了 TTL 才按 100 结算（迟到）：整笔 100 是结算那一刻的花费，额度覆盖，净头寸 0 + 0 - 0 = 0。
+    for what in ["released", "settled late"] {
+        let db = TempDb::new(&format!("books-settle-on-{}", what.replace(' ', "-")));
+        let store = credit_only_world(&db);
+        credit_line(&store, "emp", 100, T0);
+        prepaid(&store, "emp-new", 100, T0, T0 + 30 * DAY, T0);
+        let first = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 1_000);
+        assert_eq!(
+            admit(&store, &first)
+                .admitted()
+                .map(|a| a.reservation.price.micros()),
+            Some(100),
+            "{what}"
+        );
+        let (healthy_at, healthy_net) = if what == "released" {
+            store
+                .release_attempt(&first.attempt, ts(T0 + 2_000))
+                .unwrap();
+            (T0 + 3_000, 100)
+        } else {
+            let ttl = store.ledger_config().unwrap().reservation_ttl_ms;
+            let settle_at = T0 + 1_000 + ttl + 5_000;
+            assert_eq!(store.sweep_expired_holds(ts(settle_at - 1_000)).unwrap(), 1);
+            let outcome = store
+                .settle_attempt(&first.attempt, &price(100), ts(settle_at))
+                .unwrap();
+            assert!(outcome.late, "{outcome:?}");
+            (settle_at + 500, 0)
+        };
+        assert_eq!(
+            view(&store, healthy_at).ceiling_remaining,
+            Some(thb(healthy_net)),
+            "{what}: the books are sound before the tampering"
+        );
+        let hold = store
+            .hold(&first.attempt, "model")
+            .unwrap()
+            .unwrap()
+            .hold_id;
+        drop(store);
+        insert_zero_entry(&db, "emp", &hold, "settle", T0 + 1_000);
+
+        let store = AccountStore::open(db.path()).unwrap();
+        let next = Req::new(&store, "r-2", 0, "cred-e", M30).at(healthy_at + 1_000);
+        let error = store
+            .admit_attempt(&next.input())
+            .expect_err("admission must fail closed");
+        assert!(
+            matches!(error, LedgerError::Corrupt(_)),
+            "{what}: {error:?}"
+        );
+        assert!(
+            store.hold(&next.attempt, "model").unwrap().is_none(),
+            "{what}: nothing was reserved"
+        );
+        assert!(
+            store
+                .account_view(&aid("emp"), ts(healthy_at + 1_000))
+                .is_err(),
+            "{what}: the view fails closed too"
+        );
+    }
+}
+
+#[test]
+fn a_negative_amount_cannot_offset_the_debt_of_a_reservation_with_or_without_allowances() {
+    // Codex 三复审 Medium：账户上没有任何花费类额度时，三本账不逐笔回放，已花（含在途）全是额度之外的部分。原来直接取整个账户的
+    // `Σ (held + spent)`：一个被改坏了的预留的负净额抵掉别的预留真实的债务。授信 200；r-1 预留 90（净额 +90）、r-2 预留 30（净额 +30），
+    // 债务 120，净头寸 -120。把 r-2 的净额改成 -40（在 30 的预留之外又放掉 70）：90 和 -40 并存，整个账户的求和是 50，旧代码读出债务 50、
+    // 净头寸 -50，多出 70 的授信。现在失败即关闭：每个预留的净额必须不为负，读到负的返回 `Corrupt`，准入和视图都不例外。
+    // 结算那一刻才发生的花费（`late_settle`）的净额同理（负的 `late_settle` 要关掉 CHECK 才插得进去）。
+    // 有额度时的回放（逐笔找额度）是同一条规矩：原来把负的花费按 0 算，现在也失败即关闭，两条路一致。
+    for (label, with_allowance, negative_settlement_spend) in [
+        ("no allowances, negative reservation", false, false),
+        ("with an allowance, negative reservation", true, false),
+        ("no allowances, negative settlement-time spend", false, true),
+        (
+            "with an allowance, negative settlement-time spend",
+            true,
+            true,
+        ),
+    ] {
+        let db = TempDb::new(&format!(
+            "books-negative-net-{with_allowance}-{negative_settlement_spend}"
+        ));
+        let store = credit_only_world(&db);
+        credit_line(&store, "emp", 200, T0);
+        if with_allowance {
+            // 额度 10，一直有效：回放要读花费；r-1 的 90 先用掉这 10，债务 80 + 30 = 110，净头寸 0 - 110 = -110
+            prepaid(&store, "emp-small", 10, T0 - DAY, T0 + 30 * DAY, T0);
+        }
+        let big = Req::new(&store, "r-1", 0, "cred-e", 40).at(T0 + 1);
+        assert_eq!(
+            admit(&store, &big)
+                .admitted()
+                .map(|a| a.reservation.price.micros()),
+            Some(90),
+            "{label}"
+        );
+        let small = Req::new(&store, "r-2", 0, "cred-e", M30).at(T0 + 2);
+        assert_eq!(
+            admit(&store, &small)
+                .admitted()
+                .map(|a| a.reservation.price.micros()),
+            Some(30),
+            "{label}"
+        );
+        assert_eq!(
+            view(&store, T0 + 3).ceiling_remaining,
+            Some(thb(if with_allowance { -110 } else { -120 })),
+            "{label}: sound before the tampering (debt 90 + 30, minus the 10 the allowance covers)"
+        );
+        drop(store);
+        if negative_settlement_spend {
+            make_the_settlement_time_spend_negative(&db, "emp", "r-2#0", -40);
+        } else {
+            make_the_net_negative(&db, "emp", "r-2#0", 70);
+        }
+
+        let store = AccountStore::open(db.path()).unwrap();
+        let error = store
+            .account_view(&aid("emp"), ts(T0 + 4))
+            .expect_err("the view must fail closed");
+        assert!(
+            matches!(error, LedgerError::Corrupt(_)),
+            "{label}: {error:?}"
+        );
+        let next = Req::new(&store, "r-3", 0, "cred-e", M30).at(T0 + 4);
+        let error = store
+            .admit_attempt(&next.input())
+            .expect_err("admission must fail closed");
+        assert!(
+            matches!(error, LedgerError::Corrupt(_)),
+            "{label}: {error:?}"
+        );
+        assert!(
+            store.hold(&next.attempt, "model").unwrap().is_none(),
+            "{label}: nothing was reserved"
+        );
+    }
+}
+
+#[test]
+fn a_settle_entry_that_holds_less_than_the_overage_its_hold_claims_never_books_more_than_it_holds()
+{
+    // 库被改坏了：预留的记录说预留 100、实际 200（超出 100，旧格式：整笔 200 记在 `settle` 里），可这条 `settle` 的已花被改成了 60，
+    // 连预留之内的部分都不够。分出来的超出部分夹到这个预留在这个账户上剩下的净额（60），预留本身是 0；不夹就是分出 100，预留本身 -40，
+    // 凭空多出 40 的额度覆盖。
+    //
+    // 授信 100，额度 100 的窗口从 T0 + 10 起（T0 + 5 创建）；T0 + 9 预留 100，T0 + 10 按 200 结算，分录改回旧格式，再把 `settle` 的已花改成 60。
+    // 读：超出的 60 在 T0 + 10，额度覆盖，剩 40；预留之内 0。净头寸 40 - 0 = 40。（不夹：覆盖 100，剩 0，净头寸 0。）
+    let db = TempDb::new("books-settle-holds-less-than-claimed");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 100, T0);
+    prepaid(&store, "emp-new", 100, T0 + 10, T0 + 10 + 30 * DAY, T0 + 5);
+    let first = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 9);
+    assert_eq!(
+        admit(&store, &first)
+            .admitted()
+            .map(|a| a.reservation.price.micros()),
+        Some(100)
+    );
+    settle_at(&store, &first, 200, T0 + 10);
+    drop(store);
+    rewrite_overage_as_v0_5_0(&db, "r-1#0");
+    let changed = rusqlite::Connection::open(db.path())
+        .unwrap()
+        .execute(
+            "UPDATE ledger_entries SET spent_micros = 60
+              WHERE hold_id = 'r-1#0' AND account_id = 'emp' AND kind = 'settle'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let store = AccountStore::open(db.path()).unwrap();
+    assert_eq!(
+        view(&store, T0 + 11).ceiling_remaining,
+        Some(thb(40)),
+        "the 60 the settle entry holds is the most it can move: allowance 100 - 60 = 40, nothing inside the reservation"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// Codex 复审（2026-11-22）：超出预留的部分、读钟乱序——没充值的账户在 main 上就有同样的两条造钱的路径
+// ------------------------------------------------------------------------------------------
+//
+// 期望数字全部从输入事件手算（推导写在注释里），不经过被测代码，也不经过 `model` 和 `Sim`。区分点是「同一笔钱不能花两次」：
+// 任何时刻已花（含在途）不超过 额度 + 授信（被撤销额度没花掉的部分不算）。
+
+/// 结算一个预留。
+fn settle_at(store: &AccountStore, req: &Req, charged: i64, at: i64) -> SettleOutcome {
+    store
+        .settle_attempt(&req.attempt, &price(charged), ts(at))
+        .unwrap()
+}
+
+#[test]
+fn the_overage_of_an_unexpired_settlement_spends_the_allowance_of_its_own_moment_once() {
+    // 授信 100；额度 100。
+    //
+    //   T0 + 9    预留 100：额度的窗口 [T0 + 10, ..) 还没开始（或者额度这时还不存在），授信 100 全部占用，债务 100
+    //   T0 + 10   按 200 结算，超出预留 100
+    //
+    // 结算那一刻额度生效、一分没动：能吸收超出部分的是额度 100 + 授信可用 (100 - 100) = 100，担保人承担 100，没有平台损失。
+    // 这 100 就是额度花掉的：结算之后额度剩余 0、债务 100、能花的 0 + (100 - 100) = 0。
+    // 旧代码把整笔 200 记在预留的时刻 T0 + 9 上，额度够不着它：债务 200、额度仍剩 100，净头寸 100 - min(200, 100) = 0，
+    // 能花的是 0 + 授信额度 100，一笔 100 的请求照样放行：花了 200 + 100，只有额度 100 + 授信 100。
+    for (label, allowance_exists_before_the_reservation) in [
+        ("the window starts after the reservation", true),
+        ("the allowance is created after the reservation", false),
+    ] {
+        let db = TempDb::new(&format!(
+            "books-overage-attribution-{allowance_exists_before_the_reservation}"
+        ));
+        let store = credit_only_world(&db);
+        credit_line(&store, "emp", 100, T0);
+        if allowance_exists_before_the_reservation {
+            prepaid(&store, "emp-new", 100, T0 + 10, T0 + 10 + 30 * DAY, T0 + 5);
+        }
+        let first = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 9);
+        assert_eq!(
+            admit(&store, &first)
+                .admitted()
+                .map(|a| a.reservation.price.micros()),
+            Some(100),
+            "{label}"
+        );
+        if !allowance_exists_before_the_reservation {
+            // 窗口早就开始了，但它是预留提交之后才存在的：覆盖不到那一笔预留
+            prepaid(&store, "emp-new", 100, T0 - DAY, T0 + 30 * DAY, T0 + 9);
+        }
+
+        let outcome = settle_at(&store, &first, 200, T0 + 10);
+        assert!(!outcome.late, "{label}");
+        assert_eq!(outcome.overage, thb(100), "{label}");
+        assert_eq!(outcome.user_borne, thb(100), "{label}");
+        assert_eq!(
+            (
+                outcome.sponsor_covered.clone(),
+                outcome.platform_loss.clone()
+            ),
+            (thb(100), thb(0)),
+            "{label}: {outcome:?}"
+        );
+        assert!(!outcome.credential_frozen, "{label}");
+
+        let after = view(&store, T0 + 11);
+        assert_eq!(
+            after.ceiling_remaining,
+            Some(thb(-100)),
+            "{label}: allowance 0 - debt 100"
+        );
+        assert_eq!(headroom(&after), 0, "{label}: 200 spent of 200");
+        let next = Req::new(&store, "r-2", 0, "cred-e", M100).at(T0 + 12);
+        let rejected = admit(&store, &next);
+        assert_eq!(
+            denied(&rejected),
+            Some(ReasonCode::BudgetExhausted),
+            "{label}: {rejected:?}"
+        );
+        let laddered = admit_with_ladder(&store, "cred-e", "r-3", M30, T0 + 13);
+        assert_eq!(
+            denied(&laddered),
+            Some(ReasonCode::BudgetExhausted),
+            "{label}: {laddered:?}"
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COALESCE(SUM(held_micros + spent_micros), 0) FROM ledger_entries WHERE account_id = 'emp'"
+            ),
+            200,
+            "{label}"
+        );
+        assert_eq!(store.loss_total("platform_loss").unwrap(), 0, "{label}");
+        assert_clean(&store);
+    }
+}
+
+#[test]
+fn an_old_allowance_revoked_after_the_reservation_and_a_new_one_in_the_same_millisecond_do_not_merge_the_overage_back()
+ {
+    // 预留、撤销旧额度、发新额度、结算全在同一毫秒 X = T0 + 10，只有调用顺序（提交顺序）分得出先后。授信 100，旧额度 100，新额度 100，一共 300。
+    //
+    //   预留 150：旧额度 100（还没撤销）+ 授信 50
+    //   撤销 `old`（预留之后），发 `new`（窗口从 X 起，撤销之后）
+    //   按 250 结算，超出预留 100
+    //
+    // 结算前：旧额度只覆盖预留，新额度一分没动；能花的 = 额度 100 + (授信 100 - 债务 50) = 150，担保人吸收超出的 100，没有平台损失。
+    // 超出的 100 是撤销和发新额度之后才提交的：旧额度不再覆盖，新额度覆盖，结算之后额度 0、债务 50、能花的 0 + (100 - 50) = 50
+    // （旧代码在同一毫秒把超出部分并回预留那一笔：新额度够不着它，债务 150，新额度还剩 100，能花的是 100，一笔 100 的请求照样放行）。
+    // 下一笔 100 的请求只能降到 50；总共花了 250 + 50 = 300，正好是全部的钱。
+    let db = TempDb::new("books-overage-same-ms");
+    let store = credit_only_world(&db);
+    let x = T0 + 10;
+    credit_line(&store, "emp", 100, T0);
+    prepaid(&store, "old", 100, T0 - DAY, T0 + 30 * DAY, T0);
+
+    let first = Req::new(&store, "r-1", 0, "cred-e", 70).at(x);
+    assert_eq!(
+        admit(&store, &first)
+            .admitted()
+            .map(|a| a.reservation.price.micros()),
+        Some(150)
+    );
+    revoke_allocation_at(&db, "old", x);
+    prepaid(&store, "new", 100, x, x + 30 * DAY, x);
+
+    let outcome = settle_at(&store, &first, 250, x);
+    assert_eq!(outcome.overage, thb(100));
+    assert_eq!(outcome.user_borne, thb(150));
+    assert_eq!(
+        (
+            outcome.sponsor_covered.clone(),
+            outcome.platform_loss.clone()
+        ),
+        (thb(100), thb(0)),
+        "room before the settlement: 100 + (100 - 50) = 150: {outcome:?}"
+    );
+    assert!(!outcome.credential_frozen);
+
+    let after = view(&store, x + 1);
+    assert_eq!(
+        after.ceiling_remaining,
+        Some(thb(-50)),
+        "allowance 0 - debt 50"
+    );
+    assert_eq!(headroom(&after), 50);
+    let next = admit(
+        &store,
+        &Req::new(&store, "r-2", 0, "cred-e", M100).at(x + 2),
+    );
+    assert_eq!(
+        next.admitted().map(|a| a.reservation.price.micros()),
+        Some(50),
+        "only 50 of the 300 is left: {next:?}"
+    );
+    assert!(
+        matches!(next, AdmissionDecision::Degrade { .. }),
+        "{next:?}"
+    );
+    let none = admit_with_ladder(&store, "cred-e", "r-3", M30, x + 3);
+    assert_eq!(denied(&none), Some(ReasonCode::BudgetExhausted), "{none:?}");
+    assert_eq!(store.loss_total("platform_loss").unwrap(), 0);
+    assert_clean(&store);
+}
+
+#[test]
+fn a_request_that_read_the_clock_earlier_cannot_move_a_committed_spend_into_a_revoked_allowance() {
+    // 授信 100；旧额度 100，窗口是毫秒级的 [T0, T0 + 100)。调用顺序（提交顺序）：
+    //
+    //   A  T0 + 101 准入 100：额度窗口已经过了，用的是授信，债务 100
+    //   撤销旧额度（A 提交之后）
+    //   B  读钟读到的是 T0 + 99（早于 A，排队才拿到写锁），准入 100
+    //
+    // A 的花费归属时刻是 T0 + 101，不在旧额度的窗口里，所以是授信承担的：债务 100；旧额度已撤销，不可花：
+    // B 能花的 0 + (100 - 100) = 0，拒绝。旧代码把 A 的归属时刻按 B 的读钟压到 T0 + 99，落进旧额度的窗口、算成它覆盖的
+    // （撤销在 A 之后提交，照样覆盖）：债务 0，授信又是满的，B 放行——同一笔 100 的授信花了两次。
+    let db = TempDb::new("books-stale-read-revoked");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 100, T0);
+    prepaid(&store, "old", 100, T0, T0 + 100, T0);
+    let a = Req::new(&store, "a-1", 0, "cred-e", M100).at(T0 + 101);
+    let decision = admit(&store, &a);
+    assert!(
+        matches!(decision, AdmissionDecision::Allow { .. }),
+        "{decision:?}"
+    );
+    revoke_allocation_at(&db, "old", T0 + 102);
+
+    let b = Req::new(&store, "b-1", 0, "cred-e", M100).at(T0 + 99);
+    let rejected = admit(&store, &b);
+    assert_eq!(
+        denied(&rejected),
+        Some(ReasonCode::BudgetExhausted),
+        "A spent the credit at T0 + 101, outside the window: {rejected:?}"
+    );
+    assert!(store.hold(&b.attempt, "model").unwrap().is_none());
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COALESCE(SUM(held_micros + spent_micros), 0) FROM ledger_entries WHERE account_id = 'emp'"
+        ),
+        100,
+        "only A is on the books"
+    );
+    assert_clean(&store);
+}
+
+#[test]
+fn a_spend_that_belongs_to_an_allowance_starting_after_the_read_time_still_uses_that_allowance() {
+    // 授信 100；额度 `b2` 100，窗口 [T0 + 100, T0 + 200)。
+    //
+    //   S  T0 + 150 准入 100：b2 在窗口里，先用 b2 的 100，授信一分没动
+    //   B  读钟读到的是 T0 + 99，准入 100：b2 在 B 的时刻还没生效，能用的只有授信 100——而 S 用的是 b2，授信是满的，放行
+    //
+    // 只回放读钟那一刻已经开始的额度，S 找不到 b2，被算成授信债务，B 就被无谓地拒绝了。
+    // 放行之后：B 用授信 100，S 用 b2 100，一共 200 = 全部的钱，再来一笔拒绝。
+    let db = TempDb::new("books-future-allowance");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 100, T0);
+    prepaid(&store, "b2", 100, T0 + 100, T0 + 200, T0);
+    let s = Req::new(&store, "s-1", 0, "cred-e", M100).at(T0 + 150);
+    assert_eq!(
+        admit(&store, &s)
+            .admitted()
+            .map(|a| a.reservation.price.micros()),
+        Some(100)
+    );
+    let b = Req::new(&store, "b-1", 0, "cred-e", M100).at(T0 + 99);
+    let decision = admit(&store, &b);
+    assert_eq!(
+        decision.admitted().map(|a| a.reservation.price.micros()),
+        Some(100),
+        "S used b2, so the credit is intact: {decision:?}"
+    );
+    assert!(
+        matches!(decision, AdmissionDecision::Allow { .. }),
+        "{decision:?}"
+    );
+    let c = Req::new(&store, "c-1", 0, "cred-e", M30).at(T0 + 151);
+    let none = admit(&store, &c);
+    assert_eq!(denied(&none), Some(ReasonCode::BudgetExhausted), "{none:?}");
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COALESCE(SUM(held_micros + spent_micros), 0) FROM ledger_entries WHERE account_id = 'emp'"
+        ),
+        200
+    );
+    assert_clean(&store);
+}
+
+#[test]
+fn spends_are_replayed_in_commit_order_even_when_their_attribution_moments_are_out_of_order() {
+    // 回放的先后是提交先后（分录号），不是归属时刻：排队让后提交的请求归属时刻更早（读钟取在排队之前，设计稿 S3-20）。
+    //
+    // 授信 100；两笔额度都在两笔花费之前创建：W 50，窗口 [T0, T0 + 300)；V 50，窗口 [T0 + 150, T0 + 350)。
+    //   S1  先提交，归属时刻 T0 + 200，预留 50：W 和 V 的窗口都包含它，先到期的先用（W 300 < V 350）：W 出 50，V 一分没动
+    //   S2  后提交，归属时刻 T0 + 100，预留 50：窗口包含它的只有 W（V 从 T0 + 150 起），W 已经被 S1 用光：额度够不着，授信债务 50
+    // （按归属时刻的先后回放：S2 先用 W，S1 改用 V，债务 0——两笔花费争同一份额度，先后换一下，落到授信上的那笔就换了。）
+    // T0 + 250（两笔额度都还有效）：W 0、V 50，额度剩余 50，债务 50：净头寸 50 - min(50, 100) = 0，两种先后读出来一样，分不出来。
+    // T0 + 400（两笔额度都到期了）：额度剩余 0，债务 50 还在：净头寸 -50，能花 -50 + 100 = 50。按归属时刻回放，债务 0，能花 100。
+    // 所以：再来一笔 70 只能降到 50（降级放行，用掉剩下的 50），之后再来任何一笔都拒绝。按归属时刻回放，这笔 70 会被整笔放行。
+    let db = TempDb::new("books-commit-order-replay");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 100, T0);
+    prepaid(&store, "emp-w", 50, T0, T0 + 300, T0);
+    prepaid(&store, "emp-v", 50, T0 + 150, T0 + 350, T0);
+    let s1 = Req::new(&store, "s-1", 0, "cred-e", 20).at(T0 + 200);
+    assert_eq!(
+        admit(&store, &s1)
+            .admitted()
+            .map(|a| a.reservation.price.micros()),
+        Some(50)
+    );
+    let s2 = Req::new(&store, "s-2", 0, "cred-e", 20).at(T0 + 100);
+    let decision = admit(&store, &s2);
+    assert_eq!(
+        decision.admitted().map(|a| a.reservation.price.micros()),
+        Some(50),
+        "{decision:?}"
+    );
+
+    let books = check_books(&store, &db, "emp", T0 + 250);
+    assert_eq!(
+        (books.allowance_left, books.covered, books.credit_debt),
+        (50, 50, 50),
+        "S1 used W, S2 could only use W: {books:?}"
+    );
+    assert_eq!(view(&store, T0 + 250).ceiling_remaining, Some(thb(0)));
+
+    let after = view(&store, T0 + 400);
+    assert_eq!(
+        after.ceiling_remaining,
+        Some(thb(-50)),
+        "both allowances ended, S2's 50 is still credit debt"
+    );
+    assert_eq!(headroom(&after), 50);
+    let books = check_books(&store, &db, "emp", T0 + 400);
+    assert_eq!(
+        (books.allowance_left, books.covered, books.credit_debt),
+        (0, 50, 50)
+    );
+    let too_big = Req::new(&store, "s-3", 0, "cred-e", 30).at(T0 + 400);
+    let degraded = admit(&store, &too_big);
+    assert!(
+        matches!(degraded, AdmissionDecision::Degrade { .. }),
+        "70 does not fit in 50, only the degraded request does: {degraded:?}"
+    );
+    assert_eq!(
+        degraded.admitted().map(|a| a.reservation.price.micros()),
+        Some(50),
+        "{degraded:?}"
+    );
+    let none_left = Req::new(&store, "s-4", 0, "cred-e", 20).at(T0 + 401);
+    let rejected = admit(&store, &none_left);
+    assert_eq!(
+        denied(&rejected),
+        Some(ReasonCode::BudgetExhausted),
+        "the last 50 went to s-3: {rejected:?}"
+    );
+    assert_clean(&store);
+}
+
+#[test]
+fn an_unexpired_overage_booked_whole_in_the_old_shape_is_split_when_the_books_are_read() {
+    // 旧写法（v0.5.0 / main）把没迟到的结算里超出预留的部分和预留之内的部分一起记在预留创建的时刻（一条 `settle`，已花是整笔）。
+    // 已经写下的行不改，读的时候按新口径解释：旧格式 `settle` 里 `charged - reserved` 的正差是一笔单独的逻辑花费，用这条 `settle`
+    // 自己的 `at_ms`（结算时刻）和 `entry_id`（结算的提交序号）。
+    //
+    // 授信 100，额度 100 的窗口从 T0 + 10 起（T0 + 5 创建）；T0 + 9 预留 100，T0 + 10 按 200 结算（超出 100）。分录改回旧写法：
+    // `settle` 的已花 200，没有 `late_settle`。
+    // 读：预留之内的 100 在 T0 + 9，额度够不着，授信债务 100；超出的 100 在 T0 + 10，额度覆盖，剩余 0。净头寸 0 - 100 = -100，
+    // 能花的 -100 + 100 = 0，下一笔 100 拒绝。（整笔 200 记在 T0 + 9 来读：债务 200，额度还剩 100，净头寸 0，能花 100，
+    // 下一笔 100 照样放行。）
+    // 两种发额度的方式，期望一样：窗口在预留之后才开始（额度先创建），或者额度在预留提交之后、结算之前才创建（窗口早就开始了）。
+    // 后一种要求超出的部分用**结算这条 `settle` 自己的分录号**（不是预留那条）：额度在预留之后才存在，只有结算的序号比它的创建序号大。
+    // 再加一个维度（Codex 三复审 Low）：超出的 100 在 `settle` 里是整笔留着（旧格式，`late_settle` 里 0），还是只搬了一半
+    // （`settle` 已花 160 + `late_settle` 40）。两种读出来是同一本账：`settle` 里还留着的 100 - 40 = 60 在 T0 + 10，加上 `late_settle`
+    // 的 40，结算时刻一共 100。
+    for (label, allowance_exists_before_the_reservation, keep_in_late) in [
+        ("the window starts after the reservation", true, 0),
+        ("the allowance is created after the reservation", false, 0),
+        ("half of it moved, window starts after", true, 40),
+        ("half of it moved, allowance created after", false, 40),
+    ] {
+        let db = TempDb::new(&format!(
+            "books-legacy-overage-split-{allowance_exists_before_the_reservation}-{keep_in_late}"
+        ));
+        let store = credit_only_world(&db);
+        credit_line(&store, "emp", 100, T0);
+        if allowance_exists_before_the_reservation {
+            prepaid(&store, "emp-new", 100, T0 + 10, T0 + 10 + 30 * DAY, T0 + 5);
+        }
+        let first = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 9);
+        assert_eq!(
+            admit(&store, &first)
+                .admitted()
+                .map(|a| a.reservation.price.micros()),
+            Some(100),
+            "{label}"
+        );
+        if !allowance_exists_before_the_reservation {
+            prepaid(&store, "emp-new", 100, T0 - DAY, T0 + 30 * DAY, T0 + 9);
+        }
+        settle_at(&store, &first, 200, T0 + 10);
+        drop(store);
+        rewrite_overage_partially(&db, "r-1#0", keep_in_late);
+
+        let store = AccountStore::open(db.path()).unwrap();
+        let mut expected = vec![
+            ("reserve".to_string(), 100, 0, T0 + 9),
+            ("settle".to_string(), -100, 200 - keep_in_late, T0 + 9),
+        ];
+        if keep_in_late > 0 {
+            expected.push(("late_settle".to_string(), 0, keep_in_late, T0 + 10));
+        }
+        assert_eq!(
+            store
+                .entries_of_hold(&first.attempt, "model")
+                .unwrap()
+                .into_iter()
+                .filter(|entry| entry.account == "emp")
+                .map(|entry| (
+                    entry.kind,
+                    entry.held,
+                    entry.spent,
+                    entry.window_at.millis()
+                ))
+                .collect::<Vec<_>>(),
+            expected,
+            "{label}: the overage is (partly) still inside the settle entry"
+        );
+        let v = view(&store, T0 + 11);
+        assert_eq!(
+            v.ceiling_remaining,
+            Some(thb(-100)),
+            "{label}: allowance 0 - debt 100"
+        );
+        let books = check_books(&store, &db, "emp", T0 + 11);
+        assert_eq!(
+            (books.allowance_left, books.covered, books.credit_debt),
+            (0, 100, 100),
+            "{label}"
+        );
+        assert_eq!(headroom(&v), 0, "{label}");
+        let next = Req::new(&store, "r-2", 0, "cred-e", M100).at(T0 + 12);
+        let rejected = admit(&store, &next);
+        assert_eq!(
+            denied(&rejected),
+            Some(ReasonCode::BudgetExhausted),
+            "{label}: {rejected:?}"
+        );
+        let smallest = admit_with_ladder(&store, "cred-e", "r-3", M30, T0 + 13);
+        assert_eq!(
+            denied(&smallest),
+            Some(ReasonCode::BudgetExhausted),
+            "{label}: {smallest:?}"
+        );
+        assert_clean(&store);
+    }
+}
+
+#[test]
+fn an_old_shape_overage_is_counted_once_not_in_both_the_reservation_and_the_overage() {
+    // 旧格式 `settle` 里整笔 200 = 预留之内 100 + 超出 100。读的时候把超出的 100 分出来记在结算时刻，预留本身就只剩 100；分出来之后
+    // 没从预留本身扣掉，这 100 就被算了两遍（预留 200 + 超出 100 = 300）。授信 100 时债务被授信额度夹住，两种读法的净头寸一样，看不出来
+    // （上面那条测试用的就是授信 100）；授信 300 不夹，债务是 100 还是 200 才分得开。
+    //
+    // 授信 300，额度 100 的窗口从 T0 + 10 起（T0 + 5 创建）；T0 + 9 预留 100，T0 + 10 按 200 结算（超出 100）；分录改回 v0.5.0 的写法。
+    // 读：预留之内的 100 在 T0 + 9，额度够不着：债务 100；超出的 100 在 T0 + 10，额度覆盖，剩余 0。净头寸 0 - min(100, 300) = -100，
+    // 能花 -100 + 300 = 200。算了两遍：债务 200、额度 0，净头寸 -200，能花 100。
+    // 端到端：再来一笔 200 整笔放行（能花的 200 正好用完），之后再来一笔拒绝。
+    let db = TempDb::new("books-legacy-overage-once");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 300, T0);
+    prepaid(&store, "emp-new", 100, T0 + 10, T0 + 10 + 30 * DAY, T0 + 5);
+    let first = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 9);
+    assert_eq!(
+        admit(&store, &first)
+            .admitted()
+            .map(|a| a.reservation.price.micros()),
+        Some(100)
+    );
+    settle_at(&store, &first, 200, T0 + 10);
+    drop(store);
+    rewrite_overage_as_v0_5_0(&db, "r-1#0");
+
+    let store = AccountStore::open(db.path()).unwrap();
+    let v = view(&store, T0 + 11);
+    assert_eq!(
+        v.ceiling_remaining,
+        Some(thb(-100)),
+        "allowance 0 - debt 100, the overage is counted once"
+    );
+    assert_eq!(headroom(&v), 200);
+    let books = check_books(&store, &db, "emp", T0 + 11);
+    assert_eq!(
+        (books.allowance_left, books.covered, books.credit_debt),
+        (0, 100, 100)
+    );
+    let big = Req::new(&store, "r-2", 0, "cred-e", 95).at(T0 + 12);
+    let decision = admit(&store, &big);
+    assert!(
+        matches!(decision, AdmissionDecision::Allow { .. }),
+        "200 fits in what is left, whole: {decision:?}"
+    );
+    assert_eq!(
+        decision.admitted().map(|a| a.reservation.price.micros()),
+        Some(200),
+        "{decision:?}"
+    );
+    let none = Req::new(&store, "r-3", 0, "cred-e", M30).at(T0 + 13);
+    let rejected = admit(&store, &none);
+    assert_eq!(
+        denied(&rejected),
+        Some(ReasonCode::BudgetExhausted),
+        "{rejected:?}"
+    );
+    assert_clean(&store);
+}
+
+#[test]
+fn a_credit_line_raised_inside_the_ttl_covers_the_overage_of_a_grace_round_instead_of_freezing_the_credential()
+ {
+    // Codex 复审（2026-11-22，7c5a03fe）High 2，没充值的账户（main 上就有）：担保人能吸收多少，要在预留之内的部分记账**之后**读，
+    // 不能在宽限里平台承担的那一块还占着的时候读。授信 10，额度 10：能花的 20，放不下最低有用的预留 30，所以走宽限（预留 210，
+    // 下限 20，平台承担缺口 190）。TTL 之内担保人把授信调到 100，随后按 300 结算（超出预留 90）。
+    //
+    // 手算：宽限承担 G = min(300, 210) - 20 = 190；记到链上 300 - 190 = 110，其中预留之内 210 - 190 = 20，超出 90。
+    // 预留之内的 20 记账之后：额度 10 覆盖 10，授信债务 10；净头寸 0 - min(10, 100) = -10，能吸收 -10 + 100 = 90 >= 90：担保人承担 90，
+    // 平台损失 0，凭证不冻结。旧代码先读：整笔 210 还占着，额度覆盖 10，债务 200，净头寸 0 - min(200, 100) = -100，能吸收 0，
+    // 超出的 90 全是平台损失，凭证被冻结。
+    // 结算之后：超出的 90 在结算那一刻、额度已经用完：债务 10 + 90 = 100 = 授信额度，能花 0，下一笔被拒。
+    let db = TempDb::new("books-grace-credit-raised");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 10, T0);
+    prepaid(&store, "emp-small", 10, T0 - DAY, T0 + 30 * DAY, T0);
+    let first = admit_with_ladder(&store, "cred-e", "r-1", 100, T0);
+    assert!(
+        matches!(first, AdmissionDecision::Grace { .. }),
+        "{first:?}"
+    );
+    credit_line(&store, "emp", 100, T0 + 500);
+    let outcome = store
+        .settle_attempt(&attempt_of("r-1"), &price(300), ts(T0 + 1_000))
+        .unwrap();
+    assert!(!outcome.late, "{outcome:?}");
+    assert_eq!(outcome.grace_absorbed, thb(190), "{outcome:?}");
+    assert_eq!(outcome.user_borne, thb(20), "{outcome:?}");
+    assert_eq!(outcome.overage, thb(90), "{outcome:?}");
+    assert_eq!(outcome.sponsor_covered, thb(90), "{outcome:?}");
+    assert_eq!(outcome.platform_loss, thb(0), "{outcome:?}");
+    assert!(!outcome.credential_frozen, "{outcome:?}");
+    assert_eq!(store.loss_total("platform_loss").unwrap(), 0);
+
+    let after = view(&store, T0 + 2_000);
+    assert_eq!(
+        after.ceiling_remaining,
+        Some(thb(-100)),
+        "allowance 0 - debt 100"
+    );
+    assert_eq!(headroom(&after), 0);
+    let next = Req::try_new(&store, "r-2", 0, "cred-e", M30, T0 + 2_000)
+        .expect("the credential is still active");
+    let decision = admit(&store, &next);
+    assert_eq!(
+        denied(&decision),
+        Some(ReasonCode::BudgetExhausted),
+        "{decision:?}"
+    );
+    assert_clean(&store);
+}
+
 // ------------------------------------------------------------------------------------------
 // 并发：24 个线程同时来，额度和授信各自恰好用掉该用的
 // ------------------------------------------------------------------------------------------
@@ -1556,13 +2207,14 @@ fn concurrent_admissions_never_exceed_allowance_plus_credit_line() {
 }
 
 // ------------------------------------------------------------------------------------------
-// 对照：有充值的账户行为不变
+// 有充值的账户（issue #601）：第五轮留着不动的对照，现在也按方案 C 记账
 // ------------------------------------------------------------------------------------------
 
 #[test]
-fn an_account_with_funds_is_unchanged_by_separate_books() {
-    // 有充值的账户：余额 = 充值 - 全期已花，本来就带着欠下的钱，新额度不会重置它，也不是花费的来源（可用额 = 余额与额度剩余里较小的）。
-    // 这条对照在「分开记」落地前后必须逐字一样。
+fn an_account_with_funds_keeps_its_old_debt_apart_from_a_new_allowance() {
+    // 第五轮这里是一条「有充值的账户行为不变」的对照：余额 = 充值 - 全期已花，带着欠下的钱，新额度不是花费的来源（可用额 = 余额与
+    // 额度剩余里较小的），余额 -100 时新额度 100 一分也花不出去。issue #601 把方案 C 延伸到有充值的账户（S3-22）：同样的历史，
+    // 新额度照常可花，不抵旧债，授信仍是占满的。（范围、顺序、告警、并发的场景在 `ledger_credit_books_funded.rs`。）
     let db = TempDb::new("books-funded-control");
     let store = credit_only_world(&db);
     store
@@ -1572,37 +2224,48 @@ fn an_account_with_funds_is_unchanged_by_separate_books() {
     for (request, at) in [("r-1", T0 + 1_000), ("r-2", T0 + 2_000)] {
         assert!(spend(&store, request, at, M100).is_admitted(), "{request}");
     }
-    assert_eq!(view(&store, T0 + 3_000).balance, Some(thb(-100)));
+    assert_eq!(
+        view(&store, T0 + 3_000).balance,
+        Some(thb(-100)),
+        "还没有任何额度：S0 自己的余额，没变"
+    );
 
     let later = T0 + 10_000;
     prepaid(&store, "emp-prepaid-1", 100, later, later + 30 * DAY, later);
     let v = view(&store, later + 1);
+    assert_eq!(v.balance, None, "自有资金并进了净头寸");
     assert_eq!(
-        v.balance,
-        Some(thb(-100)),
-        "全期求和：不会因为新额度窗口而重置"
+        v.ceiling_remaining,
+        Some(thb(0)),
+        "额度 100，旧债 100 仍占满授信 100：净头寸 0，不是旧代码的 -100"
     );
-    assert_eq!(v.ceiling_remaining, Some(thb(100)), "额度窗口自 later 起");
     assert_eq!(v.credit_limit, thb(100));
-    let blocked = admit_with_ladder(&store, "cred-e", "r-3", M30, later + 1_000);
+    // 新额度 100 照常可花（30 + 70），授信一分没动
+    assert!(spend(&store, "r-3", later + 1_000, M30).is_admitted());
+    assert!(spend(&store, "r-4", later + 2_000, 30).is_admitted());
+    let blocked = admit_with_ladder(&store, "cred-e", "r-5", M30, later + 3_000);
     assert_eq!(
         denied(&blocked),
         Some(ReasonCode::BudgetExhausted),
-        "可用额 = min(余额 -100, 额度 100) = -100，加授信 100 = 0：{blocked:?}"
+        "额度 100 花完了，授信仍被旧债占满：{blocked:?}"
     );
     assert_eq!(
         scalar(
             &db,
             "SELECT COALESCE(SUM(spent_micros), 0) FROM ledger_entries WHERE account_id = 'emp'"
         ),
-        200
+        300
     );
     assert_clean(&store);
 }
 
 // ------------------------------------------------------------------------------------------
-// 随机历史：视图、独立模型、准入决定三方对得上
+// 随机历史：视图、两个独立模型、准入决定、结算分摊对得上
 // ------------------------------------------------------------------------------------------
+//
+// 期望从 [`Sim`] 来：它只吃这个测试自己做过的事（发额度、撤销额度、预留、释放、结算）和业务规则，不读库、不读被测实现。
+// 每一步之后，视图、读原始表回放的 `model`（账本的分录有没有记对）、`Sim` 三方必须逐项一致。历史里有超出预留的结算
+// （超出的部分记在结算那一刻）、读钟乱序（`jitter`）和迟发、起点倒填的额度。
 
 /// xorshift64*：不引入依赖，结果确定。
 struct Rng(u64);
@@ -1622,13 +2285,80 @@ impl Rng {
 /// 按模型预测一个预留 `reserve` 微泰铢的请求在账上的结果：能花的 = 额度剩余 + 授信可用；
 /// 放得下就全额放行，放不下但够最低有用的预留（30）就压到「能花的」里最大的偶数，再小就拒绝。
 fn expected_price(books: &Books, credit: i64, reserve: i64) -> Option<i64> {
-    let room = books.allowance_left + (credit - books.credit_debt.min(credit));
+    let room = books.room(credit);
     if reserve <= room {
         Some(reserve)
     } else if room >= 30 {
         Some(room - (room % 2))
     } else {
         None
+    }
+}
+
+/// 视图、读原始表回放的 `model`、不读库的 `Sim` 三方一致。返回账。
+fn check_against_sim(store: &AccountStore, db: &TempDb, sim: &Sim, now: i64) -> Books {
+    let books = check_books(store, db, "emp", now);
+    assert_eq!(
+        books,
+        sim.books(now),
+        "the entries in the ledger replay to something other than what the events say, read at {now}"
+    );
+    books
+}
+
+/// 结算 `req`（预留 `reserved`，实际 `charged`），同步到 `Sim`，并按**手算规则**核对这次结算的分摊（`Sim::settle`）：先记预留之内的部分、再读
+/// 整条链的余量，担保人能吸收 `min(超出, max(余量, 0))`，吸收不了的是平台损失，凭证因此被冻结（然后解冻，历史接着走）。超出预留的部分
+/// **不再**被夹到余量以内：余量不够时要有平台损失和冻结。`legacy`：结算之后把这个预留的分录改回 v0.5.0 的写法（超出的部分并回 `settle`、
+/// 没有 `late_settle`），账不能变——读旧格式的分录要和新格式是同一回事。
+#[allow(clippy::too_many_arguments)]
+fn settle_both(
+    store: &AccountStore,
+    db: &TempDb,
+    sim: &mut Sim,
+    req: &Req,
+    spend: usize,
+    reserved: i64,
+    charged: i64,
+    at: i64,
+    legacy: bool,
+    reached: &mut Reached,
+) {
+    let hold = store.hold(&req.attempt, "model").unwrap().unwrap().hold_id;
+    let extra = (charged - reserved).max(0);
+    if extra > 0 {
+        reached.overage_settled += 1;
+        if sim.books(at).allowance_left > 0 {
+            reached.overage_with_allowance += 1;
+        }
+    }
+    let outcome = settle_at(store, req, charged, at);
+    let expected = sim.settle(spend, charged, at);
+    assert!(!outcome.late, "{outcome:?}");
+    assert_eq!(outcome.overage, thb(expected.overage), "{outcome:?}");
+    assert_eq!(
+        outcome.sponsor_covered,
+        thb(expected.sponsor),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.platform_loss, thb(expected.loss), "{outcome:?}");
+    assert_eq!(
+        outcome.credential_frozen,
+        expected.loss > 0,
+        "a platform loss freezes the credential, and only a platform loss does: {outcome:?}"
+    );
+    reached.loss_total += expected.loss;
+    assert_eq!(
+        store.loss_total("platform_loss").unwrap(),
+        reached.loss_total,
+        "the platform's losses are exactly the overage the chain could not absorb"
+    );
+    if expected.loss > 0 {
+        reached.loss_settled += 1;
+        unfreeze_credential(db, "cred-e");
+    }
+    if legacy && extra > 0 {
+        rewrite_overage_as_v0_5_0(db, &hold);
+        reached.legacy_rewritten += 1;
     }
 }
 
@@ -1649,8 +2379,20 @@ struct Reached {
     in_flight_at_check: u32,
     /// 已经发过额度，但此刻额度剩余是 0（花光、到期或被撤销之后），债务仍留着。
     debt_without_allowance: u32,
+    /// 超出预留的结算。
+    overage_settled: u32,
+    /// 超出预留的结算，结算那一刻还有额度可花：超出的部分用了结算那一刻的额度。
+    overage_with_allowance: u32,
+    /// 超出预留的部分超过了整条链能吸收的：有平台损失，凭证被冻结（然后解冻，历史接着走）。
+    loss_settled: u32,
+    /// 平台损失的总额。
+    loss_total: i64,
+    /// 结算之后把分录改回 v0.5.0 的写法（超出的部分并回 `settle`）的次数。
+    legacy_rewritten: u32,
     /// 写进表里的毫秒取的是排队之前的旧时间的步骤数（只有抖动的随机历史才有）。
     stale_stamped: u32,
+    /// 读钟比已经提交的某笔花费的归属时刻更早的请求数：回放不能把那笔花费压到读钟上。
+    read_behind_a_spend: u32,
 }
 
 impl Reached {
@@ -1665,30 +2407,41 @@ impl Reached {
         self.half_settled += other.half_settled;
         self.in_flight_at_check += other.in_flight_at_check;
         self.debt_without_allowance += other.debt_without_allowance;
+        self.overage_settled += other.overage_settled;
+        self.overage_with_allowance += other.overage_with_allowance;
+        self.loss_settled += other.loss_settled;
+        self.loss_total += other.loss_total;
+        self.legacy_rewritten += other.legacy_rewritten;
         self.stale_stamped += other.stale_stamped;
+        self.read_behind_a_spend += other.read_behind_a_spend;
     }
 }
 
-/// `jitter`：一部分步骤写进表里的毫秒比提交顺序更早（排队乱序），也会和前一步相同（同毫秒）；先后仍是调用顺序。
+/// `jitter`：一半的步骤写进表里的毫秒（额度的创建时间、撤销时间、请求的读钟）比提交顺序更早（排队乱序，最多早 6 秒），也会和
+/// 前一步相同（同毫秒）；先后仍是调用顺序。
 fn run_random_history(seed: u64, steps: usize, jitter: bool) -> Reached {
     const CREDIT: i64 = 200;
     let db = TempDb::new(&format!("books-random-{seed}-{jitter}"));
     let store = credit_only_world(&db);
     credit_line(&store, "emp", CREDIT, T0);
+    let mut sim = Sim::new(CREDIT);
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut now = T0;
-    let mut allowances: Vec<String> = Vec::new();
+    // （额度 id，它在 Sim 里的编号）
+    let mut allowances: Vec<(String, usize)> = Vec::new();
     let mut revoked: Vec<String> = Vec::new();
-    let mut open: Vec<Req> = Vec::new();
+    // 在途的请求，和它在 Sim 里的花费编号
+    let mut open: Vec<(Req, usize)> = Vec::new();
     let mut next_request = 0_u32;
     let mut reached = Reached::default();
     for step in 0..steps {
         now += 1_000 * (1 + rng.below(4));
-        // 这一步写进表里的毫秒（额度的创建时间、撤销时间、请求的准入时间）。不抖动时就是 `now`；抖动时三分之一的步骤
-        // 取到的是排队之前的旧时间（最多早 2 秒），所以会比前面已经提交的花费更早，也会和前一步的毫秒相同。
-        let stamp = if jitter && rng.below(3) == 0 {
+        // 这一步写进表里的毫秒（额度的创建时间、撤销时间、请求的读钟）。不抖动时就是 `now`；抖动时一半的步骤取到的是排队之前的
+        // 旧时间（最多早 6 秒），所以会比前面已经提交的花费更早，也会和前一步的毫秒相同。
+        let stamp = if jitter && rng.below(2) == 0 {
             reached.stale_stamped += 1;
-            now - 1_000 * rng.below(3)
+            // 授信是 T0 起生效的：读钟不早于 T0（更早时授信还没生效，模型里的授信额度是个常数）
+            (now - 1_000 * rng.below(7)).max(T0)
         } else {
             now
         };
@@ -1698,47 +2451,83 @@ fn run_random_history(seed: u64, steps: usize, jitter: bool) -> Reached {
                 // 抖动的历史里一半的额度是「迟发、起点倒填」的：起点比创建时刻早 3 ~ 10 秒，窗口里已经有更早的花费，
                 // 它们不是这笔额度覆盖的（只有创建之后提交的花费才可能是）。
                 let backdated = jitter && rng.below(2) == 0;
-                let from = if backdated {
-                    stamp - 1_000 * (3 + rng.below(8))
+                let (from, until) = if backdated {
+                    (
+                        stamp - 1_000 * (3 + rng.below(8)),
+                        stamp + 1_000 * (5 + rng.below(40)),
+                    )
                 } else {
-                    stamp + 1_000 * (rng.below(6) - 2)
-                };
-                let until = if backdated {
-                    stamp + 1_000 * (5 + rng.below(40))
-                } else {
-                    from + 1_000 * (5 + rng.below(40))
+                    let from = stamp + 1_000 * (rng.below(6) - 2);
+                    (from, from + 1_000 * (5 + rng.below(40)))
                 };
                 let cap = [50_i64, 100, 150, 250][usize::try_from(rng.below(4)).unwrap()];
                 let id = format!("rnd-{seed}-{step}");
                 prepaid(&store, &id, cap, from, until, stamp);
-                allowances.push(id);
+                let bucket = sim.allowance(from, until, cap);
+                allowances.push((id, bucket));
             }
             2 => {
-                if let Some(id) = allowances.iter().find(|id| !revoked.contains(id)).cloned() {
-                    if model(db.path(), "emp", now).covered > 0 {
+                if let Some((id, bucket)) = allowances
+                    .iter()
+                    .find(|(id, _)| !revoked.contains(id))
+                    .cloned()
+                {
+                    if sim.books(now).covered > 0 {
                         reached.revoked_after_cover += 1;
                     }
                     revoke_allocation_at(&db, &id, stamp);
+                    sim.revoke(bucket);
                     revoked.push(id);
                 }
             }
             3 => {
-                // 收尾一个在途的预留：释放，或者按一半结算
-                if let Some(req) = open.pop() {
+                // 收尾一个在途的预留：释放，按一半结算，或者超出预留结算（额外的部分不超过结算那一刻整条链能吸收的）
+                if let Some((req, spend)) = open.pop() {
                     let reserved = store
                         .hold(&req.attempt, "model")
                         .unwrap()
                         .unwrap()
                         .reserved
                         .micros;
-                    if rng.below(2) == 0 {
-                        store.release_attempt(&req.attempt, ts(now)).unwrap();
-                        reached.released += 1;
-                    } else {
-                        store
-                            .settle_attempt(&req.attempt, &price(reserved / 2), ts(now))
-                            .unwrap();
-                        reached.half_settled += 1;
+                    match rng.below(3) {
+                        0 => {
+                            store.release_attempt(&req.attempt, ts(now)).unwrap();
+                            sim.release(spend);
+                            reached.released += 1;
+                        }
+                        1 => {
+                            settle_both(
+                                &store,
+                                &db,
+                                &mut sim,
+                                &req,
+                                spend,
+                                reserved,
+                                reserved / 2,
+                                now,
+                                false,
+                                &mut reached,
+                            );
+                            reached.half_settled += 1;
+                        }
+                        _ => {
+                            // 超出预留的部分不再夹到余量以内：余量不够就是平台损失，凭证被冻结
+                            let extra =
+                                [1_i64, 20, 60, 150, 400][usize::try_from(rng.below(5)).unwrap()];
+                            let legacy = rng.below(3) == 0;
+                            settle_both(
+                                &store,
+                                &db,
+                                &mut sim,
+                                &req,
+                                spend,
+                                reserved,
+                                reserved + extra,
+                                now,
+                                legacy,
+                                &mut reached,
+                            );
+                        }
                     }
                 }
             }
@@ -1746,8 +2535,11 @@ fn run_random_history(seed: u64, steps: usize, jitter: bool) -> Reached {
                 next_request += 1;
                 let max_tokens = [10_u64, 20, 45, 100][usize::try_from(rng.below(4)).unwrap()];
                 let reserve = i64::try_from(10 + 2 * max_tokens).unwrap();
-                let before = model(db.path(), "emp", stamp);
+                let before = sim.books(stamp);
                 let want = expected_price(&before, CREDIT, reserve);
+                if stamp < sim.latest_at() {
+                    reached.read_behind_a_spend += 1;
+                }
                 let req = Req::new(
                     &store,
                     &format!("q-{seed}-{next_request}"),
@@ -1770,24 +2562,41 @@ fn run_random_history(seed: u64, steps: usize, jitter: bool) -> Reached {
                     _ => reached.rejected += 1,
                 }
                 if let Some(charged) = got {
+                    let spend = sim.reserve(stamp, charged);
                     if rng.below(4) == 0 {
-                        open.push(req); // 留着在途，之后的某一步再收尾
+                        open.push((req, spend)); // 留着在途，之后的某一步再收尾
                     } else {
-                        store
-                            .settle_attempt(&req.attempt, &price(charged), ts(now + 500))
-                            .unwrap();
+                        let at = now + 500;
+                        let extra = if rng.below(4) == 0 {
+                            [1_i64, 20, 60, 150, 400][usize::try_from(rng.below(5)).unwrap()]
+                        } else {
+                            0
+                        };
+                        let legacy = rng.below(3) == 0;
+                        settle_both(
+                            &store,
+                            &db,
+                            &mut sim,
+                            &req,
+                            spend,
+                            charged,
+                            charged + extra,
+                            at,
+                            legacy,
+                            &mut reached,
+                        );
                     }
                 } else {
                     assert_eq!(denied(&decision), Some(ReasonCode::BudgetExhausted));
                 }
             }
         }
-        // 每一步之后：视图对得上模型，授信占用不超过授信额度
+        // 每一步之后：视图、模型、事件三方对得上，授信占用不超过授信额度
         let check_at = now + 700;
-        let books = check_books(&store, &db, "emp", check_at);
+        let books = check_against_sim(&store, &db, &sim, check_at);
         assert!(
-            books.credit_debt <= CREDIT,
-            "seed {seed} step {step}: credit use beyond the line: {books:?}"
+            books.credit_debt <= CREDIT + reached.loss_total,
+            "seed {seed} step {step}: credit use beyond the line by more than the platform lost: {books:?}"
         );
         if books.allowance_left > 0 && books.credit_debt > 0 {
             reached.allowance_and_debt += 1;
@@ -1805,13 +2614,13 @@ fn run_random_history(seed: u64, steps: usize, jitter: bool) -> Reached {
 }
 
 #[test]
-fn random_histories_agree_with_the_independent_model_and_the_owner_rule() {
+fn random_histories_agree_with_the_independent_models_and_the_owner_rule() {
     let mut total = Reached::default();
     for seed in [1_u64, 2, 3, 4, 5, 6] {
         total.add(run_random_history(seed, 50, false));
     }
     eprintln!("random histories reached: {total:?}");
-    // 没有走到这些状态，上面「三方对得上」就没有说服力
+    // 没有走到这些状态，上面「几方对得上」就没有说服力
     assert!(total.allowed >= 30, "{total:?}");
     assert!(total.degraded >= 3, "{total:?}");
     assert!(total.rejected >= 10, "{total:?}");
@@ -1822,23 +2631,33 @@ fn random_histories_agree_with_the_independent_model_and_the_owner_rule() {
     assert!(total.half_settled >= 3, "{total:?}");
     assert!(total.in_flight_at_check >= 10, "{total:?}");
     assert!(total.debt_without_allowance >= 10, "{total:?}");
+    assert!(total.overage_settled >= 5, "{total:?}");
+    assert!(total.overage_with_allowance >= 3, "{total:?}");
+    assert!(total.loss_settled >= 5, "{total:?}");
+    assert!(total.legacy_rewritten >= 2, "{total:?}");
 }
 
 #[test]
-fn random_histories_with_out_of_order_timestamps_still_agree_with_the_independent_model() {
-    // 同样的随机历史，但额度的创建时间、撤销时间、请求的准入时间有三分之一取的是排队之前的旧时间：比前面已经提交的花费更早，
-    // 也会和前一步同一毫秒。先后始终是调用顺序（提交顺序），视图、独立模型、准入决定三方必须仍然对得上，授信占用仍不超过授信额度。
+fn random_histories_with_out_of_order_clocks_still_agree_with_the_independent_models() {
+    // 同样的随机历史（有超出预留的结算），但额度的创建时间、撤销时间、请求的读钟有一半取的是排队之前的旧时间：比前面已经提交的
+    // 花费更早，也会和前一步同一毫秒；一半的新额度起点倒填。先后始终是调用顺序（提交顺序），视图、两个模型、准入决定、
+    // 结算分摊必须仍然对得上，授信占用仍不超过授信额度。
     let mut total = Reached::default();
     for seed in [11_u64, 12, 13, 14, 15, 16, 17, 18] {
         total.add(run_random_history(seed, 60, true));
     }
     eprintln!("jittered random histories reached: {total:?}");
-    assert!(total.stale_stamped >= 40, "{total:?}");
+    assert!(total.stale_stamped >= 100, "{total:?}");
+    assert!(total.read_behind_a_spend >= 15, "{total:?}");
     assert!(total.allowed >= 40, "{total:?}");
     assert!(total.rejected >= 10, "{total:?}");
     assert!(total.allowance_and_debt >= 10, "{total:?}");
     assert!(total.credit_full >= 10, "{total:?}");
     assert!(total.debt_without_allowance >= 10, "{total:?}");
+    assert!(total.overage_settled >= 10, "{total:?}");
+    assert!(total.overage_with_allowance >= 3, "{total:?}");
+    assert!(total.loss_settled >= 5, "{total:?}");
+    assert!(total.legacy_rewritten >= 4, "{total:?}");
 }
 
 fn attempt_of(request: &str) -> idoris_compute_contracts::ids::AttemptId {

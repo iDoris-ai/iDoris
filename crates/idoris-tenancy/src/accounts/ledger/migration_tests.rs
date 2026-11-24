@@ -155,7 +155,7 @@ fn an_old_database_keeps_its_latest_enabled_credit_lines_as_allocations_and_lose
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(applied, [1, 2, 3, 4]);
+    assert_eq!(applied, [1, 2, 3, 4, 5]);
 }
 
 /// PR #600 第二轮评审 Medium：迁移固定生成 `cl-v<旧版本号>`，旧库里如果恰好已经有一笔叫这个名字的合法额度
@@ -251,7 +251,7 @@ fn credit_lines_whose_generated_ids_are_already_taken_still_migrate_under_the_ne
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(applied, [1, 2, 3, 4]);
+    assert_eq!(applied, [1, 2, 3, 4, 5]);
     run_migrations(&mut conn).unwrap();
     let count: i64 = conn
         .query_row("SELECT count(*) FROM allocations", [], |row| row.get(0))
