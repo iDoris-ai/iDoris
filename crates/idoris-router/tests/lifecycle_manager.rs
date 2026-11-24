@@ -4719,3 +4719,36 @@ async fn a_clean_never_shutdown_lets_a_pending_seal_finish_so_the_next_idoris_ad
     assert!(pid_alive(pid));
     next.manager.shutdown(true).await;
 }
+
+/// 复审七 M：要留引擎的封印撞上停止期限（封印要 3 秒，期限 1 秒）：到期限就放弃封印，收尾在期限里结束，引擎仍在（`never`），不是等封印做完把整个收尾拖过期限。
+#[tokio::test]
+async fn a_keep_engine_seal_that_reaches_the_cutoff_is_given_up_at_the_cutoff() {
+    let rig = Rig::new(&Behavior::default());
+    let inspector = Scripted::claiming(rig.port);
+    *inspector.seal_delay.lock().unwrap() = Duration::from_secs(3);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector,
+        fast(),
+        StopOnExit::Never,
+    );
+    wait_for("the engine to be ready and the seal to be pending", || {
+        rig.fake.launches() >= 1 && rig.fake.requests().iter().any(|(_, auth)| auth == "ok")
+    })
+    .await;
+    let pid = rig.pid(0);
+    let begun = Instant::now();
+    h.manager
+        .shutdown_by(
+            false,
+            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+        )
+        .await;
+    assert!(
+        begun.elapsed() < Duration::from_millis(2500),
+        "the shutdown did not wait for the 3 s seal: {:?}",
+        begun.elapsed()
+    );
+    assert!(pid_alive(pid), "never + clean exit: the engine is kept");
+}

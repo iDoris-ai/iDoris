@@ -1850,10 +1850,11 @@ impl Actor {
         // 暖着的引擎白白丢了（Codex 复审六 M）。
         let sealed = {
             let seal = owned.engine.seal();
+            // 截止点排在封印前面（`biased`）：两者同时就绪时走放弃的路，不在期限之后才写下封印记录（Codex 复审七 M）。
             tokio::select! {
                 biased;
-                sealed = seal => Some(sealed),
                 () = self.seal_cancel_point() => None,
+                sealed = seal => Some(sealed),
             }
         };
         let Some(sealed) = sealed else {
