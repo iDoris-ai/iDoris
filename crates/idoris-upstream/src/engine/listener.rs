@@ -244,11 +244,12 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use std::collections::BTreeMap;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
 
-    use super::super::inspect::PidState;
+    use super::super::inspect::{Bind, ListeningSocket, PidState};
     use super::*;
 
     const TEAM: &str = "PSK5Q5T46L";
@@ -258,6 +259,8 @@ mod tests {
     #[derive(Default)]
     struct Scripted {
         listeners: Mutex<BTreeMap<u16, Result<Vec<u32>, InspectError>>>,
+        /// 编排了套接字（含绑的地址族与地址）的端口按它回答 `listening_sockets`；没编排的由 `listeners` 的 pid 推出（每个当作 IPv4 通配）。
+        sockets: Mutex<BTreeMap<u16, Vec<ListeningSocket>>>,
         procs: Mutex<BTreeMap<u32, Proc>>,
         team_calls: AtomicUsize,
         uid_calls: AtomicUsize,
@@ -298,6 +301,11 @@ mod tests {
             self.procs.lock().unwrap().insert(pid, proc);
             self
         }
+
+        fn sockets(self, port: u16, sockets: Vec<ListeningSocket>) -> Self {
+            self.sockets.lock().unwrap().insert(port, sockets);
+            self
+        }
     }
 
     #[async_trait]
@@ -332,6 +340,17 @@ mod tests {
                 .get(&port)
                 .cloned()
                 .unwrap_or(Ok(Vec::new()))
+        }
+        async fn listening_sockets(&self, port: u16) -> Result<Vec<ListeningSocket>, InspectError> {
+            if let Some(sockets) = self.sockets.lock().unwrap().get(&port) {
+                return Ok(sockets.clone());
+            }
+            Ok(self
+                .listeners_on(port)
+                .await?
+                .into_iter()
+                .map(ListeningSocket::any)
+                .collect())
         }
         async fn uid_of(&self, pid: u32) -> Result<u32, InspectError> {
             self.uid_calls.fetch_add(1, Ordering::SeqCst);
@@ -378,6 +397,120 @@ mod tests {
             verifier.check(19731).await,
             ListenerVerdict::Verified {
                 listeners: vec![identity(42)]
+            }
+        );
+    }
+
+    // ----- Codex focused review M13: only the listeners that can take the connection count --------------------------------------------
+
+    /// A listener bound where a connection to `127.0.0.1` cannot reach it (`[::1]`, an IPv6 wildcard without dual-stack evidence, another
+    /// IPv4 address) is neither checked nor part of the verdict: the process behind `127.0.0.1` is the one that passes. Nothing is read
+    /// about the bystanders (they are not scripted: reading them would be `Unverifiable`).
+    #[tokio::test]
+    async fn a_listener_bound_where_the_connection_cannot_reach_it_is_not_counted() {
+        let (verifier, scripted) = rig(Scripted::default()
+            .sockets(
+                19731,
+                vec![
+                    ListeningSocket::v4(42, Ipv4Addr::LOCALHOST),
+                    ListeningSocket {
+                        pid: 43,
+                        bind: Bind::v6(Ipv6Addr::LOCALHOST, false),
+                    },
+                    ListeningSocket {
+                        pid: 44,
+                        bind: Bind::v6(Ipv6Addr::UNSPECIFIED, false),
+                    },
+                    ListeningSocket::v4(45, Ipv4Addr::new(10, 1, 2, 3)),
+                ],
+            )
+            .process(42, Proc::ok()));
+        assert_eq!(
+            verifier.check(19731).await,
+            ListenerVerdict::Verified {
+                listeners: vec![identity(42)]
+            }
+        );
+        assert_eq!(
+            scripted.uid_calls.load(Ordering::SeqCst),
+            1,
+            "only the one that can take the connection was read"
+        );
+    }
+
+    /// A listener that **can** take the connection and is not authorized spoils the verdict, wherever it sits among the others: the
+    /// IPv4 wildcard, and an IPv6 wildcard that was shown to be dual-stack (it accepts IPv4 too).
+    #[tokio::test]
+    async fn a_listener_that_can_take_the_connection_must_be_authorized() {
+        let mut unsigned = Proc::ok();
+        unsigned.team = Ok(None);
+        for (stranger, bind) in [
+            (45, Bind::V4(Ipv4Addr::UNSPECIFIED)),
+            (46, Bind::v6(Ipv6Addr::UNSPECIFIED, true)),
+            (47, Bind::V4(Ipv4Addr::LOCALHOST)),
+        ] {
+            let (verifier, _) = rig(Scripted::default()
+                .sockets(
+                    19731,
+                    vec![
+                        ListeningSocket::v4(42, Ipv4Addr::LOCALHOST),
+                        ListeningSocket {
+                            pid: stranger,
+                            bind,
+                        },
+                    ],
+                )
+                .process(42, Proc::ok())
+                .process(stranger, unsigned.clone()));
+            assert_eq!(
+                verifier.check(19731).await,
+                ListenerVerdict::Rejected(ListenerRejection::NoTeam { pid: stranger }),
+                "{bind:?}"
+            );
+        }
+    }
+
+    /// Listeners that are all somewhere the connection does not reach: nobody can take it, which is no listener at all (never a pass).
+    #[tokio::test]
+    async fn listeners_that_are_all_elsewhere_are_no_listener() {
+        let (verifier, _) = rig(Scripted::default()
+            .sockets(
+                19731,
+                vec![
+                    ListeningSocket {
+                        pid: 42,
+                        bind: Bind::v6(Ipv6Addr::LOCALHOST, false),
+                    },
+                    ListeningSocket {
+                        pid: 43,
+                        bind: Bind::v6(Ipv6Addr::UNSPECIFIED, false),
+                    },
+                ],
+            )
+            .process(42, Proc::ok())
+            .process(43, Proc::ok()));
+        assert_eq!(verifier.check(19731).await, ListenerVerdict::NoListener);
+    }
+
+    /// One process with several sockets on the port is one identity (sorted by pid, listed once).
+    #[tokio::test]
+    async fn one_process_with_several_sockets_is_one_identity_and_the_pids_are_sorted() {
+        let (verifier, _) = rig(Scripted::default()
+            .sockets(
+                19731,
+                vec![
+                    ListeningSocket::v4(43, Ipv4Addr::LOCALHOST),
+                    ListeningSocket::v4(42, Ipv4Addr::LOCALHOST),
+                    ListeningSocket::any(42),
+                    ListeningSocket::v4(43, Ipv4Addr::UNSPECIFIED),
+                ],
+            )
+            .process(42, Proc::ok())
+            .process(43, Proc::ok()));
+        assert_eq!(
+            verifier.check(19731).await,
+            ListenerVerdict::Verified {
+                listeners: vec![identity(42), identity(43)]
             }
         );
     }

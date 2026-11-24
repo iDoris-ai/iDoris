@@ -278,7 +278,9 @@ pub(crate) fn parse_row(line: &str, v6: bool) -> Option<Row> {
     })
 }
 
-/// The rows of a whole table (the header line is skipped), those that parse.
+/// The rows of a whole table (the header line is skipped), those that parse. (The probe itself reads the table line by line; this is the
+/// whole-table view the tests use.)
+#[cfg(test)]
 pub(crate) fn parse_net_tcp(text: &str, v6: bool) -> Vec<Row> {
     text.lines()
         .skip(1)

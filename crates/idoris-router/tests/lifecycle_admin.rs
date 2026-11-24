@@ -4969,14 +4969,13 @@ async fn fr_h3_a_socket_that_left_listen_with_its_descriptor_kept_is_refused_on_
 
 // ----- H6：引擎换代之后，同一个适配器不复用通往旧进程的连接 ---------------------------------------------------------------------------
 
-/// 外部引擎 A 服务过请求（适配器、代理的连接留在池里），然后 A 放掉端口**但进程活着、连接开着**；B 在同一个端口上起来，管理器接管它（新一代）。同一个适配器
-/// 的下一个请求（账本复位的采样、加载、聊天）必须落在 B，走新开的连接：之前它们走池里的旧连接，落在 A 身上（A 的请求记录里多出带新引擎 key 的请求），B 收到的
-/// 反而是空的。
+/// 外部引擎 A 服务过请求（每个发送的地方都留下了一个通往 A 的连接：Supervisor 的适配器、转发的代理、公共模型列表、后台探测），然后 A 放掉端口**但进程活着、
+/// 连接开着**；B 在同一个端口上起来，管理器接管它（新一代）。之后每个发送的地方的下一个请求（账本复位的采样、加载、聊天、转发、模型列表、探测）都必须落在 B，
+/// 走新开的连接：之前它们走池里的旧连接，落在 A 身上（A 的请求记录里多出带新引擎 key 的请求），B 收到的反而是空的。
 #[tokio::test]
-async fn fr_h6_after_an_external_changeover_the_same_adapters_never_reuse_a_connection_to_the_old_process()
- {
+async fn fr_h6_after_an_external_changeover_no_sender_reuses_a_connection_to_the_old_process() {
     if !in_a_child_with_canary_keys(
-        "fr_h6_after_an_external_changeover_the_same_adapters_never_reuse_a_connection_to_the_old_process",
+        "fr_h6_after_an_external_changeover_no_sender_reuses_a_connection_to_the_old_process",
     ) {
         return;
     }
@@ -4985,12 +4984,40 @@ async fn fr_h6_after_an_external_changeover_the_same_adapters_never_reuse_a_conn
     let port = a.port;
     let mut rig = Rig::new(&Behavior::default());
     rig.port = port;
+    let endpoint = rig.endpoint();
+    let companion = resident_chat_card(&endpoint);
     let inspector = Scripted::new();
     inspector.external_listener(port, a.pid(), Some(TEAM));
-    let full = Full::start(rig, inspector.clone()).await;
+    let full =
+        Full::start_with_cards(rig, inspector.clone(), fast(), vec![companion.clone()]).await;
     full.wait_open().await;
+    // 后台探测用它自己的客户端，前后用同一个（真的探测器也是）。
+    let prober = ProberContext {
+        health: full.health.clone(),
+        plans: plan_upstreams(std::slice::from_ref(&companion)).unwrap(),
+        runtimes: RuntimeRegistry::default(),
+        client: reqwest::Client::new(),
+        remote_kill_switch: Arc::new(AtomicBool::new(false)),
+        timings: ProberTimings::default(),
+    };
+    let daily = || {
+        full.data(
+            "POST",
+            "/v1/chat/completions",
+            Some(json!({"model": "idoris/daily", "messages": [{"role": "user", "content": "hi"}]})),
+        )
+    };
+
+    // 每个发送的地方都用一遍：适配器（加载、聊天）、转发的代理、模型列表、探测。
     assert_eq!(full.chat().await.0, StatusCode::OK);
     assert_eq!(a.fake.model_loads(), 1);
+    assert_eq!(daily().await.0, StatusCode::OK);
+    assert_eq!(full.data("GET", "/v1/models", None).await.0, StatusCode::OK);
+    assert_eq!(
+        prober.observe(&prober.plans[0]).await,
+        Observation::Ready,
+        "the probe read A"
+    );
 
     // A 放掉端口，进程活着、它已经接受的连接还开着；管理器看到没有监听者。
     a.fake.release_port();
@@ -5006,9 +5033,25 @@ async fn fr_h6_after_an_external_changeover_the_same_adapters_never_reuse_a_conn
         full.health.view().upstreams[0].state == UpstreamState::Ready
     })
     .await;
+
+    // 适配器：加载与聊天落在 B。
     assert_eq!(full.chat().await.0, StatusCode::OK);
     assert_eq!(b.fake.model_loads(), 1, "the chat loaded the model on B");
-    assert!(b.fake.requests_of("POST:/v1/chat/completions") >= 1);
+    // 转发的代理、模型列表、探测：落在 B。
+    let b_chats = b.fake.requests_of("POST:/v1/chat/completions");
+    assert_eq!(daily().await.0, StatusCode::OK);
+    assert_eq!(
+        b.fake.requests_of("POST:/v1/chat/completions"),
+        b_chats + 1,
+        "the forwarded chat reached B"
+    );
+    assert_eq!(full.data("GET", "/v1/models", None).await.0, StatusCode::OK);
+    assert_eq!(
+        prober.observe(&prober.plans[0]).await,
+        Observation::Ready,
+        "the probe read B"
+    );
+
     assert_eq!(
         a.fake.requests().len(),
         a_saw,
