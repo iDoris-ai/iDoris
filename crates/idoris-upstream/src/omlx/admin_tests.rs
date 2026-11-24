@@ -627,3 +627,74 @@ async fn a_load_whose_pin_would_land_on_the_replacement_engine_is_refused_not_se
     );
     assert_eq!(requests_carrying(&server, SECOND_COOKIE).await, 0);
 }
+
+/// 复审 L2 终检（Low）：Admin 登录（体里是主 key）**建好之后、最后一眼之前**换掉引擎：不发，而且是**确定的**本地拒绝（`AdminRequestError::Definite`），不是「结果未知」：
+/// 之前只断言了「没发出去」。结果未知的 Admin 变更，调用方要保守处理（加载围栏等）；确定没发出去的不必。
+#[tokio::test]
+async fn an_admin_login_refused_at_the_last_look_is_a_definite_refusal_and_sends_nothing() {
+    use super::admin::AdminRequestError;
+    use super::key::test_hooks::between_build_and_send_for;
+
+    let server = MockServer::start().await;
+    let url = server.uri();
+    let _governed = Governed(url.clone());
+    govern_endpoint(&url, EndpointKey::Private(FIRST_KEY.into()));
+    mock_engine_login(&server, FIRST_KEY, FIRST_COOKIE).await;
+    let adapter = per_request_adapter(&server);
+    let _hook = between_build_and_send_for(&format!("{url}/admin/api/login"), {
+        let url = url.clone();
+        move || {
+            govern_endpoint(&url, EndpointKey::Private(SECOND_KEY.into()));
+        }
+    });
+    let error = adapter
+        .admin_request_classified(Method::PUT, SETTINGS, Some(&json!({"is_pinned": true})))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AdminRequestError::Definite(_)), "{error:?}");
+    assert!(error.into_backend().to_string().contains("was replaced"));
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "not even the login went out"
+    );
+}
+
+/// 带会话 cookie 的 Admin 请求（改 pin 的 `PUT`）建好之后、最后一眼之前换掉引擎：不发，确定的本地拒绝；登录那一次是发出去了的（引擎还是第一代）。
+#[tokio::test]
+async fn an_admin_request_refused_at_the_last_look_is_a_definite_refusal_and_sends_nothing() {
+    use super::admin::AdminRequestError;
+    use super::key::test_hooks::between_build_and_send_for;
+
+    let server = MockServer::start().await;
+    let url = server.uri();
+    let _governed = Governed(url.clone());
+    govern_endpoint(&url, EndpointKey::Private(FIRST_KEY.into()));
+    mock_engine_login(&server, FIRST_KEY, FIRST_COOKIE).await;
+    let adapter = per_request_adapter(&server);
+    let _hook = between_build_and_send_for(&format!("{url}{SETTINGS}"), {
+        let url = url.clone();
+        move || {
+            govern_endpoint(&url, EndpointKey::Private(SECOND_KEY.into()));
+        }
+    });
+    let error = adapter
+        .admin_request_classified(Method::PUT, SETTINGS, Some(&json!({"is_pinned": true})))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AdminRequestError::Definite(_)), "{error:?}");
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(
+        received
+            .iter()
+            .filter(|request| request.url.path() == "/admin/api/login")
+            .count(),
+        1,
+        "the login went out (the engine was still the first one)"
+    );
+    assert!(
+        !received
+            .iter()
+            .any(|request| request.url.path() == SETTINGS),
+        "the settings change went out although the engine had been replaced"
+    );
+}

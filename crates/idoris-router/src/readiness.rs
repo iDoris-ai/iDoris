@@ -672,6 +672,8 @@ pub async fn probe_resident_admitted(
     let Ok(built) = built else {
         return Observation::Unavailable(None);
     };
+    #[cfg(test)]
+    idoris_upstream::omlx::key::test_hooks::between_build_and_send(built.url().as_str());
     if held
         .as_ref()
         .is_some_and(|authorization| authorization.ensure_current().is_err())
@@ -1685,6 +1687,52 @@ mod tests {
         assert!(
             seen[0].headers.get("authorization").is_none(),
             "the engine's private key went to a card that may not carry it"
+        );
+    }
+
+    /// 复审 L2 终检：resident 卡的就绪探测，请求**建好之后、最后一眼之前**换掉引擎：不发，这一轮的观测是「不可用」。
+    #[tokio::test]
+    async fn a_probe_built_for_a_replaced_engine_is_not_sent() {
+        use idoris_upstream::omlx::key::test_hooks::between_build_and_send_for;
+        use idoris_upstream::omlx::key::{EndpointKey, forget_endpoint, govern_endpoint};
+
+        struct Governed(String);
+        impl Drop for Governed {
+            fn drop(&mut self) {
+                forget_endpoint(&self.0);
+            }
+        }
+
+        let server =
+            models_server(ResponseTemplate::new(200).set_body_json(json!({"data": []}))).await;
+        let endpoint = server.uri();
+        let _governed = Governed(endpoint.clone());
+        govern_endpoint(&endpoint, EndpointKey::Private("first-engine".to_owned()));
+        let card = resident_card("omlx-card", &endpoint, "omlx@0.6.4");
+        let admitted = crate::models::admission_generation(&card);
+        assert!(admitted.is_some());
+
+        // 对照：没有换引擎，探测发得出去。
+        assert_eq!(
+            probe_resident_admitted(&client(), &card, admitted, Duration::from_secs(2)).await,
+            Observation::Ready
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        let _hook = between_build_and_send_for(&format!("{endpoint}/v1/models"), {
+            let endpoint = endpoint.clone();
+            move || {
+                govern_endpoint(&endpoint, EndpointKey::Private("replacement".to_owned()));
+            }
+        });
+        assert_eq!(
+            probe_resident_admitted(&client(), &card, admitted, Duration::from_secs(2)).await,
+            Observation::Unavailable(None)
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the probe built for the replaced engine was sent"
         );
     }
 
