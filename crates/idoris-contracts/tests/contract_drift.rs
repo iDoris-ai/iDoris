@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use idoris_contracts::adapter_manifest::AdapterManifest;
 use idoris_contracts::admin_v0::{
-    AdminBackend, AdminModelsResponse, AdminRole, AdminRuntimesResponse, AdminStatusResponse,
+    ADMIN_UPSTREAM_REASON_VALUES, ADMIN_UPSTREAM_STATE_VALUES, AdminBackend, AdminModelsResponse,
+    AdminRole, AdminRuntimesResponse, AdminStatusResponse, AdminUpstream, AdminUpstreamsResponse,
 };
 use idoris_contracts::component_card::ComponentCard;
 use idoris_contracts::deploy_mode::DEPLOY_MODE_VALUES;
@@ -218,6 +219,44 @@ fn admin_v0_status_shape_matches_schema() {
         .into_iter()
         .map(str::to_string)
         .collect()
+    );
+}
+
+#[test]
+fn admin_v0_upstreams_shape_matches_schema() {
+    assert_shape::<AdminUpstreamsResponse>();
+    assert_shape::<AdminUpstream>();
+    // The collection is `{upstreams: [<element schema>]}`: the element is referenced, not copied.
+    let collection = load_schema("admin-v0-upstreams.schema.json");
+    assert_eq!(
+        collection["properties"]["upstreams"]["items"]["$ref"],
+        "admin-v0-upstream.schema.json"
+    );
+    // The two closed `enum`s, value for value and in order, against the contract's own lists.
+    let element = load_schema("admin-v0-upstream.schema.json");
+    let listed = |field: &str| -> Vec<String> {
+        element["properties"][field]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("admin-v0-upstream.schema.json `{field}` must be an enum"))
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(
+        listed("state"),
+        ADMIN_UPSTREAM_STATE_VALUES
+            .iter()
+            .map(|state| state.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        "DRIFT: admin-v0-upstream.schema.json state enum changed"
+    );
+    assert_eq!(
+        listed("reason"),
+        ADMIN_UPSTREAM_REASON_VALUES
+            .iter()
+            .map(|reason| reason.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        "DRIFT: admin-v0-upstream.schema.json reason enum changed"
     );
 }
 

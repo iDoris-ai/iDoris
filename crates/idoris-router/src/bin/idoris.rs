@@ -21,7 +21,7 @@ use idoris_router::{
     AppState, BIND_HOST,
     admin::{
         ADMIN_PORT_ENV, AdminBindConfig, AdminSessionToken, SharedAdminToken,
-        build_admin_app_with_token,
+        build_admin_app_with_engines, build_admin_app_with_token,
     },
     auth::VirtualKeyAuthenticator,
     build_app,
@@ -983,6 +983,8 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
             ));
             let finalize: lifecycle::gate::Finalize = {
                 let admin_token = admin_token.clone();
+                // 完整的 Admin 经它给 `upstreams` 的写接口下命令（`start|stop|restart`，规范 §2.11.4），读接口取它的只读快照。
+                let admin_engines = engines.clone();
                 let prober_slot = prober_slot.clone();
                 let prober_cancel = prober_cancel.clone();
                 let mut state = state.clone();
@@ -1032,7 +1034,11 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
                     *prober_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(prober);
                     Ok(lifecycle::gate::Finalized {
                         data: build_app(state.clone()),
-                        admin: build_admin_app_with_token(state, admin_token),
+                        admin: build_admin_app_with_engines(
+                            state,
+                            admin_token,
+                            Some(admin_engines),
+                        ),
                         runtimes,
                     })
                 })
