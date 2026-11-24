@@ -1973,6 +1973,7 @@ fn rebaseline_runtime_capacity(
 /// of the old generation impossible.
 async fn handle_reset(
     sample: bool,
+    deadline: Option<Instant>,
     startup_probe: bool,
     models: &mut HashMap<String, ModelSlot>,
     active_op_held: bool,
@@ -1991,6 +1992,20 @@ async fn handle_reset(
         env.startup_error = Some(err.clone());
         err
     };
+    // The caller's deadline bounds the sampling and is checked again before anything is committed (IDORIS-CORE S6, Codex
+    // pre-review H5): a reset that outlives its caller must not commit, because the caller has by then written the result
+    // off (it no longer vouches that this ledger belongs to the process it is tracking), and a late commit is exactly what
+    // let an old reset's models and capacity charge land under the wrong owner. Not committing is not enough on its own:
+    // the old ledger describes a process that is gone, so the error latches (fail closed) until a later reset succeeds.
+    let remaining = |now: Instant| deadline.map(|deadline| deadline.saturating_duration_since(now));
+    let expired = |now: Instant| deadline.is_some_and(|deadline| now >= deadline);
+    let past_deadline = || {
+        BackendError::busy(
+            "the reset's deadline passed before it could commit: nothing was changed; the ledger stays fenced until a later reset succeeds",
+            None,
+            None,
+        )
+    };
     if sample {
         // The new process has nothing loaded, so a durable marker can only be a stale one.
         let fence = match env.load_fence {
@@ -2004,7 +2019,10 @@ async fn handle_reset(
     let status = if sample {
         let adapter = env.adapter.clone();
         let ownership = env.load_fence.cloned();
-        let timeout = env.config.adapter_call_timeout;
+        let timeout = remaining(Instant::now())
+            .map_or(env.config.adapter_call_timeout, |left| {
+                left.min(env.config.adapter_call_timeout)
+            });
         // The same isolation as the startup sample: a panic in the adapter is a `JoinError` here, and the
         // timeout bounds a hanging engine.
         let sampled = tokio::spawn(async move {
@@ -2027,6 +2045,10 @@ async fn handle_reset(
             loaded: Vec::new(),
         }
     };
+    // The last look at the clock before the first mutation (the capacity re-baseline is the first one).
+    if expired(Instant::now()) {
+        return Err(latch(env, past_deadline()));
+    }
     if let Err(err) = rebaseline_runtime_capacity(env, &status) {
         return Err(latch(env, err));
     }
@@ -2403,6 +2425,7 @@ async fn run_actor(
                 let adapter_calls_in_flight = call_slots.available_permits() < call_slot_capacity;
                 let result = handle_reset(
                     sample,
+                    deadline,
                     startup_probe,
                     &mut models,
                     active_op.is_some(),
