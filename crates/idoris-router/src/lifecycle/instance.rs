@@ -271,6 +271,9 @@ pub(super) struct Actor {
     /// 一个自有的子进程正在启动（拉起了、或认回了，等它就绪，还没封印）：它此刻在 [`Actor::wait_owned_ready`] 的局部变量里，不在
     /// `engine`。`stop`、`restart` 要看见它（Codex 预审 M3）：命令打断等待之后，半拉起的引擎交给命令处置（[`Actor::abandon`]）。
     starting_owned: bool,
+    /// 半拉起的引擎被命令打断后放回了 `engine`（[`Actor::abandon`]），命令还没被收下。命令在收下之前过期了的，继续等**同一个**引擎就绪，不退役它
+    /// （Codex 复审 M7）。
+    handed_off: bool,
     /// 这一轮启动决策走到了外部监听者那条路（端口上有东西答话或在听）：不是在拉起自有引擎。每轮 [`Actor::attempt`] 开头清零。
     external_path: bool,
     /// 退役中的引擎进程（pid 加启动时间）：停它之前记下，**只有确认它消失才清掉**（Codex 预审 M4）。没能确认时它可能还活着、
@@ -308,6 +311,7 @@ impl Actor {
             owned_key_revoked: false,
             pending: None,
             starting_owned: false,
+            handed_off: false,
             external_path: false,
             condemned: None,
         }
@@ -737,16 +741,20 @@ impl Actor {
     /// iDoris 来了停止指令，放手的只是「等」，不是正在进行的 SIGTERM、宽限、SIGKILL（Codex 预审 H3）：
     ///
     /// - 指令在开始停之前就到了：停止直接带着它的期限（宽限只拿剩下的），等到期限加一个确认窗口，到点中止任务。
-    /// - 指令在停止进行中到达（任务的宽限是按**没有期限**算的，可能比剩下的时间长）：等到期限之前留出一段（[`MIN_TERM_GRACE`] 加确认），
-    ///   那之后还没停完，就中止任务，用**身份闸过的恢复**把剩下的收尾（[`Self::finish_stop_by_recovery`]：所有权记录还在，认回它，带期限
-    ///   SIGTERM 之后立刻 SIGKILL）。`Owned` 的句柄丢弃时杀整组，`stop_on_exit:"never"` 拉起的、认回的不杀，所以不能靠丢弃（Codex 复审 H1）。
+    /// - 指令在停止进行中到达（任务的宽限是按**没有期限**算的，可能比剩下的时间长）：到期限之前留出升级的时间，那之后还没停完就**剪短** SIGTERM
+    ///   的等待（`stop_until_cut`：同一个停止直接进入 SIGKILL，句柄与身份闸不变）。不取消：`Owned` 的句柄丢弃时杀整组，`stop_on_exit:"never"`
+    ///   拉起的、认回的不杀（Codex 复审 H1、H2）。
     ///
     /// 到点还没确认：所有权记录保留，下一个 iDoris 认回并收尾。
     async fn drive_stop(&self, engine: OwnedEngine) -> bool {
         let grace = self.timings().stop_grace;
         let bounded_from_start = self.shutdown_order().and_then(|order| order.deadline);
-        let mut stopping =
-            tokio::spawn(async move { engine.stop_until(grace, bounded_from_start).await });
+        let (cut, cut_rx) = tokio::sync::watch::channel(false);
+        let mut stopping = tokio::spawn(async move {
+            engine
+                .stop_until_cut(grace, bounded_from_start, cut_rx)
+                .await
+        });
         let mut order = self.shared.shutdown.subscribe();
         let joined = tokio::select! {
             biased;
@@ -754,32 +762,40 @@ impl Actor {
             () = async { let _ = order.wait_for(Option::is_some).await; } => {
                 self.log("退役中的引擎还在停：iDoris 在停，等它做完，不超过停止期限");
                 let deadline = self.shutdown_order().and_then(|order| order.deadline);
-                let (wait_until, escalate) = match (deadline, bounded_from_start) {
-                    // 停止一开始就带着期限：它自己会在期限里收尾，只等到期限加确认窗口。
-                    (Some(deadline), Some(_)) => (Some(deadline + super::backoff::MIN_CONFIRM), false),
-                    // 进行中到达的期限：在它之前留出升级的时间。
-                    (Some(deadline), None) => (
-                        Some(
-                            deadline
-                                .checked_sub(super::backoff::MIN_TERM_GRACE)
-                                .unwrap_or(deadline),
-                        ),
-                        true,
+                // 停止一开始就带着期限（`bounded_from_start`）的，宽限已经按它算；进行中到达的期限，宽限是按没有期限算的，可能比剩下的时间长：
+                // 在期限之前留出升级的时间，那之后还没停完就**剪短** SIGTERM 的等待（同一个停止直接进入 SIGKILL，句柄、身份闸都不变；不取消它：
+                // 丢弃 `never`、认回的句柄不杀进程），再多等一个确认窗口。
+                let escalate_at = match (deadline, bounded_from_start) {
+                    (Some(deadline), None) => Some(
+                        deadline
+                            .checked_sub(super::backoff::MIN_TERM_GRACE)
+                            .unwrap_or(deadline),
                     ),
-                    (None, _) => (None, false),
+                    _ => None,
                 };
-                let waited = match wait_until {
-                    Some(limit) => tokio::time::timeout_at(limit, &mut stopping).await.ok(),
-                    None => Some((&mut stopping).await),
-                };
+                let mut waited = None;
+                if let Some(at) = escalate_at {
+                    waited = tokio::time::timeout_at(at, &mut stopping).await.ok();
+                    if waited.is_none() {
+                        self.log("停止引擎来不及在停止期限里自己做完：剪短 SIGTERM 的等待，直接 SIGKILL");
+                        let _ = cut.send(true);
+                    }
+                }
+                if waited.is_none() {
+                    waited = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(
+                            deadline + super::backoff::MIN_CONFIRM,
+                            &mut stopping,
+                        )
+                        .await
+                        .ok(),
+                        None => Some((&mut stopping).await),
+                    };
+                }
                 match waited {
                     Some(joined) => joined,
                     None => {
                         stopping.abort();
-                        if escalate {
-                            self.log("停止引擎来不及在停止期限里自己做完：认回它，SIGTERM 之后立刻 SIGKILL");
-                            return self.finish_stop_by_recovery(deadline).await;
-                        }
                         self.log("停止引擎超过停止期限：不再等待（所有权记录保留，下一个 iDoris 会认回并收尾）");
                         return false;
                     }
@@ -822,6 +838,15 @@ impl Actor {
         }
     }
 
+    /// 启动决策里停遗留引擎没成：iDoris 在停就放手（主循环收尾），否则按一次失败退避重试。drive_stop 已经写过原因日志。
+    fn recovery_stop_failed(&self) -> Attempt {
+        if self.shutdown_order().is_some() {
+            Attempt::Interrupted
+        } else {
+            Attempt::Failure { reason: None }
+        }
+    }
+
     /// 暂存的命令是 `stop` 或 `restart` 吗。
     fn pending_is_stop_or_restart(&self) -> bool {
         matches!(
@@ -857,6 +882,8 @@ impl Actor {
             }
             return current;
         }
+        // 命令被收下了：交出来的半拉起的引擎归它处置。
+        self.handed_off = false;
         let Request {
             command,
             reply,
@@ -993,6 +1020,14 @@ impl Actor {
 
     /// iDoris 停止：收尾。`stop_engine` 为真才停自己拥有的引擎，在 `deadline` 之前（见 [`Command::Shutdown`]）。
     async fn shutdown(&mut self, stop_engine: bool, deadline: Option<tokio::time::Instant>) {
+        // 退役没能确认的进程（没有握在手里，所有权记录还在）：要停就在期限里再认回一次、带身份闸地停（Codex 复审 M4）。
+        if stop_engine
+            && self.engine.is_none()
+            && self.condemned.is_some()
+            && self.finish_stop_by_recovery(deadline).await
+        {
+            self.condemned = None;
+        }
         self.external = None;
         match self.engine.take() {
             // 停掉自己拥有的引擎，在 `deadline` 之前：先等进程退出，之后才封上端点（G2，见 `stop_engine_by`）。
@@ -1071,7 +1106,11 @@ impl Actor {
     /// 一次 `start`、`restart` 操作做完了（就绪，或者不会再往前走）：之前入队的 `restart` 都并进它的结果（[`Self::restart_cover`]）。
     fn finish_op(&mut self) {
         if self.op.take().is_some() {
-            self.restart_cover = self.shared.seq_now(&self.plan.id);
+            // 这一轮走的是外部监听者那条路：结果是接管了一个外部引擎，不是我们换了一个自有引擎，之前入队的 `restart` 没有可并入的结果
+            // （Codex 复审 M6）：不更新截断点，它们按各自到达时的状态回答。
+            if !self.external_path {
+                self.restart_cover = self.shared.seq_now(&self.plan.id);
+            }
         }
     }
 
@@ -1149,6 +1188,19 @@ impl Actor {
         // 不丢弃一个还活着的引擎句柄：丢弃就是 SIGKILL，绕过 `stop_engine`（优雅停止、封上端点），也没有人知道引擎换了。
         // 对一个还活着却不答的自有引擎 `start`（`unavailable`，G3）走到这里时它还在：走完整的退役路径（关门、排空、停进程、封上
         // 端点），再重新走启动决策。
+        // 半拉起的引擎被一个后来过期的命令打断：命令没有被收下，继续等同一个引擎就绪（Codex 复审 M7）。
+        if self.handed_off
+            && let Some(mut owned) = self.engine.take()
+        {
+            self.handed_off = false;
+            self.starting_owned = true;
+            let waited = self.wait_owned_ready(&mut owned).await;
+            self.starting_owned = false;
+            return match waited {
+                Ok(()) => self.finish_owned(owned).await,
+                Err(failure) => self.abandon(owned, failure).await,
+            };
+        }
         if self.engine.is_some() {
             match self.retire_engine().await {
                 // 同 `restart`：旧进程确认消失，它占着的共享容量现在就放掉（Codex 终审 M2）。
@@ -1184,6 +1236,7 @@ impl Actor {
                         )
                     {
                         self.condemned = None;
+                        self.forget_engine().await;
                     }
                     break None;
                 }
@@ -1204,14 +1257,15 @@ impl Actor {
                             };
                         }
                         self.condemned = None;
+                        // 退役终于确认了：旧进程占着的共享容量现在放掉（Codex 复审 M5），不等新引擎起来。
+                        self.forget_engine().await;
                         break None;
                     }
                     if self.fence_is_present() {
                         // 引擎可能正处于加载中，我们对它无从确认：它是我们的，所以杀掉整组、确认消失、清围栏、重拉。
                         self.log("接管到自己遗留的引擎，但有加载围栏：停掉重拉");
-                        if let Err(error) = engine.stop(self.timings().stop_grace).await {
-                            self.log(&format!("停止遗留的引擎失败（{}）", error.reason_code()));
-                            return Attempt::Failure { reason: None };
+                        if !self.drive_stop(engine).await {
+                            return self.recovery_stop_failed();
                         }
                         break None;
                     }
@@ -1225,9 +1279,8 @@ impl Actor {
                 Ok(Recovery::Starting(engine)) => {
                     // 上一个 iDoris 在引擎启动途中被杀：它没有就绪过，什么都没加载，停掉重拉。
                     self.log("遗留的引擎没有封印（启动途中被杀）：停掉重拉");
-                    if let Err(error) = engine.stop(self.timings().stop_grace).await {
-                        self.log(&format!("停止遗留的引擎失败（{}）", error.reason_code()));
-                        return Attempt::Failure { reason: None };
+                    if !self.drive_stop(engine).await {
+                        return self.recovery_stop_failed();
                     }
                     break None;
                 }
@@ -1238,9 +1291,8 @@ impl Actor {
                     self.log(
                         "遗留的引擎正在退出（端口上已没有它在监听）：有界地停掉，确认消失之后重拉",
                     );
-                    if let Err(error) = engine.stop(self.timings().stop_grace).await {
-                        self.log(&format!("停止遗留的引擎失败（{}）", error.reason_code()));
-                        return Attempt::Failure { reason: None };
+                    if !self.drive_stop(engine).await {
+                        return self.recovery_stop_failed();
                     }
                     break None;
                 }
@@ -1265,6 +1317,14 @@ impl Actor {
             }
         };
 
+        // 退役时没能确认消失的进程还没有落定（记录没了、作废了，进程却还在）：它可能还握着端口、还在加载。没有它已经消失的证据，不探测、不清围栏、
+        // 不拉起替身（Codex 复审 H3），端点保持封上，按一次失败退避再认。
+        if adopted.is_none() && self.condemned.is_some() {
+            self.log("之前没能确认停掉的进程还在：不拉起新的，端点保持封上，稍后再认");
+            return Attempt::Failure {
+                reason: Some(UpstreamReason::PortInUse),
+            };
+        }
         // iDoris 在停：不再往下认回、拉起（Codex 复审 H2）。认回的引擎放回手里，由主循环按停止指令收尾。
         if self.shutdown_order().is_some() {
             if let Some(owned) = adopted {
@@ -1716,6 +1776,7 @@ impl Actor {
         if matches!(failure, WaitFailure::Interrupted)
             && (self.pending_is_shutdown() || self.pending_is_stop_or_restart())
         {
+            self.handed_off = true;
             self.engine = Some(owned);
             return Attempt::Interrupted;
         }

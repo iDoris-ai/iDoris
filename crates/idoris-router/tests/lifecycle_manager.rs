@@ -4120,10 +4120,16 @@ async fn a_condemned_process_does_not_come_back_as_an_external_engine() {
     }
     inspector.external_listener(rig.port, u32::try_from(old).unwrap(), Some(TEAM));
     inspector.set_identity_unreadable(false);
-    wait_for("the condemned process to be refused as external", || {
-        h.logged("不当作外部引擎接管")
+    // 记录没了、进程还在：没有它已经消失的证据，不探测、不拉起替身（也就不会把它当作外部引擎接管回来）。
+    wait_for("the condemned process to be refused", || {
+        h.logged("之前没能确认停掉的进程还在")
     })
     .await;
+    assert_eq!(
+        rig.fake.launches(),
+        1,
+        "no replacement while it may still be alive"
+    );
     assert_ne!(h.view().state, UpstreamState::Ready);
     h.manager.shutdown(true).await;
     let _ = Command::new("kill")
