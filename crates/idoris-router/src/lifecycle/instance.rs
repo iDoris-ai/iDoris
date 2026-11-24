@@ -15,10 +15,12 @@ use idoris_backend::load_fence::LoadFence;
 use idoris_upstream::engine::{
     DiscoveryError, EngineError, EngineInstance, EngineKey, EngineLaunch, EngineLaunchSpec,
     EngineProbe, EngineRecipe, ExternalListenerGuard, LaunchError, ListenerIdentity,
-    ListenerVerdict, ListenerVerifier, MANAGED_DIAL, OwnedEngine, OwnedListenerGuard, Recovery,
-    fresh_connection_client,
+    ListenerVerdict, ListenerVerifier, MANAGED_DIAL, OwnedEngine, OwnedListenerGuard,
+    OwnershipRecord, Recovery, fresh_connection_client,
 };
-use idoris_upstream::omlx::key::{EndpointGuard, seal_endpoint_flights_if_idle};
+use idoris_upstream::omlx::key::{
+    EndpointGuard, authorize_omlx_request_without_key, seal_endpoint_flights_if_idle,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use super::backoff::{CrashWindow, restart_delay};
@@ -276,12 +278,12 @@ pub(super) struct Actor {
     handed_off: bool,
     /// 这一轮启动决策走到了外部监听者那条路（端口上有东西答话或在听）：不是在拉起自有引擎。每轮 [`Actor::attempt`] 开头清零。
     external_path: bool,
-    /// 退役中的引擎进程（pid 加启动时间）：停它之前记下，**只有确认它消失才清掉**（Codex 预审 M4）。没能确认时它可能还活着、
+    /// 退役中的引擎进程的**完整所有权记录**（pid、启动时间、「代」标识、进程组、命令；Codex 复审四 H）：停它之前记下，**只有确认它消失才清掉**（Codex 预审 M4）。没能确认时它可能还活着、
     /// 还握着端口；之后 `start` 或重启的启动决策又认回同一个进程时，不能把它当作新引擎放行，要先把它停掉。
-    condemned: Option<(u32, String)>,
-    /// 操作员的 `stop`、`restart` 已经被受理、退役还没确认：之后 iDoris 停止时（哪怕 `stop_on_exit:"never"` 的正常退出）这个引擎也要停掉，
-    /// 不能把一个已经受理了的停止放手成一个在跑的引擎（Codex 复审三 M）。
-    retire_accepted: bool,
+    condemned: Option<OwnershipRecord>,
+    /// 操作员的 `stop`、`restart` 已经被受理、退役还没确认的那个引擎（pid）：之后 iDoris 停止时（哪怕 `stop_on_exit:"never"` 的正常退出）这个引擎也要停掉，
+    /// 不能把一个已经受理了的停止放手成一个在跑的引擎（Codex 复审三 M）。绑在引擎的身份上：那个引擎的退役确认了就清掉，之后的替身不受它影响（复审四 M）。
+    retire_accepted: Option<u32>,
 }
 
 impl Actor {
@@ -317,7 +319,7 @@ impl Actor {
             handed_off: false,
             external_path: false,
             condemned: None,
-            retire_accepted: false,
+            retire_accepted: None,
         }
     }
 
@@ -568,6 +570,26 @@ impl Actor {
             .await
     }
 
+    /// 带 key 的探测，走授权（[`authorize_omlx_request_without_key`]：key 由调用方给，授权只负责监听者的重新确认、代际、拨号地址与新开的连接）。
+    /// 授权被拒绝（监听者变了、读不出来、端点封上）：这一轮没有结论（`Unavailable`），key 一个字节也没发出去。
+    async fn probe_authorized(&self, recipe: &Arc<dyn EngineRecipe>, key: &str) -> EngineProbe {
+        let Some(client) = &self.client else {
+            return EngineProbe::Unavailable;
+        };
+        let Ok(authorization) = authorize_omlx_request_without_key(&self.plan.endpoint, None).await
+        else {
+            return EngineProbe::Unavailable;
+        };
+        recipe
+            .probe_ready(
+                &authorization.client(client),
+                &authorization.dial_url(&self.plan.endpoint),
+                Some(key),
+                self.timings().probe_timeout,
+            )
+            .await
+    }
+
     fn probe_instance(&self) -> Option<EngineInstance> {
         EngineInstance::new(
             self.plan.backend.probe_recipe(),
@@ -732,13 +754,11 @@ impl Actor {
     /// 退役里的停进程：把引擎交给 [`Self::drive_stop`]；确认消失才清 [`Actor::condemned`]，端点封上在进程确认消失**之后**（G2，同
     /// [`Self::stop_engine_by`]）。
     async fn stop_retiring(&mut self, owned: Owned) -> Retired {
-        let record = owned.engine.record();
-        self.condemned = Some((record.pid, record.started_at.clone()));
+        self.condemned = Some(owned.engine.record().clone());
         let confirmed = self.drive_stop(owned.engine).await;
         self.plan.backend.block(&self.plan.endpoint);
         if confirmed {
-            self.condemned = None;
-            self.retire_accepted = false;
+            self.clear_retirement();
             Retired::Confirmed
         } else {
             Retired::Unconfirmed
@@ -823,35 +843,33 @@ impl Actor {
         }
     }
 
-    /// 中止了进行中的停止之后收尾：所有权记录还在（只有确认消失才删），认回同一个引擎，带 `deadline` 停（不到 2 秒就 SIGTERM 之后立刻
-    /// SIGKILL，身份闸照旧）。记录没了或作废了就是已经消失。认回不了（身份读不出来）就是没能确认。
+    /// 退役没能确认的进程，在期限里再停一次：用**留着的完整记录**重建句柄（不读记录文件：文件没了、作废了，进程也可能还在），过身份闸
+    /// （进程没了、pid 给了别人就什么信号也不发，算已经消失；读不出来算没能确认），带 `deadline` 停。没有 condemned 就是没有要停的（`true`）。
     async fn finish_stop_by_recovery(&self, deadline: Option<tokio::time::Instant>) -> bool {
+        let Some(record) = self.condemned.clone() else {
+            return true;
+        };
         let Some(instance) = self.probe_instance() else {
             return false;
         };
         let inspector = self.shared.config.inspector.clone();
         let grace = self.timings().stop_grace;
-        match OwnedEngine::recover(&instance, &inspector).await {
-            // 没有记录不等于进程没了（记录作废也可能是命令行变了而进程还在）：只有它的 pid 确实不在了才算数（Codex 复审三 H2）。
-            Ok(Recovery::NoRecord | Recovery::Stale(_)) => {
-                self.condemned.as_ref().is_none_or(|(pid, _)| {
-                    matches!(
-                        inspector.pid_state(*pid),
-                        idoris_upstream::engine::PidState::Gone
-                    )
-                })
+        match OwnedEngine::from_record(&instance, record, &inspector)
+            .stop_until(grace, deadline)
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                self.log(&format!("停止引擎失败（{}）", error.reason_code()));
+                false
             }
-            Ok(
-                Recovery::Adopted(engine) | Recovery::Starting(engine) | Recovery::Exiting(engine),
-            ) => match engine.stop_until(grace, deadline).await {
-                Ok(()) => true,
-                Err(error) => {
-                    self.log(&format!("停止引擎失败（{}）", error.reason_code()));
-                    false
-                }
-            },
-            Ok(Recovery::Unverifiable(_)) | Err(_) => false,
         }
+    }
+
+    /// 退役确认了（进程确认消失）：退役中的记录与受理的停止意图一起放下。
+    fn clear_retirement(&mut self) {
+        self.condemned = None;
+        self.retire_accepted = None;
     }
 
     /// 启动决策里停遗留引擎成了：它要是就是退役没能确认的那个，现在确认了，放下并放掉它占着的共享容量（Codex 复审三 M）。
@@ -859,9 +877,9 @@ impl Actor {
         if self
             .condemned
             .as_ref()
-            .is_some_and(|(condemned, _)| *condemned == pid)
+            .is_some_and(|condemned| condemned.pid == pid)
         {
-            self.condemned = None;
+            self.clear_retirement();
             self.forget_engine().await;
         }
     }
@@ -991,7 +1009,7 @@ impl Actor {
                     self.close_admission().await;
                     self.publish_terminal(UpstreamState::Stopped, None);
                     answer(Ok(()));
-                    self.retire_accepted = true;
+                    self.retire_accepted = self.engine.as_ref().map(|owned| owned.engine.pid());
                     let retired = self.retire_engine().await;
                     if matches!(retired, Retired::Shutdown) {
                         // iDoris 在停：主循环按停止指令收尾（引擎还握在手里）。
@@ -1029,7 +1047,7 @@ impl Actor {
                     self.close_admission().await;
                     self.publish_uncounted(UpstreamState::Restarting, None);
                     answer(Ok(()));
-                    self.retire_accepted = true;
+                    self.retire_accepted = self.engine.as_ref().map(|owned| owned.engine.pid());
                     // 没能确认旧进程消失时也往下走：`attempt()` 开头的孤儿接管按既有的规矩处理（记录还在，围栏没清）。
                     // 旧进程确认消失了：它的模型占着的共享容量现在就放掉（Codex 终审 M2）。新引擎要是起不来（找不到可执行文件、
                     // 起不来），账本若还留着旧进程的占用，别的上游申请同一份容量就一直被它挡着；门保持关着，新进程就绪之后再单独采样。
@@ -1050,14 +1068,22 @@ impl Actor {
 
     /// iDoris 停止：收尾。`stop_engine` 为真才停自己拥有的引擎，在 `deadline` 之前（见 [`Command::Shutdown`]）。
     async fn shutdown(&mut self, stop_engine: bool, deadline: Option<tokio::time::Instant>) {
-        let stop_engine = stop_engine || self.retire_accepted;
+        // 受理了的 `stop`、`restart` 的那个引擎（还握在手里的，或退役没能确认的）要停，不管 `stop_on_exit`；换上来的替身不算。
+        let intent = self.retire_accepted.is_some_and(|pid| match &self.engine {
+            Some(owned) => owned.engine.pid() == pid,
+            None => self
+                .condemned
+                .as_ref()
+                .is_some_and(|condemned| condemned.pid == pid),
+        });
+        let stop_engine = stop_engine || intent;
         // 退役没能确认的进程（没有握在手里，所有权记录还在）：要停就在期限里再认回一次、带身份闸地停（Codex 复审 M4）。
         if stop_engine
             && self.engine.is_none()
             && self.condemned.is_some()
             && self.finish_stop_by_recovery(deadline).await
         {
-            self.condemned = None;
+            self.clear_retirement();
         }
         self.external = None;
         match self.engine.take() {
@@ -1259,14 +1285,19 @@ impl Actor {
             match OwnedEngine::recover(&probe_instance, &inspector).await {
                 Ok(Recovery::NoRecord | Recovery::Stale(_)) => {
                     // 记录没了或作废了：之前没能确认的退役进程不一定不在了（记录作废也可能是命令行变了、而同一个进程还在听，Codex 复审 M6）。
-                    // 只有确认它已经不在才放下；还在就保留，外部接管也不收它（[`Self::adopt_external`]）。
-                    if let Some((pid, _)) = &self.condemned
-                        && matches!(
-                            inspector.pid_state(*pid),
-                            idoris_upstream::engine::PidState::Gone
-                        )
-                    {
-                        self.condemned = None;
+                    // 用留着的完整记录重建句柄、过身份闸再停一次（进程没了、pid 给了别人就什么也不发，算消失；读不出来就按一次失败退避，复审四 H）。
+                    if let Some(record) = self.condemned.clone() {
+                        let engine = OwnedEngine::from_record(&probe_instance, record, &inspector);
+                        if !self.drive_stop(engine).await {
+                            return if self.shutdown_order().is_some() {
+                                Attempt::Interrupted
+                            } else {
+                                Attempt::Failure {
+                                    reason: Some(UpstreamReason::PortInUse),
+                                }
+                            };
+                        }
+                        self.clear_retirement();
                         self.forget_engine().await;
                     }
                     break None;
@@ -1275,7 +1306,9 @@ impl Actor {
                     // 刚才退役时没能确认消失的那个进程（它还活着、认得出来）：不是新引擎，不能放行（Codex 预审 M4）。先把它停掉，
                     // 确认消失才往下拉起新的；停不掉就按一次失败退避重试。
                     let record = engine.record();
-                    if self.condemned.as_ref() == Some(&(record.pid, record.started_at.clone())) {
+                    if self.condemned.as_ref().is_some_and(|condemned| {
+                        condemned.pid == record.pid && condemned.started_at == record.started_at
+                    }) {
                         self.log("认回的是之前没能确认停掉的那个进程：先把它停掉，不放行");
                         // 走和退役同一条有期限、可被停止指令打断的停止（Codex 复审 H2）。
                         if !self.drive_stop(engine).await {
@@ -1287,7 +1320,7 @@ impl Actor {
                                 }
                             };
                         }
-                        self.condemned = None;
+                        self.clear_retirement();
                         // 退役终于确认了：旧进程占着的共享容量现在放掉（Codex 复审 M5），不等新引擎起来。
                         self.forget_engine().await;
                         break None;
@@ -1480,8 +1513,10 @@ impl Actor {
             }
         };
         // 退役时没能确认消失的自有进程，不能以「外部引擎」的身份回来（Codex 复审 M6）：它还握着端口，却已经被我们判了退役。
-        if let Some((pid, _)) = &self.condemned
-            && listeners.iter().any(|listener| listener.pid == *pid)
+        if let Some(condemned) = &self.condemned
+            && listeners
+                .iter()
+                .any(|listener| listener.pid == condemned.pid)
         {
             self.log("端口上监听的是之前没能确认停掉的那个进程：不当作外部引擎接管");
             backend.block(&self.plan.endpoint);
@@ -1749,12 +1784,13 @@ impl Actor {
             }
             // **每一次**带私有 key 的探测之前都重新确认监听这个端口的是这个进程，不缓存（Codex 审计 H3）：进程活着不等于端口还是
             // 它的，引擎可以放掉端口而不退出，别的东西接着绑上来；之前确认过一次，不能让之后每一次探测都带着 key 出去。
-            let listener_confirmed = matches!(
-                inspector
-                    .listens_on(owned.engine.pid(), owned.engine.port())
-                    .await,
-                Ok(true)
-            );
+            let Some(asked) = self
+                .unless_shutdown(inspector.listens_on(owned.engine.pid(), owned.engine.port()))
+                .await
+            else {
+                return Err(WaitFailure::Interrupted);
+            };
+            let listener_confirmed = matches!(asked, Ok(true));
             if listener_confirmed {
                 let key = owned.key.as_ref().map(EngineKey::expose);
                 match self.probe(&recipe, key).await {
@@ -1816,7 +1852,9 @@ impl Actor {
         // 被 `Shutdown`、`stop`、`restart` 打断：半拉起的引擎交给那条命令（Codex 预审 M3）。`stop`、`restart` 在 `engine` 里看到它，走
         // 完整的退役（关门、排空、停进程、确认），不是在这里先停了、命令却说「没有自有引擎」。
         if matches!(failure, WaitFailure::Interrupted)
-            && (self.pending_is_shutdown() || self.pending_is_stop_or_restart())
+            && (self.pending_is_shutdown()
+                || self.pending_is_stop_or_restart()
+                || self.shutdown_order().is_some())
         {
             self.handed_off = true;
             self.engine = Some(owned);
@@ -2036,7 +2074,12 @@ impl Actor {
         // 进程活着不等于端口还是它的（Codex 审计 H3）：引擎可以放掉端口而不退出，别的进程接着绑上来。**每个节拍**重新确认一次
         // 监听这个端口的此刻还是我们的进程（不缓存）；确认不了，先收回私有 key（端点封上）、发布 `unavailable`（`port_in_use`，数据
         // 面立刻 503），这一轮不发探测：发往那个端口的请求不再带私有 key。又确认了，把私有 key 登记回去，接着往下探测。
-        if !self.owned_listener_confirmed().await {
+        // 检查（`lsof`，读不出来时还要按 `unverifiable_retries` 重读、每次隔一段）可能占掉很多秒：iDoris 在停时放手，引擎还握在手里，
+        // 主循环马上带着期限收尾（Codex 复审四 H）。
+        let Some(confirmed) = self.unless_shutdown(self.owned_listener_confirmed()).await else {
+            return None;
+        };
+        if !confirmed {
             self.revoke_owned_key();
             self.publish(UpstreamState::Unavailable, Some(UpstreamReason::PortInUse));
             return None;
@@ -2205,7 +2248,13 @@ impl Actor {
         }
         let recipe = backend.probe_recipe();
         let key = backend.current_key(&self.plan.endpoint);
-        let (state, reason) = match self.probe(&recipe, key.as_deref()).await {
+        // 带 key 的周期探测走授权（监听者重新确认、代际、核验过的拨号地址与新开的连接），不是对着端口直接发一个裸的 bearer：换主人的窗口里
+        // 它不会把 key 发给端口上的另一个进程（Codex 复审四 H）。授权不过（监听者变了、读不出来）就这一轮没有结论，下一个周期重新核对。
+        let probed = match key.as_deref() {
+            Some(key) => self.probe_authorized(&recipe, key).await,
+            None => self.probe(&recipe, None).await,
+        };
+        let (state, reason) = match probed {
             EngineProbe::Ready => {
                 if self.supervisor_latched().await {
                     (
@@ -2298,7 +2347,7 @@ impl Actor {
         // 还是校验过的那个进程：登记它的凭证与新的守卫（登记表的代际前进），再复位账本。复位的采样要用这份凭证，所以登记在前；但**身份与守卫
         // 在复位成功之后才一起发布**（`self.external`、`self.identity`，Codex 预审 H5）：复位没成功时旧的守卫、旧的身份原样留着，之后旧进程
         // 回来也不会拿到新进程的守卫。
-        let external = External::new(verifier, self.plan.port, &expected);
+        let external = External::new(verifier.clone(), self.plan.port, &expected);
         backend.govern_external(&self.plan.endpoint, external.guard.clone());
         let Some(bound) = bound else {
             // 没有 Supervisor（门控还没放行、resident 的托管卡）：没有账本要复位。
@@ -2308,6 +2357,19 @@ impl Actor {
             return true;
         };
         match self.reset_supervisor(&bound, true).await {
+            // 复位（采样）花了一段时间，期间端口可能又换了主人（B 走了、C 占了）：开门之前**重新核对**监听者还是复位对着的那个。不是就不开门，
+            // 端点保持封上，账本身份作废，下一个周期对着新的监听者重新来（Codex 复审四 H）。
+            Ok(())
+                if !matches!(
+                    verifier.check(self.plan.port).await,
+                    ListenerVerdict::Verified { listeners } if listeners == expected
+                ) =>
+            {
+                self.log("外部引擎复位期间监听者又变了：不开门，端点保持封上，下一个周期重新来");
+                backend.block(&self.plan.endpoint);
+                self.identity = None;
+                false
+            }
             Ok(()) => match self.reopen_admission(&bound).await {
                 Synced::Done => {
                     self.external = Some(external);

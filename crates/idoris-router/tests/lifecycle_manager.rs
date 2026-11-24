@@ -3826,7 +3826,10 @@ async fn an_unconfirmed_retirement_never_ends_in_ready_on_the_original_process()
 /// 一个 `status()` 在第一次（Supervisor 启动采样）睡很久的适配器：Supervisor 的 actor 在采样结束前不收任何命令，关门的 RPC 因此要等。
 struct SlowFirstStatus {
     mock: idoris_backend::MockAdapter,
-    calls: AtomicUsize,
+    /// 到目前为止 `status()` 被问了几次（测试据此知道复位的采样什么时候开始）。
+    calls: Arc<AtomicUsize>,
+    /// 第几次（从 0 起）`status()` 睡 `first` 那么久。
+    slow_call: usize,
     first: Duration,
 }
 
@@ -3849,7 +3852,7 @@ impl idoris_backend::RuntimeAdapter for SlowFirstStatus {
         self.mock.unload(id).await
     }
     async fn status(&self) -> Result<idoris_backend::BackendStatus, idoris_backend::BackendError> {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == self.slow_call {
             tokio::time::sleep(self.first).await;
         }
         self.mock.status().await
@@ -3886,7 +3889,8 @@ async fn an_engine_failure_is_published_before_the_slow_cleanup_not_after_it() {
         RuntimeRegistry::spawn_with_factory(&[card("omlx", &rig.endpoint(), true)], |_| {
             Ok(Arc::new(SlowFirstStatus {
                 mock: idoris_backend::MockAdapter::new(Vec::new()),
-                calls: AtomicUsize::new(0),
+                calls: Arc::new(AtomicUsize::new(0)),
+                slow_call: 0,
                 first: Duration::from_secs(4),
             }))
         })
@@ -4098,9 +4102,10 @@ async fn a_second_restart_while_the_replacement_is_starting_joins_it_and_does_no
     h.manager.shutdown(true).await;
 }
 
-/// 复审 M6：退役没能确认的进程，所有权记录被删（认回的路走不通）之后，端口上它还在听，外部校验通过——也不能当作外部引擎接管回来。
+/// 复审 M6、复审四 H：退役没能确认的进程，所有权记录文件被删（认回的路走不通）、进程还在。之前只记 pid 与启动时间，记录没了就没有东西能证明它的身份，
+/// 既不能停它、也不能放它回来；现在留着完整的记录，过身份闸照样停它（停掉才拉替身，它不会作为外部引擎或别的什么回来）。
 #[tokio::test]
-async fn a_condemned_process_does_not_come_back_as_an_external_engine() {
+async fn a_condemned_process_whose_record_file_is_gone_is_stopped_from_the_kept_record() {
     let rig = Rig::new(&Behavior::default());
     let inspector = Scripted::claiming(rig.port);
     let old = leave_an_orphan(&rig, &inspector).await;
@@ -4115,28 +4120,202 @@ async fn a_condemned_process_does_not_come_back_as_an_external_engine() {
     inspector.set_identity_unreadable(true);
     h.manager.restart_upstream("omlx").await.unwrap();
     wait_for("the unconfirmed stop", || h.logged("停止引擎失败")).await;
-    // 记录没了：认回的路没有东西可认。端口上那个进程还在听，并且看起来是合格的外部监听者。
     for entry in std::fs::read_dir(rig.record_dir()).unwrap() {
         std::fs::remove_file(entry.unwrap().path()).unwrap();
     }
-    inspector.external_listener(rig.port, u32::try_from(old).unwrap(), Some(TEAM));
     inspector.set_identity_unreadable(false);
-    // 记录没了、进程还在：没有它已经消失的证据，不探测、不拉起替身（也就不会把它当作外部引擎接管回来）。
-    wait_for("the condemned process to be refused", || {
-        h.logged("之前没能确认停掉的进程还在")
-    })
-    .await;
+    wait_for("the condemned process to be stopped", || !pid_alive(old)).await;
+    let status = h
+        .until("a replacement", |s| {
+            s.state == UpstreamState::Ready && s.owned
+        })
+        .await;
+    assert_eq!(status.reason, None);
     assert_eq!(
         rig.fake.launches(),
-        1,
-        "no replacement while it may still be alive"
+        2,
+        "the replacement came after it was gone"
+    );
+    h.manager.shutdown(true).await;
+}
+
+/// 复审四 H（上一轮的 H2 还没修）：`stop` 没能确认（身份读不出来）后落在终态不再重试；记录文件被删；这时 iDoris 停止。此前 `shutdown` 的回收路径用
+/// 磁盘上的记录认回引擎，记录没了就当它已经消失，引擎活下来（测试以前是自己在 `shutdown` 之后补一个 SIGKILL）。现在 `shutdown` 自己用留着的完整记录把
+/// 它停掉。
+#[tokio::test]
+async fn a_shutdown_stops_a_condemned_engine_even_when_its_record_file_is_gone() {
+    let rig = Rig::new(&Behavior::default());
+    let inspector = Scripted::claiming(rig.port);
+    let old = leave_an_orphan(&rig, &inspector).await;
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    inspector.set_identity_unreadable(true);
+    h.manager.stop_upstream("omlx").await.unwrap();
+    wait_for("the unconfirmed stop", || h.logged("停止引擎失败")).await;
+    h.until("terminal and unconfirmed", |s| {
+        s.state == UpstreamState::Unavailable && s.reason == Some(UpstreamReason::PortInUse)
+    })
+    .await;
+    assert!(pid_alive(old));
+    for entry in std::fs::read_dir(rig.record_dir()).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    inspector.set_identity_unreadable(false);
+
+    h.manager
+        .shutdown_by(
+            true,
+            Some(tokio::time::Instant::now() + Duration::from_secs(4)),
+        )
+        .await;
+    assert!(
+        !pid_alive(old),
+        "the shutdown itself stopped the condemned engine"
+    );
+}
+
+/// 复审四 H：外部引擎换进程（A 到 B），复位的采样在进行时端口又换了主人（C，不合格）。此前复位一成功就开门、紧接着对端口发带 key 的探测：key 发给了
+/// 一个没有通过校验的进程。现在开门之前重新核对监听者，不对就不开门、端点保持封上；带 key 的周期探测也走授权，不是裸的 bearer。
+#[tokio::test]
+async fn the_key_is_not_sent_to_a_process_that_took_the_port_during_an_external_reset() {
+    use idoris_router::runtime::RuntimeRegistry;
+
+    let work = tempfile::tempdir().unwrap();
+    let a = External::start(work.path(), Some("secret"));
+    let other_b = tempfile::tempdir().unwrap();
+    let b = External::start(other_b.path(), None);
+    let other_c = tempfile::tempdir().unwrap();
+    let c = External::start(other_c.path(), None);
+    let rig = rig_for(&a);
+    let inspector = Scripted::new();
+    inspector.external_listener(a.port, a.pid(), Some(TEAM));
+    let backend = default_backend(&rig);
+    *backend.external_key.lock().unwrap() = Some("secret".to_owned());
+    let h = Harness::start(&rig, backend, inspector.clone(), fast(), StopOnExit::Owned);
+    h.until_state(UpstreamState::Ready).await;
+    assert!(h.manager.open_gate().is_some());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sampled = calls.clone();
+    let registry =
+        RuntimeRegistry::spawn_with_factory(&[card("omlx", &rig.endpoint(), true)], move |_| {
+            Ok(Arc::new(SlowFirstStatus {
+                mock: idoris_backend::MockAdapter::new(Vec::new()),
+                calls: sampled.clone(),
+                // 第 0 次是 Supervisor 的启动采样，第 1 次是外部换进程之后的复位：它睡 2 秒。
+                slow_call: 1,
+                first: Duration::from_secs(2),
+            }))
+        })
+        .unwrap();
+    h.manager.attach_runtimes(registry);
+    h.until_state(UpstreamState::Ready).await;
+    wait_for("the startup sample", || calls.load(Ordering::SeqCst) >= 1).await;
+
+    // A 换成 B：复位开始，采样睡着。
+    inspector.external_listener(a.port, b.pid(), Some(TEAM));
+    wait_for("the reset's sample to start", || {
+        calls.load(Ordering::SeqCst) >= 2
+    })
+    .await;
+    // 采样睡着的时候端口被 C 占了：C 没有通过校验（没有团队）。
+    inspector.external_listener(a.port, c.pid(), None);
+    let keyed = || {
+        a.fake
+            .requests()
+            .iter()
+            .filter(|(_, auth)| auth == "ok")
+            .count()
+    };
+    let before = keyed();
+    // 采样结束、复位成功之后的几秒里，没有一个带 key 的请求发出去。
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert_eq!(
+        keyed(),
+        before,
+        "a key went to a process that never passed the owner check: {:?}",
+        a.fake.requests()
     );
     assert_ne!(h.view().state, UpstreamState::Ready);
     h.manager.shutdown(true).await;
-    let _ = Command::new("kill")
-        .args(["-KILL", &old.to_string()])
-        .stderr(Stdio::null())
-        .status();
+}
+
+/// 复审四 H：监听者检查（`lsof` 读不出来，按重试次数重读、每次隔一段）占着实例任务时 iDoris 停止。此前实例任务不看停止指令，管理器按期限中止它，
+/// `stop_on_exit:"never"` 的子进程成了孤儿。现在检查与重试的等待都在停止指令到来时放手，引擎握在手里带期限收尾。
+#[tokio::test]
+async fn a_shutdown_during_a_slow_listener_inspection_still_stops_the_never_engine() {
+    let rig = Rig::new(&Behavior::default());
+    let inspector = Scripted::claiming(rig.port);
+    let mut timings = fast();
+    timings.unverifiable_retries = 4;
+    timings.unverifiable_pause = Duration::from_secs(3);
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        timings,
+        StopOnExit::Never,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    let pid = rig.pid(0);
+    // 从现在起每次检查都读不出来：监督的下一个节拍进入 4 次、每次隔 3 秒的重读。
+    inspector.unreadable.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let begun = Instant::now();
+    h.manager
+        .shutdown_by(
+            true,
+            Some(tokio::time::Instant::now() + Duration::from_secs(3)),
+        )
+        .await;
+    wait_for("the engine to die", || !pid_alive(pid)).await;
+    assert!(
+        begun.elapsed() < Duration::from_secs(6),
+        "the 12 s of inspection did not hold the 3 s deadline: {:?}",
+        begun.elapsed()
+    );
+    assert_eq!(rig.records(), 0);
+}
+
+/// 复审四 M：受理的 `restart` 退役没能确认，之后的重试确认了（旧进程停掉）、替身起来。此前重试成功只清了 `condemned`，没清「已受理的退役」：之后 `never` 的
+/// 正常退出把无辜的替身也停掉了。现在退役的意图绑在那个引擎上，确认就清，替身被留下。
+#[tokio::test]
+async fn a_confirmed_retirement_does_not_make_a_later_never_shutdown_kill_the_replacement() {
+    let rig = Rig::new(&Behavior::default());
+    let inspector = Scripted::claiming(rig.port);
+    let old = leave_an_orphan(&rig, &inspector).await;
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        fast(),
+        StopOnExit::Never,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    inspector.set_identity_unreadable(true);
+    h.manager.restart_upstream("omlx").await.unwrap();
+    wait_for("the unconfirmed stop", || h.logged("停止引擎失败")).await;
+    inspector.set_identity_unreadable(false);
+    h.until("the replacement", |s| {
+        s.state == UpstreamState::Ready && s.owned
+    })
+    .await;
+    wait_for("the old engine to be gone", || !pid_alive(old)).await;
+    let replacement = rig.pid(1);
+
+    // 正常退出、`never`：替身留给下一个 iDoris。
+    h.manager.shutdown(false).await;
+    assert!(
+        pid_alive(replacement),
+        "the replacement was handed over, not killed by a stale retirement intent"
+    );
+    assert_eq!(rig.records(), 1, "its record is kept");
 }
 
 // ---------------------------------------------------------------------------------------------

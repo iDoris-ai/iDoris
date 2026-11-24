@@ -450,6 +450,18 @@ impl OwnedEngine {
         }
     }
 
+    /// 用一份**留着的**所有权记录重建一个认回的句柄（不读记录文件）。给「记录文件没了、作废了，进程却可能还在」的收尾用：调用方在停
+    /// 引擎之前留了一份完整的记录（pid、启动时间、「代」标识、进程组、命令），停的时候照样过身份闸（[`gate`]：对不上就什么信号也不发），
+    /// 不靠磁盘上那份文件还在不在（Codex 复审四 H）。
+    pub fn from_record(
+        instance: &EngineInstance,
+        record: OwnershipRecord,
+        inspector: &Arc<dyn ProcessInspector>,
+    ) -> Self {
+        let store = instance.store();
+        Self::recovered(instance, record, store, inspector)
+    }
+
     pub fn instance(&self) -> &EngineInstance {
         &self.instance
     }
