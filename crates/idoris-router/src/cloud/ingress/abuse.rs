@@ -184,7 +184,7 @@ impl std::fmt::Debug for AuthSlot {
 
 impl AuthBudget {
     /// `unknown` 是全局的查询预算（总闸），`per_source` 是单个来源的份额。后者应当明显小于前者（见 [`AuthBudget`]：
-    /// 一个来源耗不光总闸靠的就是这个比例；启动时 `IngressConfig::budget_warnings` 会对不满足的配置打警告）。
+    /// 一个来源耗不光总闸靠的就是这个比例；份额超过总闸的一半时，启动会由 `IngressConfig::budget_warnings` 打警告）。
     pub fn new(
         max_concurrent: usize,
         unknown: RateLimit,

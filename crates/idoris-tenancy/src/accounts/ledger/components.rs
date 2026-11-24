@@ -19,6 +19,8 @@
 //!
 //! 附加成本的预留只会放行或拒绝，**不**降级、**不**用宽限：它是平台要做的检查，不是用户能用更少 token 换来的东西。
 //! 附加成本的 overage（实际超过预留）和主要预留同一条规则（担保人承担 / 平台损失 / 冻结凭证）。
+//! 附加成本的预留动了授信（超出额度剩余加自有资金剩余）时，和主要预留一样在占预留的同一个事务里给担保人写一条 `credit_used` 告警
+//! （判断「这一笔动没动授信」是同一个函数，见 `admit.rs` 的 `credit_users`）。
 //!
 //! 请求收尾时，该尝试下还没结算的附加成本按 0 释放，并留一条 `extra_unsettled` 告警（见 `hook.rs`）：
 //! S6 应当在收尾之前自己结算；没结算就是少收，告警是让这件事看得见。
@@ -29,7 +31,7 @@ use idoris_compute_contracts::pricing::Price;
 use idoris_compute_contracts::reason::ReasonCode;
 use rusqlite::Connection;
 
-use super::admit::{check_extra, gate};
+use super::admit::{check_extra, gate, insert_credit_used_alerts};
 use super::error::{LedgerError, add};
 use super::holds::{
     NewHold, hold_id_of, insert_hold_and_reserve, load_hold, settle_hold_in, sweep_expired_in,
@@ -87,13 +89,13 @@ pub(super) fn reserve_component_in(
     if load_hold(conn, &hold_id)?.is_some() {
         return Err(LedgerError::HoldExists(hold_id));
     }
-    let (chain, rejection) = check_extra(conn, &main.payer, amount, now_ms, &config)?;
-    if let Some(code) = rejection {
+    let check = check_extra(conn, &main.payer, amount, now_ms, &config)?;
+    if let Some(code) = check.rejection {
         return Ok(ComponentDecision::Rejected(code));
     }
     insert_hold_and_reserve(
         conn,
-        &chain,
+        &check.chain,
         &NewHold {
             attempt,
             component,
@@ -106,6 +108,16 @@ pub(super) fn reserve_component_in(
             expires_at_ms: add(now_ms, config.reservation_ttl_ms)?,
             grace_floor: None,
         },
+    )?;
+    // 附加成本动了授信，同样要通知担保人（和主要预留同一条规则、同一个事务）
+    insert_credit_used_alerts(
+        conn,
+        &check.chain,
+        &check.credit_used,
+        main.credential.as_str(),
+        &hold_id,
+        &main.unit,
+        now_ms,
     )?;
     Ok(ComponentDecision::Reserved { hold_id })
 }
@@ -154,14 +166,14 @@ pub(super) fn reserve_request_component_in(
     if let Some(code) = gate(conn, payment, &chain, now_ms)? {
         return Ok(ComponentDecision::Rejected(code));
     }
-    let (chain, rejection) = check_extra(conn, payment.payer(), amount, now_ms, &config)?;
-    if let Some(code) = rejection {
+    let check = check_extra(conn, payment.payer(), amount, now_ms, &config)?;
+    if let Some(code) = check.rejection {
         return Ok(ComponentDecision::Rejected(code));
     }
     let period = period_of(now_ms, &config.billing_timezone)?.to_string();
     insert_hold_and_reserve(
         conn,
-        &chain,
+        &check.chain,
         &NewHold {
             attempt: &attempt,
             component,
@@ -174,6 +186,16 @@ pub(super) fn reserve_request_component_in(
             expires_at_ms: add(now_ms, config.reservation_ttl_ms)?,
             grace_floor: None,
         },
+    )?;
+    // 附加成本动了授信，同样要通知担保人（和主要预留同一条规则、同一个事务）
+    insert_credit_used_alerts(
+        conn,
+        &check.chain,
+        &check.credit_used,
+        payment.credential().as_str(),
+        &hold_id,
+        payment.unit(),
+        now_ms,
     )?;
     Ok(ComponentDecision::Reserved { hold_id })
 }
