@@ -249,7 +249,9 @@ static GOVERNED: RwLock<BTreeMap<String, Governance>> = RwLock::new(BTreeMap::ne
 /// loopback 的主机写法：`localhost`、`127.0.0.0/8`、`::1`（含 IPv4 映射的写法）。**唯一的判据**：端点标识、key 的资格（[`card_may_carry_omlx_key`]）、
 /// `settings.json` 只发往 loopback（[`is_loopback_base_url`]）、代理的出站统计都用它，所以同一个套接字的各种写法在每一处得到同一个答案。
 pub fn is_loopback_host(host: &str) -> bool {
+    // `localhost.`（带点的完全限定写法）是同一个名字（S8 的预审也发现了它）。
     host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("localhost.")
         || host
             .trim_matches(['[', ']'])
             .parse::<std::net::IpAddr>()

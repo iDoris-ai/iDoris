@@ -271,6 +271,7 @@ async fn every_loopback_spelling_of_a_governed_port_lands_on_the_same_registrati
     let _governed = Governed(main.clone());
     let aliases = [
         "http://localhost:19808",
+        "http://localhost.:19808",
         "https://localhost:19808/v1",
         "http://[::1]:19808",
         "http://127.0.0.2:19808",
@@ -1187,6 +1188,7 @@ fn the_registry_and_key_eligibility_classify_every_spelling_of_loopback_the_same
     for spelling in [
         "http://127.0.0.1:19840",
         "http://localhost:19840",
+        "http://localhost.:19840",
         "http://[::1]:19840",
         "http://[::ffff:127.0.0.1]:19840",
         "http://127.0.0.2:19840",
@@ -1212,6 +1214,7 @@ fn the_registry_and_key_eligibility_classify_every_spelling_of_loopback_the_same
         );
     }
     // The same function everywhere: what the registry folds into 127.0.0.1 is loopback, what it does not is not.
+    assert!(is_loopback_host("localhost."));
     assert!(is_loopback_host("::ffff:127.0.0.1"));
     assert!(is_loopback_host("[::ffff:127.0.0.1]"));
     assert!(!is_loopback_host("::ffff:8.8.8.8"));
