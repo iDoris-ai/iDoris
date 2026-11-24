@@ -337,7 +337,16 @@ for line in sys.stdin:
             let mut lines = BufReader::new(child.stdout.take().unwrap());
             let mut first = String::new();
             lines.read_line(&mut first).unwrap();
-            let port = first.trim().strip_prefix("listening ")?.parse().ok()?;
+            let Some(port) = first
+                .trim()
+                .strip_prefix("listening ")
+                .and_then(|port| port.parse().ok())
+            else {
+                // It could not listen (no IPv6 here): do not leave the child behind.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            };
             Some(Self {
                 child,
                 stdin,

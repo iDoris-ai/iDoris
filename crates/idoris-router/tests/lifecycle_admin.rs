@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use fake_omlx::{Behavior, FakeOmlx, Hold, spawn_retrying};
+use fake_omlx::{Behavior, FakeOmlx, Hold, Release, spawn_retrying};
 use http_body_util::BodyExt;
 use idoris_contracts::{ComponentCard, load_policy::LoadMode};
 use idoris_router::admin::{AdminSessionToken, SharedAdminToken, build_admin_app_with_engines};
@@ -42,8 +42,8 @@ use idoris_router::runtime::RuntimeRegistry;
 use idoris_router::swap::SwapApp;
 use idoris_router::{AppState, build_app};
 use idoris_upstream::engine::{
-    Bind, CodesignPolicy, InspectError, ListenerPolicy, ListenerWatch, ListeningSocket, PidState,
-    ProcessInspector, StopOnExit, SystemInspector,
+    Bind, CodesignPolicy, FALLBACK_TTL, InspectError, ListenerPolicy, ListenerWatch,
+    ListeningSocket, MANAGED_DIAL, PidState, ProcessInspector, StopOnExit, SystemInspector,
 };
 use idoris_upstream::omlx::key::{
     EndpointKey, endpoint_generation, forget_endpoint, governed_endpoint,
@@ -125,6 +125,8 @@ struct Scripted {
     listens_asked: AtomicUsize,
     /// 守卫在没有原生监视时，贵的问题的**肯定**答案重用多久（毫秒）；缺省 0：每个请求都问。
     fallback_ttl_millis: AtomicUsize,
+    /// 一个答案由测试编排的原生监视（[`Scripted::script_native`]）：所有守卫共用这一个。
+    native_script: Mutex<Option<Arc<ScriptedWatch>>>,
 }
 
 /// 永远说「还握着」的原生监视（[`Scripted::offer_a_native_watch_that_always_holds`]）。
@@ -135,6 +137,27 @@ struct StillHolds;
 impl ListenerWatch for StillHolds {
     async fn holds(&self) -> Result<bool, InspectError> {
         Ok(true)
+    }
+}
+
+/// 答案由测试编排的原生监视（[`Scripted::script_native`]）：按顺序给，最后一个重复。
+#[derive(Debug, Default)]
+struct ScriptedWatch {
+    answers: Mutex<std::collections::VecDeque<Result<bool, InspectError>>>,
+}
+
+#[async_trait]
+impl ListenerWatch for ScriptedWatch {
+    async fn holds(&self) -> Result<bool, InspectError> {
+        let mut answers = self.answers.lock().unwrap();
+        if answers.len() > 1 {
+            answers.pop_front().unwrap()
+        } else {
+            answers
+                .front()
+                .copied()
+                .unwrap_or(Err(InspectError::NoAnswer))
+        }
     }
 }
 
@@ -165,7 +188,20 @@ impl Scripted {
             watch_requests: Mutex::new(Vec::new()),
             listens_asked: AtomicUsize::new(0),
             fallback_ttl_millis: AtomicUsize::new(0),
+            native_script: Mutex::new(None),
         })
+    }
+
+    /// 从现在起建的守卫带一个答案由测试编排的原生监视（按顺序，最后一个重复）；之后再调一次只是换掉它的答案，已经建好的守卫也跟着变。要在管理器登记引擎
+    /// **之前**第一次调用（守卫建的时候取到这个监视）。
+    fn script_native(&self, answers: Vec<Result<bool, InspectError>>) {
+        let watch = self
+            .native_script
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| Arc::new(ScriptedWatch::default()))
+            .clone();
+        *watch.answers.lock().unwrap() = answers.into();
     }
 
     /// 从现在起建的守卫带一个永远「读不了这个进程」的原生监视（守卫退到 `listens_on`）。
@@ -304,6 +340,9 @@ impl ProcessInspector for Scripted {
     }
     fn watch_listener(&self, pid: u32, dial: SocketAddr) -> Option<Arc<dyn ListenerWatch>> {
         self.watch_requests.lock().unwrap().push((pid, dial));
+        if let Some(watch) = self.native_script.lock().unwrap().clone() {
+            return Some(watch);
+        }
         if self.native_unreadable.load(Ordering::SeqCst) {
             return Some(Arc::new(CannotRead));
         }
@@ -3527,6 +3566,7 @@ async fn settled_tool_calls(log: &std::path::Path) -> usize {
 /// 检查器是真的，`ps` 与 `lsof` 换成会数自己被运行了几次的替身（运行完还是真的那个）：引擎落定、门控放行之后，一串聊天请求不让它们多运行一次；
 /// 管理器的监督被拉到小时级，所以挡在引擎的私有 key 与端口之间的只有每个请求的确认。引擎放掉端口（进程还活着），冒名者绑上来：聊天、公共模型
 /// 列表、Admin 的模型观察都在发送前被拒，冒名者**一个请求**也没有收到，更没有 `Authorization`；拒绝同样没有起子进程。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn h1_the_per_request_check_starts_no_child_process_and_the_very_next_request_sees_the_engine_let_go_of_its_port()
  {
@@ -4635,4 +4675,609 @@ async fn m6_the_public_model_list_never_asks_a_card_stopped_while_a_slower_card_
 async fn m6_the_admin_model_observation_never_asks_a_card_stopped_while_a_slower_card_was_being_observed()
  {
     listing_while_the_managed_card_is_stopped("/admin/api/v1/models", true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Codex 专项评审（d900486d）的必修项：H1、H2、H3、H6、H7、M9、M10、M11、M13、L14。真的 Router、真的假引擎；每个用例都在带金丝雀 key 的子进程里再跑一遍
+// （冒名者收到任何 `Authorization` 都是失败，不只是金丝雀的值）。时序用同步点到达，不靠墙钟。
+// ---------------------------------------------------------------------------------------------
+
+/// 一个在 IPv4 回环上空着、而且 `[::1]` 上已经有监听套接字的端口；这台机器没有 IPv6 回环时是 `None`。
+fn ipv6_listener_on_a_port_free_on_ipv4() -> Option<(u16, std::net::TcpListener)> {
+    for _ in 0..50 {
+        let port = free_port();
+        if let Ok(listener) = std::net::TcpListener::bind(("::1", port)) {
+            return Some((port, listener));
+        }
+    }
+    None
+}
+
+fn has_lsof() -> bool {
+    ["/usr/sbin/lsof", "/usr/bin/lsof"]
+        .iter()
+        .any(|path| std::path::Path::new(path).is_file())
+}
+
+/// 等到没有任何东西在监听这个端口（引擎放掉它是异步的）。
+async fn wait_until_nothing_listens(port: u16) {
+    wait_for("the port to be free", || {
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_err()
+    })
+    .await;
+}
+
+// ----- H1：核验过的地址就是拨号的地址 ------------------------------------------------------------------------------------------
+
+/// 引擎在 `127.0.0.1:<端口>`，一个冒名者在**同一个端口**的 `[::1]` 上。伴生卡写成 `http://[::1]:<端口>`（登记表把它与主卡并成同一个端口身份）：它的
+/// 转发、预热、公共模型列表、Admin 的模型观察、后台探测都必须拨守卫验证过的 `127.0.0.1`，不能拨卡里写的 `[::1]`。冒名者**一个请求**也没收到，更没有
+/// `Authorization`。之前授权只核对「端口上的是引擎」，发送端照卡里的写法去拨，请求（连同引擎的私有 key）落在 `[::1]` 的冒名者手里。
+#[tokio::test]
+async fn fr_h1_a_companion_card_spelled_as_ipv6_loopback_is_dialed_at_the_verified_ipv4_address() {
+    if !in_a_child_with_canary_keys(
+        "fr_h1_a_companion_card_spelled_as_ipv6_loopback_is_dialed_at_the_verified_ipv4_address",
+    ) {
+        return;
+    }
+    let Some((port, listener)) = ipv6_listener_on_a_port_free_on_ipv4() else {
+        eprintln!("no IPv6 loopback on this machine: nothing to show");
+        return;
+    };
+    let impostor = Impostor::on(listener).await;
+    let mut rig = Rig::new(&stateful());
+    rig.port = port;
+    let companion = resident_chat_card(&format!("http://[::1]:{port}"));
+    let inspector = Scripted::claiming(port);
+    let full = Full::start_with_cards(
+        rig,
+        inspector.clone(),
+        supervision_paused(),
+        vec![companion.clone()],
+    )
+    .await;
+    full.wait_open().await;
+    // 管理器给守卫的拨号地址是 127.0.0.1（托管的引擎只被拨它）。
+    assert!(
+        inspector
+            .watched()
+            .iter()
+            .all(|(_, dial)| *dial == SocketAddr::new(MANAGED_DIAL, port)),
+        "{:?}",
+        inspector.watched()
+    );
+
+    // 经托管的卡把模型加载上；之后伴生卡（`[::1]` 写法）的聊天经代理发出去。
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    let chats = full.rig.fake.requests_of("POST:/v1/chat/completions");
+    let (status, body) = full
+        .data(
+            "POST",
+            "/v1/chat/completions",
+            Some(json!({"model": "idoris/daily", "messages": [{"role": "user", "content": "hi"}]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        full.rig.fake.requests_of("POST:/v1/chat/completions"),
+        chats + 1,
+        "the companion card's chat reached the engine"
+    );
+    assert!(
+        full.rig
+            .fake
+            .requests()
+            .iter()
+            .filter(|(path, _)| path == "POST:/v1/chat/completions")
+            .all(|(_, auth)| auth == "ok"),
+        "{:?}",
+        full.rig.fake.requests()
+    );
+
+    // 预热（resident 的最小请求）。
+    let (status, body) = full
+        .data(
+            "POST",
+            "/v1/models/warmup",
+            Some(json!({"model": "idoris/daily"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 公共模型列表：伴生卡与主卡都读到引擎。
+    let models = full.rig.fake.requests_of("/v1/models");
+    let (status, body) = full.data("GET", "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        full.rig.fake.requests_of("/v1/models") > models,
+        "the model list reached the engine"
+    );
+    assert!(
+        !body["data"].as_array().unwrap().is_empty(),
+        "the engine's model is listed: {body}"
+    );
+
+    // Admin 的模型观察：伴生卡如实读到了引擎。
+    let (status, body) = full.admin("GET", "/admin/api/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let source = body["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["provider_id"] == "omlx-chat")
+        .unwrap_or_else(|| panic!("no source for the companion card: {body}"));
+    assert_eq!(source["state"], "observed", "{source}");
+    assert_eq!(source["models"], json!(["fake-model"]), "{source}");
+
+    // 后台探测：伴生卡经 `[::1]` 写法的探测读到的是引擎，不是冒名者。
+    let context = ProberContext {
+        health: full.health.clone(),
+        plans: plan_upstreams(std::slice::from_ref(&companion)).unwrap(),
+        runtimes: RuntimeRegistry::default(),
+        client: reqwest::Client::new(),
+        remote_kill_switch: Arc::new(AtomicBool::new(false)),
+        timings: ProberTimings::default(),
+    };
+    assert_eq!(
+        context.observe(&context.plans[0]).await,
+        Observation::Ready,
+        "the probe through the [::1] spelling read the engine"
+    );
+
+    assert_eq!(
+        impostor.count().await,
+        0,
+        "the IPv6 listener was sent something: {:?}",
+        impostor.requests().await
+    );
+    impostor.assert_never_authorized().await;
+}
+
+// ----- H2：IPv6 通配没有「也接 IPv4」的证据，不算 IPv4 拨号地址的监听者 ------------------------------------------------------------
+
+/// 引擎放掉 IPv4 的监听套接字，只在同一个端口上留一个 `IPV6_V6ONLY` 的 `::` 套接字（连到 `127.0.0.1` 的连接到不了它）；冒名者绑上 `127.0.0.1:<端口>`。
+/// 引擎在这个端口上**还握着一个 LISTEN 套接字**，但不是 `127.0.0.1` 连得到的那一个：每个请求的确认说不是，聊天、公共模型列表、Admin 的模型观察都在发送前被
+/// 拒，冒名者一个请求也没收到。（管理器的监督被暂停：挡在 key 与冒名者之间的只有每个请求的确认。）
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn fr_h2_an_engine_that_keeps_only_an_ipv6_only_socket_is_refused_on_the_very_next_request() {
+    if !in_a_child_with_canary_keys(
+        "fr_h2_an_engine_that_keeps_only_an_ipv6_only_socket_is_refused_on_the_very_next_request",
+    ) {
+        return;
+    }
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let endpoint = rig.endpoint();
+    let inspector = Arc::new(SystemInspector::new().with_native_probe(true));
+    let full = Full::start_with(rig, inspector, supervision_paused()).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    let private_key = full.rig.key(0);
+
+    let outcome = full.rig.fake.release_port_as(Release::Ipv6Only);
+    if outcome != "ok" {
+        eprintln!("this machine cannot bind an IPv6-only socket: {outcome}");
+        return;
+    }
+    let impostor = Impostor::on_port(port).await;
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Private(private_key.clone())),
+        "the manager has not noticed: only the per-request check stands between the key and the new listener"
+    );
+
+    let (status, _) = full.chat().await;
+    assert_ne!(status, StatusCode::OK, "the very next chat request");
+    let (status, body) = full.data("GET", "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"], json!([]), "{body}");
+    let (status, body) = full.admin("GET", "/admin/api/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        impostor.count().await,
+        0,
+        "not one request reached the new listener"
+    );
+    impostor.assert_never_authorized().await;
+    for request in impostor.requests().await {
+        assert!(!format!("{:?}", request.headers).contains(&private_key));
+    }
+}
+
+/// 同一件事走 `lsof` 的退路（没有原生监视的平台，或原生读不了那个进程）：`lsof -Fpnt` 的 `t` 行保留地址族，IPv6 通配不当作 IPv4 的监听者。引擎只留一个
+/// `IPV6_V6ONLY` 的 `::` 套接字：管理器的下一个节拍问「唯一的监听者」，答案是「不是」（它在这个端口上没有 `127.0.0.1` 连得到的套接字）：收回私有 key、
+/// `unavailable` 加 `port_in_use`。之前 `*` 一律当作「任何地址」，这个引擎一直被当成端口的主人。
+#[tokio::test]
+async fn fr_h2_the_lsof_fallback_keeps_the_address_family_and_the_tick_notices_an_ipv6_only_engine()
+{
+    if !has_lsof() {
+        return;
+    }
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let endpoint = rig.endpoint();
+    let inspector = Arc::new(SystemInspector::new().with_native_probe(false));
+    let full = Full::start(rig, inspector).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Private(full.rig.key(0)))
+    );
+
+    let outcome = full.rig.fake.release_port_as(Release::Ipv6Only);
+    if outcome != "ok" {
+        eprintln!("this machine cannot bind an IPv6-only socket: {outcome}");
+        return;
+    }
+    wait_for("unavailable, port_in_use", || {
+        let upstream = &full.health.view().upstreams[0];
+        upstream.state == UpstreamState::Unavailable
+            && upstream.reason == Some(UpstreamReason::PortInUse)
+    })
+    .await;
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Blocked),
+        "the tick revoked the private key of an engine whose only socket cannot take connections to 127.0.0.1"
+    );
+    let _ = port;
+}
+
+// ----- H3（Linux）：描述符还在，套接字已经不是 LISTEN ------------------------------------------------------------------------------
+
+/// 引擎不关套接字，对它 `shutdown(SHUT_RD)`：Linux 上监听套接字离开 LISTEN 状态、描述符还开着；冒名者绑上 `127.0.0.1:<端口>`（旧套接字不是 LISTEN，
+/// `SO_REUSEADDR` 的绑定不冲突）。之前快路径只看「这个描述符是端口上的一个套接字」，一直说「还握着」，key 发给了冒名者。现在每个请求的确认读到那个套接字
+/// 已经不是 LISTEN：下一个请求就被拒。
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn fr_h3_a_socket_that_left_listen_with_its_descriptor_kept_is_refused_on_the_very_next_request()
+ {
+    if !in_a_child_with_canary_keys(
+        "fr_h3_a_socket_that_left_listen_with_its_descriptor_kept_is_refused_on_the_very_next_request",
+    ) {
+        return;
+    }
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let endpoint = rig.endpoint();
+    let inspector = Arc::new(SystemInspector::new().with_native_probe(true));
+    let full = Full::start_with(rig, inspector, supervision_paused()).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    let private_key = full.rig.key(0);
+
+    assert_eq!(full.rig.fake.release_port_as(Release::ShutdownRead), "ok");
+    let impostor = Impostor::on_port(port).await;
+    assert_eq!(
+        governed_endpoint(&endpoint),
+        Some(EndpointKey::Private(private_key.clone())),
+        "the manager has not noticed"
+    );
+    let (status, _) = full.chat().await;
+    assert_ne!(status, StatusCode::OK, "the very next chat request");
+    let (status, body) = full.data("GET", "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"], json!([]), "{body}");
+    assert_eq!(
+        impostor.count().await,
+        0,
+        "not one request reached the new listener"
+    );
+    impostor.assert_never_authorized().await;
+}
+
+// ----- H6：引擎换代之后，同一个适配器不复用通往旧进程的连接 ---------------------------------------------------------------------------
+
+/// 外部引擎 A 服务过请求（适配器、代理的连接留在池里），然后 A 放掉端口**但进程活着、连接开着**；B 在同一个端口上起来，管理器接管它（新一代）。同一个适配器
+/// 的下一个请求（账本复位的采样、加载、聊天）必须落在 B，走新开的连接：之前它们走池里的旧连接，落在 A 身上（A 的请求记录里多出带新引擎 key 的请求），B 收到的
+/// 反而是空的。
+#[tokio::test]
+async fn fr_h6_after_an_external_changeover_the_same_adapters_never_reuse_a_connection_to_the_old_process()
+ {
+    if !in_a_child_with_canary_keys(
+        "fr_h6_after_an_external_changeover_the_same_adapters_never_reuse_a_connection_to_the_old_process",
+    ) {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let a = External::start_on(work.path(), "external-a", &stateful(), free_port());
+    let port = a.port;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let inspector = Scripted::new();
+    inspector.external_listener(port, a.pid(), Some(TEAM));
+    let full = Full::start(rig, inspector.clone()).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(a.fake.model_loads(), 1);
+
+    // A 放掉端口，进程活着、它已经接受的连接还开着；管理器看到没有监听者。
+    a.fake.release_port();
+    wait_until_nothing_listens(port).await;
+    inspector.forget_listener(port);
+    full.until_unavailable().await;
+    let a_saw = a.fake.requests().len();
+
+    // B 在同一个端口上起来，管理器接管它（新一代，账本对着 B 重建）。
+    let b = External::start_on(work.path(), "external-b", &stateful(), port);
+    inspector.external_listener(port, b.pid(), Some(TEAM));
+    wait_for("ready again", || {
+        full.health.view().upstreams[0].state == UpstreamState::Ready
+    })
+    .await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(b.fake.model_loads(), 1, "the chat loaded the model on B");
+    assert!(b.fake.requests_of("POST:/v1/chat/completions") >= 1);
+    assert_eq!(
+        a.fake.requests().len(),
+        a_saw,
+        "the old process was sent something over a connection that outlived it: {:?}",
+        a.fake.requests()
+    );
+    assert!(
+        pid_alive(u64::from(a.pid())),
+        "A is still alive, holding its connections"
+    );
+}
+
+// ----- H7：退路缓存：一个突发的并发请求只起一个 `lsof` ---------------------------------------------------------------------------
+
+/// 没有原生监视（退路）：窗口关着的时候同时到达的一批请求，只有一个贵的检查（`lsof`）在途，别的请求排队等它的结论；之前每个请求各起一个 `lsof`，
+/// 一批请求一起把 `lsof` 拉起来几十次。
+#[tokio::test]
+async fn fr_h7_a_burst_of_concurrent_requests_costs_a_handful_of_lsof_in_the_fallback() {
+    if !has_lsof() {
+        return;
+    }
+    let rig = Rig::new(&stateful());
+    let tools = tempfile::tempdir().unwrap();
+    let log = tools.path().join("calls.log");
+    let ps = counting_tool(tools.path(), "ps", &["/bin/ps", "/usr/bin/ps"], &log);
+    let lsof = counting_tool(
+        tools.path(),
+        "lsof",
+        &["/usr/sbin/lsof", "/usr/bin/lsof"],
+        &log,
+    );
+    let inspector = Arc::new(
+        SystemInspector::with_tools(ps, lsof)
+            .with_timeouts(PATIENT, PATIENT)
+            .with_native_probe(false),
+    );
+    let full = Arc::new(Full::start_with(rig, inspector, supervision_paused()).await);
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    let settled = settled_tool_calls(&log).await;
+    // 上一次「是」的窗口过期之后，突发的请求找到的是关着的窗口。
+    tokio::time::sleep(FALLBACK_TTL + Duration::from_millis(150)).await;
+
+    let tasks: Vec<_> = (0..24)
+        .map(|_| {
+            let full = full.clone();
+            tokio::spawn(async move { full.chat().await.0 })
+        })
+        .collect();
+    for task in tasks {
+        assert_eq!(task.await.unwrap(), StatusCode::OK);
+    }
+    let started = tool_calls(&log) - settled;
+    assert!(started >= 1, "the fallback asked lsof at all");
+    assert!(
+        started <= 6,
+        "24 concurrent requests started {started} lsof (one check at a time, the rest wait for its answer)"
+    );
+}
+
+/// 退路的缓存与原生监视并存：原生读不出来的时候，贵的问题（`listens_on`）的「是」重用一个窗口；原生一旦说「不握了」，窗口里的「是」作废，之后原生再读不出
+/// 来，就得重新问，不能拿那个旧的「是」放行（旧的「是」比这次「不握了」早）。窗口设成一分钟，所以任何放行都只可能来自缓存。
+#[tokio::test]
+async fn fr_h7_a_native_no_ends_the_window_of_the_fallback_so_a_stale_yes_is_never_served() {
+    if !in_a_child_with_canary_keys(
+        "fr_h7_a_native_no_ends_the_window_of_the_fallback_so_a_stale_yes_is_never_served",
+    ) {
+        return;
+    }
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let inspector = Scripted::claiming(port);
+    inspector.reuse_fallback_for(Duration::from_secs(60));
+    inspector.script_native(vec![Err(InspectError::NoAnswer)]);
+    let full = Full::start_with(rig, inspector.clone(), supervision_paused()).await;
+    full.wait_open().await;
+
+    // 原生读不出来：贵的问题答「是」，开一个一分钟的窗口；窗口里的请求不再问。
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    let asked = inspector.listens_asked();
+    assert!(asked >= 1);
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert_eq!(
+        inspector.listens_asked(),
+        asked,
+        "the second request was served from the window"
+    );
+
+    // 原生说「不握了」：下一个请求被拒，即使窗口还开着。
+    inspector.script_native(vec![Ok(false)]);
+    let (status, _) = full.chat().await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a native no wins over the open window"
+    );
+
+    // 原生又读不出来了：窗口已经作废，要重新问（不能拿旧的「是」放行）。
+    inspector.script_native(vec![Err(InspectError::NoAnswer)]);
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    assert!(
+        inspector.listens_asked() > asked,
+        "the stale yes was served after a native no instead of asking again"
+    );
+}
+
+// ----- M10、M11：原生监视读不了这个进程：问那个贵的问题，不能就此拒绝 --------------------------------------------------------------
+
+/// 原生监视对这个引擎永远「读不出来」（权限、短读、没查成的候选）：守卫每个请求退到 `listens_on`，引擎照常被服务（不被一口回绝）；引擎放掉端口之后，
+/// 退路仍然抓得到它（冒名者一个请求也收不到）。守卫建监视时问的是 `127.0.0.1:<端口>` 这个地址，对着引擎的 pid。
+#[tokio::test]
+async fn fr_m10_m11_a_watch_that_cannot_read_the_process_falls_back_and_never_refuses_outright() {
+    if !in_a_child_with_canary_keys(
+        "fr_m10_m11_a_watch_that_cannot_read_the_process_falls_back_and_never_refuses_outright",
+    ) {
+        return;
+    }
+    let rig = Rig::new(&stateful());
+    let port = rig.port;
+    let inspector = Scripted::claiming(port);
+    inspector.offer_a_native_watch_that_cannot_read();
+    let full = Full::start_with(rig, inspector.clone(), supervision_paused()).await;
+    full.wait_open().await;
+    let engine = u32::try_from(full.rig.pid(0)).unwrap();
+    assert!(
+        inspector
+            .watched()
+            .contains(&(engine, SocketAddr::new(MANAGED_DIAL, port))),
+        "{:?}",
+        inspector.watched()
+    );
+    let asked = inspector.listens_asked();
+    for _ in 0..5 {
+        assert_eq!(
+            full.chat().await.0,
+            StatusCode::OK,
+            "an unreadable watch is not a refusal"
+        );
+    }
+    assert!(
+        inspector.listens_asked() >= asked + 5,
+        "every request fell back to the expensive question"
+    );
+
+    // 引擎放掉端口：退路抓得到。
+    full.rig.fake.release_port();
+    inspector.lose(port);
+    let impostor = Impostor::on_port(port).await;
+    let (status, _) = full.chat().await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(impostor.count().await, 0);
+    impostor.assert_never_authorized().await;
+}
+
+// ----- M9：进程自己重建了监听套接字（新的描述符）：重新定位，仍被服务 --------------------------------------------------------------
+
+/// 引擎在同一个进程、同一个端口上关掉监听套接字再重新监听（新的描述符）。原生监视记着的描述符已经关了：它在阻塞线程池里重新定位新的套接字，之后的每个
+/// 请求照常被服务（不被误判成「不握了」，也不拖住异步执行器）。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn fr_m9_an_engine_that_listens_again_on_a_new_descriptor_is_still_served() {
+    let rig = Rig::new(&stateful());
+    let inspector = Arc::new(SystemInspector::new().with_native_probe(true));
+    let full = Full::start_with(rig, inspector, supervision_paused()).await;
+    full.wait_open().await;
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+
+    assert_eq!(full.rig.fake.release_port_as(Release::Relisten), "ok");
+    for _ in 0..5 {
+        assert_eq!(
+            full.chat().await.0,
+            StatusCode::OK,
+            "the engine listens on a new descriptor: the watch relocates it"
+        );
+    }
+}
+
+// ----- M13：外部引擎：只数能接这个连接的监听者 ------------------------------------------------------------------------------------
+
+/// 外部引擎的端口上还有第二个监听者，但它绑在 `[::1]` 上（不合格：没有签名团队），连到 `127.0.0.1` 的连接到不了它：它不影响校验，引擎被接管并照常
+/// 服务；守卫的期望集合里只有那个能接连接的引擎。之前端口上的每个 pid 都得合格，这个旁观者让引擎永远接管不了。
+#[tokio::test]
+async fn fr_m13_a_listener_that_cannot_take_the_connection_does_not_keep_an_external_engine_from_being_adopted()
+ {
+    if !in_a_child_with_canary_keys(
+        "fr_m13_a_listener_that_cannot_take_the_connection_does_not_keep_an_external_engine_from_being_adopted",
+    ) {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start_on(work.path(), "external-a", &stateful(), free_port());
+    let port = external.port;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let inspector = Scripted::new();
+    inspector.sign(external.pid(), TEAM);
+    let bystander = std::os::unix::process::parent_id();
+    inspector.sockets_on(
+        port,
+        vec![
+            ListeningSocket::v4(external.pid(), std::net::Ipv4Addr::LOCALHOST),
+            ListeningSocket {
+                pid: bystander,
+                bind: Bind::v6(std::net::Ipv6Addr::LOCALHOST, false),
+            },
+        ],
+    );
+    let full = Full::start(rig, inspector.clone()).await;
+    full.wait_open().await;
+    assert_eq!(
+        governed_endpoint(&full.rig.endpoint()),
+        Some(EndpointKey::External {
+            settings_key_verified: true
+        }),
+        "the engine was adopted"
+    );
+    assert_eq!(full.chat().await.0, StatusCode::OK);
+    // 守卫只为那个能接连接的引擎建监视（旁观者不在期望集合里）。
+    assert!(
+        inspector
+            .watched()
+            .iter()
+            .all(|(pid, dial)| *pid == external.pid()
+                && *dial == SocketAddr::new(MANAGED_DIAL, port)),
+        "{:?}",
+        inspector.watched()
+    );
+}
+
+/// 反过来：第二个监听者绑在 IPv4 通配上（能接 `127.0.0.1` 的连接）而且不合格：任何能接这个连接的监听者都得是被授权的，所以不接管，凭证一个也不发；
+/// 引擎收到的只有匿名的探测。
+#[tokio::test]
+async fn fr_m13_a_second_listener_that_can_take_the_connection_and_is_not_authorized_prevents_the_adoption()
+ {
+    if !in_a_child_with_canary_keys(
+        "fr_m13_a_second_listener_that_can_take_the_connection_and_is_not_authorized_prevents_the_adoption",
+    ) {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start_on(work.path(), "external-a", &stateful(), free_port());
+    let port = external.port;
+    let mut rig = Rig::new(&Behavior::default());
+    rig.port = port;
+    let inspector = Scripted::new();
+    inspector.sign(external.pid(), TEAM);
+    let stranger = std::os::unix::process::parent_id();
+    inspector.sockets_on(
+        port,
+        vec![
+            ListeningSocket::v4(external.pid(), std::net::Ipv4Addr::LOCALHOST),
+            ListeningSocket::any(stranger),
+        ],
+    );
+    let full = Full::start(rig, inspector.clone()).await;
+    full.wait_open().await;
+    assert_eq!(
+        governed_endpoint(&full.rig.endpoint()),
+        Some(EndpointKey::Blocked),
+        "an unauthorized listener that can take the connection: nothing is adopted"
+    );
+    assert_eq!(full.chat().await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        external
+            .fake
+            .requests()
+            .iter()
+            .all(|(_, auth)| auth == "none"),
+        "no credential reached the engine: {:?}",
+        external.fake.requests()
+    );
 }

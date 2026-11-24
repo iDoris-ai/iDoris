@@ -106,7 +106,7 @@ pub trait ProcessInspector: Send + Sync {
             .listeners_on(port)
             .await?
             .into_iter()
-            .map(|pid| ListeningSocket::any(pid))
+            .map(ListeningSocket::any)
             .collect())
     }
 
@@ -1498,13 +1498,31 @@ mod tests {
         }
     }
 
+    /// Lets the blocked scans go. Dropping it releases every scan still waiting, so a test that fails half way does not leave a thread of
+    /// the blocking pool hanging the shutdown of its runtime.
+    struct Releaser(std::sync::mpsc::Sender<()>);
+
+    impl Releaser {
+        fn one(&self) {
+            let _ = self.0.send(());
+        }
+
+        fn sender(&self) -> std::sync::mpsc::Sender<()> {
+            self.0.clone()
+        }
+    }
+
+    impl Drop for Releaser {
+        fn drop(&mut self) {
+            for _ in 0..64 {
+                let _ = self.0.send(());
+            }
+        }
+    }
+
     fn slow_native(
         answer: native::Probe,
-    ) -> (
-        Arc<SlowNative>,
-        std::sync::mpsc::Sender<()>,
-        std::sync::mpsc::Receiver<()>,
-    ) {
+    ) -> (Arc<SlowNative>, Releaser, std::sync::mpsc::Receiver<()>) {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(64);
         (
@@ -1517,7 +1535,7 @@ mod tests {
                 entered: entered_tx,
                 answer,
             }),
-            release_tx,
+            Releaser(release_tx),
             entered_rx,
         )
     }
@@ -1527,6 +1545,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_scan_does_not_block_the_executor() {
         let (native, release, entered) = slow_native(native::Probe::Holds);
+        // A safety net: a scan that blocks the executor would hang this test; let it go after a while so the test fails instead.
+        let safety = release.sender();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(5));
+            let _ = safety.send(());
+        });
         let watch = Arc::new(NativeWatch::new(native.clone()));
         let asked = {
             let watch = watch.clone();
@@ -1538,18 +1562,19 @@ mod tests {
             .unwrap();
         // ... and this single-threaded runtime is still alive: a timer fires and another task completes while the scan is blocked.
         let side = tokio::spawn(async { 7_u32 });
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::time::sleep(Duration::from_millis(50)),
-        )
-        .await
-        .expect("the runtime was blocked by the scan");
+        let started = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the runtime was blocked by the scan for {:?}",
+            started.elapsed()
+        );
         assert_eq!(side.await.unwrap(), 7);
         assert!(
             !asked.is_finished(),
             "the request is still waiting for its scan"
         );
-        release.send(()).unwrap();
+        release.one();
         assert_eq!(asked.await.unwrap(), Ok(true));
     }
 
@@ -1570,7 +1595,7 @@ mod tests {
             .unwrap();
         // Give the other fifteen time to queue up behind the scan.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        release.send(()).unwrap();
+        release.one();
         for task in tasks {
             assert_eq!(task.await.unwrap(), Ok(true));
         }
@@ -1587,6 +1612,7 @@ mod tests {
     async fn the_scans_of_all_watches_are_bounded_process_wide() {
         let total = MAX_SCANS + 3;
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release = Releaser(release_tx);
         let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
         let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1640,7 +1666,7 @@ mod tests {
         );
         // Let them all through, one by one; every request is answered.
         for _ in 0..total {
-            release_tx.send(()).unwrap();
+            release.one();
         }
         for task in tasks {
             assert_eq!(task.await.unwrap(), Ok(true));
@@ -1658,7 +1684,7 @@ mod tests {
             (native::Probe::Holds, Ok(true)),
         ] {
             let (native, release, _entered) = slow_native(found);
-            release.send(()).unwrap();
+            release.one();
             let watch = NativeWatch::new(native);
             assert_eq!(watch.holds().await, expected);
         }

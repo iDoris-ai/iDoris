@@ -61,32 +61,17 @@ impl Engine {
     /// An IPv4 listener on `host` (an ephemeral port).
     fn start(host: &str) -> Self {
         Self::spawn(host, "4", "-", 0)
+            .unwrap_or_else(|| panic!("the IPv4 listener could not listen"))
     }
 
     /// An IPv6 listener on `host`; `v6only` is `"0"` (dual-stack), `"1"` (IPv6 only) or `"-"` (the system default). `None` when this
-    /// machine has no IPv6 loopback to bind.
+    /// machine has no IPv6 to bind.
     fn start_v6(host: &str, v6only: &str, port: u16) -> Option<Self> {
-        let mut child = Command::new("/usr/bin/python3")
-            .args(["-B", "-c", LISTENER, host, "6", v6only, &port.to_string()])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take().unwrap();
-        let mut lines = BufReader::new(child.stdout.take().unwrap());
-        let mut first = String::new();
-        lines.read_line(&mut first).unwrap();
-        let port = first.trim().strip_prefix("listening ")?.parse().unwrap();
-        Some(Self {
-            child,
-            stdin,
-            lines,
-            port,
-        })
+        Self::spawn(host, "6", v6only, port)
     }
 
-    fn spawn(host: &str, family: &str, v6only: &str, port: u16) -> Self {
+    /// Start the helper process; `None` (child reaped) when it could not listen.
+    fn spawn(host: &str, family: &str, v6only: &str, port: u16) -> Option<Self> {
         let mut child = Command::new("/usr/bin/python3")
             .args([
                 "-B",
@@ -106,18 +91,21 @@ impl Engine {
         let mut lines = BufReader::new(child.stdout.take().unwrap());
         let mut first = String::new();
         lines.read_line(&mut first).unwrap();
-        let port = first
+        let Some(port) = first
             .trim()
             .strip_prefix("listening ")
-            .unwrap_or_else(|| panic!("the engine said {first:?}"))
-            .parse()
-            .unwrap();
-        Self {
+            .and_then(|port| port.parse().ok())
+        else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        };
+        Some(Self {
             child,
             stdin,
             lines,
             port,
-        }
+        })
     }
 
     fn pid(&self) -> u32 {
