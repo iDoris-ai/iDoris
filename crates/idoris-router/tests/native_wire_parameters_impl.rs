@@ -2,6 +2,8 @@
 #[path = "support/state_isolation.rs"]
 mod state_isolation;
 
+use state_isolation::IsolateState;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -331,6 +333,7 @@ fn parameters_cannot_bypass_supervisor_memory_admission() {
         .env(CHILD_ENV, "1")
         .env("HOME", home.path())
         .env_remove("IDORIS_OMLX_API_KEY")
+        .isolate_state()
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
