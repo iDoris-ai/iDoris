@@ -14,9 +14,9 @@ use idoris_upstream::engine::{
     DiscoveryError, EngineError, EngineInstance, EngineKey, EngineLaunch, EngineLaunchSpec,
     EngineProbe, EngineRecipe, ExternalListenerGuard, LaunchError, ListenerIdentity,
     ListenerVerdict, ListenerVerifier, MANAGED_DIAL, OwnedEngine, OwnedListenerGuard, Recovery,
-    fresh_connection_client,
+    fresh_connection_client, probe_authorized,
 };
-use idoris_upstream::omlx::key::EndpointGuard;
+use idoris_upstream::omlx::key::{EndpointGuard, KeyRefusal};
 use tokio::sync::{mpsc, oneshot};
 
 use super::backoff::{CrashWindow, restart_delay};
@@ -374,6 +374,28 @@ impl Actor {
                 self.timings().probe_timeout,
             )
             .await
+    }
+
+    /// 一次**带凭证**的探测，经登记表的授权路径（[`idoris_upstream::engine::probe_authorized`]；Codex 复审 L2 的 M2'）：外部引擎的接管与监督用它，
+    /// 第 3 层引擎换代之后的探测也该用它。`key` 要由调用方**先**取好（之后才是授权里的监听者确认）；探测只拨核验过的地址、走授权给的不保留空闲连接的客户端，
+    /// 发出前再同步看一眼端点。`Err` = 授权被拒绝（封上了、代际变了、监听者确认不了或已经不是登记时的那个、托管客户端建不出来）：什么都没有发出去。
+    /// 没有客户端（建不出来）同裸的 [`Self::probe`]：`Unavailable`。
+    async fn probe_authorized(
+        &self,
+        recipe: &Arc<dyn EngineRecipe>,
+        key: Option<&str>,
+    ) -> Result<EngineProbe, KeyRefusal> {
+        let Some(client) = &self.client else {
+            return Ok(EngineProbe::Unavailable);
+        };
+        probe_authorized(
+            recipe.as_ref(),
+            &self.plan.endpoint,
+            client,
+            key,
+            self.timings().probe_timeout,
+        )
+        .await
     }
 
     fn probe_instance(&self) -> Option<EngineInstance> {
@@ -784,21 +806,27 @@ impl Actor {
                             reason: Some(UpstreamReason::AuthRequired),
                         };
                     }
-                    Some(key) => match self.probe(recipe, Some(&key)).await {
-                        EngineProbe::Ready => true,
-                        EngineProbe::AuthRejected(_) => {
+                    // key 先取好（上面），再经授权路径探测：守卫重新确认监听者、只拨核验过的地址、走新开的连接（Codex 复审 L2 的 M2'）。
+                    Some(key) => match self.probe_authorized(recipe, Some(&key)).await {
+                        Ok(EngineProbe::Ready) => true,
+                        Ok(EngineProbe::AuthRejected(_)) => {
                             return Attempt::Terminal {
                                 state: UpstreamState::Unavailable,
                                 reason: Some(UpstreamReason::AuthFailed),
                             };
                         }
-                        EngineProbe::NotThisEngine => {
+                        Ok(EngineProbe::NotThisEngine) => {
                             return Attempt::Terminal {
                                 state: UpstreamState::Failed,
                                 reason: Some(UpstreamReason::PortInUse),
                             };
                         }
-                        EngineProbe::ConnectionRefused | EngineProbe::Unavailable => false,
+                        Ok(EngineProbe::ConnectionRefused | EngineProbe::Unavailable) => false,
+                        // 授权被拒绝：校验通过之后、发出之前监听者变了（或确认不了），什么都没发。当作监听者没了：退避之后从头再来。
+                        Err(refusal) => {
+                            self.log(&format!("外部引擎的带凭证探测没有发出（{refusal}）"));
+                            return Attempt::Failure { reason: None };
+                        }
                     },
                 }
             }
@@ -1276,8 +1304,24 @@ impl Actor {
             }
         }
         let recipe = backend.probe_recipe();
+        // key 先取好，再经授权路径探测（守卫重新确认监听者、只拨核验过的地址、走新开的连接；Codex 复审 L2 的 M2'）。
         let key = backend.current_key(&self.plan.endpoint);
-        let (state, reason) = match self.probe(&recipe, key.as_deref()).await {
+        let probe = match self.probe_authorized(&recipe, key.as_deref()).await {
+            Ok(probe) => probe,
+            // 授权被拒绝，什么都没有发出去。刚才的校验通过了、授权里的确认却没过：监听者在这一刻变了或读不出来，这一轮说确认不了
+            // （`port_in_use`）；封上了、代际变了、客户端建不出来都只是这一轮没探测成。下一个周期的校验会把监听者的变化分清楚。
+            Err(refusal) => {
+                self.log(&format!("外部引擎的探测没有发出（{refusal}）"));
+                let reason = matches!(
+                    refusal,
+                    KeyRefusal::ListenerChanged | KeyRefusal::Unverified
+                )
+                .then_some(UpstreamReason::PortInUse);
+                self.publish(UpstreamState::Unavailable, reason);
+                return;
+            }
+        };
+        let (state, reason) = match probe {
             EngineProbe::Ready => {
                 if self.supervisor_latched().await {
                     (
