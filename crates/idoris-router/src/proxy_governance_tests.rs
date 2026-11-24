@@ -40,6 +40,21 @@ impl Drop for Governed {
     }
 }
 
+/// 一个此刻没人监听的端口，挑在内核的临时端口范围之外。登记表是进程全局的，而这些用例要在一个没人监听的端口上登记（甚至封上）
+/// 端点好几百毫秒：从临时范围里挑，同一个进程里别的用例的 wiremock 可能恰好被分到同一个端口，撞上这里的登记。
+fn free_port_outside_the_ephemeral_range() -> u16 {
+    // 进程内递增的游标：并行的用例拿到不同的端口（它们挑完就放掉，只靠「此刻能绑上」区分不了）。
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let start = 20_000 + std::process::id() % 5_000;
+    (0..5_000u32)
+        .map(|_| {
+            let step = NEXT.fetch_add(1, Ordering::SeqCst);
+            u16::try_from(20_000 + (start - 20_000 + step) % 10_000).unwrap_or(20_000)
+        })
+        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
+        .unwrap_or_else(|| panic!("a free port outside the ephemeral range"))
+}
+
 fn body() -> Value {
     serde_json::json!({"messages": [{"role": "user", "content": "a prompt nobody else may read"}]})
 }
@@ -250,9 +265,7 @@ async fn a_request_to_an_endpoint_nobody_governs_is_not_subject_to_the_registry(
 /// 连着发生比熔断上限（本地类 2 次）多的次数之后，端点恢复，下一个请求直接发出去，而不是 `provider_circuit_open`。
 #[tokio::test]
 async fn a_refusal_between_connection_retries_does_not_count_against_the_provider_breaker() {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
+    let port = free_port_outside_the_ephemeral_range();
     let uri = format!("http://127.0.0.1:{port}");
     let _governed = Governed(uri.clone());
     govern_endpoint(&uri, EndpointKey::Private("old".into()));
@@ -301,10 +314,8 @@ async fn a_refusal_between_connection_retries_does_not_count_against_the_provide
 async fn a_connection_failure_retry_is_not_sent_to_an_engine_that_replaced_the_one_it_was_admitted_for()
  {
     for replaced in [false, true] {
-        // 先占一个端口再放掉：第一次发送连接被拒。
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        // 第一次发送连接被拒：一个此刻没人监听的端口。
+        let port = free_port_outside_the_ephemeral_range();
         let uri = format!("http://127.0.0.1:{port}");
         let _governed = Governed(uri.clone());
         govern_endpoint(&uri, EndpointKey::Private("key-of-the-old-engine".into()));
