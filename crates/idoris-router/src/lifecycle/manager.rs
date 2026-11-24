@@ -759,7 +759,7 @@ impl EngineManager {
         let call = async {
             // 先占邮箱的位子（可能要等：邮箱满了），**占到之后**才盖章并入队，两步在同一把锁里（Codex 复审 M4）：序号的先后就是命令在邮箱里的先后。
             // 先盖章、后入队时，一个盖了章的命令可以在入队之前被抢占，排在更晚盖章的 `stop` 后面，`stop` 的截断就盖不住它。序号不大于某次
-            // 操作完成时的 `seq_now` 的 `restart`，都是在那次操作进行期间（或之前）入队的，它们并进那次操作的结果（见 `Actor::restart_cover`）。
+            // 操作就绪时的水位（[`Shared::publish_at_watermark`]）的 `restart`，都是在那次操作进行期间（或之前）入队的，它们并进那次操作的结果（见 `Actor::restart_cover`）。
             let permit = sender.reserve().await.map_err(|_| CommandError::Closed)?;
             {
                 let _order = self.shared.freeze_stamping();

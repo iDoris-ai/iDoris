@@ -349,9 +349,9 @@ pub(super) struct Actor {
     /// 一次因为找不到可执行文件而以 `absent` 收尾的 `start`，排在它后面的 `restart` 不能被说成并进了一个什么引擎都没换的操作）。操作开始时清零。
     op_launched: bool,
     /// 序号不大于它的 `restart` 命令，都是在上一次 `start`、`restart` 操作进行期间（或之前）入队的：它们并进那次操作的结果，
-    /// 不再换第二次引擎。命令在**入队时**盖章（[`Shared::next_seq`]），操作完成时记下此刻盖出的最大序号；这样即使命令
-    /// 在 actor 忙着排空、停进程、复位、不去收命令的时候排在队里，它也被认出是「同一次操作」的并发（IDORIS-CORE S6，
-    /// Codex 预审 5）。
+    /// 不再换第二次引擎。命令在**入队时**盖章（[`Shared::next_seq`]），操作拉起了自有引擎并就绪时、在发布 `ready` 的同一步里记下此刻盖出的最大序号
+    /// （[`Self::publish_ready_finishing_op`]）；这样即使命令在 actor 忙着排空、停进程、复位、不去收命令的时候排在队里，它也被认出是
+    /// 「同一次操作」的并发（IDORIS-CORE S6，Codex 预审 5）。没有换上引擎就结束的操作不记（复审 L4 第二轮）。
     restart_cover: u64,
     /// 启动决策「前提变了、重来」（[`Attempt::Redecide`]）的这一串从什么时候开始。
     redecide_since: Option<Instant>,
@@ -1131,8 +1131,8 @@ impl Actor {
             }
             // 并发的 `restart`：它入队的时候一次 `start`、`restart` 操作正在进行（actor 忙着排空、停进程、复位，没有去收命令）或者
             // 刚做完，所以并进那次操作的结果，**不换第二次引擎**。归属与并入在这里一起决定（Codex 预审 L4 的 M2）：`restart_cover` 只记
-            // 真的换了自有引擎的操作（[`Self::finish_op`]：外部引擎的自动重新同步、接管外部引擎的 `start` 都不记），那样的 `restart` 往下走到
-            // 没有自有引擎的 `NotOwned`。
+            // 拉起了自有引擎并且就绪的操作（[`Self::publish_ready_finishing_op`]：外部引擎的自动重新同步、接管外部引擎的 `start`、没有拉起引擎就结束的
+            // 操作都不记），那样的 `restart` 往下走到没有自有引擎的 `NotOwned`。
             Command::Restart if self.restart_covered(seq) => {
                 answer(Ok(self.view()));
                 current
@@ -1334,7 +1334,7 @@ impl Actor {
             }
             Attempt::Terminal { state, reason } => {
                 self.redecide_since = None;
-                // 终局的失败之后端点保持封上（Codex 审计 H1）：上面那条对每一条非 `Ready` 的出口统一做了。水位先于发布（L4'）。
+                // 终局的失败之后端点保持封上（Codex 审计 H1）：上面那条对每一条非 `Ready` 的出口统一做了。操作的结束先于发布（L4'；没有换上引擎，不记水位）。
                 self.finish_op();
                 self.publish_terminal(state, reason);
                 Step::Idle(Idle::Terminal)
