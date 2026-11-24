@@ -219,35 +219,100 @@ pub fn read_launcher_frame(reader: &mut impl BufRead) -> Result<LauncherFrame, F
     parse_frame_line(&read_frame_line(reader)?)
 }
 
+/// 等取消的间隔：阻塞的读不能被打断，所以每隔这么久看一眼取消标志（H1：停止信号不能等读帧的 10 秒自己结束，launcher 17 秒就 SIGKILL）。
+pub const CANCEL_POLL: Duration = Duration::from_millis(50);
+
+/// [`wait_on_thread`] 的结果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Waited<T> {
+    /// 读完了。
+    Done(T),
+    /// 超过了时限。
+    TimedOut,
+    /// 被取消（停止信号到了）。
+    Cancelled,
+    /// 读线程起不来，或没给结果就结束了（panic）。
+    Disconnected,
+}
+
+/// 在独立线程里做一次阻塞的读（阻塞的 stdin 读不能被打断），等它做完、超过 `timeout`，或 `cancel()` 为真（每 [`CANCEL_POLL`] 看一次，
+/// 进入时先看一次）。超时或取消之后读线程留在后台，随进程退出一起结束（调用方马上退出）：它不会再被读到，也不会再碰 stdin 以外的东西。
+pub fn wait_on_thread<T, F>(
+    name: &str,
+    read: F,
+    timeout: Duration,
+    cancel: &dyn Fn() -> bool,
+) -> Waited<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if cancel() {
+        return Waited::Cancelled;
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let _ = sender.send(read());
+        });
+    if spawned.is_err() {
+        return Waited::Disconnected;
+    }
+    let started = std::time::Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        match receiver.recv_timeout(remaining.min(CANCEL_POLL)) {
+            Ok(result) => return Waited::Done(result),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Waited::Disconnected,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if cancel() {
+                    return Waited::Cancelled;
+                }
+                if started.elapsed() >= timeout {
+                    return Waited::TimedOut;
+                }
+            }
+        }
+    }
+}
+
+/// [`read_with_timeout`]，可以被取消：`Ok(None)` 是被取消（停止信号到了，没有读到帧也不是帧有问题），其余同它。
+pub fn read_with_timeout_or_cancel<F>(
+    read: F,
+    timeout: Duration,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<LauncherFrame>, FrameError>
+where
+    F: FnOnce() -> Result<LauncherFrame, FrameError> + Send + 'static,
+{
+    match wait_on_thread("idoris-launcher-frame", read, timeout, cancel) {
+        Waited::Done(result) => result.map(Some),
+        Waited::Cancelled => Ok(None),
+        Waited::TimedOut => Err(FrameError::new(FrameErrorCode::Timeout)),
+        Waited::Disconnected => Err(FrameError::new(FrameErrorCode::FrameNotJson)),
+    }
+}
+
 /// 在独立线程里读（阻塞的 stdin 读不能被打断），超过 `timeout` 报 `timeout`。读线程留在后台，
 /// 随进程退出一起结束（调用方马上以退出码 1 退出）。
 pub fn read_with_timeout<F>(read: F, timeout: Duration) -> Result<LauncherFrame, FrameError>
 where
     F: FnOnce() -> Result<LauncherFrame, FrameError> + Send + 'static,
 {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("idoris-launcher-frame".to_string())
-        .spawn(move || {
-            let _ = sender.send(read());
-        })
-        .map_err(|_| FrameError::new(FrameErrorCode::FrameNotJson))?;
-    match receiver.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err(FrameError::new(FrameErrorCode::Timeout))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(FrameError::new(FrameErrorCode::FrameNotJson))
-        }
-    }
+    // 永不取消，所以 `Ok(None)` 不会出现；真出现了就当作超时，不 panic。
+    read_with_timeout_or_cancel(read, timeout, &|| false)?
+        .ok_or_else(|| FrameError::new(FrameErrorCode::Timeout))
 }
 
-/// 生产入口：从进程的 stdin 读一帧，10 秒内。
-pub fn read_launcher_frame_from_stdin() -> Result<LauncherFrame, FrameError> {
-    read_with_timeout(
+/// 生产入口：从进程的 stdin 读一帧，10 秒内；`cancel()` 为真（停止信号到了）就放弃，返回 `Ok(None)`。
+pub fn read_launcher_frame_from_stdin_or_cancel(
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<LauncherFrame>, FrameError> {
+    read_with_timeout_or_cancel(
         || read_launcher_frame(&mut std::io::stdin().lock()),
         FRAME_READ_TIMEOUT,
+        cancel,
     )
 }
 
@@ -831,6 +896,78 @@ mod tests {
         assert_eq!(error.to_string(), "launcher 帧无效（timeout）");
         // 在时限（20 毫秒）就返回，没有等读线程睡完 5 秒；阈值留足调度余量。
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    /// H1：读线程卡在一个永远不会来的字节上（launcher 还没写帧），取消标志一置位，等待在一个轮询间隔之内放弃，不等 10 秒的时限。
+    #[test]
+    fn a_cancelled_wait_gives_up_within_a_poll_interval_not_at_the_timeout() {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            read_with_timeout_or_cancel(
+                || {
+                    std::thread::sleep(Duration::from_secs(30));
+                    parse(minimal())
+                },
+                Duration::from_secs(4),
+                &|| cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        });
+        assert!(matches!(result, Ok(None)), "cancelled is not an error");
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(150), "{waited:?}");
+        assert!(
+            waited < Duration::from_secs(2),
+            "gave up promptly, not at the 4 s limit: {waited:?}"
+        );
+    }
+
+    /// 已经取消了：不起读线程，立刻放弃；没取消：照常返回读到的帧，时限仍然生效（取消与超时是两回事）。
+    #[test]
+    fn an_already_cancelled_wait_returns_at_once_and_an_uncancelled_one_keeps_its_timeout() {
+        let started = std::time::Instant::now();
+        let result = read_with_timeout_or_cancel(
+            || {
+                std::thread::sleep(Duration::from_secs(30));
+                parse(minimal())
+            },
+            Duration::from_secs(20),
+            &|| true,
+        );
+        assert!(matches!(result, Ok(None)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let frame =
+            read_with_timeout_or_cancel(|| parse(minimal()), Duration::from_secs(5), &|| false)
+                .unwrap()
+                .unwrap_or_else(|| panic!("not cancelled: the frame"));
+        assert!(frame.admin_token.matches(TOKEN));
+        let error = read_with_timeout_or_cancel(
+            || {
+                std::thread::sleep(Duration::from_secs(5));
+                parse(minimal())
+            },
+            Duration::from_millis(80),
+            &|| false,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), FrameErrorCode::Timeout);
+    }
+
+    /// 读线程 panic：没有结果、也不是超时，是 `Disconnected`（帧读不出来）。
+    #[test]
+    fn a_reader_that_panics_is_reported_as_disconnected_not_as_a_timeout() {
+        let waited = wait_on_thread::<u8, _>(
+            "test-reader",
+            || panic!("the reader died"),
+            Duration::from_secs(5),
+            &|| false,
+        );
+        assert_eq!(waited, Waited::Disconnected);
     }
 
     #[test]

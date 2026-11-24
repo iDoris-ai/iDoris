@@ -148,7 +148,7 @@ mod instance;
 mod manager;
 
 pub use backend::{EngineBackend, OmlxBackend, PrepareFailure};
-pub use backoff::{CrashWindow, Timings, restart_delay};
+pub use backoff::{CrashWindow, MIN_CONFIRM, MIN_TERM_GRACE, Timings, restart_delay, stop_windows};
 pub use manager::{
     CommandError, EngineFailure, EngineManager, GateOutcome, ManagedPlan, ManagedView,
     ManagerConfig, PlanError, managed_backend_kind, plan_managed, plan_managed_with,

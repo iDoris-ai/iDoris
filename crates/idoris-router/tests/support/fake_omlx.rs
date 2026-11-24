@@ -27,6 +27,21 @@ pub struct Behavior {
     pub exit_after_secs: f64,
     /// 一启动就以这个退出码退出，不监听（模拟引擎起不来）；`None` = 正常。
     pub exit_immediately: Option<i32>,
+    /// 收到 SIGTERM 怎么办。
+    pub on_sigterm: OnSigterm,
+}
+
+/// 假引擎收到 SIGTERM 的反应。非 `Die` 的两种都在 `records/sigterm.log` 里记一行收到的时刻（Unix 秒），测试据此知道信号是否到过、
+/// 什么时候到的；它们都只有 SIGKILL 杀得掉。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnSigterm {
+    /// 照常：SIGTERM 终止进程（解释器的默认动作）。
+    #[default]
+    Die,
+    /// 记下来，然后什么也不做，照常服务（引擎卡住了，对 SIGTERM 没有反应）。
+    Ignore,
+    /// 记下来，关掉监听 socket，然后赖着不走（模拟「正在退出」的引擎：关了监听、在等在途的生成结束，而那一刻起端口上已经没有它）。
+    CloseListenerAndLinger,
 }
 
 /// 一个生成好的假引擎。
@@ -79,6 +94,15 @@ impl FakeOmlx {
     /// 取消 [`Self::force_status`]。
     pub fn answer_normally(&self) {
         let _ = std::fs::remove_file(self.record_dir.join("force-status"));
+    }
+
+    /// 引擎收到 SIGTERM 的时刻（Unix 秒），按先后；没收到过就是空（`on_sigterm` 为 `Die` 时进程直接没了，也不记）。
+    pub fn sigterm_times(&self) -> Vec<f64> {
+        std::fs::read_to_string(self.record_dir.join("sigterm.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
     }
 
     /// 已经启动过几次（`launch-*.json` 的个数）。
@@ -175,20 +199,41 @@ pub fn spawn_retrying(command: &mut Command) -> std::io::Result<ChildGuard> {
 
 fn python_source(behavior: &Behavior, record_dir: &Path) -> String {
     format!(
-        r#"import http.server, json, os, sys, threading, time
+        r#"import http.server, json, os, signal, sys, threading, time
 
 RECORDS = {records}
 LISTEN_DELAY = {delay}
 NEVER_LISTEN = {never}
 EXIT_AFTER = {exit_after}
 EXIT_IMMEDIATELY = {exit_now}
+ON_SIGTERM = {on_sigterm}
 
 def arg(name):
     args = sys.argv[1:]
     return args[args.index(name) + 1] if name in args else None
 
-# One record per launch: what the engine was started with. Numbered by the files already there.
 os.makedirs(RECORDS, exist_ok=True)
+
+# The SIGTERM reaction is in place BEFORE the launch record exists: a test that has seen the record can signal the engine
+# and know it will react as configured (not die in the interpreter's start-up).
+server = None
+
+def on_term(signum, frame):
+    # One line per SIGTERM: the moment it arrived. Then what this engine does with it (see `OnSigterm`).
+    with open(os.path.join(RECORDS, "sigterm.log"), "a") as f:
+        f.write("%f\n" % time.time())
+    if ON_SIGTERM == "linger" and server is not None:
+        # The listener goes away at once (the port has no listener from here on) while the process stays.
+        # `shutdown()` waits for `serve_forever()` to return and that runs in this very (main) thread: from a helper thread.
+        def close_listener():
+            server.shutdown()
+            server.server_close()
+        threading.Thread(target=close_listener, daemon=True).start()
+
+if ON_SIGTERM != "die":
+    signal.signal(signal.SIGTERM, on_term)
+
+# One record per launch: what the engine was started with. Numbered by the files already there.
 index = len([n for n in os.listdir(RECORDS) if n.startswith("launch-")])
 tmp = os.path.join(RECORDS, "tmp-%04d-%d" % (index, os.getpid()))
 with open(tmp, "w") as f:
@@ -272,7 +317,14 @@ host = arg("--host") or "127.0.0.1"
 port = int(arg("--port"))
 server = http.server.ThreadingHTTPServer((host, port), Handler)
 server.daemon_threads = True
-server.serve_forever()
+try:
+    server.serve_forever()
+except BaseException:
+    pass
+if ON_SIGTERM == "linger":
+    # The listener is closed and every in-flight request is done: nothing left to serve, but the process does not exit.
+    while True:
+        time.sleep(3600)
 "#,
         // A JSON string is a valid Python string literal.
         records = serde_json::to_string(&record_dir.display().to_string()).unwrap(),
@@ -286,6 +338,11 @@ server.serve_forever()
         exit_now = match behavior.exit_immediately {
             Some(code) => code.to_string(),
             None => "None".to_owned(),
+        },
+        on_sigterm = match behavior.on_sigterm {
+            OnSigterm::Die => "\"die\"",
+            OnSigterm::Ignore => "\"ignore\"",
+            OnSigterm::CloseListenerAndLinger => "\"linger\"",
         },
     )
 }
