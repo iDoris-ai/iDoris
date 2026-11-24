@@ -272,6 +272,7 @@ async fn every_loopback_spelling_of_a_governed_port_lands_on_the_same_registrati
     let _governed = Governed(main.clone());
     let aliases = [
         "http://localhost:19808",
+        "http://localhost.:19808",
         "https://localhost:19808/v1",
         "http://[::1]:19808",
         "http://127.0.0.2:19808",
@@ -1080,6 +1081,83 @@ mod dial {
         .await;
     }
 
+    /// A guard that says the listener behind the endpoint is not the engine any more (the managed listener left, another process took the port).
+    #[derive(Debug)]
+    struct Refusing {
+        dial: SocketAddr,
+    }
+
+    #[async_trait]
+    impl EndpointGuard for Refusing {
+        async fn verify(&self) -> Verification {
+            Verification::Mismatch
+        }
+        fn dial(&self) -> Option<SocketAddr> {
+            Some(self.dial)
+        }
+    }
+
+    /// The adapter built for a card that may not carry the oMLX key (not in per-request mode, no key of its own).
+    fn adapter_without_the_key(url: &str) -> OmlxAdapter {
+        OmlxAdapter::new(OmlxAdapterConfig {
+            base_url: url.to_owned(),
+            api_key: None,
+            call_timeout: Duration::from_secs(5),
+        })
+        .unwrap()
+        .with_load_fence_path(idoris_backend::mock::temporary_load_fence_path())
+    }
+
+    /// Codex pre-review of layer 2, H1: governed is decided by the endpoint, not by the adapter's mode. The adapter of a card that may not carry
+    /// the key (a hand-written card that claims to be oMLX, a card on an IPv4-mapped spelling of the port...) aims at a port the engine
+    /// manager governs: it goes to the verified address, carries no key, and is refused — nothing sent — when the endpoint is blocked or when
+    /// the listener is no longer the engine. Before, it skipped the whole check and sent its prompts to whatever held the port.
+    #[tokio::test]
+    async fn an_adapter_that_may_not_carry_the_key_is_still_gated_by_its_governed_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = RawServer::start(listener, "engine");
+        let url = format!("http://127.0.0.1:{port}");
+        let _governed = Governed(url.clone());
+        govern_endpoint_guarded(
+            &url,
+            EndpointKey::Private("engine-key".into()),
+            Some(Arc::new(Dialing { dial: v4(port) })),
+        );
+        let adapter = adapter_without_the_key(&url);
+        assert!(
+            idoris_backend::RuntimeAdapter::engine_generation(&adapter).is_some(),
+            "bound to the endpoint's generation like any adapter of a governed endpoint"
+        );
+
+        // Healthy: the request goes out, with no credential (the registered key is not this adapter's).
+        adapter.list().await.unwrap();
+        assert_eq!(server.count(), 1);
+        assert_eq!(
+            server.seen()[0].authorization,
+            None,
+            "the engine's private key went to an adapter that may not carry it"
+        );
+
+        // The endpoint is blocked (stopped, being replaced): nothing is sent.
+        idoris_upstream::omlx::key::block_endpoint(&url);
+        assert!(adapter.list().await.is_err());
+        assert_eq!(server.count(), 1, "a request went to a blocked endpoint");
+
+        // A new engine is registered, but the guard says the listener behind the port is not it: nothing is sent either.
+        govern_endpoint_guarded(
+            &url,
+            EndpointKey::Private("other-key".into()),
+            Some(Arc::new(Refusing { dial: v4(port) })),
+        );
+        assert!(adapter.list().await.is_err());
+        assert_eq!(
+            server.count(),
+            1,
+            "a request went to a listener the guard no longer vouches for"
+        );
+    }
+
     /// An endpoint nobody governs keeps the shared, pooling client: this change is about connections that carry an engine credential.
     #[tokio::test]
     async fn an_ungoverned_endpoint_keeps_its_pooled_connection() {
@@ -1119,4 +1197,231 @@ mod dial {
         assert_eq!(server.count(), 4);
         assert_eq!(server.connections(), 4);
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Codex pre-review of layer 2: L1 (no bearer in `Debug`), H3 (the last-moment check), H1 (governed by the endpoint, one classification of
+// loopback)
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+/// L1: the derived `Debug` printed the bearer into diagnostics and failing assertions. It is redacted now, wherever it is formatted (alone,
+/// pretty-printed, inside a `Result`).
+#[tokio::test]
+async fn an_authorization_never_prints_its_bearer() {
+    let url = endpoint(19850);
+    let _governed = Governed(url.clone());
+    govern_endpoint(&url, EndpointKey::Private("canary-bearer-value".into()));
+    let authorization = authorize_omlx_request(&url, None).await.unwrap();
+    assert_eq!(authorization.key(), Some("canary-bearer-value"));
+    for printed in [format!("{authorization:?}"), format!("{authorization:#?}")] {
+        assert!(!printed.contains("canary-bearer-value"), "{printed}");
+        assert!(printed.contains("REDACTED"), "{printed}");
+        assert!(
+            !printed.contains("19850"),
+            "the endpoint is not printed either: {printed}"
+        );
+    }
+    let result: Result<_, KeyRefusal> = Ok(authorization);
+    assert!(!format!("{result:?}").contains("canary-bearer-value"));
+    // An authorization without a key says so, and still prints no key.
+    let keyless = idoris_upstream::omlx::key::authorize_omlx_request_without_key(&url, None)
+        .await
+        .unwrap();
+    assert_eq!(keyless.key(), None);
+    assert!(!format!("{keyless:?}").contains("canary-bearer-value"));
+}
+
+/// H3: an authorization is the old engine's the moment a restart overtakes it. `ensure_current` is the synchronous look the senders take right
+/// before they send (after the authorization, the request is built, the body serialized: time in which the engine can be replaced): the
+/// endpoint was blocked, or a new engine registered (another generation) — refuse; a fresh authorization is current; an ungoverned endpoint
+/// has nothing to overtake it.
+#[tokio::test]
+async fn an_authorization_is_not_current_once_a_restart_has_overtaken_it() {
+    let url = endpoint(19851);
+    let _governed = Governed(url.clone());
+    govern_endpoint_guarded(
+        &url,
+        EndpointKey::Private("old-key".into()),
+        Some(Scripted::answering(&[Verification::Verified])),
+    );
+    let authorization = authorize_omlx_request(&url, None).await.unwrap();
+    assert!(authorization.ensure_current().is_ok());
+
+    // The restart: the old engine's registration is blocked ...
+    block_endpoint(&url);
+    assert!(matches!(
+        authorization.ensure_current().unwrap_err(),
+        KeyRefusal::StaleGeneration { .. }
+    ));
+    // ... and the replacement registers its own key: the authorization held here is still the old one's.
+    govern_endpoint_guarded(
+        &url,
+        EndpointKey::Private("new-key".into()),
+        Some(Scripted::answering(&[Verification::Verified])),
+    );
+    assert!(matches!(
+        authorization.ensure_current().unwrap_err(),
+        KeyRefusal::StaleGeneration { .. }
+    ));
+    let fresh = authorize_omlx_request(&url, None).await.unwrap();
+    assert!(fresh.ensure_current().is_ok());
+    assert_eq!(fresh.key(), Some("new-key"));
+
+    let ungoverned = authorize_omlx_request("http://127.0.0.1:19852", None)
+        .await
+        .unwrap();
+    assert!(ungoverned.ensure_current().is_ok());
+}
+
+/// H1: "governed" is a property of the endpoint (the canonical identity), not of the card that asks. Every spelling of the port is
+/// governed once the manager registered it; an authorization for a card that may not carry the key gets the same gate (blocked, stale
+/// generation, listener re-verified, verified dial) and **no key**, not even the registered private one.
+#[tokio::test]
+async fn a_governed_endpoint_is_governed_whatever_card_asks_and_a_card_without_the_key_gets_the_gate_but_no_key()
+ {
+    use idoris_upstream::omlx::key::{authorize_omlx_request_without_key, is_governed_endpoint};
+
+    let url = endpoint(19853);
+    let _governed = Governed(url.clone());
+    let spellings = [
+        "http://127.0.0.1:19853",
+        "http://localhost:19853",
+        "http://[::1]:19853",
+        "http://[::ffff:127.0.0.1]:19853",
+        "http://127.0.0.2:19853",
+    ];
+    for spelling in spellings {
+        assert!(
+            !is_governed_endpoint(spelling),
+            "{spelling}: nobody governs it yet"
+        );
+    }
+    let guard = Scripted::answering(&[Verification::Verified]);
+    govern_endpoint_guarded(
+        &url,
+        EndpointKey::Private("engine-key".into()),
+        Some(guard.clone()),
+    );
+    for spelling in spellings {
+        assert!(is_governed_endpoint(spelling), "{spelling}");
+        let gated = authorize_omlx_request_without_key(spelling, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            gated.key(),
+            None,
+            "{spelling}: the registered key is not for this card"
+        );
+    }
+    assert_eq!(
+        guard.asked(),
+        spellings.len(),
+        "the guard was asked for every one"
+    );
+    assert_eq!(endpoint_flights(&url), 0, "none is held any more");
+
+    // The gate is real: a stale generation, a blocked endpoint and a listener that is no longer the engine all refuse it.
+    let admitted = endpoint_generation(&url);
+    guard_says_mismatch(&url, &guard);
+    assert_eq!(
+        authorize_omlx_request_without_key("http://[::ffff:127.0.0.1]:19853", Some(admitted))
+            .await
+            .unwrap_err(),
+        KeyRefusal::ListenerChanged
+    );
+    assert_eq!(
+        endpoint_flights(&url),
+        0,
+        "a refusal leaves nothing in flight"
+    );
+    block_endpoint(&url);
+    for spelling in spellings {
+        assert_eq!(
+            authorize_omlx_request_without_key(spelling, None)
+                .await
+                .unwrap_err(),
+            KeyRefusal::Blocked,
+            "{spelling}"
+        );
+    }
+    assert!(matches!(
+        authorize_omlx_request_without_key(&url, Some(admitted))
+            .await
+            .unwrap_err(),
+        KeyRefusal::StaleGeneration { .. }
+    ));
+}
+
+/// The scripted guard answers `Mismatch` from now on (the managed listener left, another process took the port).
+fn guard_says_mismatch(_url: &str, guard: &Arc<Scripted>) {
+    *guard.answers.lock().unwrap() = [Verification::Mismatch].into_iter().collect();
+}
+
+fn omlx_card(
+    endpoint: &str,
+    extensions: Option<serde_json::Value>,
+) -> idoris_contracts::ComponentCard {
+    let mut card: idoris_contracts::ComponentCard = serde_json::from_value(serde_json::json!({
+        "provider": {"id": "omlx-x", "family": "local", "tier": "local",
+            "capabilities": ["chat"], "privacy_class": "local_only",
+            "cost": {"input_per_m": 0, "output_per_m": 0}, "locality": "loopback"},
+        "form": "http_service", "endpoint": endpoint, "version_pin": "omlx@0.6.4",
+        "privacy_class": "local_only", "allowed_egress": ["loopback"],
+        "fallback_policy": "fail_closed", "fail_closed": true
+    }))
+    .unwrap();
+    card.extensions = extensions.map(|value| value.as_object().unwrap().clone());
+    card
+}
+
+/// H1: one classification of "loopback" for the registry (the endpoint identity) and for key eligibility (`card_may_carry_omlx_key`,
+/// `is_loopback_base_url`, which also decides whether `settings.json` may be read for the target). The registry folds the IPv4-mapped
+/// spelling into the same port; eligibility used `IpAddr::is_loopback`, which does not: a card spelled that way sat on a governed port
+/// as "not loopback, no key, not the registry's business".
+#[test]
+fn the_registry_and_key_eligibility_classify_every_spelling_of_loopback_the_same_way() {
+    use idoris_upstream::omlx::key::{
+        card_may_carry_omlx_key, endpoint_identity, is_loopback_base_url, is_loopback_host,
+    };
+
+    let plain = "http://127.0.0.1:19840";
+    for spelling in [
+        "http://127.0.0.1:19840",
+        "http://localhost:19840",
+        "http://localhost.:19840",
+        "http://[::1]:19840",
+        "http://[::ffff:127.0.0.1]:19840",
+        "http://127.0.0.2:19840",
+        "https://localhost:19840",
+    ] {
+        assert_eq!(
+            endpoint_identity(spelling),
+            endpoint_identity(plain),
+            "{spelling}"
+        );
+        assert!(endpoint_identity(spelling).is_some(), "{spelling}");
+        assert!(is_loopback_base_url(spelling), "{spelling}");
+        assert!(
+            card_may_carry_omlx_key(&omlx_card(spelling, None)),
+            "{spelling}: the registry treats it as the managed port, so eligibility must too"
+        );
+        assert!(
+            !card_may_carry_omlx_key(&omlx_card(
+                spelling,
+                Some(serde_json::json!({"idoris_upstream": {"kind": "openai_compat"}}))
+            )),
+            "{spelling}: a card with idoris_upstream is never eligible"
+        );
+    }
+    // The same function everywhere: what the registry folds into 127.0.0.1 is loopback, what it does not is not.
+    assert!(is_loopback_host("localhost."));
+    assert!(is_loopback_host("::ffff:127.0.0.1"));
+    assert!(is_loopback_host("[::ffff:127.0.0.1]"));
+    assert!(!is_loopback_host("::ffff:8.8.8.8"));
+    assert!(!is_loopback_base_url("http://[::ffff:8.8.8.8]:19840"));
+    assert!(!card_may_carry_omlx_key(&omlx_card(
+        "http://[::ffff:8.8.8.8]:19840",
+        None
+    )));
+    assert!(!is_loopback_base_url("http://example.com:19840"));
 }

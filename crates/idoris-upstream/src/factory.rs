@@ -231,8 +231,10 @@ mod tests {
         ];
         for card in &disguised {
             let adapter = create_adapter(card).unwrap();
+            // The endpoint is one the engine manager governs: the adapter is bound to its generation like any other (Codex pre-review of
+            // layer 2, H1: governed is decided by the endpoint, not the card) — it just never carries the key.
             assert!(
-                adapter.engine_generation().is_none(),
+                adapter.engine_generation().is_some(),
                 "{}",
                 card.version_pin
             );

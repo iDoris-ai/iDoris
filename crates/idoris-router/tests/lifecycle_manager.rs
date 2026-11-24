@@ -143,7 +143,8 @@ impl Scripted {
         }
     }
 
-    /// 自有引擎的端口，但只有第一次问到 `listens_on` 时为真（等就绪那一次），之后为假（封印那一次）。
+    /// 自有引擎的端口，但只有第一次问到 `listens_on` 时为真，之后一律为假。等就绪的循环在每一次带 key 的探测之前都重新问，所以这「第一次」
+    /// 是等就绪的第一轮，不管引擎那时有没有开始监听：之后没有哪个带 key 的探测会发出去（H2 的用例靠它）。要造「等就绪时监听它的是引擎、
     fn claiming_once(port: u16) -> Arc<Self> {
         let scripted = Self::new();
         scripted.claim_budget.lock().unwrap().insert(port, 1);
@@ -4136,4 +4137,83 @@ async fn a_condemned_process_does_not_come_back_as_an_external_engine() {
         .args(["-KILL", &old.to_string()])
         .stderr(Stdio::null())
         .status();
+}
+
+// ---------------------------------------------------------------------------------------------
+// 外部引擎换了监听者：用新校验出来的监听者重新登记，监听者没了就封上（Codex 预审 L2 的 M1）
+// ---------------------------------------------------------------------------------------------
+
+/// 预审 L2 的 M1：合法的外部重启——监听者 A 退出、B 起来。监督原来校验了 B、却拿着 A 的守卫继续对着 B 登记：数据面的每个请求都对着 A 的集合验、一直被拒绝
+/// （登记表也没有新的代际）。现在新校验出来的集合与登记时的不一样，就用它建一个新的守卫登记进去（代际前进），请求对着 B 验、通过。监听者没了（`NoListener`）
+/// 原来只发布 `unavailable`、登记还留着：现在端点立刻封上，什么凭证都不发；同一个监听者回来，再登记回去。
+#[tokio::test]
+async fn m1_a_replaced_external_listener_is_registered_afresh_and_a_vanished_one_blocks_the_endpoint()
+ {
+    use idoris_upstream::omlx::key::{KeyRefusal, authorize_omlx_request, endpoint_generation};
+
+    let work = tempfile::tempdir().unwrap();
+    let external = External::start(work.path(), None);
+    let rig = rig_for(&external);
+    let inspector = Scripted::new();
+    inspector.external_listener(external.port, external.pid(), Some(TEAM));
+    let h = Harness::start(
+        &rig,
+        default_backend(&rig),
+        inspector.clone(),
+        fast(),
+        StopOnExit::Owned,
+    );
+    h.until_state(UpstreamState::Ready).await;
+    let endpoint = rig.endpoint();
+    let verified = EndpointKey::External {
+        settings_key_verified: true,
+    };
+    assert_eq!(governed_endpoint(&endpoint), Some(verified.clone()));
+    let first_generation = endpoint_generation(&endpoint);
+    assert!(
+        authorize_omlx_request(&endpoint, None).await.is_ok(),
+        "the verified listener is authorized"
+    );
+
+    // A 被 B 取代（B 通过同样的校验，pid 与启动时间都不同）：新登记，代际前进，请求对着 B 验、通过。
+    let b_pid = std::process::id();
+    inspector.external_listener(external.port, b_pid, Some(TEAM));
+    wait_for("the listener to be registered afresh", || {
+        endpoint_generation(&endpoint) > first_generation
+    })
+    .await;
+    h.until_state(UpstreamState::Ready).await;
+    let second_generation = endpoint_generation(&endpoint);
+    assert_eq!(governed_endpoint(&endpoint), Some(verified.clone()));
+    let authorized = authorize_omlx_request(&endpoint, None).await;
+    assert!(
+        authorized.is_ok(),
+        "the guard of the listener that left would refuse the one that came: {authorized:?}"
+    );
+    drop(authorized);
+
+    // 监听者没了：端点立刻封上（之前只发布 `unavailable`，登记留着），授权被拒绝。
+    inspector.forget_listener(external.port);
+    wait_for("the endpoint to be blocked", || {
+        governed_endpoint(&endpoint) == Some(EndpointKey::Blocked)
+    })
+    .await;
+    assert_eq!(
+        authorize_omlx_request(&endpoint, None).await.unwrap_err(),
+        KeyRefusal::Blocked
+    );
+    assert!(endpoint_generation(&endpoint) > second_generation);
+
+    // 同一个监听者回来：校验通过，再登记，回到 `ready`。
+    inspector.external_listener(external.port, b_pid, Some(TEAM));
+    h.until_state(UpstreamState::Ready).await;
+    assert_eq!(governed_endpoint(&endpoint), Some(verified));
+    assert!(authorize_omlx_request(&endpoint, None).await.is_ok());
+    assert_eq!(
+        rig.fake.launches(),
+        0,
+        "an external engine is never replaced by ours"
+    );
+    assert!(pid_alive(u64::from(external.pid())), "never signalled");
+    h.manager.shutdown(true).await;
 }

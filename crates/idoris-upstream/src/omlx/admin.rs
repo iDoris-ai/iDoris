@@ -113,6 +113,18 @@ impl OmlxAdapter {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Value, AdminRequestError> {
+        // The login, the request, the retry after a 401 are one operation: one engine generation for all of them (Codex pre-review
+        // of layer 2, M2; see `OmlxAdapter::operation`).
+        self.operation(self.admin_request_unpinned(method, path, body))
+            .await
+    }
+
+    async fn admin_request_unpinned(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, AdminRequestError> {
         let mut session = self.admin_session.lock().await;
         for attempt in 0..2 {
             // Authorize this send — a reuse of a cached cookie is a send like any other: the generation it was admitted
