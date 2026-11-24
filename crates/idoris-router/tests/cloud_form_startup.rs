@@ -14,6 +14,7 @@ mod fake_upstream;
 #[path = "support/cloud_harness.rs"]
 mod harness;
 
+use child_guard::IsolateState;
 use child_guard::SpawnGuarded;
 use std::io::Write;
 use std::{
@@ -231,7 +232,7 @@ impl Fixture {
             .stderr(Stdio::piped());
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            match cmd.spawn() {
+            match cmd.isolate_state().spawn() {
                 Ok(child) => return Running(Some(child)),
                 Err(err)
                     if err.kind() == std::io::ErrorKind::ExecutableFileBusy
@@ -696,7 +697,7 @@ async fn a_public_listener_serves_the_data_plane_while_admin_v0_stays_on_loopbac
         .env("IDORIS_ADMIN_PORT", admin_port.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = Running(Some(cmd.spawn().unwrap()));
+    let mut child = Running(Some(cmd.isolate_state().spawn().unwrap()));
     wait_health(&mut child, &public_ip, port).await;
 
     // 数据面在公网地址上（也就是非 loopback 的地址）

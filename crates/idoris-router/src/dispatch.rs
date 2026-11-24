@@ -95,13 +95,36 @@ impl BoundSupervisor {
         self.handle.is_quiescent().await
     }
 
-    /// Constructs the adapter from the same card used for the binding.
+    /// Constructs the adapter from the same card used for the binding. The load fence lives under the state
+    /// directory resolved from `IDORIS_STATE_DIR` / `HOME`; tests use [`Self::spawn_omlx_in_state_dir`].
     pub fn spawn_omlx(card: &ComponentCard) -> Result<Self, String> {
+        Self::spawn_omlx_with(card, None)
+    }
+
+    /// [`Self::spawn_omlx`] with an explicit state directory: the load fence is
+    /// `idoris_upstream::omlx::load_fence_path_in(state_dir, <card endpoint>)`, so nothing is read from or written
+    /// under the real user state directory (an in-process caller cannot change the process environment).
+    pub fn spawn_omlx_in_state_dir(
+        card: &ComponentCard,
+        state_dir: &std::path::Path,
+    ) -> Result<Self, String> {
+        Self::spawn_omlx_with(card, Some(state_dir))
+    }
+
+    fn spawn_omlx_with(
+        card: &ComponentCard,
+        state_dir: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
         // 与生产同一条构造路径（`idoris_upstream::factory`）：这张卡能不能带 key 按代理同一个判据（`models::is_loopback_omlx`）
         // 定；能带的，每个请求按引擎管理器此刻的登记取 key，引擎换了、停了、端口换了主人，之前读到的 key 都不能再用；不能带的，
         // 什么 key 都不发。
-        let adapter = idoris_upstream::factory::create_omlx_adapter(card)
+        let mut adapter = idoris_upstream::factory::create_omlx_adapter(card)
             .map_err(|err| format!("无法构造 oMLX 适配器（{}）：{err}", card.provider.id))?;
+        if let Some(state_dir) = state_dir {
+            let fence = idoris_upstream::omlx::load_fence_path_in(state_dir, &card.endpoint)
+                .map_err(|err| format!("无法确定加载围栏路径（{}）：{err}", card.provider.id))?;
+            adapter = adapter.with_load_fence_path(fence);
+        }
         let handle = idoris_backend::Supervisor::spawn(
             std::sync::Arc::new(adapter),
             idoris_backend::SupervisorConfig::default(),

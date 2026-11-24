@@ -17,6 +17,10 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "../../idoris-router/tests/support/state_isolation.rs"]
+mod state_isolation;
+use state_isolation::IsolateState;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
@@ -1194,7 +1198,7 @@ async fn the_four_identity_items_are_each_required_against_real_ps_and_lsof() {
     let mut leader = std::process::Command::new(&exe);
     leader.env_clear();
     std::os::unix::process::CommandExt::process_group(&mut leader, 0);
-    let leader = KillOnDrop(leader.spawn().unwrap());
+    let leader = KillOnDrop(leader.isolate_state().spawn().unwrap());
     let pid = leader.0.id();
     wait_until("the subject to listen", || started.exists());
     let record = OwnershipRecord {

@@ -16,6 +16,9 @@
 //! 夹具只打印非敏感字段（被探测字段的值、POST 次数、HTTP 状态）。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+
 use idoris_contracts::ComponentCard;
 use idoris_router::{AppState, build_app, dispatch::BoundSupervisor};
 use serde_json::{Value, json};
@@ -118,7 +121,14 @@ impl Harness {
             .unwrap(),
         );
         let app = build_app(AppState {
-            runtimes: Some(BoundSupervisor::spawn_omlx(&card).unwrap()).into(),
+            runtimes: Some(
+                BoundSupervisor::spawn_omlx_in_state_dir(
+                    &card,
+                    &state_isolation::fresh_state_dir(),
+                )
+                .unwrap(),
+            )
+            .into(),
             cards: vec![card],
             ..AppState::default()
         });

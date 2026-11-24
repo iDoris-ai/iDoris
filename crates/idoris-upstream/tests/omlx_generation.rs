@@ -23,6 +23,7 @@ fn adapter(endpoint: &str) -> OmlxAdapter {
         call_timeout: Duration::from_millis(500),
     })
     .unwrap()
+    .with_load_fence_path(idoris_backend::mock::temporary_load_fence_path())
     .with_per_request_key()
 }
 
@@ -158,7 +159,8 @@ async fn an_adapter_with_a_fixed_key_has_no_generation_and_ignores_the_registry(
         api_key: Some("constructed".to_owned()),
         call_timeout: Duration::from_millis(500),
     })
-    .unwrap();
+    .unwrap()
+    .with_load_fence_path(idoris_backend::mock::temporary_load_fence_path());
     assert_eq!(fixed.engine_generation(), None);
     govern_endpoint(&endpoint, EndpointKey::Private("engine".into()));
     block_endpoint(&endpoint);

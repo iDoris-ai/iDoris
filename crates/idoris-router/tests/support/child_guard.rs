@@ -9,9 +9,19 @@
 //! 用法：`command.spawn_guarded()` 代替 `command.spawn()`；之后和 `Child` 一样用（`Deref`/`DerefMut`：`id()`、`try_wait()`、
 //! `stdin`/`stdout`/`stderr` 字段，传给要 `&Child` 或 `&mut Child` 的辅助函数都行）。
 //!
+//! 状态目录隔离：`spawn_guarded()` 在起进程前自动调用 [`IsolateState::isolate_state`]，给子进程一套测试私有的
+//! `HOME`、`XDG_STATE_HOME`、`IDORIS_STATE_DIR`（并去掉会读到真实 key 的 `IDORIS_OMLX_API_KEY`、`OMLX_API_KEY`），
+//! 这样 `~/.local/state/idoris/` 与 `~/.omlx` 不会被测试读写。不走 `spawn_guarded()` 的地方（`.output()`、`.status()`、
+//! 裸 `.spawn()`）必须自己调 `.isolate_state()`；`tests/no_real_state_dir.rs` 会逐文件核对这一点。测试自己显式设置过的变量不会被覆盖。
+//!
 //! 整个测试进程被 SIGKILL 时（OOM、`kill -9`、变异驱动超时）`Drop` 不会跑，守卫管不到；那一层见各测试文件里
 //! `orphan_timeout_s` 的说明。
 #![allow(dead_code)]
+
+#[allow(clippy::duplicate_mod)] // child_guard.rs 与 startup_wait.rs 各自带一份，测试文件同时用两者时就是两份
+#[path = "state_isolation.rs"]
+mod state_isolation;
+pub use state_isolation::IsolateState;
 
 use std::{
     io,
@@ -72,6 +82,6 @@ pub trait SpawnGuarded {
 
 impl SpawnGuarded for Command {
     fn spawn_guarded(&mut self) -> io::Result<ChildGuard> {
-        self.spawn().map(ChildGuard::new)
+        self.isolate_state().spawn().map(ChildGuard::new)
     }
 }
