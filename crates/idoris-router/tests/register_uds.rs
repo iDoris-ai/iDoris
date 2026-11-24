@@ -2613,12 +2613,18 @@ async fn the_token_is_replaced_before_the_ack_is_written_even_when_that_write_th
             matches!(e, Event::SessionLost { .. })
         })
         .await;
-    assert_eq!(
-        lost,
-        Event::SessionLost {
-            reason: RetryReason::WriteFailed
-        },
-        "the ack could not be written"
+    // 对端在 `set_admin_token` 之后立刻关闭，客户端有两种合法的观察顺序：ack 写到已关闭的 socket 上失败
+    // （`WriteFailed`），或者客户端在对端 `drop` 之前就把 ack 写完了、随后才读到 EOF（`Disconnected`）。
+    // 哪个先发生取决于调度（满载时复现过后者），不取决于被测行为；被测的「替换先于 ack 的写」由上面的 token 断言
+    // 与下面的替换次数断言承担。其他原因（心跳超时、IO 错误、握手类原因）仍然不被接受。
+    assert!(
+        matches!(
+            lost,
+            Event::SessionLost {
+                reason: RetryReason::WriteFailed | RetryReason::Disconnected
+            }
+        ),
+        "the session ends as write_failed or disconnected: {lost:?}"
     );
     assert_eq!(
         rig.events.count(|e| matches!(e, Event::AdminTokenReplaced)),
