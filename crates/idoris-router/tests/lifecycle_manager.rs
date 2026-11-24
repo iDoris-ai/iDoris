@@ -110,6 +110,8 @@ struct Scripted {
     slow: Mutex<Duration>,
     /// 读启动时间一律读不出来（`ps` 不答）：认回的孤儿的身份闸因此「确认不了」，不发信号（造「停止没能确认」）。
     identity_unreadable: std::sync::atomic::AtomicBool,
+    /// 第一次签名团队检查（外部监听者的属主校验）做完之后，把这个端口上的监听者换成这个 pid（没有团队：不合格）：造「校验期间端口换了主人」。
+    flip_after_first_team_check: Mutex<Option<(u16, u32)>>,
 }
 
 impl Scripted {
@@ -124,6 +126,7 @@ impl Scripted {
             unreadable: std::sync::atomic::AtomicBool::new(false),
             slow: Mutex::new(Duration::ZERO),
             identity_unreadable: std::sync::atomic::AtomicBool::new(false),
+            flip_after_first_team_check: Mutex::new(None),
         })
     }
 
@@ -223,7 +226,11 @@ impl ProcessInspector for Scripted {
     }
     async fn signing_team(&self, pid: u32) -> Result<Option<String>, InspectError> {
         self.team_checks.fetch_add(1, Ordering::SeqCst);
-        Ok(self.teams.lock().unwrap().get(&pid).cloned())
+        let team = self.teams.lock().unwrap().get(&pid).cloned();
+        if let Some((port, other)) = self.flip_after_first_team_check.lock().unwrap().take() {
+            self.listeners.lock().unwrap().insert(port, vec![other]);
+        }
+        Ok(team)
     }
 }
 
@@ -4394,5 +4401,42 @@ async fn m1_a_replaced_external_listener_is_registered_afresh_and_a_vanished_one
         "an external engine is never replaced by ours"
     );
     assert!(pid_alive(u64::from(external.pid())), "never signalled");
+    h.manager.shutdown(true).await;
+}
+
+/// 复审五 H：初次接管外部引擎时，带 key 的重试原来是对着端口发裸的 bearer。属主校验期间端口换了主人（C，没有团队）：校验通过的是 A，key 却发给了
+/// 校验之后才到的 C。现在重试走授权，发出之前重新确认监听者，不对就一个字节也不发。
+#[tokio::test]
+async fn the_key_of_an_initial_external_adoption_is_not_sent_to_a_listener_that_replaced_the_verified_one()
+ {
+    let work = tempfile::tempdir().unwrap();
+    let a = External::start(work.path(), Some("secret"));
+    let other = tempfile::tempdir().unwrap();
+    let c = External::start(other.path(), None);
+    let rig = rig_for(&a);
+    let inspector = Scripted::new();
+    inspector.external_listener(a.port, a.pid(), Some(TEAM));
+    *inspector.flip_after_first_team_check.lock().unwrap() = Some((a.port, c.pid()));
+    let backend = default_backend(&rig);
+    *backend.external_key.lock().unwrap() = Some("secret".to_owned());
+    let h = Harness::start(&rig, backend, inspector.clone(), fast(), StopOnExit::Owned);
+    wait_for("the owner check to have run", || {
+        inspector.team_checks.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let keyed = a
+        .fake
+        .requests()
+        .iter()
+        .filter(|(_, auth)| auth == "ok")
+        .count();
+    assert_eq!(
+        keyed,
+        0,
+        "a key went to a listener the owner check never saw: {:?}",
+        a.fake.requests()
+    );
+    assert_ne!(h.view().state, UpstreamState::Ready);
     h.manager.shutdown(true).await;
 }

@@ -1540,7 +1540,8 @@ impl Actor {
                             reason: Some(UpstreamReason::AuthRequired),
                         };
                     }
-                    Some(key) => match self.probe(recipe, Some(&key)).await {
+                    // 带 key 的重试走授权（监听者重新确认、拨号地址、新开连接），不是对着端口发裸的 bearer（Codex 复审五 H）。
+                    Some(key) => match self.probe_authorized(recipe, &key).await {
                         EngineProbe::Ready => true,
                         EngineProbe::AuthRejected(_) => {
                             return Attempt::Terminal {
@@ -1820,7 +1821,15 @@ impl Actor {
 
     /// 引擎就绪之后：封印所有权记录（读它此刻的命令行、确认监听端口的就是这个 pid），登记私有 key。
     async fn finish_owned(&mut self, mut owned: Owned) -> Attempt {
-        match owned.engine.seal().await {
+        // 封印要再问一次 `lsof`，也会占着停止的预算：iDoris 在停时放手，引擎放回手里按停止指令收尾（Codex 复审五 M）。
+        let sealed = match self.unless_shutdown(owned.engine.seal()).await {
+            Some(sealed) => sealed,
+            None => {
+                self.engine = Some(owned);
+                return Attempt::Interrupted;
+            }
+        };
+        match sealed {
             Ok(()) => {}
             Err(error) => {
                 let reason = match error {
