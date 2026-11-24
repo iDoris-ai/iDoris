@@ -345,6 +345,9 @@ pub(super) struct Actor {
     adopted_listeners: Option<Vec<ListenerIdentity>>,
     /// 操作员发起的、还没做完的 `start`、`restart`。
     op: Option<Op>,
+    /// 这次操作有没有真的拉起过一个自有引擎（`OwnedEngine::spawn` 成功过）：`restart` 的水位只给**拉起了自有引擎、并且就绪了**的操作记（Codex 复审 L4 第二轮：
+    /// 一次因为找不到可执行文件而以 `absent` 收尾的 `start`，排在它后面的 `restart` 不能被说成并进了一个什么引擎都没换的操作）。操作开始时清零。
+    op_launched: bool,
     /// 序号不大于它的 `restart` 命令，都是在上一次 `start`、`restart` 操作进行期间（或之前）入队的：它们并进那次操作的结果，
     /// 不再换第二次引擎。命令在**入队时**盖章（[`Shared::next_seq`]），操作完成时记下此刻盖出的最大序号；这样即使命令
     /// 在 actor 忙着排空、停进程、复位、不去收命令的时候排在队里，它也被认出是「同一次操作」的并发（IDORIS-CORE S6，
@@ -399,6 +402,7 @@ impl Actor {
             identity: None,
             adopted_listeners: None,
             op: None,
+            op_launched: false,
             restart_cover: 0,
             redecide_since: None,
             external_gap: false,
@@ -521,6 +525,25 @@ impl Actor {
         count: Count,
         log: bool,
     ) {
+        let (status, changed) = self.advance(state, reason, terminal, count);
+        self.shared.publish(&self.plan.id, status);
+        if changed && log {
+            match reason {
+                Some(reason) => self.log(&format!("{}（{}）", state.as_str(), reason.as_str())),
+                None => self.log(state.as_str()),
+            }
+        }
+    }
+
+    /// 实例任务自己的簿记：更新状态字段与失败计数，返回要发布的状态和「状态或原因有没有变」。发布与日志由调用方做（发布 `ready` 要与水位同一步，
+    /// 见 [`Self::publish_ready_finishing_op`]）。
+    fn advance(
+        &mut self,
+        state: UpstreamState,
+        reason: Option<UpstreamReason>,
+        terminal: bool,
+        count: Count,
+    ) -> (Status, bool) {
         let changed = self.state != state || self.reason != reason;
         let counted = match count {
             Count::Edge => counts_as_failure(self.state, state),
@@ -534,8 +557,7 @@ impl Actor {
         self.state = state;
         self.reason = reason;
         self.terminal = terminal;
-        self.shared.publish(
-            &self.plan.id,
+        (
             Status {
                 state,
                 reason,
@@ -545,13 +567,8 @@ impl Actor {
                 failures: self.failures,
                 last_failure_at_ms: self.last_failure_at_ms,
             },
-        );
-        if changed && log {
-            match reason {
-                Some(reason) => self.log(&format!("{}（{}）", state.as_str(), reason.as_str())),
-                None => self.log(state.as_str()),
-            }
-        }
+            changed,
+        )
     }
 
     fn state_line(state: UpstreamState, reason: Option<UpstreamReason>) -> String {
@@ -1139,6 +1156,7 @@ impl Actor {
                     // 走完整的退役路径（关门、排空、停进程、封上端点），再重新走启动决策（G3）。
                     self.window.clear();
                     self.op = Some(Op::Start);
+                    self.op_launched = false;
                     // 先发布 `starting` 再回答：Admin 的 202 体是受理之后的元素，不能还说 `stopped`（数据面也马上对它 503）。回答带的是
                     // 这一刻自己的快照（Codex 预审 L4 的 M1）。
                     self.publish(UpstreamState::Starting, None);
@@ -1201,6 +1219,7 @@ impl Actor {
                     // 次序同 `stop`：先关门，再发布，再回答，最后才排空、停旧引擎。状态是 `restarting`，从受理一直到新引擎就绪
                     // （Agent24 只对 `restarting` 有界等待）；这是操作员要的重启，不记失败。认领在第一个副作用之前，同 `stop`。
                     self.op = Some(Op::Restart);
+                    self.op_launched = false;
                     self.close_admission().await;
                     self.publish_uncounted(UpstreamState::Restarting, None);
                     answer(Ok(self.view()));
@@ -1289,10 +1308,9 @@ impl Actor {
                 self.redecide_since = None;
                 match self.sync_supervisor().await {
                     Synced::Done => {
-                        // 水位与操作的结束**先于**发布 `ready`（Codex 复审 L4 的 L4'）：发布之后客户端就看得见 `ready`，紧接着发的 `restart` 盖的章要比水位大，
-                        // 是一次新的重启；先发布、后记水位，发布时写日志的那段时间里到达的 `restart` 会被并进刚做完的这一次。
-                        self.finish_op();
-                        self.publish(UpstreamState::Ready, None);
+                        // 水位与 `ready` 的发布是**一步**（盖章的锁里，Codex 复审 L4 的 L4' 与第二轮）：每个在 `ready` 对外可见之前盖章的命令都不超过水位
+                        // （并入这次操作），每个在它可见之后盖章的都超过（一次新的重启）；两步分开，之间盖章的 `restart` 会被当成新的、把刚拉起的引擎又换掉。
+                        self.publish_ready_finishing_op();
                         Step::Supervise
                     }
                     // Supervisor 的账本没能跟上：这个引擎不能放行，停掉它（`sync_supervisor` 已经停了），按一次失败算，退避之后重来。
@@ -1330,15 +1348,29 @@ impl Actor {
         }
     }
 
-    /// 一次 `start`、`restart` 操作做完了（就绪，或者不会再往前走）：之前入队的 `restart` 都并进它的结果（[`Self::restart_cover`]）。**要在发布做完的状态之前调**
-    /// （Codex 复审 L4 的 L4'）：发布之后客户端就看得见它，紧接着发来的 `restart` 盖的章必须比这里记下的水位大。
+    /// 一次 `start`、`restart` 操作**没有成功地换上一个自有引擎**就结束了（终局的失败、找不到可执行文件、重判耗尽、熔断、Supervisor 没了）：只结束操作，**不记水位**
+    /// （Codex 复审 L4 第二轮）：排在它后面的 `restart` 没有可并入的结果，各按各自到达时的状态回答（没有自有引擎：409 `upstream_not_owned`）。
     fn finish_op(&mut self) {
-        if self.op.take().is_some() {
-            // 这一轮走的是外部监听者那条路：结果是接管了一个外部引擎，不是我们换了一个自有引擎，之前入队的 `restart` 没有可并入的结果
-            // （Codex 复审 M6）：不更新截断点，它们按各自到达时的状态回答。
-            if !self.external_path {
-                self.restart_cover = self.shared.seq_now(&self.plan.id);
-            }
+        self.op = None;
+        self.op_launched = false;
+    }
+
+    /// 一次 `start`、`restart` 操作成功做完（引擎就绪）：发布 `ready`，并在**同一步**里记下 `restart` 的水位——之前入队的 `restart` 并进这次操作的结果
+    /// （[`Self::restart_cover`]）。水位**只给拉起了自有引擎的操作**记：这一轮走的是外部监听者那条路（结果是接管了一个外部引擎，Codex 复审 M6）、或者这次操作
+    /// 根本没拉起过引擎（认回了遗留的进程），排在它后面的 `restart` 没有可并入的结果。
+    ///
+    /// 「记水位」与「发布」是一步（[`Shared::publish_at_watermark`]：盖章的锁里读计数、发布共享状态），日志在放锁之后才写。盖章在锁里，所以每个在 `ready` 对外可见之前
+    /// 盖章的命令都不超过水位，每个在它可见之后盖章的都超过。
+    fn publish_ready_finishing_op(&mut self) {
+        let grants = self.op.is_some() && self.op_launched && !self.external_path;
+        let (status, changed) = self.advance(UpstreamState::Ready, None, false, Count::Edge);
+        let watermark = self.shared.publish_at_watermark(&self.plan.id, status);
+        if grants {
+            self.restart_cover = watermark;
+        }
+        self.finish_op();
+        if changed {
+            self.log(UpstreamState::Ready.as_str());
         }
     }
 
@@ -1905,6 +1937,8 @@ impl Actor {
             };
             match OwnedEngine::spawn(launch, inspector.clone(), &launched_by).await {
                 Ok(engine) => {
+                    // 这次操作真的拉起了一个自有引擎（见 [`Self::op_launched`]）。
+                    self.op_launched = true;
                     spawned = Some(Ok(engine));
                     break;
                 }

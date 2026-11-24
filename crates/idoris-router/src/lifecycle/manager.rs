@@ -454,6 +454,33 @@ impl Shared {
             .map_or(0, |counter| counter.fetch_add(1, Ordering::SeqCst) + 1)
     }
 
+    /// 盖章的那把锁：[`EngineManager::command`] 在里面盖章并入队，[`Self::publish_at_watermark`] 在里面读水位并发布。临界区里都不 await、不写日志。
+    pub(super) fn freeze_stamping(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.stamp.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 发布 `status`，并在**同一步**里读出此刻的 `restart` 水位（[`Self::seq_now`]）：读水位与发布共享状态都在盖章的锁里。每个在这一步之前盖章的命令序号都
+    /// 不超过水位（它们并入这次操作，实例任务据此记 `Actor::restart_cover`），每个在这一步之后盖章的都超过，而且盖章的那一刻 `status` 已经对外可见（那是一个真正新的命令）。
+    /// 读水位与发布分成两步时，夹在中间盖章的 `restart` 序号比水位大、却是在 `ready` 可见之前发的，会被当成新的、把刚拉起的引擎又换掉（Codex 复审 L4 第二轮）。
+    /// 临界区里只有读计数与写共享状态：日志在放锁之后才写（日志的出口可能阻塞，不能把盖章挡在锁外）。
+    pub fn publish_at_watermark(&self, id: &str, status: Status) -> u64 {
+        self.publish_at_watermark_with(id, status, || {})
+    }
+
+    /// 同 [`Self::publish_at_watermark`]，`between` 在读完水位之后、发布之前、锁里被调用一次：测试在这里验证盖章被挡在外面（生产路径传空闭包）。
+    pub(super) fn publish_at_watermark_with(
+        &self,
+        id: &str,
+        status: Status,
+        between: impl FnOnce(),
+    ) -> u64 {
+        let _stamping = self.freeze_stamping();
+        let watermark = self.seq_now(id);
+        between();
+        self.publish(id, status);
+        watermark
+    }
+
     /// 此刻已盖出的最大序号：序号不大于它的命令都是在这一刻之前入队的。
     pub fn seq_now(&self, id: &str) -> u64 {
         self.enqueued
@@ -735,11 +762,7 @@ impl EngineManager {
             // 操作完成时的 `seq_now` 的 `restart`，都是在那次操作进行期间（或之前）入队的，它们并进那次操作的结果（见 `Actor::restart_cover`）。
             let permit = sender.reserve().await.map_err(|_| CommandError::Closed)?;
             {
-                let _order = self
-                    .shared
-                    .stamp
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
+                let _order = self.shared.freeze_stamping();
                 let seq = self.shared.next_seq(id);
                 permit.send(Request {
                     command,
@@ -802,6 +825,11 @@ impl EngineManager {
     /// 账本在发布 `ready` 之前对着新进程重建（S6）；放行时没就绪而冻结的上游 [`CommandError::RestartRequired`]。
     pub async fn restart_upstream(&self, id: &str) -> Result<CommandAck, CommandError> {
         self.command_logged(id, "restart", Command::Restart).await
+    }
+
+    /// 到此刻为止给这个上游入队的命令数（盖章的计数）：序号不大于它的命令都已经在实例任务的邮箱里。测试据此等「命令已经入队」，不靠睡眠；诊断也可以读它。
+    pub fn commands_enqueued(&self, id: &str) -> u64 {
+        self.shared.seq_now(id)
     }
 
     /// 每个托管上游此刻的只读快照（`GET /admin/api/v1/upstreams`，S6）。在管理器自己的状态表的锁里一次读完，所以每个实例的
@@ -1424,6 +1452,73 @@ mod tests {
         assert!(again.claim());
         assert!(!again.abandon());
         assert!(!on_the_dot.claim());
+    }
+
+    /// 复审 L4 第二轮：「记 `restart` 的水位」与「发布 `ready`」是**一步**（[`Shared::publish_at_watermark`]，实例任务发布 `ready` 走的就是它）。在水位读完、
+    /// 发布之前（`between` 钩子，锁里）：盖章的锁被握着（确定的，不靠睡眠），一个正抢着盖章的客户端线程什么也没盖出去；之后它盖的章比水位大，而且盖章的那一刻
+    /// `ready` 已经对外可见（那是真正新的命令）；在这一步之前盖的章不超过水位（并入这次操作）。
+    #[test]
+    fn publishing_ready_and_taking_the_watermark_exclude_command_stamping() {
+        let shared = shared_for_tests("omlx", Timings::default(), Arc::new(|_| {}));
+        // 一个在这一步之前盖章的命令：不超过水位（并入这次操作）。
+        let before = {
+            let _order = shared.freeze_stamping();
+            shared.next_seq("omlx")
+        };
+        let ready = Status {
+            state: UpstreamState::Ready,
+            reason: None,
+            owned: true,
+            terminal: false,
+            pid: Some(1),
+            failures: 0,
+            last_failure_at_ms: None,
+        };
+        let (racing_tx, racing_rx) = std::sync::mpsc::channel::<()>();
+        let (stamped_tx, stamped_rx) = std::sync::mpsc::channel::<(u64, bool)>();
+        std::thread::scope(|scope| {
+            // 客户端：与 `EngineManager::command` 一样在盖章的锁里盖章，并记下盖章那一刻 `ready` 是不是已经可见。
+            let for_client = Arc::clone(&shared);
+            let client = scope.spawn(move || {
+                racing_tx.send(()).unwrap();
+                let _order = for_client.freeze_stamping();
+                let seq = for_client.next_seq("omlx");
+                let ready_visible = for_client
+                    .statuses
+                    .lock()
+                    .unwrap()
+                    .get("omlx")
+                    .is_some_and(|status| status.state == UpstreamState::Ready);
+                stamped_tx.send((seq, ready_visible)).unwrap();
+            });
+            let watermark = shared.publish_at_watermark_with("omlx", ready, || {
+                // 客户端已经起来、正抢着盖章；这时锁在这一步手里。
+                racing_rx.recv().unwrap();
+                assert!(
+                    matches!(
+                        shared.stamp.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "the stamping lock is held between taking the watermark and publishing"
+                );
+                assert!(
+                    stamped_rx.try_recv().is_err(),
+                    "nothing is stamped between taking the watermark and publishing"
+                );
+                assert!(
+                    shared.statuses.lock().unwrap().get("omlx").is_none(),
+                    "`ready` is not visible yet"
+                );
+            });
+            let (seq, ready_visible) = stamped_rx.recv().unwrap();
+            client.join().unwrap();
+            assert!(before <= watermark, "stamped before the step: merged");
+            assert!(seq > watermark, "stamped after the step: genuinely new");
+            assert!(
+                ready_visible,
+                "a command stamped after the watermark found `ready` already visible"
+            );
+        });
     }
 
     /// L3：审计日志一条只占一行。id 来自卡的配置，契约允许它含控制字符：照原样写进日志，一条记录能裂成几行、伪造出别的记录。控制字符转义，

@@ -2504,19 +2504,28 @@ async fn c6_a_restart_enqueued_while_the_reset_is_waiting_is_merged_and_the_engi
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // 等到它真的入了邮箱（第 1 条是第一个 `restart`），不靠睡眠。
+    wait_for("the second restart to be in the mailbox", || {
+        full.manager.commands_enqueued("omlx") >= 2
+    })
+    .await;
     full.rig.fake.release(Hold::Status);
 
     let (status, body) = first.await.unwrap();
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     let (status, body) = second.await.unwrap();
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    // 第二个并进了第一个：它是在复位做完、`ready` 发布之后才被收下的（并入的判据是入队时盖的章不超过 `ready` 那一步记的水位），回答里的状态是 `ready`；
+    // 当成一次新的重启收下的话回答是 `restarting`，引擎要再换一次。这一条取代了原来的「睡 800 毫秒再数拉起次数」。
+    assert_eq!(
+        body["state"], "ready",
+        "the second restart was merged: {body}"
+    );
     wait_for("the replacement to be ready", || {
         full.health.view().upstreams[0].state == UpstreamState::Ready
     })
     .await;
-    // 并发的两个 `restart` 只换了一次引擎：之后也不会再换。
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // 并发的两个 `restart` 只换了一次引擎。
     assert_eq!(full.rig.fake.launches(), 2, "a second restart ran");
     assert_eq!(full.health.view().upstreams[0].state, UpstreamState::Ready);
     assert_eq!(full.logged("收到命令 restart，已受理"), 2);
@@ -4514,7 +4523,10 @@ async fn m5_a_stop_the_busy_instance_cannot_take_in_time_is_abandoned_and_never_
             && full.health.view().upstreams[0].state == UpstreamState::Ready
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    // 邮箱是先进先出：这个无害的 `start`（就绪的引擎上是幂等的 202）要等排在它前面的每条命令（含那个被放弃的 `stop`）都处理过才有回答，
+    // 回答之后再看，被放弃的 `stop` 已经有过执行的机会；取代了原来的「睡 700 毫秒」。
+    let (status, body) = full.post_command("start").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert_eq!(full.health.view().upstreams[0].state, UpstreamState::Ready);
     assert_eq!(full.rig.fake.launches(), 2);
     assert_eq!(
@@ -4566,7 +4578,9 @@ async fn m5_a_command_abandoned_while_the_instance_was_busy_in_the_reset_is_neve
         full.health.view().upstreams[0].state == UpstreamState::Ready
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    // 先进先出的哨兵：就绪的引擎上 `start` 是幂等的 202，要等排在它前面的每条命令（含那个被放弃的 `stop`）都处理过才有回答；取代了原来的「睡 700 毫秒」。
+    let (status, body) = full.post_command("start").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert_eq!(
         full.health.view().upstreams[0].state,
         UpstreamState::Ready,
@@ -5500,7 +5514,11 @@ async fn m2_a_restart_that_arrives_while_an_external_engine_is_resynchronising_i
         let full = full.clone();
         tokio::spawn(async move { full.post_command("restart").await })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // 等到它真的入了邮箱（盖了章、排在实例任务的邮箱里），不靠睡眠。
+    wait_for("the restart to be in the mailbox", || {
+        full.manager.commands_enqueued("omlx") >= 1
+    })
+    .await;
     // 排空期间监听者又变了（第三个进程）：重新同步失败、带着 `restarting` 返回，实例任务回到监管，第一件事收下排着的 `restart`。
     inspector.external_listener(port, c_pid, Some(TEAM));
     a.fake.release(Hold::Chat);
@@ -5819,7 +5837,11 @@ async fn m1b_a_restart_queued_behind_a_start_that_adopts_an_external_engine_is_n
         let full = full.clone();
         tokio::spawn(async move { full.post_command("restart").await })
     };
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // `start` 是第 1 条命令，`restart` 是第 2 条：等到它真的入了邮箱，不靠睡眠。
+    wait_for("the restart to be in the mailbox", || {
+        full.manager.commands_enqueued("omlx") >= 2
+    })
+    .await;
     gate.release();
 
     let (status, body) = restart.await.unwrap();
@@ -5994,8 +6016,12 @@ async fn l4b_a_restart_sent_the_moment_ready_is_visible_is_a_new_restart_even_wh
     assert_eq!(world.rig.fake.launches(), 2);
 
     // 看到 `ready` 的客户端马上又发一个 `restart`：实例任务还停在日志里，它排在邮箱里。
+    // 放开之前先等第二个 `restart` 真的入了邮箱（第 1 条是第一个 `restart`），不靠睡眠。
     let release = async {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_for("the second restart to be in the mailbox", || {
+            world.manager.commands_enqueued("omlx") >= 2
+        })
+        .await;
         gate.release();
     };
     let ((status, body), ()) = tokio::join!(world.post("omlx", "restart"), release);
@@ -6073,4 +6099,65 @@ async fn m5_a_model_list_that_reaches_the_managed_card_during_the_stop_grace_sen
     // 宽限到点、SIGKILL：停止照常做完。
     full.until_gone().await;
     wait_for("the process to be gone", || !pid_alive(old)).await;
+}
+
+/// 复审（第二轮）：一次因为找不到可执行文件、以 `absent` 收尾的 `start`，排在它后面的 `restart` 不能被说成并进了一个什么引擎都没换的操作。之前水位记在每一次不走外部路径的
+/// 操作做完时，这个 `restart` 回了 202、没有任何引擎被换；现在水位只给拉起了自有引擎并且就绪了的操作记，这个 `restart` 按它到达时的状态（没有自有引擎）回 409 `upstream_not_owned`。
+/// 引擎先起来（放行时就绪，不冻结）、被 `stop` 停下，可执行文件随后不见了；日志出口（`LogGate`）把实例任务扣在 `start` 发布 `starting` 的那行日志里（已经认领、还没回答），
+/// `restart` 在这时入队（序号 3：`stop` 是 1，`start` 是 2）；放开之后 `start` 走完（`absent`），`restart` 才被收下。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m1c_a_restart_queued_behind_a_start_that_ends_absent_is_decided_against_the_current_state()
+{
+    let gate = LogGate::new("引擎 omlx：starting");
+    let world = World::start_gated(Engine::Fake(Behavior::default()), fast(), &gate).await;
+    assert_eq!(world.element("omlx").await["state"], "ready");
+    let (status, body) = world.post("omlx", "stop").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    world
+        .until("the engine to be stopped", |element| {
+            element["state"] == "stopped" && element["owned"] == false
+        })
+        .await;
+    // 可执行文件不见了：下一次 `start` 拉不起任何东西。
+    std::fs::rename(
+        &world.rig.fake.executable,
+        world.rig.work.path().join("moved-away"),
+    )
+    .unwrap();
+    assert_eq!(world.rig.fake.launches(), 1);
+
+    gate.arm();
+    let start = world.post("omlx", "start");
+    let restart = async {
+        wait_for(
+            "the instance task to be inside the log line of `starting`",
+            || gate.entered(),
+        )
+        .await;
+        world.post("omlx", "restart").await
+    };
+    let release = async {
+        wait_for("the restart to be in the mailbox", || {
+            world.manager.commands_enqueued("omlx") >= 3
+        })
+        .await;
+        gate.release();
+    };
+    let ((start_status, start_body), (status, body), ()) = tokio::join!(start, restart, release);
+    assert_eq!(start_status, StatusCode::ACCEPTED, "{start_body}");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(error_of(&body), ("upstream_not_owned", "not_owned"));
+    // 什么都没发生：没有再拉起任何引擎，状态是 `absent`。
+    let element = world
+        .until("the start to have ended", |element| {
+            element["state"] == "absent"
+        })
+        .await;
+    assert_eq!(element["owned"], false, "{element}");
+    assert_eq!(
+        world.rig.fake.launches(),
+        1,
+        "no second engine was launched"
+    );
+    world.manager.shutdown(true).await;
 }
