@@ -14,6 +14,9 @@
 mod child_guard;
 #[path = "support/fake_omlx.rs"]
 mod fake_omlx;
+// 托管卡的端口是事先挑好、过一会儿才由假引擎去绑的：不能用 `bind(0)` 取号再放掉（见 `support/ports.rs`）。
+#[path = "support/ports.rs"]
+mod ports;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -39,6 +42,7 @@ use idoris_router::setup_engine::SetupError;
 use idoris_router::swap::SwapApp;
 use idoris_router::{AppState, build_app, build_starting_app};
 use idoris_upstream::engine::{CodesignPolicy, ListenerPolicy, StopOnExit, SystemInspector};
+use ports::free_port;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use wiremock::matchers::{method, path};
@@ -75,14 +79,6 @@ async fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 // ---------------------------------------------------------------------------------------------

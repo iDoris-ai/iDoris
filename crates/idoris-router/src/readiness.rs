@@ -34,7 +34,10 @@
 //!
 //! # `phase`
 //!
-//! 任一上游还是 `starting`（没有第一次观测）→ `starting`；否则至少一个 `ready` → `ready`；否则 `degraded`。
+//! 有托管上游处于终态 → `degraded`（优先；勘误十二（4））；否则任一上游还是 `starting`（没有第一次观测）→ `starting`；
+//! 否则至少一个 `ready` → `ready`；否则 `degraded`。门控未开时 `starting` 之外另有 [`gated_phase`]。
+//! `starting` 不等于数据面不可用：只有门控未开时才 503 `idoris_starting`；门控已开（或没有托管卡）而仍有上游没有第一次观测时，
+//! `phase` 仍是 `starting`，数据面已经在服务（规范 §2.11.1）。
 //! S1 没有引擎管理（那是 S5 的启动门控）：`starting` 持续到每个上游都有了第一次观测为止。resident 卡通常一轮探测
 //! 就有结论；Supervisor 管理的卡在它还在做启动采样时，状态查询超时按「没有新信息」处理、保持 `starting`，所以会更久
 //! （单次调用上限是 `adapter_call_timeout`，默认 30 秒）。期间数据面照常服务（没有托管卡时行为不变，规范 §2.7.6）。
@@ -212,18 +215,22 @@ fn gated_phase(upstreams: &[UpstreamStatus]) -> Phase {
 ///
 /// 门控放行之后，有托管上游处于终态（`absent`、`failed`、`unavailable`、`stopped`）是 `degraded`，哪怕别的上游
 /// 都在服务：门控不会被一个起不来的托管引擎拖住（接口规范 §2.7.6，勘误六），但界面要能看出有一个托管引擎没好。
-/// 没有托管上游时这一条不起作用（`managed` 恒为 false），行为与 v0.5.0 一致。
+/// **托管上游的终态优先于「某个上游还没有第一次观测」**（勘误十二（4）：探测器在门控放行之后才起，别的上游此刻还是 `starting`，
+/// 此前这个 `starting` 遮住了托管引擎的终局失败）。没有托管上游时这一条不起作用（`managed` 恒为 false），行为与 v0.5.0 一致。
+///
+/// 门控已开（或没有门控）而仍有上游没有第一次观测时 `phase` 可以是 `starting`，这时数据面已经在服务（只有门控未开时才 503
+/// `idoris_starting`，规范 §2.11.1）。取值集合不变：`starting`、`ready`、`degraded`。
 pub fn phase_of(upstreams: &[UpstreamStatus]) -> Phase {
     if upstreams
-        .iter()
-        .any(|upstream| upstream.state == UpstreamState::Starting)
-    {
-        Phase::Starting
-    } else if upstreams
         .iter()
         .any(|upstream| upstream.managed && is_terminal(upstream.state))
     {
         Phase::Degraded
+    } else if upstreams
+        .iter()
+        .any(|upstream| upstream.state == UpstreamState::Starting)
+    {
+        Phase::Starting
     } else if upstreams
         .iter()
         .any(|upstream| upstream.state == UpstreamState::Ready)
@@ -856,7 +863,7 @@ mod tests {
                 "{state:?}"
             );
         }
-        // 一个上游还没有第一次观测（探测器刚起）：还是 `starting`。
+        // 别的上游观测到了（不再是 `starting`）：托管引擎的终局失败仍是 `degraded`。
         health.apply("lmstudio", Observation::Unavailable(None));
         health.set_managed("omlx", Failed, Some(UpstreamReason::CrashLoop), false);
         assert_eq!(health.view().phase, Phase::Degraded);
@@ -864,6 +871,86 @@ mod tests {
         health.apply("lmstudio", Observation::Ready);
         health.set_managed("omlx", Ready, None, true);
         assert_eq!(health.view().phase, Phase::Ready);
+    }
+
+    /// 规范勘误十二（4）(a)：门控已开之后，托管上游的终局失败优先于「别的上游还没有第一次观测」。探测器在门控放行之后才起，
+    /// 放行那一刻别的上游还是 `starting`；此前这个 `starting` 遮住了托管引擎的 `degraded`，直到别的上游有了第一次观测。
+    #[test]
+    fn after_the_gate_a_managed_terminal_failure_outranks_another_upstream_that_has_no_first_observation()
+     {
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", Absent),
+                status("lmstudio", Starting, None),
+            ],
+        );
+        health.set_gate(GateState::Open);
+        for state in [Absent, Failed, Unavailable, Stopped] {
+            health.set_managed("omlx", state, Some(UpstreamReason::EngineNotFound), false);
+            let view = health.view();
+            assert_eq!(
+                (view.phase, view.ready),
+                (Phase::Degraded, false),
+                "{state:?}"
+            );
+            assert_eq!(
+                view.upstreams[1].state, Starting,
+                "the other upstream really has no observation yet"
+            );
+        }
+        // 同一个判据的纯函数形式，没有门控：有托管上游终态就是 `degraded`，与别的上游是否 `starting` 无关。
+        assert_eq!(
+            phase_of(&[
+                managed_status("omlx", Failed),
+                status("lmstudio", Starting, None)
+            ]),
+            Phase::Degraded
+        );
+        // 反过来：托管上游没有终局失败（就绪，或还在往前走）时，没有第一次观测的上游仍让 `phase` 停在 `starting`。
+        for state in [Ready, Starting, Restarting] {
+            assert_eq!(
+                phase_of(&[
+                    managed_status("omlx", state),
+                    status("lmstudio", Starting, None)
+                ]),
+                Phase::Starting,
+                "{state:?}"
+            );
+        }
+    }
+
+    /// 规范勘误十二（4）(b)：门控已开（或根本没有托管卡）而仍有上游没有第一次观测时，`phase` 是 `starting`，而数据面此刻已经在服务：
+    /// `starting` 在这里的意思只是「还有上游没有首次观测」，不是「数据面 503」。取值集合不变（`starting`、`ready`、`degraded`）。
+    #[test]
+    fn starting_after_the_gate_only_means_an_upstream_has_no_first_observation_yet() {
+        use UpstreamState::*;
+        // 没有托管卡：没有门控，`phase` 只由上游状态推出，没有观测就是 `starting`。
+        let plain = HealthState::with_upstreams(0, vec![status("lmstudio", Starting, None)]);
+        assert_eq!(plain.gate(), GateState::NotGated);
+        assert_eq!(plain.view().phase, Phase::Starting);
+        plain.apply("lmstudio", Observation::Ready);
+        assert_eq!(plain.view().phase, Phase::Ready);
+
+        // 有托管卡，门控已开，托管引擎就绪，别的上游刚起探测器：`starting`，一次观测之后 `ready`。
+        let managed = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", Ready),
+                status("lmstudio", Starting, None),
+            ],
+        );
+        managed.set_gate(GateState::Open);
+        let view = managed.view();
+        assert_eq!((view.phase, view.ready), (Phase::Starting, false));
+        managed.apply("lmstudio", Observation::Ready);
+        let view = managed.view();
+        assert_eq!((view.phase, view.ready), (Phase::Ready, true));
+        // 门控未开时，`starting` 才是「数据面 503」的意思：托管上游的终态此时仍是 `degraded`（`gated_phase` 不变）。
+        let pending = HealthState::with_upstreams(0, vec![managed_status("omlx", Failed)]);
+        pending.set_gate(GateState::Pending);
+        assert_eq!(pending.view().phase, Phase::Degraded);
     }
 
     #[test]

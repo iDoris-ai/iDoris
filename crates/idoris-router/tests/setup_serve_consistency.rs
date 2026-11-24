@@ -255,6 +255,54 @@ fn a_serve_read_times_out_with_a_clear_error_while_setup_holds_the_lock() {
     );
 }
 
+/// H1：serve 在等 `idoris setup` 放开组件目录的锁（最长 30 秒，可配到 10 分钟）时收到停止信号：等锁的每一轮（20 毫秒）看一眼取消标志，
+/// 看到就返回 `Cancelled`（不是 `DirLocked`，没有读卡），不等够时限。锁一放开、能拿到的时候不看取消标志：读几个文件的事，读到一半放弃没有意义，
+/// 信号由调用方在读完之后处理。
+#[test]
+fn a_serve_read_that_waits_for_the_lock_gives_up_when_the_stop_signal_arrives() {
+    use idoris_router::components::{canonical_components_dir, load_components_locked_cancellable};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let work = TempDir::new().unwrap();
+    let out = work.path().join("comp");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("a.yaml"), upstream_card("a", 1)).unwrap();
+    let canonical = canonical_components_dir(&out).unwrap();
+    let held = lock_out_dir(&out).unwrap();
+
+    let raised = AtomicBool::new(false);
+    let started = std::time::Instant::now();
+    let error = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(150));
+            raised.store(true, Ordering::SeqCst);
+        });
+        load_components_locked_cancellable(&canonical, false, Duration::from_secs(3), None, &|| {
+            raised.load(Ordering::SeqCst)
+        })
+        .unwrap_err()
+    });
+    assert!(matches!(error, LoadError::Cancelled), "{error:?}");
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(100), "{waited:?}");
+    assert!(
+        waited < Duration::from_millis(2500),
+        "cut short, not run to the 3 s limit: {waited:?}"
+    );
+
+    // 锁放开之后：已经置位的取消标志不再拦住读卡（拿到锁就读完）。
+    drop(held);
+    let cards = load_components_locked_cancellable(
+        &canonical,
+        false,
+        Duration::from_secs(60),
+        None,
+        &|| true,
+    )
+    .unwrap();
+    assert_eq!(cards.len(), 1);
+}
+
 /// 反方向：serve 正在读（持有共享锁）时，setup 的落盘等它读完，不会在读到一半时换掉文件。
 #[test]
 fn setup_waits_for_a_reader_that_holds_the_shared_lock() {

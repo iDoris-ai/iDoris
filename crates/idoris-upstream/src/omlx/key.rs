@@ -121,6 +121,18 @@ pub fn card_may_carry_omlx_key(card: &idoris_contracts::ComponentCard) -> bool {
         })
 }
 
+static RESOLUTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 到目前为止，这个进程从环境与 `settings.json` 解析过几次 oMLX API key（每次读环境、可能读用户的密钥文件）。诊断与测试用：
+/// 启动时对适配器的干跑**不该**解析任何凭证（凭证只在真正建适配器时才解析），测试靠它数。
+pub fn resolutions() -> usize {
+    RESOLUTIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn note_resolution() {
+    RESOLUTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// 当前进程环境下、发往 `base_url` 的 key（UTF-8）。引擎管理器接管的端点按它登记的口径（[`EndpointKey`]）。
 pub fn resolve_omlx_api_key_for(base_url: &str) -> Option<String> {
     resolve_omlx_api_key_os_for(base_url)?.into_string().ok()
@@ -130,6 +142,7 @@ pub fn resolve_omlx_api_key_for(base_url: &str) -> Option<String> {
 /// 常驻代理、模型列表、就绪探测）都经这里，所以引擎管理器登记的私有 key 与「外部引擎的 settings.json key 要先过
 /// 端口属主校验」对它们同时生效。
 pub fn resolve_omlx_api_key_os_for(base_url: &str) -> Option<OsString> {
+    note_resolution();
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
     resolve_for_endpoint(
         std::env::var_os(OMLX_API_KEY_ENV),
@@ -142,6 +155,7 @@ pub fn resolve_omlx_api_key_os_for(base_url: &str) -> Option<OsString> {
 /// 只回答「`base_url` 是不是引擎管理器接管的端点」：是，给出发往它的 key（`None` = 不带 key）；不是，`None` 外面再包一层
 /// （调用方沿用自己原来的 key 来源）。
 pub fn resolve_governed_os(base_url: &str) -> Option<Option<OsString>> {
+    note_resolution();
     let governed = governed_endpoint(base_url)?;
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
     Some(resolve_for_endpoint(
@@ -462,6 +476,7 @@ pub fn resolve_omlx_api_key_checked(
 }
 
 fn resolve_from_snapshot(base_url: &str, governed: Option<&EndpointKey>) -> Option<OsString> {
+    note_resolution();
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
     resolve_for_endpoint(
         std::env::var_os(OMLX_API_KEY_ENV),
@@ -647,6 +662,7 @@ pub fn resolve_for_endpoint(
 /// 同上，但直接给 `loopback`，并保留非 UTF-8 的环境变量，让调用方按「无效凭证」处理。
 /// `loopback` 为 false 时 `settings.json` 的 key 不会被返回。
 pub fn resolve_omlx_api_key_os(loopback: bool) -> Option<OsString> {
+    note_resolution();
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
     resolve_from_for(
         std::env::var_os(OMLX_API_KEY_ENV),
