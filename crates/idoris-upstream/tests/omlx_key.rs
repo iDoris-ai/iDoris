@@ -185,6 +185,60 @@ fn a_symlinked_settings_file_is_ignored() {
     assert_eq!(settings_api_key(home.path()).as_deref(), Some("via-link"));
 }
 
+/// #609：检查与打开之间没有窗口——类型由已打开的句柄说了算。测试自己先开着一个读端（让管道里的数据留得住），
+/// 再开写端写入合法的、带 key 的 JSON 并关掉写端：这时 FIFO 里躺着完整内容、也没有写端，实现若不核对句柄类型，
+/// `O_NONBLOCK` 打开后能读到内容并遇到 EOF，就会返回 key。正确的实现因为不是常规文件而返回 `None`。
+#[cfg(unix)]
+#[test]
+fn a_fifo_with_valid_content_is_rejected_by_the_opened_handles_type() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let home = Home::new();
+    let path = home.path().join(".omlx/settings.json");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let nonblock = nix::fcntl::OFlag::O_NONBLOCK.bits();
+    let _keeper = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nonblock)
+        .open(&path)
+        .unwrap();
+    let mut writer = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(nonblock)
+        .open(&path)
+        .unwrap();
+    writer
+        .write_all(br#"{"auth":{"api_key":"from-fifo"}}"#)
+        .unwrap();
+    drop(writer);
+    assert_eq!(settings_api_key(home.path()), None);
+    assert_eq!(resolve_from(None, Some(home.path())), None);
+}
+
+/// 「不跟随符号链接」只对最后一段成立（规范与注释已收窄）：`~/.omlx` 本身是符号链接（常见：模型与配置放在别的盘）
+/// 时，里面的常规文件照常读取。这条钉住的是已知口径，不是承诺的安全属性。
+#[cfg(unix)]
+#[test]
+fn only_the_final_path_component_is_not_followed() {
+    let home = Home::new();
+    let real = home.path().join("elsewhere");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(
+        real.join("settings.json"),
+        r#"{"auth":{"api_key":"k-dir"}}"#,
+    )
+    .unwrap();
+    fs::remove_dir_all(home.path().join(".omlx")).unwrap();
+    std::os::unix::fs::symlink(&real, home.path().join(".omlx")).unwrap();
+    assert_eq!(settings_api_key(home.path()).as_deref(), Some("k-dir"));
+}
+
 #[test]
 fn settings_key_is_only_for_loopback_but_env_key_is_unchanged() {
     let home = Home::new();

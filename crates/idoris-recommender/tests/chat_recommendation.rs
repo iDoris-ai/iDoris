@@ -6,8 +6,8 @@ use idoris_recommender::catalog::{
     Catalog, ModelKind, OmlxBinding, load_catalog, load_omlx_bindings,
 };
 use idoris_recommender::chat_recommendation::{
-    ChatRecommendation, FALLBACK_ORDER, GIB, MODEL_8B, MODEL_27B, MODEL_35B, RecommendError,
-    RecommendInput, probed_gpu_available_bytes, recommend_chat,
+    ChatRecommendation, FALLBACK_ORDER, GIB, HEADROOM_BYTES, MODEL_8B, MODEL_27B, MODEL_35B,
+    RecommendError, RecommendInput, probed_gpu_available_bytes, recommend_chat,
 };
 use idoris_recommender::local_models::LocalModel;
 
@@ -114,11 +114,15 @@ fn physical_ram_below_the_catalog_min_ram_gate_blocks_even_when_memory_would_fit
 fn fallback_skips_models_at_or_above_the_tier_pick_and_takes_the_first_that_fits() {
     let fx = fixture();
     let est_27b = run(&fx, 64 * GIB, None, &[]).est_memory_bytes.unwrap();
-    // 额度恰好等于 27B 的估算：放得下，不回落；少 1 字节：回落。
-    let at = run(&fx, 64 * GIB, Some(est_27b), &[]);
+    // 额度恰好等于「27B 的估算加 1 GB 余量」：放得下，不回落；少 1 字节：回落。
+    let at = run(&fx, 64 * GIB, Some(est_27b + HEADROOM_BYTES), &[]);
     assert_eq!(at.model_id.as_deref(), Some(MODEL_27B));
     assert_eq!(at.reason, "tier_64gib_plus");
-    assert_eq!(at.host.allocated_budget_bytes, Some(est_27b));
+    assert_eq!(
+        at.host.allocated_budget_bytes,
+        Some(est_27b + HEADROOM_BYTES),
+        "host 回显的是调用方给的额度本身，不是扣过余量的值"
+    );
 
     // 35B-A3B 现在按实测 24.694 GB 估算，估算内存比 27B 大：任何装得下 35B 的额度也装得下 27B，
     // 原先「额度落在两者之间」的构造不再存在。原意图（回落只从档位推荐的下一个往后找，不倒回选更靠前的
@@ -133,7 +137,7 @@ fn fallback_skips_models_at_or_above_the_tier_pick_and_takes_the_first_that_fits
         .est_memory_bytes
         .unwrap();
     assert!(est_35b > est_27b);
-    let roomy = run(&fx, 64 * GIB, Some(est_35b), &[]);
+    let roomy = run(&fx, 64 * GIB, Some(est_35b + HEADROOM_BYTES), &[]);
     assert_eq!(roomy.model_id.as_deref(), Some(MODEL_27B));
     assert_eq!(roomy.reason, "tier_64gib_plus");
     let roomy_35 = roomy
@@ -143,7 +147,7 @@ fn fallback_skips_models_at_or_above_the_tier_pick_and_takes_the_first_that_fits
         .unwrap();
     assert!(roomy_35.fits, "35B 自己放得下，只是档位推荐不是它");
 
-    let between = run(&fx, 64 * GIB, Some(est_27b - 1), &[]);
+    let between = run(&fx, 64 * GIB, Some(est_27b + HEADROOM_BYTES - 1), &[]);
     assert_eq!(between.model_id.as_deref(), Some(MODEL_8B));
     assert_eq!(between.reason, "fallback_does_not_fit");
     assert!(between.fits);
@@ -161,7 +165,7 @@ fn fallback_skips_models_at_or_above_the_tier_pick_and_takes_the_first_that_fits
 fn a_budget_that_only_fits_27b_does_not_fit_35b_by_measured_weights() {
     let fx = fixture();
     let est_27b = run(&fx, 64 * GIB, None, &[]).est_memory_bytes.unwrap();
-    let rec = run(&fx, 64 * GIB, Some(est_27b), &[]);
+    let rec = run(&fx, 64 * GIB, Some(est_27b + HEADROOM_BYTES), &[]);
     assert_eq!(rec.model_id.as_deref(), Some(MODEL_27B));
     let alt_35b = rec
         .alternatives
@@ -385,4 +389,88 @@ fn every_reason_code_and_model_name_in_the_code_appears_verbatim_in_the_spec() {
     for reason in seen {
         assert!(section.contains(&format!("`{reason}`")), "{reason}");
     }
+}
+
+/// #609：设置了额度时，`fits` 要先扣 1 GB 余量；估算落在 (额度 − 1 GB, 额度] 的模型加载时会 503
+/// `headroom_confirmation_required`，不能报 `fits: true`。没有额度时（自探的 GPU 内存）没有余量要求。
+#[test]
+fn an_allocated_budget_leaves_the_one_gb_headroom_out_of_fits() {
+    let fx = fixture();
+    assert_eq!(HEADROOM_BYTES, 1_000_000_000);
+    let est_27b = run(&fx, 64 * GIB, None, &[]).est_memory_bytes.unwrap();
+    // 额度恰好等于估算：旧行为 fits=true，现在装不下（只剩 0 余量），回落到 8B。
+    let at_est = run(&fx, 64 * GIB, Some(est_27b), &[]);
+    assert_eq!(at_est.model_id.as_deref(), Some(MODEL_8B));
+    assert_eq!(at_est.reason, "fallback_does_not_fit");
+    // 估算落在 (额度 − 1 GB, 额度]：不放得下。
+    for allocated in [est_27b, est_27b + HEADROOM_BYTES - 1] {
+        let rec = run(&fx, 64 * GIB, Some(allocated), &[]);
+        assert_ne!(
+            rec.model_id.as_deref(),
+            Some(MODEL_27B),
+            "allocated={allocated}"
+        );
+        assert_eq!(
+            rec.model_id.as_deref(),
+            Some(MODEL_8B),
+            "allocated={allocated}"
+        );
+    }
+    // 额度恰好 = 估算 + 余量：放得下。
+    let exact = run(&fx, 64 * GIB, Some(est_27b + HEADROOM_BYTES), &[]);
+    assert_eq!(exact.model_id.as_deref(), Some(MODEL_27B));
+    assert!(exact.fits);
+    // 备选项上的 fits 同一口径。
+    let est_35b = exact
+        .alternatives
+        .iter()
+        .find(|alt| alt.model_id == MODEL_35B)
+        .unwrap()
+        .est_memory_bytes
+        .unwrap();
+    let wide = run(&fx, 64 * GIB, Some(est_35b + HEADROOM_BYTES - 1), &[]);
+    assert_eq!(wide.model_id.as_deref(), Some(MODEL_27B));
+    assert!(!wide.alternatives[0].fits, "35B 差 1 字节凑够余量");
+    let wide = run(&fx, 64 * GIB, Some(est_35b + HEADROOM_BYTES), &[]);
+    assert!(wide.alternatives[0].fits);
+    // 额度小于余量本身：饱和为 0，不下溢成巨大的预算。
+    let tiny = run(&fx, 64 * GIB, Some(HEADROOM_BYTES - 1), &[]);
+    assert_eq!(tiny.model_id, None);
+    assert_eq!(tiny.reason, "insufficient_memory");
+    // 没有额度：自探值整个可用，不扣余量。
+    let rec = recommend_chat(&RecommendInput {
+        ram_bytes: 64 * GIB,
+        allocated_budget_bytes: None,
+        gpu_available_bytes: est_27b,
+        installed: &[],
+        catalog: &fx.catalog,
+        bindings: &fx.bindings,
+    })
+    .unwrap();
+    assert_eq!(rec.model_id.as_deref(), Some(MODEL_27B));
+}
+
+/// #609 测试缺口：`alternatives[].reason` 取该档位行自己的代码，不随回落变成 `fallback_does_not_fit`。
+#[test]
+fn alternatives_carry_their_tier_rows_reason_code_even_after_a_fallback() {
+    let fx = fixture();
+    let reasons = |rec: &ChatRecommendation| -> Vec<String> {
+        rec.alternatives
+            .iter()
+            .map(|alt| alt.reason.clone())
+            .collect()
+    };
+    assert_eq!(reasons(&run(&fx, 48 * GIB, None, &[])), ["tier_48_64gib"]);
+    assert_eq!(
+        reasons(&run(&fx, 64 * GIB, None, &[])),
+        ["tier_64gib_plus", "tier_64gib_plus"]
+    );
+    assert_eq!(reasons(&run(&fx, 63 * GIB, None, &[])), ["tier_48_64gib"]);
+    // 回落之后（顶层 reason 是 fallback_does_not_fit，或 insufficient_memory），备选项的 reason 不变。
+    let fell_back = run(&fx, 64 * GIB, Some(12_000_000_000), &[]);
+    assert_eq!(fell_back.reason, "fallback_does_not_fit");
+    assert_eq!(reasons(&fell_back), ["tier_64gib_plus", "tier_64gib_plus"]);
+    let none = run(&fx, 64 * GIB, Some(1), &[]);
+    assert_eq!(none.reason, "insufficient_memory");
+    assert_eq!(reasons(&none), ["tier_64gib_plus", "tier_64gib_plus"]);
 }

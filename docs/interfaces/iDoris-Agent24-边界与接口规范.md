@@ -20,8 +20,10 @@
 >
 > **文档修订 1.6 勘误九（#633 评审的后续，不改 wire，2026-11-21）**：§2.7.8 `setup omlx --force` 再收紧四处，并记一处已知限制。（1）被保留的符号链接若指向这次要替换或删除的文件（例如 `alias.yaml -> omlx-embed.yaml`），整体 `validation_failed`，点名链接与目标：暂存目录里放的是解引用后的内容，校验会过，落盘后链接就悬空了。（2）受管名字（`omlx.yaml`、`omlx-embed.yaml`、`subscription.yaml`）上必须是普通文件：那里是目录或符号链接时 `--force` 报 `out_dir_not_empty`，不挪、不删、不替换；`setup upstream` 本来就是这个口径。（3）撞名检查：目录里有名字不同、却与这次要写的文件是同一个路径的条目，一律 `validation_failed`，说明里点名两个文件名。"同一个路径"有两种：只差 ASCII 大小写（用户的 `OMLX.yaml` 与要生成的 `omlx.yaml`），以及文件系统自己折叠成同一个文件（APFS 把 `ſubscription.yaml`（U+017F）与 `subscription.yaml` 当同一个文件，所以还比较两个路径背后的设备与 inode）。`setup upstream` 写 `<id>.yaml` 时同样检查（探测之前和落盘事务里各一次），带不带 `--force` 都拒绝，因为被保留的快照只排除名字完全相同的、真的会被替换的条目；在大小写不敏感的文件系统（macOS 默认的 APFS）上它们是同一个路径，不能悄悄换掉用户的文件，大小写敏感的文件系统上同样拒绝，让同一个目录在不同机器上行为一致。（4）`--force` 不再放行「目录非空、没有任何组件卡（`.yaml` / `.yml`）、也没有受管文件」的目录，报 `out_dir_not_empty`，说明里提示多半是 `--out-dir` 写错了；有别的卡的目录（#626 的用法）照常。**已知限制**：落盘用 `hard_link` 放入新文件，不支持硬链接的文件系统（部分网络盘、FAT/exFAT 类的卷）上 `setup` 会以 `write_failed` 失败而不是降级，目录保持原样（回滚见勘误七）；需要在这类目录里用时，先在本地目录生成再复制过去。
 >
+> **文档修订 1.6 勘误十一（#609：§2.9 推荐、本地模型列表与 `settings.json` 读取的跟进，不改 wire，2026-11-22）**：PR-Daemon 对 #604、#605 的非阻塞跟进，口径写进 §2.9，只收紧、不改字段：（1）**`installed` 与本地列表的「完整」**：`config.json` 必须是合法的 JSON 对象（截断、损坏、空文件、不是对象都算不完整，目录里写了 `kind` 也不能让它复活）；权重文件必须非空（零字节占位文件不算权重），`model.safetensors.index.json` 列出的分片必须是非空的常规文件。此前损坏的 `config.json` 仍报 `installed: true`，推荐会因此跳过下载、到首次加载才失败。`{}`（合法的空对象）照旧算完整，`kind` 为 `unknown`。（2）**符号链接模型目录本版不支持，按未安装**（含 HF snapshot 风格的链接，也含指向 models 根内别处的别名）：不跟随链接就不会读到根目录之外的东西，也不会为同一份权重重复计体积；代价是把模型放在别的盘再链进 `~/.omlx/models` 的用户会被推荐去下载，下载切片落地时要在界面里说明，并且**下载不得写穿符号链接**。要支持得先定「目标必须落在哪里、链接里的文件如何计体积、如何防环」，留给下载切片一并决定；在此之前以实机 oMLX 对符号链接目录的加载行为未经验证为由保持现状。（3）**遍历上限**数的是目录项（文件与子目录都算，上限 10 万项、深度 8），超过即当作不完整；此前只数文件，一堆空子目录能绕过。整体预算见（9）。（4）**`fits` 与余量**：设置了 `IDORIS_ALLOCATED_BUDGET_BYTES`（`--allocated-budget-bytes`）时，`fits` 要求估算内存不超过「额度减 1 GB 余量」（十进制 1 GB，与加载准入同一个常量），估算落在（额度减 1 GB，额度]的模型不再报 `fits: true`。这里规定的只是 **`fits` 的计算规则**（与加载准入用同一个余量常量）；加载时是否真的需要余量确认（503 `headroom_confirmation_required`），取决于加载那一刻的估算与账本，`fits` 不保证、也不替代那次判断；`host.allocated_budget_bytes` 仍回显调用方给的额度本身。没有额度时按自探的可用 GPU 内存，加载准入对它没有余量要求，行为不变。回落规则相应按扣过余量的预算判断。（5）**`role` 查询参数**按 `application/x-www-form-urlencoded` 解码后再比较：`role=ch%61t` 等价于 `role=chat`；解码后重复、大小写不对、带空白或坏转义的仍是 400 `unsupported_role`。（6）**`settings.json` 读取**：`O_NOFOLLOW|O_NONBLOCK` 打开后对已打开的句柄 `fstat`，只有常规文件才读，不再是先 `stat` 路径再 `open`（消除检查与打开之间被换成符号链接或 FIFO 的窗口）；「符号链接不算」只对**最后一段**成立，`~/.omlx` 本身是符号链接时仍被跟随（与此前一致）。key 的选择与治理顺序不变。（7）**按句柄读 `config.json` 与分片索引**：相对已打开的模型目录句柄，`O_NOFOLLOW|O_NONBLOCK` 打开，对已打开的句柄 `fstat` 确认是常规文件，最多读 4 MiB 加 1 字节，超过 4 MiB 一律当作不完整（恰好 4 MiB 可以）；不再先 `lstat` 路径、再按名字重新打开，索引也不再无上限地读。（8）**逐级打开**：模型目录从已打开的根目录句柄 `openat(O_DIRECTORY|O_NOFOLLOW)` 打开，子目录同样从父句柄逐级打开；`config.json`、索引、分片的检查都相对同一个目录句柄。扫描过程中某一级被换成符号链接（或别的东西）时打开失败，该模型按不完整处理，不会走出模型根。模型根目录本身（`~/.omlx/models`）可以是符号链接，根以下一律不跟随。（9）**整体工作预算与单飞**：单个模型仍有 10 万目录项、深度 8 的上限；另外一次扫描（根目录与所有模型）共用 30 万目录项的预算。预算用完后还没检查完的模型**标为未检查：不出现在列表里，`installed` 为 `false`**（保守的一侧，下载仍须用户确认），wire 不变、不新增字段，内部以 `ScanReport.unchecked` 报告。预算数的是目录项个数，不是字节数；一个目录里列出的名字在处理它们、进入子目录之前就全部计入（单模型上限与整体预算都是），溢出的那一次同样计费。根目录本身的条目超过预算时，读到的名字之外的条目看不见，内部以 `ScanReport.root_truncated` 报告。并发的请求共用同一次进行中的扫描（单飞，不缓存）：扫描结束后到达的请求重新扫描，扫描进行中到达的请求拿到的是那次扫描的结果。（10）**分片索引**：`weight_map` 必须是非空对象，值必须是非空字符串；去重后的分片名必须全部属于遍历时认定的「模型目录顶层、可见（不以 `.` 开头）、非空的权重文件」集合，所以隐藏文件、空文件、目录、子目录里的文件、不是权重后缀的文件都不算分片，也不再对分片重复 `stat`。（11）**遍历错误**：只有 `NotFound`（条目刚好消失）当作「没有这个条目」；模型内任何别的枚举、`fstatat`、打开错误都让**这个模型**不完整，其他模型照常扫描。（12）**不改的**：`models.rs` 里向 loopback 解析 key 的调用点由逐请求 key 治理（S6）重写，那里一并处理，本勘误不动；`native_wire_parameters_impl.rs` 的内存准入用例改成子进程加假 `HOME`，只是测试卫生，不属于契约。
+>
 > **文档修订 1.6 勘误十三（Codex 集成审计的三条 setup 回填，不改 wire，2026-11-22）**：（1）§2.7.8：serve 读组件目录时对目录拿**共享** `flock`，与 `idoris setup` 落盘时的独占锁是同一把：setup 落盘期间 serve 的读卡等着，读到的要么是落盘前完整的旧集合，要么是落盘后完整的新集合，不会是 setup 一个一个挪动文件的中间状态（此前启动器在 setup 中途重启 serve，serve 可能读到混合的集合并一直用着）。等锁有上限（默认 30 秒；环境变量 `IDORIS_COMPONENTS_LOCK_WAIT_MS` 毫秒数可调，诊断与测试用）：先立刻试一次，锁着就重试，每次重试之前看剩余时间、睡剩余时间与 20 毫秒里小的那个；`0` 是只试一次，没设或空白用默认，纯数字按毫秒，超过 10 分钟的值（含装不进 64 位的数字）按 10 分钟截断，其他取值（负数、小数、带单位、乱写）是启动错误，说明里点名变量与取值；超时启动失败，说明点出目录、实际等了多少毫秒，并提示是 `idoris setup` 在改写它；反过来 serve 正在读时 setup 的落盘等它读完。建议锁约束不了不遵守它的写入者（手工改文件），那一类改动不在这个保证里；目录不存在或不是目录时立刻报「不是目录」，不拿锁也不读卡（不留「先看一眼不存在、再看一眼又存在」的缝）；在 Unix 上，每一条走到读卡的成功路径都持有共享锁。serve 启动时只确定**一次**组件目录的 canonical 路径，加锁与读卡（相对锁住的目录 fd 枚举并 `openat` 读取，所以目录本身中途被改名也读的是加锁的那一个）都用这同一个结果；`components::load_components_locked_canonical` 接受调用方已确定的 canonical 路径，发布给 launcher 的启动快照应当用同一个值。**只保证当前目录**：卡文件是指向目录之外的符号链接时，serve 与 `setup` 都按校验失败处理（`validation_failed` / 启动失败，说明点名链接与它指向的位置），因为外面那个目录的锁我们拿不到；目录之内的符号链接照常按卡读取。（2）§2.7.8、§2.7.6：`setup omlx` 与 `setup upstream` 在发布（落盘）之前，对暂存目录里「保留的卡加新卡」的最终集合，除了加载器与默认卡检查，再过一遍 serve 启动时的纯配置校验（`preflight::validate_card_set`）：运行时对卡 `form` 的确定拒绝（订阅卡与 resident 的 HTTP 卡不走运行时，其余只有 `http_service` 有运行时构造器，别的形态如 `bundled_binary` 报 `has no runtime constructor`，serve 启动时用的是同一个纯函数 `runtime::check_runtime_form`）、引擎型上游的种类解析，以及托管卡的计划——endpoint 形状（`http://127.0.0.1:<端口>`）、引擎种类有对应的管理器、端口不重复、每种引擎只托管一个实例。不过就 `validation_failed`，说明是 serve 会报的那一句，目录不变。典型情形：目录里已有一张 id 与端口都不同的托管 oMLX 卡，再 `setup omlx --force --managed`，以前 setup 成功而 serve 在托管计划里退出 1，现在 setup 一侧就拒绝。校验是纯函数（`lifecycle::validate_managed_plan`），serve 的 `plan_managed` 用的是同一个，不读环境、不碰文件系统、不探测引擎；需要读环境的检查（托管引擎需要 `IDORIS_STATE_DIR` 或 `HOME`）是运行环境的事，不在其中。（3）§2.7.1、§2.7.8：路径类环境变量（含 `IDORIS_COMPONENTS_DIR`）里 `trim` 只用来判断是不是整个都是空白，非空的路径原样使用、不去掉首尾空白，所以 `setup` 输出的 `next.env.IDORIS_COMPONENTS_DIR` 原样交给 serve 就是同一个目录（路径末尾带空格也是）；整个是空白仍视为没设。`optional_env_path`（本地运行时配置、云档配置等）同此规则。（4）`setup` 对卡集合的加载与 serve 共用 mock 开关：`IDORIS_ALLOW_MOCK=1`（只有 `1` 算开）且编译时带 `dev-mock` 特性才加载 `provider.id: mock` 的卡，否则跳过；`setup` 放行的目录与 serve 在 mock 卡要不要进来上是同一个答案。
-
+>
 > **文档修订 1.5，2026-11-19**：只改状态说法，不改契约内容。§2.9 中的推荐接口、本地模型列表和 oMLX 密钥顺序已在 iDoris v0.5.0 实现，wire 契约 1.2.0 随该版本生效；§2.9 的下载部分仍未实现，接口形状待另行修订。
 >
 > **文档修订 1.4，2026-11-15**：owner 要求装了 oMLX 的机器首次启动时按硬件自动选默认 chat 模型，由 iDoris 负责推荐。新增 §2.9（本机 chat 模型推荐、本地模型类别与下载，拟议 wire 1.2.0，只新增），档位表由 owner 拍板，iDoris 与 Agent24 两个会话各确认一次。iDoris 侧推荐、本地模型列表与密钥顺序已在 v0.5.0 实现（见修订 1.5）；下载部分仍未实现。
@@ -430,7 +432,7 @@ idoris setup upstream --kind openai_compat --endpoint <loopback-url> --out-dir <
 
 （owner 原话「≤8GB 不推荐本地 chat；16/24/32GB → 8B；48GB+ → 27B；64GB+ 可选 35B-A3B」。8 GiB 机器在第一行按放不下返回 `null`；18 / 36 GiB 等落在第二行。）
 
-档位按真实物理 RAM 判断（与 §2.4 的 min_ram 门一致）。「放得下」（`fits`）另按 iDoris 的内存公式判断：设置了 `IDORIS_ALLOCATED_BUDGET_BYTES` 时按该额度，否则按 iDoris 自探的可用 GPU 内存。
+档位按真实物理 RAM 判断（与 §2.4 的 min_ram 门一致）。「放得下」（`fits`）另按 iDoris 的内存公式判断：设置了 `IDORIS_ALLOCATED_BUDGET_BYTES` 时按该额度**扣掉 1 GB 余量**之后的值（估算内存不超过「额度减 1 GB」；与加载准入同一个余量，勘误十一），否则按 iDoris 自探的可用 GPU 内存（不扣余量）。
 
 **回落规则**：档位推荐的模型放不下时，按 `Qwen3.6-35B-A3B-OptiQ-4bit` → `Qwen3.8-27B-OptiQ-4bit` → `Qwen3-8B-4bit` 的顺序，从档位推荐的下一个起找第一个放得下的作为 `model_id`，此时 `reason` 为 `fallback_does_not_fit`；一个都放不下时 `model_id: null`，`reason` 为 `insufficient_memory`。`alternatives` 只列档位表里该行的备选，每项各自带 `fits`。
 
@@ -438,7 +440,7 @@ idoris setup upstream --kind openai_compat --endpoint <loopback-url> --out-dir <
 
 **`GET /v1/recommendation?role=chat`**（只读，需要数据 key，与 `/v1/models` 同级鉴权）
 
-- 查询参数：`role`，本版只支持 `chat`，其他值返回 400，`error.reason_code` 为 `unsupported_role`。
+- 查询参数：`role`，本版只支持 `chat`（按 URL 查询串规则解码后比较），其他值返回 400，`error.reason_code` 为 `unsupported_role`。
 - 响应 200：
   ```json
   {
@@ -455,7 +457,7 @@ idoris setup upstream --kind openai_compat --endpoint <loopback-url> --out-dir <
     ]
   }
   ```
-- `model_id` 是 oMLX 目录名（即 `/v1/chat/completions` 的 `model` 应填的值），可为 `null`。`installed` 表示 `~/.omlx/models/<model_id>` 已存在且完整。`size_bytes` 为磁盘/下载体积（未安装时为预计下载体积），`est_memory_bytes` 为加载后的内存估算；两者未知时都为 `null`（不用 0），`alternatives` 里的同名字段相同。`reason` 只取上面档位表与回落规则里的代码（`tier_below_16gib`、`tier_16_48gib`、`tier_48_64gib`、`tier_64gib_plus`、`fallback_does_not_fit`、`insufficient_memory`），供程序判断；给人看的说明另放 `remediation`，不属于契约。
+- `model_id` 是 oMLX 目录名（即 `/v1/chat/completions` 的 `model` 应填的值），可为 `null`。`installed` 表示 `~/.omlx/models/<model_id>` 已存在且完整（`config.json` 是合法 JSON 对象、有非空权重、分片齐全、无下载残留；符号链接目录不支持，按未安装；见勘误十一）。`size_bytes` 为磁盘/下载体积（未安装时为预计下载体积），`est_memory_bytes` 为加载后的内存估算；两者未知时都为 `null`（不用 0），`alternatives` 里的同名字段相同。`reason` 只取上面档位表与回落规则里的代码（`tier_below_16gib`、`tier_16_48gib`、`tier_48_64gib`、`tier_64gib_plus`、`fallback_does_not_fit`、`insufficient_memory`），供程序判断；给人看的说明另放 `remediation`，不属于契约。
 - 本接口不加载、不下载、不改任何状态。Agent24 保存用户的选择，iDoris 不记忆。
 
 **`idoris recommend --role chat --json`**（CLI，同一响应形状）
@@ -478,7 +480,7 @@ idoris setup upstream --kind openai_compat --endpoint <loopback-url> --out-dir <
 **oMLX 密钥**
 
 - 优先级：`IDORIS_OMLX_API_KEY`（§2.7，保持不变）→ `~/.omlx/settings.json` 的 `auth.api_key` → 无鉴权连接。
-- `settings.json` 的 key 只发给 loopback 的 oMLX（base URL 非 loopback 时视为没有）；文件必须是常规文件（符号链接不算），key 取 trim 后的值，含内部空白或控制字符视为没有。环境变量的 key 维持原行为。
+- `settings.json` 的 key 只发给 loopback 的 oMLX（base URL 非 loopback 时视为没有）；文件必须是常规文件（最后一段是符号链接不算；`O_NOFOLLOW` 打开后对句柄判类型，勘误十一），key 取 trim 后的值，含内部空白或控制字符视为没有。环境变量的 key 维持原行为。
 - 只从文件读取，不打印、不写日志、不进 argv 或响应体。不硬编码任何默认值（Agent24 侧同样不再假定默认 key）。
 - oMLX 开了鉴权而两处都没有 key 时，iDoris 按 401 处理并在 `remediation` 说明，不重试。
 
