@@ -1615,6 +1615,31 @@ mod tests {
         );
     }
 
+    /// **The cheap hit does not queue behind a scan.** A request whose cheap question can be answered returns at once even while another
+    /// request's scan of the same watch is blocked (the lock that merges scans is only for the requests that have to scan).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cheap_hit_does_not_wait_behind_a_scan_of_the_same_watch() {
+        let (native, release, entered) = slow_native(native::Probe::Holds);
+        let watch = Arc::new(NativeWatch::new(native.clone()));
+        let scanning = {
+            let watch = watch.clone();
+            tokio::spawn(async move { watch.holds().await })
+        };
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(10)).unwrap())
+            .await
+            .unwrap();
+        // the scan is blocked inside the system calls; meanwhile the cheap question can answer
+        *native.cached.lock().unwrap() = Some(native::Probe::Holds);
+        let answer = tokio::time::timeout(Duration::from_secs(2), watch.holds()).await;
+        assert_eq!(
+            answer.unwrap(),
+            Ok(true),
+            "the cheap hit waited for the scan that was in flight"
+        );
+        release.one();
+        assert_eq!(scanning.await.unwrap(), Ok(true));
+    }
+
     /// **The scans of the whole process are bounded** ([`MAX_SCANS`]): more watches than the bound scanning at once leave the rest waiting
     /// for a permit; none of them gives up or answers wrongly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
