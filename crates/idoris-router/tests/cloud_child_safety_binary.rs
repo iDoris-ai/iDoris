@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use child_guard::IsolateState;
 use child_guard::SpawnGuarded;
 use child_safety::{
     ANSWER_SENTINEL, CHILD_SENTINEL, answer, benign_question, child_body, contains,
@@ -262,7 +263,7 @@ impl Fixture {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            match cmd.spawn() {
+            match cmd.isolate_state().spawn() {
                 Ok(child) => return Running(Some(child)),
                 Err(err)
                     if err.kind() == std::io::ErrorKind::ExecutableFileBusy

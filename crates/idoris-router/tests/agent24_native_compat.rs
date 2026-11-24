@@ -1,4 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -60,7 +63,11 @@ async fn check(field: &str, value: Value) {
         .unwrap(),
     );
     let app = build_app(AppState {
-        runtimes: Some(BoundSupervisor::spawn_omlx(&card).unwrap()).into(),
+        runtimes: Some(
+            BoundSupervisor::spawn_omlx_in_state_dir(&card, &state_isolation::fresh_state_dir())
+                .unwrap(),
+        )
+        .into(),
         cards: vec![card],
         ..AppState::default()
     });

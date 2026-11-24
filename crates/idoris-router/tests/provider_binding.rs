@@ -1,5 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use idoris_contracts::ComponentCard;
@@ -37,7 +40,9 @@ async fn mismatch_is_blocked(same_provider: bool, same_endpoint: bool) {
             "http://127.0.0.1:9"
         },
     );
-    let supervisor = BoundSupervisor::spawn_omlx(&bound_card).unwrap();
+    let supervisor =
+        BoundSupervisor::spawn_omlx_in_state_dir(&bound_card, &state_isolation::fresh_state_dir())
+            .unwrap();
     let app = build_app(AppState {
         cards: vec![selected],
         runtimes: Some(supervisor).into(),
