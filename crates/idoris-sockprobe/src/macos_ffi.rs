@@ -474,6 +474,15 @@ mod tests {
         assert!(!table.full);
         let entry = table.entries.iter().find(|entry| entry.fd == fd).unwrap();
         assert!(entry.is_socket);
+        // a plain file is in the table too, and is not a socket (the scan skips what is not one)
+        let plain = std::fs::File::open("/dev/null").unwrap();
+        let table = complete(Libproc.fd_table(me(), needed + 32));
+        let entry = table
+            .entries
+            .iter()
+            .find(|entry| entry.fd == plain.as_raw_fd())
+            .unwrap();
+        assert!(!entry.is_socket, "a plain file is not a socket");
         // exactly as many entries as there are descriptors fills the buffer completely, and so does asking for fewer
         let few = complete(Libproc.fd_table(me(), 1));
         assert_eq!(few.entries.len(), 1);

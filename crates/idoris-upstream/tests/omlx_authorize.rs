@@ -694,6 +694,33 @@ mod dial {
         );
     }
 
+    /// A URL that cannot be pointed at the verified address is **not sent at all** (the empty string is not a URL any client can send): a
+    /// string that is not a URL, a relative one, and one that has no host to replace.
+    #[tokio::test]
+    async fn a_url_that_cannot_be_rewritten_to_the_verified_address_is_not_sent() {
+        let main = "http://127.0.0.1:19824".to_owned();
+        let _governed = Governed(main.clone());
+        govern_endpoint_guarded(
+            &main,
+            EndpointKey::Private("engine-key".into()),
+            Some(Arc::new(Dialing { dial: v4(19824) })),
+        );
+        let authorization = authorize_omlx_request(&main, None).await.unwrap();
+        for unsendable in [
+            "not a url",
+            "/v1/models",
+            "mailto:someone@example.com",
+            "data:text/plain,hello",
+        ] {
+            assert_eq!(authorization.dial_url(unsendable), "", "{unsendable:?}");
+        }
+        // and a good one still is
+        assert_eq!(
+            authorization.dial_url("http://localhost:19824/v1/models"),
+            "http://127.0.0.1:19824/v1/models"
+        );
+    }
+
     /// A listener on `[::1]:<port>` while the engine is on `127.0.0.1:<port>`: an adapter whose card is spelled `[::1]` (a companion card
     /// of the managed engine) must dial the address the guard verified, not the spelling. Every adapter call (GET, POST, the load with its
     /// admin login and settings) reaches the engine; the impostor on IPv6 loopback sees nothing.
