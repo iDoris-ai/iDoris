@@ -4717,6 +4717,47 @@ mod tests {
         assert_eq!(health.status(), StatusCode::OK);
     }
 
+    /// Codex 预审 M1：`/health` 在每一个 phase 里都是 200（Agent24 靠 `phase` 字段而不是状态码判断）。
+    #[tokio::test]
+    async fn health_is_200_in_every_phase() {
+        use crate::readiness::{HealthState, UpstreamState, UpstreamStatus};
+        for (state, phase) in [
+            (UpstreamState::Starting, "starting"),
+            (UpstreamState::Restarting, "starting"),
+            (UpstreamState::Ready, "ready"),
+            (UpstreamState::Failed, "degraded"),
+        ] {
+            let health = HealthState::with_upstreams(
+                0,
+                vec![UpstreamStatus {
+                    id: "omlx".into(),
+                    engine_kind: "omlx".into(),
+                    state,
+                    reason: None,
+                    managed: true,
+                    owned: false,
+                }],
+            );
+            let app = build_app(AppState {
+                health_state: health,
+                ..AppState::default()
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{state:?}");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["phase"], phase, "{state:?}");
+        }
+    }
+
     #[tokio::test]
     async fn health_components_count_reflects_loaded_cards() {
         let state = AppState {
