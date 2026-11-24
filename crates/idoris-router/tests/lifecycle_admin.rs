@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use child_guard::IsolateState;
 use fake_omlx::{Behavior, FakeOmlx, Hold, Release, spawn_retrying};
 use http_body_util::BodyExt;
 use idoris_contracts::{ComponentCard, load_policy::LoadMode};
@@ -2866,6 +2867,7 @@ fn in_a_child_with_canary_keys(test: &str) -> bool {
         .env("IDORIS_KEY_AUDIT_CHILD", "1")
         .env("HOME", home.path())
         .env("IDORIS_OMLX_API_KEY", CANARY_ENV_KEY)
+        .isolate_state()
         .output()
         .unwrap();
     assert!(

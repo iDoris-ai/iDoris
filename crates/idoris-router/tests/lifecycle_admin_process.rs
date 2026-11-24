@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use child_guard::ChildGuard;
+use child_guard::{ChildGuard, IsolateState};
 use fake_omlx::{Behavior, FakeOmlx, spawn_retrying};
 use serde_json::{Value, json};
 
@@ -173,6 +173,7 @@ impl Env {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command.isolate_state();
         command
     }
 
