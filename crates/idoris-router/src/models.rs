@@ -179,6 +179,8 @@ async fn fetch_models_body(
     let Ok(built) = built else {
         return Ok(None);
     };
+    #[cfg(test)]
+    idoris_upstream::omlx::key::test_hooks::between_build_and_send(built.url().as_str());
     if held
         .as_ref()
         .is_some_and(|authorization| authorization.ensure_current().is_err())
@@ -415,6 +417,67 @@ pub async fn list_models_with_subscriptions_admitted(
             }),
     );
     Ok(response)
+}
+
+#[cfg(test)]
+mod post_build_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    /// 复审 L2 终检：模型列表的逐卡请求**建好之后、最后一眼之前**换掉引擎（`test_hooks`）：不发，这张卡算「不可用」（`Ok(None)`）。授权是在 await 里取到的，
+    /// 请求头在它之后建；换代落在这两步之间时，之前（最后一眼在加请求头**之前**）能放过去一个已经通过代际核对的请求。
+    #[tokio::test]
+    async fn a_model_list_request_built_for_a_replaced_engine_is_not_sent() {
+        use idoris_upstream::omlx::key::test_hooks::between_build_and_send_for;
+        use idoris_upstream::omlx::key::{EndpointKey, forget_endpoint, govern_endpoint};
+
+        struct Governed(String);
+        impl Drop for Governed {
+            fn drop(&mut self) {
+                forget_endpoint(&self.0);
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+        let _governed = Governed(endpoint.clone());
+        govern_endpoint(&endpoint, EndpointKey::Private("first-engine".to_owned()));
+        let card = crate::tests::resident_component_card("omlx", &endpoint);
+        let admitted = admission_generation(&card);
+        assert!(
+            admitted.is_some(),
+            "bound to the governed endpoint's generation"
+        );
+
+        // 对照：没有换引擎，同一个请求发得出去。
+        let listed = fetch_models_body(&reqwest::Client::new(), &card, admitted).await;
+        assert!(matches!(listed, Ok(Some(_))), "{listed:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        let _hook = between_build_and_send_for(&format!("{endpoint}/v1/models"), {
+            let endpoint = endpoint.clone();
+            move || {
+                govern_endpoint(&endpoint, EndpointKey::Private("replacement".to_owned()));
+            }
+        });
+        let listed = fetch_models_body(&reqwest::Client::new(), &card, admitted).await;
+        assert!(matches!(listed, Ok(None)), "{listed:?}");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the request built for the replaced engine was sent"
+        );
+    }
 }
 
 #[cfg(test)]
