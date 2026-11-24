@@ -1,5 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -27,7 +30,9 @@ fn card_with_provider(provider_id: &str, endpoint: &str) -> ComponentCard {
 
 async fn app_with_provider(server: &MockServer, provider_id: &str) -> axum::Router {
     let card = card_with_provider(provider_id, &server.uri());
-    let supervisor = BoundSupervisor::spawn_omlx(&card).unwrap();
+    let supervisor =
+        BoundSupervisor::spawn_omlx_in_state_dir(&card, &state_isolation::fresh_state_dir())
+            .unwrap();
     build_app(AppState {
         cards: vec![card],
         runtimes: Some(supervisor).into(),

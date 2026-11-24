@@ -7,6 +7,11 @@
 //! still has to exit on its own with the expected status and stderr. Timing
 //! out is still a test failure.
 
+#[allow(clippy::duplicate_mod)] // child_guard.rs 与 startup_wait.rs 各自带一份，测试文件同时用两者时就是两份
+#[path = "state_isolation.rs"]
+mod state_isolation;
+use state_isolation::IsolateState;
+
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -74,6 +79,7 @@ pub fn warm_exec(exe: &Path) {
 /// Spawn, retrying only a transient text-busy exec (`ETXTBSY`) until the
 /// observe limit. Every other spawn error fails the test immediately.
 pub fn spawn_when_executable(command: &mut Command) -> Child {
+    command.isolate_state();
     let deadline = Instant::now() + startup_observe_limit();
     loop {
         match command.spawn() {

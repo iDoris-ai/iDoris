@@ -2,6 +2,10 @@
 //! 全部使用临时假 HOME，不碰真实 `~/.omlx`。
 #![allow(clippy::unwrap_used)]
 
+#[path = "../../idoris-router/tests/support/state_isolation.rs"]
+mod state_isolation;
+use state_isolation::IsolateState;
+
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -329,7 +333,7 @@ fn adapter_config_follows_the_same_loopback_rule() {
         if let Some(key) = env_key {
             cmd.env("IDORIS_OMLX_API_KEY", key);
         }
-        let output = cmd.output().unwrap();
+        let output = cmd.isolate_state().output().unwrap();
         assert!(output.status.success(), "case {case}");
     }
 }
