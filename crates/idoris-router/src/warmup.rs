@@ -377,6 +377,9 @@ fn request_kind(capability: Capability) -> Option<&'static str> {
     }
 }
 
+/// 透传给调用方的上游错误正文的上限。
+const MAX_RELAYED_ERROR_BODY_BYTES: usize = 64 * 1024;
+
 /// 一个 resident 最小请求的结果，摘出预热需要的部分：状态码，以及非 2xx 时要原样透传的类型与正文。
 ///
 /// 正文是**复制**出来的：代理给结果的正文挂着并发许可（结果被丢掉才还），而这个结果要在合并的几个预热之间共享，许可不能跟着
@@ -390,14 +393,22 @@ struct Answer {
 impl Answer {
     /// 吃掉代理的结果：函数结束时那个结果被丢掉，并发许可就在这里还。
     fn from_outcome(outcome: ForwardOutcome) -> Self {
+        let mut content_type = outcome.content_type.clone();
         let body = if (200..300).contains(&outcome.status) {
             Bytes::new()
+        } else if outcome.body.len() > MAX_RELAYED_ERROR_BODY_BYTES {
+            // 复制出来的正文脱离了并发许可，不再受许可的背压；一个预热只透传小的错误信封，大得离谱的正文换成一个固定的
+            // 小信封（状态码照旧），已完成的预热在慢读者那里最多各留这么一点（Codex 复审 M）。
+            content_type = Some("application/json".to_string());
+            Bytes::from_static(
+                br#"{"error":{"type":"upstream_error","message":"the upstream error body was too large to relay"}}"#,
+            )
         } else {
             Bytes::copy_from_slice(&outcome.body)
         };
         Self {
             status: outcome.status,
-            content_type: outcome.content_type.clone(),
+            content_type,
             body,
         }
     }
@@ -1552,6 +1563,41 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
         );
     }
 
+    /// 复制出来的错误正文有上限：小的原样透传，大得离谱的换成固定的小信封，状态码不变。
+    #[test]
+    fn a_huge_upstream_error_body_is_replaced_by_a_small_envelope_when_copied() {
+        let outcome = |status: u16, body: Bytes| ForwardOutcome {
+            status,
+            body,
+            content_type: Some("text/plain".into()),
+            cached: false,
+            origin_record_id: None,
+            replayed_served_locality: None,
+            retries: 0,
+            execution: crate::proxy::ExecutionDisposition::Executed,
+        };
+        let small = Answer::from_outcome(outcome(500, Bytes::from_static(b"boom")));
+        assert_eq!(small.body.as_ref(), b"boom");
+        assert_eq!(small.content_type.as_deref(), Some("text/plain"));
+        let huge = Answer::from_outcome(outcome(
+            500,
+            Bytes::from(vec![b'x'; MAX_RELAYED_ERROR_BODY_BYTES + 1]),
+        ));
+        assert_eq!(huge.status, 500);
+        assert!(huge.body.len() < 200);
+        assert_eq!(huge.content_type.as_deref(), Some("application/json"));
+        let at_limit = Answer::from_outcome(outcome(
+            502,
+            Bytes::from(vec![b'x'; MAX_RELAYED_ERROR_BODY_BYTES]),
+        ));
+        assert_eq!(at_limit.body.len(), MAX_RELAYED_ERROR_BODY_BYTES);
+        assert!(
+            Answer::from_outcome(outcome(200, Bytes::from_static(b"ok")))
+                .body
+                .is_empty()
+        );
+    }
+
     // ---- 全局上限、并入者上限、预检（本地预审 L-3、L-4） ----
 
     /// 四把 key 各领头两个，正好是全局上限；返回它们的守卫（丢掉就还）。
@@ -1676,7 +1722,7 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
     /// 判据随**真要连接的目标**走，不随字符串的样子走：端点交给 URL 解析器，连接落在解析出来的主机上。
     ///
     /// - 落在本机的各种写法：`localhost`（含全限定的 `localhost.`）、各种 loopback 地址（含 IPv4 映射的 IPv6 loopback，那条连接落在
-    ///   `127.0.0.1`）、未指定的地址（`0.0.0.0`、`::` 作为目的地就是「本机」；在 macOS 上实测落在 `127.0.0.1` 与 `::1`），以及解析器
+    ///   `127.0.0.1`），以及解析器
     ///   规范成 `127.0.0.1` 的数字写法；用户信息（`@` 之前）不是主机；`?` 与 `#` 之后的一切不是主机（代理把路径接在端点后面，
     ///   连接仍然落在端点的主机上）。
     /// - 不是本机，或者从 URL 看不出落在哪：主机是别处的（含 `127.0.0.1@evil.com` 这种主机其实是 `evil.com` 的）；除 `localhost`
@@ -1694,9 +1740,6 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
             "http://[0:0:0:0:0:0:0:1]:8088",
             "http://[::ffff:127.0.0.1]:8088",
             "http://[::ffff:7f00:1]:8088",
-            "http://0.0.0.0:8088",
-            "http://0:8088",
-            "http://[::]:8088",
             "http://127.1:8088",
             "http://2130706433:8088",
             "http://0x7f.1:8088",
@@ -1722,6 +1765,11 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
             "http://localtest.me:8088",
             "http://foo.localhost:8088",
             "http://localhost.localdomain:8088",
+            // 未指定的地址不算：主线的 loopback 判据（`is_loopback_host`，也是端点标识与 key 资格的判据）不收它们，预热只收
+            // 登记表也认得的写法，否则能绕开托管引擎的封上。
+            "http://0.0.0.0:8088",
+            "http://0:8088",
+            "http://[::]:8088",
             "http://10.0.0.5:8088",
             "http://192.168.1.2:8088",
             "http://8.8.8.8:8088",

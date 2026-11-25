@@ -543,12 +543,20 @@ impl OmlxAdapter {
         let started = tokio::time::Instant::now();
         {
             let credential = self.credential().await?;
+            // 授权（含监听者的重新核实）也算在加载预算里：它用掉的时间从 POST 的期限里扣掉；预算在发送之前就用尽了，
+            // 一个字节都不发（这是确定的「没发」，不是「结果未知」，所以不是 `LoadUnconfirmed`，也不留围栏）。
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(upstream_error(format!(
+                    "oMLX load of {id} was not sent: authorizing it used the whole load budget of {budget:?}"
+                )));
+            }
             http::post_load(
                 &credential.client(&self.client),
                 &credential.base_url(&self.base_url),
                 &self.encoded_path("/v1/models/", id, "/load"),
                 credential.key(),
-                budget,
+                remaining,
                 id,
                 credential.authorization(),
             )
