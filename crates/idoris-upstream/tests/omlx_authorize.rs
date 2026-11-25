@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use idoris_upstream::omlx::key::{
     EndpointGuard, EndpointKey, KeyRefusal, Verification, authorize_omlx_request, block_endpoint,
     check_endpoint_admission, endpoint_flights, endpoint_generation, forget_endpoint,
-    govern_endpoint, govern_endpoint_guarded, governed_endpoint,
+    govern_endpoint, govern_endpoint_guarded, governed_endpoint, resolve_omlx_api_key_checked,
+    seal_endpoint_flights_if_idle,
 };
 
 /// 守卫的回答是编排的（按顺序，最后一个重复）；每次被问都计数，并可以挂一个钩子（在回答之前执行，模拟「校验期间发生了别的事」）。
@@ -302,6 +303,205 @@ async fn every_loopback_spelling_of_a_governed_port_lands_on_the_same_registrati
     }
     // Another port is another endpoint: not governed, nothing asked.
     assert_eq!(governed_endpoint("http://localhost:19809"), None);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Codex pre-review of layer 3, M5: "zero in flight" and "no new flight" are one atomic step
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// The drain used to read the flight count and see zero; a request that had captured the card earlier (the public model list walks
+/// its cards one by one, a slow card in front keeps it away from this one) then registered a new flight while the engine was still
+/// listening in its SIGTERM grace and was interrupted by it. Sealing is the same atomic step as the zero check: once it succeeded,
+/// every later authorization is refused with `Draining` before anything is registered, asked or sent.
+#[tokio::test]
+async fn once_the_flights_are_sealed_at_zero_a_late_request_is_refused_and_registers_nothing() {
+    let url = endpoint(19830);
+    let _governed = Governed(url.clone());
+    let guard = Scripted::answering(&[Verification::Verified]);
+    govern_endpoint_guarded(
+        &url,
+        EndpointKey::Private("engine-key".into()),
+        Some(guard.clone()),
+    );
+
+    assert!(
+        seal_endpoint_flights_if_idle(&url),
+        "nothing in flight: the seal is taken"
+    );
+    // The key is still the engine's (the process is alive during its grace): only the admission of NEW operations is closed.
+    assert_eq!(
+        governed_endpoint(&url),
+        Some(EndpointKey::Private("engine-key".into()))
+    );
+    let refused = authorize_omlx_request(&url, None).await.unwrap_err();
+    assert_eq!(refused, KeyRefusal::Draining, "{refused}");
+    assert_eq!(
+        guard.asked(),
+        0,
+        "refused before the guard is even asked, so no probe of the listener either"
+    );
+    assert_eq!(endpoint_flights(&url), 0, "and nothing was registered");
+    // The pre-check of the proxy and the pure resolution refuse it the same way.
+    assert_eq!(
+        check_endpoint_admission(&url, None).unwrap_err(),
+        KeyRefusal::Draining
+    );
+    assert_eq!(
+        resolve_omlx_api_key_checked(&url, None).unwrap_err(),
+        KeyRefusal::Draining
+    );
+    // Taking the seal again while it is held and nothing is in flight is still "empty and sealed".
+    assert!(seal_endpoint_flights_if_idle(&url));
+}
+
+/// An operation that is already in flight keeps the seal from being taken (the drain keeps waiting for it), and a failed attempt
+/// changes nothing: a request that arrives meanwhile is still admitted.
+#[tokio::test]
+async fn the_seal_is_refused_while_anything_is_in_flight_and_changes_nothing() {
+    let url = endpoint(19831);
+    let _governed = Governed(url.clone());
+    govern_endpoint_guarded(
+        &url,
+        EndpointKey::Private("engine-key".into()),
+        Some(Scripted::answering(&[Verification::Verified])),
+    );
+    let in_flight = authorize_omlx_request(&url, None).await.unwrap();
+    assert!(
+        !seal_endpoint_flights_if_idle(&url),
+        "one operation is in flight: no seal"
+    );
+    let another = authorize_omlx_request(&url, None).await.unwrap();
+    assert_eq!(endpoint_flights(&url), 2);
+    drop(in_flight);
+    assert!(!seal_endpoint_flights_if_idle(&url), "one is left");
+    drop(another);
+    assert_eq!(endpoint_flights(&url), 0);
+    assert!(
+        seal_endpoint_flights_if_idle(&url),
+        "now the drain is complete"
+    );
+}
+
+/// The seal lives for one generation. The moment the registration changes (the endpoint is blocked once the process has exited, a
+/// new engine registers its key) the generation advances and the seal is lifted: a sealed endpoint must never stay closed to the
+/// engine that replaces the one being stopped.
+#[tokio::test]
+async fn a_new_generation_lifts_the_seal_and_the_new_engine_is_served() {
+    let url = endpoint(19832);
+    let _governed = Governed(url.clone());
+    govern_endpoint_guarded(
+        &url,
+        EndpointKey::Private("old-key".into()),
+        Some(Scripted::answering(&[Verification::Verified])),
+    );
+    let old_generation = endpoint_generation(&url);
+    assert!(seal_endpoint_flights_if_idle(&url));
+
+    // The process is gone: blocked (a new generation), still refused, now as `Blocked`.
+    block_endpoint(&url);
+    assert!(endpoint_generation(&url) > old_generation);
+    assert_eq!(
+        authorize_omlx_request(&url, None).await.unwrap_err(),
+        KeyRefusal::Blocked
+    );
+    // The replacement registers: served, and a request admitted for the old engine is still turned away as stale.
+    govern_endpoint_guarded(
+        &url,
+        EndpointKey::Private("new-key".into()),
+        Some(Scripted::answering(&[Verification::Verified])),
+    );
+    let served = authorize_omlx_request(&url, Some(endpoint_generation(&url)))
+        .await
+        .unwrap();
+    assert_eq!(served.key(), Some("new-key"));
+    assert!(matches!(
+        authorize_omlx_request(&url, Some(old_generation))
+            .await
+            .unwrap_err(),
+        KeyRefusal::StaleGeneration { .. }
+    ));
+}
+
+/// A registration with the same policy and the same guard is not a new generation (requests in flight stay valid): it must not lift a
+/// seal either. The seal only ends when the generation moves.
+#[tokio::test]
+async fn registering_the_same_thing_again_does_not_lift_the_seal() {
+    let url = endpoint(19833);
+    let _governed = Governed(url.clone());
+    let guard = Scripted::answering(&[Verification::Verified]);
+    govern_endpoint_guarded(
+        &url,
+        EndpointKey::Private("engine-key".into()),
+        Some(guard.clone()),
+    );
+    assert!(seal_endpoint_flights_if_idle(&url));
+    govern_endpoint_guarded(
+        &url,
+        EndpointKey::Private("engine-key".into()),
+        Some(guard.clone()),
+    );
+    assert_eq!(
+        authorize_omlx_request(&url, None).await.unwrap_err(),
+        KeyRefusal::Draining
+    );
+}
+
+/// Admission and sealing race on many threads. The invariant: a request that **starts after the seal was taken** is never admitted,
+/// and once the seal was taken the count is zero and stays zero (nothing slipped in between the zero check and the seal: they are one
+/// compare-and-swap).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_that_starts_after_the_seal_is_never_admitted_however_the_threads_interleave() {
+    let url = endpoint(19834);
+    let _governed = Governed(url.clone());
+    govern_endpoint(&url, EndpointKey::Private("engine-key".into()));
+    let sealed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let late_but_admitted = Arc::new(AtomicUsize::new(0));
+    let mut racers = Vec::new();
+    for _ in 0..8 {
+        let (url, sealed, late_but_admitted) =
+            (url.clone(), sealed.clone(), late_but_admitted.clone());
+        racers.push(tokio::spawn(async move {
+            for _ in 0..300 {
+                let seal_was_already_taken = sealed.load(Ordering::SeqCst);
+                if let Ok(authorization) = authorize_omlx_request(&url, None).await {
+                    if seal_was_already_taken {
+                        late_but_admitted.fetch_add(1, Ordering::SeqCst);
+                    }
+                    // Held across a yield, like a short request.
+                    tokio::task::yield_now().await;
+                    drop(authorization);
+                }
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+    // The drain: take the seal when zero (retry while anything is in flight).
+    let taken = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !seal_endpoint_flights_if_idle(&url) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(taken.is_ok(), "the seal was never taken");
+    sealed.store(true, Ordering::SeqCst);
+    assert_eq!(endpoint_flights(&url), 0, "zero at the moment of the seal");
+    for racer in racers {
+        racer.await.unwrap();
+    }
+    assert_eq!(
+        late_but_admitted.load(Ordering::SeqCst),
+        0,
+        "a request that started after the seal was admitted"
+    );
+    assert_eq!(
+        endpoint_flights(&url),
+        0,
+        "every admitted request was dropped"
+    );
+    assert_eq!(
+        authorize_omlx_request(&url, None).await.unwrap_err(),
+        KeyRefusal::Draining
+    );
 }
 
 /// An endpoint nobody governs has no registration to guard, no generation to check and nothing to count.

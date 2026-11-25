@@ -182,6 +182,30 @@ impl MockAdapter {
         }
     }
 
+    /// Simulates the engine **process** being replaced by a fresh one (restarted by whoever owns its
+    /// lifecycle, IDORIS-CORE S6): nothing is loaded any more and every applied policy is forgotten,
+    /// while the scripts and call counters stay. A [`crate::Supervisor`] built before still believes
+    /// what it saw until [`crate::SupervisorHandle::engine_replaced`] tells it otherwise.
+    pub fn replace_engine(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.loaded.clear();
+            state.policies.clear();
+            state.event_log.push("engine:replaced".to_string());
+        }
+    }
+
+    /// Puts `id` into the engine behind the Supervisor's back — a model the (replaced) process came up
+    /// with. Unknown ids are ignored.
+    pub fn preload(&self, id: &str) {
+        if let Ok(mut state) = self.state.lock()
+            && state.catalog.iter().any(|model| model.id == id)
+            && !state.loaded.iter().any(|loaded| loaded == id)
+        {
+            state.loaded.push(id.to_string());
+            state.event_log.push(format!("preload:{id}"));
+        }
+    }
+
     pub fn load_call_count(&self, id: &str) -> u32 {
         self.state
             .lock()

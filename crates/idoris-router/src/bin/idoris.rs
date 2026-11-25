@@ -1062,7 +1062,8 @@ async fn run(options: cli::ServeOptions, exit_deadline: &ExitDeadline) -> Result
                 );
                 Box::new(move |outcome: &lifecycle::GateOutcome| {
                     // 降级放行（有托管引擎终局失败，接口规范 §2.7.6 勘误六）：没就绪的托管卡不建 Supervisor——它会去采样一个没起来、
-                    // 或者没通过属主校验的端点；路由到这些卡的请求由 `managed_failures` 直接 503（带原因），别的卡照常服务。
+                    // 或者没通过属主校验的端点；路由到这些卡的请求由 `/health` 的实时快照（`HealthState::managed_failure`）直接
+                    // 503（带原因），别的卡照常服务。
                     // 本地 runtime 配置从不绑托管卡（启动时 `validate_local_configs` 已拒绝，勘误十二（3））：配置表原样交给它，不需要投影；
                     // 适配器参数用启动时按原始卡集解析好的，建表走启动时干跑过的同一条路径（勘误十二（3））。
                     let runtimes = RuntimeRegistry::spawn_after_gate(
@@ -1074,7 +1075,6 @@ async fn run(options: cli::ServeOptions, exit_deadline: &ExitDeadline) -> Result
                         &adapter_params,
                     )?;
                     state.runtimes = runtimes.clone();
-                    state.managed_failures = Arc::new(outcome.degraded.clone());
                     state.capabilities = capabilities_inputs.take().map(|(catalog, facts)| {
                         Arc::new(
                             LiveCapabilitiesProvider::new(catalog, facts, runtimes.clone())

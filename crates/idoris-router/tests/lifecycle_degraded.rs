@@ -68,6 +68,8 @@ fn fast() -> Timings {
         crash_limit: 2,
         half_open_interval: Duration::from_millis(400),
         stop_grace: Duration::from_secs(3),
+        drain_timeout: Duration::from_secs(5),
+        command_timeout: Duration::from_secs(10),
         unverifiable_retries: 2,
         unverifiable_pause: Duration::from_millis(20),
     }
@@ -265,11 +267,11 @@ impl World {
             health.clone(),
             data.clone(),
             SwapApp::new(Router::new()),
-            Box::new(move |outcome| {
+            Box::new(move |_outcome| {
+                // 没就绪的托管卡由 `health_state` 的实时快照挡住（IDORIS-CORE S6：不再有门控放行时拍下的名单）。
                 let state = AppState {
                     cards,
                     health_state: state_health,
-                    managed_failures: Arc::new(outcome.degraded.clone()),
                     ..AppState::default()
                 };
                 Ok(Finalized {

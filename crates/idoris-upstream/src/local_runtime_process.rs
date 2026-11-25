@@ -166,18 +166,38 @@ impl ManagedRuntimeProcess {
     /// (the launcher's SIGKILL of iDoris) shrinks `term_grace` and keeps a short `confirm`.
     #[cfg(unix)]
     pub async fn shutdown_bounded(
+        self,
+        term_grace: Duration,
+        confirm: Duration,
+    ) -> Result<(), ShutdownError> {
+        self.shutdown_bounded_cut(term_grace, confirm, None).await
+    }
+
+    /// [`Self::shutdown_bounded`] whose SIGTERM wait can be **cut short** while it runs: when `cut` turns `true` the wait ends at once and the
+    /// stop goes on to the SIGKILL sweep (same pinned group, same checks). A stop that began with a long grace learns that the process has to be
+    /// gone by a deadline after all (iDoris was told to stop) without being cancelled, which would drop the handle that pins the group.
+    #[cfg(unix)]
+    pub async fn shutdown_bounded_cut(
         mut self,
         term_grace: Duration,
         confirm: Duration,
+        mut cut: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(), ShutdownError> {
         // Keep the direct child unreaped while group signals are possible.
         // Its PID is also this group's PGID, so the zombie/live child is
         // the ownership anchor that prevents the numeric PGID from being
         // recycled for an unrelated process group.
         self.signal_terminate().map_err(ShutdownError::Pinned)?;
-        let leader_exited = wait_child_exit_without_reap(self.process_group, term_grace)
-            .await
-            .map_err(ShutdownError::Pinned)?;
+        let waiting = wait_child_exit_without_reap(self.process_group, term_grace);
+        let leader_exited = match cut.as_mut() {
+            Some(cut) => tokio::select! {
+                biased;
+                _ = cut.wait_for(|cut| *cut) => Ok(false),
+                exited = waiting => exited,
+            },
+            None => waiting.await,
+        }
+        .map_err(ShutdownError::Pinned)?;
         if !leader_exited || group_exists(self.process_group).map_err(ShutdownError::Pinned)? {
             // The unreaped leader still anchors the PGID here. Sweep any
             // descendants that survived SIGTERM before releasing that anchor.
@@ -257,6 +277,17 @@ impl ManagedRuntimeProcess {
             }
             Ok(())
         }
+    }
+
+    /// Non-unix: no process group, nothing to cut: the same as [`Self::shutdown_bounded`].
+    #[cfg(not(unix))]
+    pub async fn shutdown_bounded_cut(
+        self,
+        term_grace: Duration,
+        confirm: Duration,
+        _cut: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<(), ShutdownError> {
+        self.shutdown_bounded(term_grace, confirm).await
     }
 
     /// Non-unix: there is no process group to sweep, so the two waits are the same wait.
