@@ -98,6 +98,7 @@ async fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
 /// 身份信息（启动时间、命令行、进程组、uid）读真的 `ps`；「谁在监听」「谁签的名」按测试编排。
 struct Scripted {
     real: SystemInspector,
+    synthetic_listener_identity: bool,
     /// 对这些端口声称「被问到的 pid 正在监听」（假引擎真的在监听，但不依赖 `lsof` 来证明）。
     claims: Mutex<Vec<u16>>,
     /// `listeners_on(port)`：端口上的监听者。没编排的端口没有监听者。
@@ -128,6 +129,7 @@ impl Scripted {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             real: SystemInspector::new(),
+            synthetic_listener_identity: false,
             claims: Mutex::new(Vec::new()),
             listeners: Mutex::new(BTreeMap::new()),
             teams: Mutex::new(BTreeMap::new()),
@@ -202,6 +204,9 @@ impl ProcessInspector for Scripted {
         self.real.pid_state(pid)
     }
     async fn start_time(&self, pid: u32) -> Result<String, InspectError> {
+        if self.synthetic_listener_identity {
+            return Ok(format!("test process {pid}"));
+        }
         self.dawdle().await;
         if let Some(scripted) = self.start_times.lock().unwrap().get(&pid).cloned() {
             return Ok(scripted);
@@ -251,7 +256,7 @@ impl ProcessInspector for Scripted {
             .unwrap_or_default())
     }
     async fn uid_of(&self, pid: u32) -> Result<u32, InspectError> {
-        if self.start_times.lock().unwrap().contains_key(&pid) {
+        if self.synthetic_listener_identity || self.start_times.lock().unwrap().contains_key(&pid) {
             return Ok(nix::unistd::geteuid().as_raw());
         }
         self.real.uid_of(pid).await
@@ -455,8 +460,11 @@ impl EngineBackend for TestBackend {
     fn block(&self, endpoint: &str) {
         self.inner.block(endpoint);
     }
-    fn current_key(&self, _endpoint: &str) -> Option<String> {
-        self.external_key.lock().unwrap().clone()
+    fn current_key(
+        &self,
+        _endpoint: &str,
+    ) -> Result<Option<String>, idoris_upstream::omlx::key::KeyRefusal> {
+        Ok(self.external_key.lock().unwrap().clone())
     }
 }
 
@@ -2125,6 +2133,106 @@ async fn an_external_listener_that_turns_into_another_service_is_failed_with_por
 }
 
 #[tokio::test]
+async fn external_liveness_detects_a_second_listener_before_the_http_probe_is_due() {
+    let rig = Rig::with_port(&Behavior::default(), 64600);
+    let mut inspector = Scripted::new();
+    Arc::get_mut(&mut inspector)
+        .unwrap()
+        .synthetic_listener_identity = true;
+    let owner = std::process::id();
+    inspector.external_listener(rig.port, owner, Some(TEAM));
+    let script = ProbeScript::new(|_| Some(EngineProbe::Ready));
+    let h = Harness::start(
+        &rig,
+        ScriptedProbeBackend::new(default_backend(&rig), script.clone()),
+        inspector.clone(),
+        Timings {
+            liveness_interval: Duration::from_millis(50),
+            probe_interval: Duration::from_secs(30),
+            ..fast()
+        },
+        StopOnExit::Owned,
+    );
+    tokio::time::timeout(Duration::from_secs(3), h.until_state(UpstreamState::Ready))
+        .await
+        .unwrap();
+    let second = std::os::unix::process::parent_id();
+    inspector
+        .listeners
+        .lock()
+        .unwrap()
+        .insert(rig.port, vec![owner, second]);
+    let failed = tokio::time::timeout(Duration::from_secs(3), h.until_state(UpstreamState::Failed))
+        .await
+        .unwrap();
+    assert_eq!(failed.reason, Some(UpstreamReason::PortInUse));
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
+    assert_eq!(
+        script.keyless.load(Ordering::SeqCst) + script.keyed.load(Ordering::SeqCst),
+        1,
+        "only the startup HTTP probe was due"
+    );
+    h.manager.shutdown(true).await;
+}
+
+/// Codex pre-review M2: a hung HTTP probe must not delay the verification of the listener. The probe hangs (30 s); a second listener
+/// appears; the endpoint is sealed and the state is failed within a few liveness ticks, while the probe is still in flight.
+#[tokio::test]
+async fn a_hung_http_probe_does_not_delay_the_listener_verification() {
+    let rig = Rig::with_port(&Behavior::default(), 64601);
+    let mut inspector = Scripted::new();
+    Arc::get_mut(&mut inspector)
+        .unwrap()
+        .synthetic_listener_identity = true;
+    let owner = std::process::id();
+    inspector.external_listener(rig.port, owner, Some(TEAM));
+    let script = ProbeScript::new(|_| Some(EngineProbe::Ready));
+    let h = Harness::start(
+        &rig,
+        ScriptedProbeBackend::new(default_backend(&rig), script.clone()),
+        inspector.clone(),
+        Timings {
+            liveness_interval: Duration::from_millis(50),
+            probe_interval: Duration::from_millis(200),
+            ..fast()
+        },
+        StopOnExit::Owned,
+    );
+    tokio::time::timeout(Duration::from_secs(3), h.until_state(UpstreamState::Ready))
+        .await
+        .unwrap();
+    // The next probe call hangs.
+    let calls = script.calls();
+    script.slow_from(calls, Duration::from_secs(30));
+    let hung = std::time::Instant::now() + Duration::from_secs(3);
+    while script.calls() <= calls {
+        assert!(
+            std::time::Instant::now() < hung,
+            "the hung probe never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let second = std::os::unix::process::parent_id();
+    inspector
+        .listeners
+        .lock()
+        .unwrap()
+        .insert(rig.port, vec![owner, second]);
+    let failed = tokio::time::timeout(Duration::from_secs(2), h.until_state(UpstreamState::Failed))
+        .await
+        .expect("the listener check waited for the hung probe");
+    assert_eq!(failed.reason, Some(UpstreamReason::PortInUse));
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
 async fn an_external_listener_that_stops_passing_the_owner_check_is_failed_and_the_settings_key_goes_off()
  {
     // 接管之后，端口上换了一个没通过属主校验的监听者（另一个进程，没有签名团队）：`failed` + `port_in_use`；`settings.json` 的 key
@@ -2868,6 +2976,9 @@ struct ProbeScript {
     answer: Box<dyn Fn(ProbeCall) -> Option<EngineProbe> + Send + Sync>,
     keyless: AtomicUsize,
     keyed: AtomicUsize,
+    /// Every probe call from this (0-based, both kinds counted together) one on first sleeps for `delay` before it answers.
+    slow_from: AtomicUsize,
+    delay: Mutex<Duration>,
 }
 
 impl std::fmt::Debug for ProbeScript {
@@ -2882,7 +2993,19 @@ impl ProbeScript {
             answer: Box::new(answer),
             keyless: AtomicUsize::new(0),
             keyed: AtomicUsize::new(0),
+            slow_from: AtomicUsize::new(usize::MAX),
+            delay: Mutex::new(Duration::ZERO),
         })
+    }
+
+    /// From the `n`th probe call on, every answer takes `delay` (a hung HTTP probe).
+    fn slow_from(&self, n: usize, delay: Duration) {
+        *self.delay.lock().unwrap() = delay;
+        self.slow_from.store(n, Ordering::SeqCst);
+    }
+
+    fn calls(&self) -> usize {
+        self.keyless.load(Ordering::SeqCst) + self.keyed.load(Ordering::SeqCst)
     }
 
     fn next(&self, bearer: Option<&str>) -> Option<EngineProbe> {
@@ -2924,7 +3047,13 @@ impl EngineRecipe for ScriptedRecipe {
         bearer: Option<&str>,
         timeout: Duration,
     ) -> EngineProbe {
-        if let Some(answer) = self.script.next(bearer) {
+        let call = self.script.calls();
+        let answer = self.script.next(bearer);
+        if call >= self.script.slow_from.load(Ordering::SeqCst) {
+            let delay = *self.script.delay.lock().unwrap();
+            tokio::time::sleep(delay).await;
+        }
+        if let Some(answer) = answer {
             return answer;
         }
         self.inner
@@ -2982,7 +3111,10 @@ impl EngineBackend for ScriptedProbeBackend {
     fn block(&self, endpoint: &str) {
         self.inner.block(endpoint);
     }
-    fn current_key(&self, endpoint: &str) -> Option<String> {
+    fn current_key(
+        &self,
+        endpoint: &str,
+    ) -> Result<Option<String>, idoris_upstream::omlx::key::KeyRefusal> {
         self.inner.current_key(endpoint)
     }
 }

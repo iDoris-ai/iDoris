@@ -12,7 +12,7 @@
 //! - **每个监督节拍和每次状态变化（引擎管理器，不在请求路径上）**：贵的那些——自有引擎「这个端口上只有它一个监听者」（`lsof`，
 //!   [`ProcessInspector::listens_on`]），外部引擎的 uid、签名团队与「每个**能接这个连接**的监听者」的身份（[`ListenerVerifier::check`]）。
 //!   引擎还握着它自己的套接字、另一个进程在同一个端口上绑了一个更具体的地址（一个并存的监听者），每个请求的确认看不见，要等
-//!   监督的下一次检查才看见（自有引擎每个 `liveness_interval`，外部引擎每个探测间隔；各自的上限见规范勘误十（8））。
+//!   监督的下一次检查才看见（自有引擎每个 `liveness_interval`，外部引擎也每个 `liveness_interval`；各自的上限见规范勘误十（8））。
 //!
 //! **退路**（原生监视建不出来：别的 unix、读不了那个进程；或某一次读不出来）：每个请求问那个贵的问题——自有引擎 `listens_on`，外部
 //! 引擎 [`ListenerVerifier::check`]——而肯定的答案至多重用 [`ProcessInspector::fallback_ttl`]（真的检查器是 [`super::FALLBACK_TTL`]，
@@ -25,9 +25,12 @@
 //!
 //! 确认不了（读不出来）就是 [`Verification::Unverifiable`]，调用方拒绝发送（fail closed）：读一次不行的立刻再问一遍，仍不行才算。
 //!
-//! **没有消除的间隙**：确认与发送之间仍有毫秒级的间隙；「并存的监听者」到监督的下一次检查才被发现；原生身份没有绑到通过签名校验的
-//! 那个身份上（pid 复用的窗口）；`exec` 之后保留监听 fd 的进程沿用旧的校验；连接失败不使退路的缓存作废。这些是 v0.6.1 的已知限制，
-//! 规范勘误十（8）逐条写明。
+//! **没有消除的间隙**：确认与发送之间仍有毫秒级的间隙；「并存的监听者」到监督的下一次检查才被发现。原生监视绑定签名通过时的进程
+//! 启动标识；进程身份用内核给出的运行映像（macOS 的代码目录哈希与映像 UUID，Linux 的 `/proc/<pid>/exe` 设备与 inode），不依赖可执行文件
+//! 路径，磁盘上的文件被删除也不影响合法引擎；`exec` 成另一份程序会被每次请求的身份核对发现；macOS 上进程身份还含 `exec` 版本（`p_idversion`），所以同一份二进制重新 `exec`
+//! 自己也会判身份不一致，触发重新核签与 `external_replaced`，在下一个存活节拍自愈（保守，不会沿用原来的签名结论）。内核没有给出身份的进程（身份全空）不因此被拒绝，由启动时间与签名核验把关。认回旧记录时先绑定并落盘原生启动标识，
+//! 请求路径稳态不起子进程。连接失败、或发送被外层期限截断，都会清除该端点代际的退路肯定缓存，也使尚未完成的旧检查无法重新填入旧结果。
+//! Unix domain socket 待确认 oMLX 支持后再评估（#646）。规范勘误十（8）及勘误十五说明对外行为。
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -187,6 +190,8 @@ impl Reuse {
 pub struct OwnedListenerGuard {
     inspector: Arc<dyn ProcessInspector>,
     pid: u32,
+    started_at: String,
+    generation: Option<String>,
     dial: SocketAddr,
     /// 每个请求的原生监视（建守卫那一刻钉死进程的身份）；检查器没有（`None`）就走退路。
     watch: Option<Arc<dyn ListenerWatch>>,
@@ -194,19 +199,29 @@ pub struct OwnedListenerGuard {
 }
 
 impl OwnedListenerGuard {
-    pub fn new(inspector: Arc<dyn ProcessInspector>, pid: u32, dial: SocketAddr) -> Self {
-        let watch = inspector.watch_listener(pid, dial);
+    pub fn new(
+        inspector: Arc<dyn ProcessInspector>,
+        pid: u32,
+        dial: SocketAddr,
+        started_at: String,
+        generation: Option<String>,
+    ) -> Self {
+        let watch = inspector
+            .watch_listener(pid, dial)
+            .filter(|watch| watch.generation() == generation.as_deref());
         let reuse = Reuse::new(inspector.fallback_ttl());
         Self {
             inspector,
             pid,
+            started_at,
+            generation,
             dial,
             watch,
             reuse,
         }
     }
 
-    /// 退路上贵的那一问：这个 pid 是端口上唯一的监听者（读不出来的那一次立刻再问一遍）。
+    /// The fallback asks whether this PID holds the only reachable socket.
     async fn ask(&self) -> Slow {
         for _ in 0..2 {
             match self.inspector.listens_on(self.pid, self.dial.port()).await {
@@ -216,6 +231,19 @@ impl OwnedListenerGuard {
             }
         }
         Slow::Unreadable
+    }
+
+    /// Confirm the recorded start time even when the socket observation was cached.
+    async fn fallback_identity(&self) -> Verification {
+        let (observed, expected) = match &self.generation {
+            Some(expected) => (self.inspector.generation(self.pid).await, expected),
+            None => (self.inspector.start_time(self.pid).await, &self.started_at),
+        };
+        match observed {
+            Ok(observed) if &observed == expected => Verification::Verified,
+            Ok(_) => Verification::Mismatch,
+            Err(_) => Verification::Unverifiable,
+        }
     }
 }
 
@@ -243,7 +271,19 @@ impl EndpointGuard for OwnedListenerGuard {
                 Err(_) => {}
             }
         }
-        self.reuse.verify(|| self.ask()).await
+        let socket = self.reuse.verify(|| self.ask()).await;
+        if socket != Verification::Verified {
+            return socket;
+        }
+        let identity = self.fallback_identity().await;
+        if identity != Verification::Verified {
+            self.reuse.invalidate();
+        }
+        identity
+    }
+
+    fn invalidate_positive(&self) {
+        self.reuse.invalidate();
     }
 
     fn dial(&self) -> Option<SocketAddr> {
@@ -270,7 +310,12 @@ impl ExternalListenerGuard {
     ) -> Self {
         let watches: Option<Vec<Arc<dyn ListenerWatch>>> = expected
             .iter()
-            .map(|identity| verifier.inspector().watch_listener(identity.pid, dial))
+            .map(|identity| {
+                verifier
+                    .inspector()
+                    .watch_listener(identity.pid, dial)
+                    .filter(|watch| watch.generation() == identity.generation.as_deref())
+            })
             .collect();
         let reuse = Reuse::new(verifier.inspector().fallback_ttl());
         Self {
@@ -293,6 +338,18 @@ impl ExternalListenerGuard {
             }
         }
         Some(true)
+    }
+
+    fn identity_changed(&self) -> Result<bool, super::InspectError> {
+        for identity in &self.expected {
+            let inspector = self.verifier.inspector();
+            if inspector.executable_identity(identity.pid)? != identity.executable
+                || inspector.listener_generation(identity.pid)? != identity.generation
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// 退路上贵的那一问：现在能接这个连接的监听者，恰好还是登记时校验通过的那些（读不出来的那一次立刻再问一遍）。
@@ -330,15 +387,28 @@ impl EndpointGuard for ExternalListenerGuard {
             // 登记时没有校验过任何监听者：现在没有什么可以确认的（空的「都还握着」不能算通过）。
             return Verification::Mismatch;
         }
-        match self.native().await {
-            Some(true) => return Verification::Verified,
-            Some(false) => {
+        let native = self.native().await;
+        if native == Some(false) {
+            self.reuse.invalidate();
+            return Verification::Mismatch;
+        }
+        match self.identity_changed() {
+            Ok(true) => {
                 self.reuse.invalidate();
                 return Verification::Mismatch;
             }
-            None => {}
+            Err(_) => {
+                self.reuse.invalidate();
+                return Verification::Unverifiable;
+            }
+            Ok(false) if native == Some(true) => return Verification::Verified,
+            Ok(false) => {}
         }
         self.reuse.verify(|| self.ask()).await
+    }
+
+    fn invalidate_positive(&self) {
+        self.reuse.invalidate();
     }
 
     fn dial(&self) -> Option<SocketAddr> {
@@ -370,6 +440,7 @@ mod tests {
     /// A watch whose answers are scripted (the last repeats) and that counts how often it was asked.
     #[derive(Debug)]
     struct ScriptedWatch {
+        generation: Option<String>,
         answers: Mutex<VecDeque<Result<bool, InspectError>>>,
         asked: AtomicUsize,
     }
@@ -377,6 +448,7 @@ mod tests {
     impl ScriptedWatch {
         fn new(answers: Vec<Result<bool, InspectError>>) -> Arc<Self> {
             Arc::new(Self {
+                generation: None,
                 answers: Mutex::new(answers.into()),
                 asked: AtomicUsize::new(0),
             })
@@ -389,6 +461,10 @@ mod tests {
 
     #[async_trait]
     impl ListenerWatch for ScriptedWatch {
+        fn generation(&self) -> Option<&str> {
+            self.generation.as_deref()
+        }
+
         async fn holds(&self) -> Result<bool, InspectError> {
             self.asked.fetch_add(1, Ordering::SeqCst);
             next(&self.answers, Err(InspectError::NoAnswer))
@@ -402,6 +478,8 @@ mod tests {
         listens: Mutex<VecDeque<Result<bool, InspectError>>>,
         listeners: Mutex<VecDeque<Result<Vec<u32>, InspectError>>>,
         start_time: Mutex<String>,
+        generation: Mutex<Option<String>>,
+        executable: Mutex<Option<super::super::inspect::ExecutableIdentity>>,
         team: Mutex<Option<String>>,
         watches: Mutex<VecDeque<Arc<ScriptedWatch>>>,
         ttl: Mutex<Duration>,
@@ -421,6 +499,8 @@ mod tests {
                 listens: Mutex::new(VecDeque::new()),
                 listeners: Mutex::new(VecDeque::new()),
                 start_time: Mutex::new(START.to_owned()),
+                generation: Mutex::new(None),
+                executable: Mutex::new(None),
                 team: Mutex::new(Some(TEAM.to_owned())),
                 watches: Mutex::new(VecDeque::new()),
                 ttl: Mutex::new(Duration::ZERO),
@@ -520,6 +600,15 @@ mod tests {
         async fn uid_of(&self, _pid: u32) -> Result<u32, InspectError> {
             Ok(ME)
         }
+        fn listener_generation(&self, _pid: u32) -> Result<Option<String>, InspectError> {
+            Ok(self.generation.lock().unwrap().clone())
+        }
+        fn executable_identity(
+            &self,
+            _pid: u32,
+        ) -> Result<Option<super::super::inspect::ExecutableIdentity>, InspectError> {
+            Ok(*self.executable.lock().unwrap())
+        }
         async fn signing_team(&self, _pid: u32) -> Result<Option<String>, InspectError> {
             Ok(self.team.lock().unwrap().clone())
         }
@@ -536,6 +625,8 @@ mod tests {
         ListenerIdentity {
             pid,
             started_at: START.to_owned(),
+            generation: None,
+            executable: None,
         }
     }
 
@@ -544,7 +635,423 @@ mod tests {
     }
 
     fn owned(fake: &Arc<Fake>) -> OwnedListenerGuard {
-        OwnedListenerGuard::new(fake.clone(), 42, dial())
+        OwnedListenerGuard::new(fake.clone(), 42, dial(), START.to_owned(), None)
+    }
+
+    /// The real system inspector with one exception: the signing team is whatever the test says (a copy of a system tool has no team).
+    /// Everything else (listening sockets, start time, generation, executable identity, uid, the native watch) is read from the system.
+    #[cfg(target_os = "macos")]
+    struct RealWithTeam(super::super::inspect::SystemInspector);
+
+    #[cfg(target_os = "macos")]
+    #[async_trait]
+    impl ProcessInspector for RealWithTeam {
+        fn pid_state(&self, pid: u32) -> PidState {
+            self.0.pid_state(pid)
+        }
+        async fn start_time(&self, pid: u32) -> Result<String, InspectError> {
+            self.0.start_time(pid).await
+        }
+        async fn command(&self, pid: u32) -> Result<String, InspectError> {
+            self.0.command(pid).await
+        }
+        async fn process_group(&self, pid: u32) -> Result<u32, InspectError> {
+            self.0.process_group(pid).await
+        }
+        async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
+            self.0.listens_on(pid, port).await
+        }
+        async fn listeners_on(&self, port: u16) -> Result<Vec<u32>, InspectError> {
+            self.0.listeners_on(port).await
+        }
+        async fn listening_sockets(&self, port: u16) -> Result<Vec<ListeningSocket>, InspectError> {
+            self.0.listening_sockets(port).await
+        }
+        async fn uid_of(&self, pid: u32) -> Result<u32, InspectError> {
+            self.0.uid_of(pid).await
+        }
+        fn watch_listener(&self, pid: u32, dial: SocketAddr) -> Option<Arc<dyn ListenerWatch>> {
+            self.0.watch_listener(pid, dial)
+        }
+        fn fallback_ttl(&self) -> Duration {
+            self.0.fallback_ttl()
+        }
+        async fn generation(&self, pid: u32) -> Result<String, InspectError> {
+            self.0.generation(pid).await
+        }
+        fn listener_generation(&self, pid: u32) -> Result<Option<String>, InspectError> {
+            self.0.listener_generation(pid)
+        }
+        fn executable_identity(
+            &self,
+            pid: u32,
+        ) -> Result<Option<super::super::inspect::ExecutableIdentity>, InspectError> {
+            self.0.executable_identity(pid)
+        }
+        async fn signing_team(&self, _pid: u32) -> Result<Option<String>, InspectError> {
+            Ok(Some(TEAM.to_owned()))
+        }
+    }
+
+    /// Not a test: the body of the listener process of the test below (a copy of this binary run with the port in the environment).
+    /// Under a normal run (no variable) it does nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn listener_helper() {
+        let Ok(port) = std::env::var("IDORIS_GUARD_TEST_LISTEN_PORT") else {
+            return;
+        };
+        let _listener = std::net::TcpListener::bind(("127.0.0.1", port.parse().unwrap())).unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// Codex pre-review H2: a running listener whose executable was deleted from disk (an app update replaced it, a package manager cleaned
+    /// it up) is the same legitimate engine: it must still be accepted, by a fresh verification and by the guard built before the deletion.
+    /// The identity is what the kernel runs, not a file at a path.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_listener_whose_executable_was_deleted_is_still_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("engine");
+        // A copy of this test binary (ad-hoc signed, runs from anywhere) acts as the listener: see `listener_helper`.
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let mut child = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "engine::guard::tests::listener_helper",
+                "--nocapture",
+            ])
+            .env("IDORIS_GUARD_TEST_LISTEN_PORT", port.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let real = || -> Arc<dyn ProcessInspector> {
+            Arc::new(RealWithTeam(super::super::inspect::SystemInspector::new()))
+        };
+        let policy = || {
+            let uid = rustix::process::getuid().as_raw();
+            ListenerPolicy::new(TEAM).with_uid(uid)
+        };
+        let verifier = ListenerVerifier::new(real(), policy());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let listeners = loop {
+            if let ListenerVerdict::Verified { listeners } = verifier.check(port).await {
+                break listeners;
+            }
+            assert!(Instant::now() < deadline, "the listener never came up");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let guard = ExternalListenerGuard::new(
+            verifier.clone(),
+            SocketAddr::new(MANAGED_DIAL, port),
+            listeners,
+        );
+        assert_eq!(guard.verify().await, Verification::Verified);
+        std::fs::remove_file(&exe).unwrap();
+        assert_eq!(
+            guard.verify().await,
+            Verification::Verified,
+            "the guard built before the deletion"
+        );
+        let fresh = ListenerVerifier::new(real(), policy());
+        assert!(
+            fresh.check(port).await.is_verified(),
+            "a fresh verification after the deletion"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Codex re-review H1: a **fresh** verifier (an iDoris that restarted while the engine kept running) uses the production signature check,
+    /// which used to be `codesign --verify <pid>`: it reads the file on disk, so an engine whose executable was updated or deleted after it
+    /// started was refused although it runs fine. A team-signed program (the Python inside the oMLX app, when installed) runs from a copy
+    /// that is deleted; no test double stands in for the signature check. Skipped where the app is not installed.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_fresh_verifier_with_the_production_signature_check_accepts_an_engine_whose_executable_is_gone()
+     {
+        let home =
+            std::path::Path::new("/Applications/oMLX.app/Contents/Resources/Python/cpython-3.11");
+        if !home.join("bin/python3.11").exists() {
+            eprintln!("SKIPPED: the oMLX app is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink(home.join("lib"), dir.path().join("lib")).unwrap();
+        let exe = dir.path().join("bin/py");
+        std::fs::copy(home.join("bin/python3.11"), &exe).unwrap();
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let mut child = std::process::Command::new(&exe)
+            .args([
+                "-I",
+                "-S",
+                "-c",
+                &format!(
+                    "import socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',{port}))\ns.listen(4)\ntime.sleep(60)"
+                ),
+            ])
+            .env("PYTHONHOME", home)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let policy =
+            || ListenerPolicy::new("PSK5Q5T46L").with_uid(rustix::process::getuid().as_raw());
+        let fresh = || {
+            ListenerVerifier::new(
+                Arc::new(super::super::inspect::SystemInspector::new()),
+                policy(),
+            )
+        };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if fresh().check(port).await.is_verified() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the engine was never accepted");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        std::fs::remove_file(&exe).unwrap();
+        assert!(
+            fresh().check(port).await.is_verified(),
+            "a fresh verifier refused a running engine whose executable is gone"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[tokio::test]
+    async fn an_owned_fallback_does_not_authorize_a_recycled_pid() {
+        let fake = Fake::new();
+        fake.script_listens(vec![Ok(true)]);
+        fake.reuse_for(Duration::from_secs(60));
+        let guard = owned(&fake);
+        assert_eq!(guard.verify().await, Verification::Verified);
+        *fake.start_time.lock().unwrap() = "recycled".into();
+        assert_eq!(guard.verify().await, Verification::Mismatch);
+    }
+
+    fn image(byte: u8) -> super::super::inspect::ExecutableIdentity {
+        super::super::inspect::ExecutableIdentity {
+            cdhash: Some([byte; 20]),
+            image: Some([byte; 16]),
+            exec_version: Some(1),
+        }
+    }
+
+    /// An external guard built over a listener that verified with `generation` and `image(1)`, with a long reuse window, so that only
+    /// the per-request identity check (`identity_changed`) can notice what changes afterwards.
+    async fn external_guard(fake: &Arc<Fake>) -> ExternalListenerGuard {
+        fake.script_listeners(vec![Ok(vec![42])]);
+        fake.reuse_for(Duration::from_secs(60));
+        *fake.generation.lock().unwrap() = Some("generation one".into());
+        *fake.executable.lock().unwrap() = Some(image(1));
+        let verifier = verifier(fake);
+        let ListenerVerdict::Verified { listeners } = verifier.check(PORT).await else {
+            panic!("the original process should verify");
+        };
+        ExternalListenerGuard::new(verifier, dial(), listeners)
+    }
+
+    #[tokio::test]
+    async fn a_changed_executable_identity_is_a_mismatch_even_inside_the_reuse_window() {
+        let fake = Fake::new();
+        let guard = external_guard(&fake).await;
+        fake.script_listens(vec![Ok(true)]);
+        assert_eq!(guard.verify().await, Verification::Verified);
+        *fake.executable.lock().unwrap() = Some(image(2));
+        assert_eq!(guard.verify().await, Verification::Mismatch);
+    }
+
+    #[tokio::test]
+    async fn a_changed_listener_generation_is_a_mismatch_even_inside_the_reuse_window() {
+        let fake = Fake::new();
+        let guard = external_guard(&fake).await;
+        fake.script_listens(vec![Ok(true)]);
+        assert_eq!(guard.verify().await, Verification::Verified);
+        *fake.generation.lock().unwrap() = Some("generation two".into());
+        assert_eq!(guard.verify().await, Verification::Mismatch);
+    }
+
+    #[tokio::test]
+    async fn an_external_watch_must_be_bound_to_the_signature_verified_generation() {
+        let fake = Fake::new();
+        let mut watch = ScriptedWatch::new(vec![Ok(true)]);
+        Arc::get_mut(&mut watch).unwrap().generation = Some("replacement generation".into());
+        fake.offer_watches(vec![watch.clone()]);
+        fake.script_listeners(vec![Ok(vec![42])]);
+        *fake.generation.lock().unwrap() = Some("original generation".into());
+        let verifier = verifier(&fake);
+        let ListenerVerdict::Verified { listeners } = verifier.check(PORT).await else {
+            panic!("the original process should verify");
+        };
+        let guard = ExternalListenerGuard::new(verifier, dial(), listeners);
+        assert_eq!(guard.verify().await, Verification::Verified);
+        assert_eq!(
+            watch.asked(),
+            0,
+            "the replacement watch cannot vouch for the signed process"
+        );
+        assert_eq!(
+            fake.listeners_asked(),
+            2,
+            "the original is checked via the fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_failure_invalidates_only_its_generation_before_retry() {
+        use crate::omlx::key::{
+            EndpointKey, KeyRefusal, authorize_omlx_request, forget_endpoint,
+            govern_endpoint_guarded, send_authorized,
+        };
+
+        let url = "http://127.0.0.1:0";
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let first = Fake::new();
+        first.script_listens(vec![Ok(true)]);
+        govern_endpoint_guarded(
+            url,
+            EndpointKey::Private("first".into()),
+            Some(Arc::new(owned(&first))),
+        );
+        let old = authorize_omlx_request(url, None).await.unwrap();
+
+        let next = Fake::new();
+        next.reuse_for(Duration::from_secs(60));
+        next.script_listens(vec![Ok(true)]);
+        govern_endpoint_guarded(
+            url,
+            EndpointKey::Private("next".into()),
+            Some(Arc::new(owned(&next))),
+        );
+        let current = authorize_omlx_request(url, None).await.unwrap();
+        assert_eq!(next.listens_asked(), 1);
+        next.script_listens(vec![Ok(false)]);
+
+        let error = send_authorized(Some(&old), client.get(url).send())
+            .await
+            .unwrap_err();
+        assert!(error.is_connect());
+        assert!(
+            authorize_omlx_request(url, Some(current.generation()))
+                .await
+                .is_ok()
+        );
+        assert_eq!(next.listens_asked(), 1);
+
+        let error = send_authorized(Some(&current), client.get(url).send())
+            .await
+            .unwrap_err();
+        assert!(error.is_connect());
+        assert_eq!(
+            authorize_omlx_request(url, Some(current.generation()))
+                .await
+                .unwrap_err(),
+            KeyRefusal::ListenerChanged
+        );
+        assert_eq!(next.listens_asked(), 2);
+        forget_endpoint(url);
+    }
+
+    /// Codex pre-review M3: a send that the caller's own deadline cancelled (possibly in the connect phase, where no connection error is ever
+    /// produced) must not leave the generation's positive cache standing: the retry checks the listener again.
+    #[tokio::test]
+    async fn a_send_cancelled_by_an_outer_deadline_invalidates_its_generation() {
+        use crate::omlx::key::{
+            EndpointKey, KeyRefusal, authorize_omlx_request, forget_endpoint,
+            govern_endpoint_guarded, send_authorized,
+        };
+
+        let url = "http://127.0.0.1:1";
+        let fake = Fake::new();
+        fake.reuse_for(Duration::from_secs(60));
+        fake.script_listens(vec![Ok(true)]);
+        govern_endpoint_guarded(
+            url,
+            EndpointKey::Private("k".into()),
+            Some(Arc::new(owned(&fake))),
+        );
+        let current = authorize_omlx_request(url, None).await.unwrap();
+        assert_eq!(fake.listens_asked(), 1);
+        fake.script_listens(vec![Ok(false)]);
+        // Still cached: no second question.
+        assert!(
+            authorize_omlx_request(url, Some(current.generation()))
+                .await
+                .is_ok()
+        );
+        assert_eq!(fake.listens_asked(), 1);
+
+        let never = std::future::pending::<Result<reqwest::Response, reqwest::Error>>();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            send_authorized(Some(&current), never),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the deadline cut the send off");
+        assert_eq!(
+            authorize_omlx_request(url, Some(current.generation()))
+                .await
+                .unwrap_err(),
+            KeyRefusal::ListenerChanged
+        );
+        assert_eq!(fake.listens_asked(), 2);
+        forget_endpoint(url);
+    }
+
+    /// Codex re-review: a request deadline of the HTTP client (not an outer cancellation) ends the send with a plain timeout error while the
+    /// connection may still have been pending: the completed error must invalidate the generation's positive cache too.
+    #[tokio::test]
+    async fn a_client_timeout_before_any_response_invalidates_its_generation() {
+        use crate::omlx::key::{
+            EndpointKey, KeyRefusal, authorize_omlx_request, forget_endpoint,
+            govern_endpoint_guarded, send_authorized,
+        };
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+        let url = server.uri();
+        let fake = Fake::new();
+        fake.reuse_for(Duration::from_secs(60));
+        fake.script_listens(vec![Ok(true)]);
+        govern_endpoint_guarded(
+            &url,
+            EndpointKey::Private("k".into()),
+            Some(Arc::new(owned(&fake))),
+        );
+        let current = authorize_omlx_request(&url, None).await.unwrap();
+        fake.script_listens(vec![Ok(false)]);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let error = send_authorized(Some(&current), client.get(&url).send())
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout() && !error.is_connect(), "{error:?}");
+        assert_eq!(
+            authorize_omlx_request(&url, Some(current.generation()))
+                .await
+                .unwrap_err(),
+            KeyRefusal::ListenerChanged
+        );
+        forget_endpoint(&url);
     }
 
     // ----- the slow question (no watch, no reuse window): what the guards asked before the per-request watch existed -----------------
@@ -611,11 +1118,11 @@ mod tests {
         let fake = Fake::new();
         let v6 = SocketAddr::new(IpAddr::V6("::1".parse().unwrap()), PORT);
         assert_eq!(
-            OwnedListenerGuard::new(fake.clone(), 42, dial()).dial(),
+            OwnedListenerGuard::new(fake.clone(), 42, dial(), START.to_owned(), None).dial(),
             Some(dial())
         );
         assert_eq!(
-            OwnedListenerGuard::new(fake.clone(), 42, v6).dial(),
+            OwnedListenerGuard::new(fake.clone(), 42, v6, START.to_owned(), None).dial(),
             Some(v6)
         );
         assert_eq!(
@@ -651,7 +1158,7 @@ mod tests {
             }
         }
         let recording = Arc::new(Recording(Mutex::new(Vec::new())));
-        let _ = OwnedListenerGuard::new(recording.clone(), 42, v6);
+        let _ = OwnedListenerGuard::new(recording.clone(), 42, v6, START.to_owned(), None);
         let _ = ExternalListenerGuard::new(
             ListenerVerifier::new(recording.clone(), ListenerPolicy::new(TEAM)),
             dial(),
@@ -720,7 +1227,13 @@ mod tests {
     async fn a_guard_whose_watch_answers_never_asks_the_inspector_anything_else() {
         // Owned: the watch alone decides, on every request.
         let watch = ScriptedWatch::new(vec![Ok(true)]);
-        let guard = OwnedListenerGuard::new(watch_only(vec![watch.clone()]), 42, dial());
+        let guard = OwnedListenerGuard::new(
+            watch_only(vec![watch.clone()]),
+            42,
+            dial(),
+            START.to_owned(),
+            None,
+        );
         for _ in 0..5 {
             assert_eq!(guard.verify().await, Verification::Verified);
         }
@@ -728,7 +1241,8 @@ mod tests {
 
         // The watch says the engine let go of the port: the very next request is refused, and so is every one after it.
         let watch = ScriptedWatch::new(vec![Ok(true), Ok(false)]);
-        let guard = OwnedListenerGuard::new(watch_only(vec![watch]), 42, dial());
+        let guard =
+            OwnedListenerGuard::new(watch_only(vec![watch]), 42, dial(), START.to_owned(), None);
         assert_eq!(guard.verify().await, Verification::Verified);
         assert_eq!(guard.verify().await, Verification::Mismatch);
         assert_eq!(guard.verify().await, Verification::Mismatch);

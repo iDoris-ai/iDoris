@@ -46,6 +46,33 @@ pub(crate) fn establish(pid: u32, port: u16, dial: IpAddr) -> Option<Watch> {
     establish_at(Path::new(PROC), pid, port, dial)
 }
 
+#[cfg(target_os = "linux")]
+fn generation_from_ticks(ticks: u64) -> Option<String> {
+    static BOOT_ID: std::sync::LazyLock<Option<String>> =
+        std::sync::LazyLock::new(|| fs::read_to_string("/proc/sys/kernel/random/boot_id").ok());
+    Some(format!("linux:{}:{ticks}", BOOT_ID.as_deref()?.trim()))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_generation(pid: u32) -> Option<String> {
+    generation_from_ticks(read_start(Path::new(PROC), pid).ok()??)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn executable_identity(pid: u32) -> Option<crate::ExecutableIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    // `stat` of the magic link resolves to the inode the process is running, also after the file was deleted or renamed.
+    let metadata = fs::metadata(Path::new(PROC).join(pid.to_string()).join("exe")).ok()?;
+    let mut image = [0_u8; 16];
+    image[..8].copy_from_slice(&metadata.dev().to_ne_bytes());
+    image[8..].copy_from_slice(&metadata.ino().to_ne_bytes());
+    Some(crate::ExecutableIdentity {
+        cdhash: None,
+        image: Some(image),
+        exec_version: None,
+    })
+}
+
 /// Pin the identity of `pid`: one read of its `stat`. Nothing is scanned.
 pub(crate) fn establish_at(root: &Path, pid: u32, port: u16, dial: IpAddr) -> Option<Watch> {
     if pid < 2 || i32::try_from(pid).is_err() {
@@ -74,6 +101,11 @@ enum Identity {
 }
 
 impl Watch {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn generation(&self) -> Option<String> {
+        generation_from_ticks(self.started)
+    }
+
     fn identity(&self) -> Identity {
         match read_start(&self.root, self.pid) {
             Ok(Some(started)) if started == self.started => Identity::Same,
@@ -122,7 +154,11 @@ impl Watch {
             Identity::Unreadable => return (Probe::Unavailable, hint),
         }
         match self.locate() {
-            Ok(Some(found)) => (Probe::Holds, Some(found)),
+            Ok(Some(found)) => match self.identity() {
+                Identity::Same => (Probe::Holds, Some(found)),
+                Identity::Different => (Probe::NotHolding, None),
+                Identity::Unreadable => (Probe::Unavailable, hint),
+            },
             Ok(None) => (Probe::NotHolding, None),
             // The process (or its descriptor table) is gone: it holds nothing.
             Err(error) if error.kind() == io::ErrorKind::NotFound => (Probe::NotHolding, None),
@@ -321,6 +357,21 @@ fn bind_of(hex: &str, v6: bool) -> Option<Bind> {
         let octets: [u8; 4] = bytes.try_into().ok()?;
         Some(Bind::V4(Ipv4Addr::from(octets)))
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn acl_grants_others_write_fd(_fd: i32, _owner: u32) -> Option<bool> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn acl_grants_others_write_link(_path: &Path, _owner: u32) -> Option<bool> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn signing_team(_pid: u32) -> Option<String> {
+    None
 }
 
 #[cfg(test)]
@@ -594,6 +645,37 @@ mod tests {
             matches!(watch.quick(hint), Quick::Answer(Probe::Holds, _)),
             "a wildcard"
         );
+    }
+
+    #[test]
+    fn a_pid_reused_during_the_proc_scan_is_not_holding() {
+        use std::io::Write;
+        use std::process::Command;
+
+        let fake = FakeProc::new(4242);
+        fake.stat(1_000);
+        fake.fd(3, Some("socket:[555]"));
+        let watch = establish_at(fake.root(), 4242, 8088, LOOPBACK).unwrap();
+        let table = fake.root().join("net/tcp");
+        fs::create_dir(table.parent().unwrap()).unwrap();
+        assert!(
+            Command::new("mkfifo")
+                .arg(&table)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        std::thread::scope(|scope| {
+            let check = scope.spawn(|| watch.scan(None));
+            // Opening the write end waits for the scanner to open the read end,
+            // which it does only after its first identity check.
+            let mut writer = File::options().write(true).open(&table).unwrap();
+            fake.stat(2_000);
+            write!(writer, "{TCP_HEADER}{}", tcp_row(LO, 8088, 555)).unwrap();
+            drop(writer);
+            assert_eq!(check.join().unwrap(), (Probe::NotHolding, None));
+        });
     }
 
     /// The watch follows a socket through descriptor changes, notices that the descriptor names another socket, finds it again under

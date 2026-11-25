@@ -10,9 +10,9 @@
 //! - 来自 `settings.json` 的 key 只发给 loopback 的 oMLX：非 loopback 的 base URL 下，文件 key 视为没有
 //!   （环境变量的 key 维持原行为，不受此限）。[`KeySource`] 标明 key 来自哪里。
 //! - `settings.json` 只从文件读取，最多读 64 KiB；必须是常规文件（最后一段是符号链接、或是 FIFO、设备，一律不要）：
-//!   用 `O_NOFOLLOW|O_NONBLOCK` 打开后对句柄 `fstat`，不是先 `stat` 再 `open`（没有检查与打开之间的窗口）；
-//!   `O_NOFOLLOW` 只对最后一段成立，`~/.omlx` 本身是符号链接时仍被跟随；读不了、不是 JSON、没有 `auth.api_key`、值不是非空字符串
-//!   一律当作没有，往下走无鉴权，不报错、不记日志。返回的是 trim 后的值；trim 后含空白或控制字符同样当作没有。
+//!   以 HOME 为起点，逐段用 `O_NOFOLLOW` 打开 `.omlx` 与 `settings.json`，再用 `fstat` 核对文件类型、有效 UID 与权限位。
+//!   文件必须属于当前用户，组和其他用户不能有写权限。解析失败时等 10 毫秒，重新打开并读取一次；再次失败会拒绝发送。
+//!   文件缺失、或合法 JSON 中没有可用的 `auth.api_key` 时，可以匿名连接。key 取 trim 后的值，含空白或控制字符视为没有。
 //! - 不打印、不写日志、不进 argv 或响应体；错误信息里不带文件内容。
 //! - 不硬编码任何默认 key。
 //! - **引擎管理器接管的端点**（IDORIS-CORE S5，规范 §2.7.7）：[`govern_endpoint`] 登记之后，iDoris 自己拉起的引擎只用它的
@@ -49,7 +49,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use async_trait::async_trait;
 
@@ -148,6 +148,50 @@ pub fn resolve_omlx_api_key_os_for(base_url: &str) -> Option<OsString> {
     )
 }
 
+/// [`resolve_omlx_api_key_os_for`] 的带拒绝版本：`settings.json` 不可核验（权限不对、两次读到不完整的 JSON）是 `Err`，不折成「没有 key」。
+/// 固定 key 的适配器构造器用它，免得匿名请求在配置文件损坏时悄悄放行。
+pub fn resolve_omlx_api_key_for_checked(base_url: &str) -> Result<Option<String>, KeyRefusal> {
+    note_resolution();
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    resolve_checked_in(
+        base_url,
+        std::env::var_os(OMLX_API_KEY_ENV),
+        home.as_deref().map(Path::new),
+    )
+}
+
+/// [`resolve_omlx_api_key_for_checked`] with the environment value and the home given (tests cannot change the process environment).
+pub(crate) fn resolve_checked_in(
+    base_url: &str,
+    env: Option<OsString>,
+    home: Option<&Path>,
+) -> Result<Option<String>, KeyRefusal> {
+    Ok(resolve_for_endpoint_checked(
+        env,
+        home,
+        is_loopback_base_url(base_url),
+        governed_endpoint(base_url).as_ref(),
+    )?
+    .and_then(|key| key.into_string().ok()))
+}
+
+/// [`resolve_checked_in`] for the request path: the same decision (this endpoint's governedscope included), with the `settings.json` read off the
+/// runtime worker and through the stat-keyed cache. A fixed-key adapter that was built while the settings could not be verified uses it on
+/// every request until the file can be verified again.
+pub(crate) async fn resolve_checked_async_in(
+    base_url: &str,
+    env: Option<OsString>,
+    home: Option<&Path>,
+) -> Result<Option<String>, KeyRefusal> {
+    let governed = governed_endpoint(base_url);
+    match plan_for_endpoint(env, home, is_loopback_base_url(base_url), governed.as_ref()) {
+        Plan::Done(key) => Ok(key.and_then(|key| key.into_string().ok())),
+        Plan::Settings(home) => read_settings_key_async(&home)
+            .await
+            .map_err(|_| KeyRefusal::SettingsUnverifiable),
+    }
+}
+
 /// 只回答「`base_url` 是不是引擎管理器接管的端点」：是，给出发往它的 key（`None` = 不带 key）；不是，`None` 外面再包一层
 /// （调用方沿用自己原来的 key 来源）。
 pub fn resolve_governed_os(base_url: &str) -> Option<Option<OsString>> {
@@ -210,6 +254,9 @@ pub enum Verification {
 #[async_trait]
 pub trait EndpointGuard: Send + Sync + std::fmt::Debug {
     async fn verify(&self) -> Verification;
+
+    /// Clear positive fallback evidence synchronously. Called under the endpoint registry lock.
+    fn invalidate_positive(&self) {}
 
     /// **经过核验的拨号地址**：守卫验证的就是「登记时认的进程握着一个**这个地址**连得到的 LISTEN 套接字」，授权结果把它带给发送端，
     /// 发送端只拨它（[`Authorization::dial_url`]），不拨卡里写的别名（`localhost`、`[::1]`、`127.0.0.2`：登记表把它们并成同一个端口
@@ -316,6 +363,9 @@ pub fn govern_endpoint_guarded(
         _ => false,
     };
     if slot.key.as_ref() != Some(&policy) || !same_guard {
+        if let Some(previous) = &slot.guard {
+            previous.invalidate_positive();
+        }
         slot.key = Some(policy);
         slot.guard = guard;
         slot.advance();
@@ -449,6 +499,8 @@ pub enum KeyRefusal {
     ListenerChanged,
     /// 发送前的重新校验读不出来（工具超时、出错）：确认不了就不发（fail closed）。
     Unverified,
+    /// The selected settings file could not be read and verified.
+    SettingsUnverifiable,
     /// 托管端点的专用 HTTP 客户端（不保留空闲连接）建不出来：不退到别的客户端（池里可能有通往旧进程的连接，调用方注入的客户端还可能有别的
     /// 代理、重定向策略），什么都不发（Codex 预审 L2 的 M4）。
     TransportUnavailable,
@@ -472,6 +524,9 @@ impl std::fmt::Display for KeyRefusal {
             ),
             Self::Unverified => f.write_str(
                 "what listens on this endpoint could not be confirmed right before sending: the request was not sent",
+            ),
+            Self::SettingsUnverifiable => f.write_str(
+                "oMLX settings.json could not be verified (for example: not valid JSON, not owned by this user or root, writable by group or others, an ACL grants others write, an untrusted directory on its path, or a read error): the request was not sent",
             ),
             Self::TransportUnavailable => f.write_str(
                 "the HTTP client for managed endpoints could not be built: the request was not sent",
@@ -525,14 +580,38 @@ pub fn resolve_omlx_api_key_checked(
 ) -> Result<Option<String>, KeyRefusal> {
     let snapshot = snapshot_of(base_url);
     refuse_stale_or_blocked(&snapshot, admitted_generation)?;
-    Ok(resolve_from_snapshot(base_url, snapshot.key.as_ref())
+    Ok(resolve_from_snapshot(base_url, snapshot.key.as_ref())?
         .and_then(|key| key.into_string().ok()))
 }
 
-fn resolve_from_snapshot(base_url: &str, governed: Option<&EndpointKey>) -> Option<OsString> {
+/// [`resolve_from_snapshot`] for the request path: the same decision, with the `settings.json` read off the runtime worker.
+async fn resolve_from_snapshot_async(
+    base_url: &str,
+    governed: Option<&EndpointKey>,
+) -> Result<Option<OsString>, KeyRefusal> {
     note_resolution();
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
-    resolve_for_endpoint(
+    match plan_for_endpoint(
+        std::env::var_os(OMLX_API_KEY_ENV),
+        home.as_deref().map(Path::new),
+        is_loopback_base_url(base_url),
+        governed,
+    ) {
+        Plan::Done(key) => Ok(key),
+        Plan::Settings(home) => read_settings_key_async(&home)
+            .await
+            .map(|key| key.map(OsString::from))
+            .map_err(|_| KeyRefusal::SettingsUnverifiable),
+    }
+}
+
+fn resolve_from_snapshot(
+    base_url: &str,
+    governed: Option<&EndpointKey>,
+) -> Result<Option<OsString>, KeyRefusal> {
+    note_resolution();
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    resolve_for_endpoint_checked(
         std::env::var_os(OMLX_API_KEY_ENV),
         home.as_deref().map(Path::new),
         is_loopback_base_url(base_url),
@@ -716,6 +795,20 @@ impl Authorization {
         Ok(())
     }
 
+    /// Invalidate only the guard for the generation whose connection failed.
+    pub(crate) fn connection_failed(&self) {
+        let Some(identity) = endpoint_identity(&self.endpoint) else {
+            return;
+        };
+        let governed = GOVERNED.read().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = governed.get(&identity)
+            && slot.generation == self.generation
+            && let Some(guard) = &slot.guard
+        {
+            guard.invalidate_positive();
+        }
+    }
+
     /// 守卫核验过的拨号地址（托管的端点）。
     pub fn dial(&self) -> Option<std::net::SocketAddr> {
         self.dial
@@ -758,6 +851,57 @@ impl Authorization {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+}
+
+/// Invalidates the positive fallback cache of the authorization's generation when dropped while armed: a send cancelled from outside (the
+/// caller's own deadline, the client going away) was stopped in a phase nobody knows, possibly the connect phase, which would have been
+/// reported as a connection error had the transport been allowed to finish. Treated like one (conservative: the cost of a wrong guess is one
+/// more listener check).
+struct CancelledSend<'a> {
+    authorization: Option<&'a Authorization>,
+    armed: bool,
+}
+
+impl Drop for CancelledSend<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(authorization) = self.authorization
+        {
+            authorization.connection_failed();
+        }
+    }
+}
+
+/// Observe a reqwest send before the caller can retry. A connection error invalidates
+/// the corresponding generation's positive fallback cache; response and body errors do not.
+/// A send that is dropped before it finished (an outer timeout, a cancelled request) invalidates it too
+/// (Codex pre-review M3: a timeout in the connect phase must not leave a stale "yes").
+pub async fn send_authorized(
+    authorization: Option<&Authorization>,
+    send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut pending = CancelledSend {
+        authorization,
+        armed: true,
+    };
+    let result = send.await;
+    pending.armed = false;
+    result
+        .inspect(|response| {
+            // An upstream refused the credential: the key in the settings cache may be stale (a rotation the timestamps did not show).
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                invalidate_settings_cache();
+            }
+        })
+        .inspect_err(|error| {
+            // A connection error, or a timeout before any response (it may have been in the connect phase, and reqwest reports a request
+            // deadline as a plain timeout): the listener evidence is not trusted any more.
+            if (error.is_connect() || error.is_timeout())
+                && let Some(authorization) = authorization
+            {
+                authorization.connection_failed();
+            }
+        })
 }
 
 /// **每个要发往 oMLX 端点的请求在发出之前**调用（IDORIS-CORE S6，Codex 终审 H1；owner 2026-11-22 拍板）：在同一个任务里，紧挨着
@@ -806,7 +950,7 @@ async fn authorize(
     let client = if guarded { Some(fresh_client()?) } else { None };
     // 登记口径一旦是私有或外部，key 在这里按这一次读到的口径取好；校验之后口径若变了，下面的代际重读会拒绝，key 不会被用。
     let key = if with_key {
-        resolve_from_snapshot(base_url, before.key.as_ref())
+        resolve_from_snapshot_async(base_url, before.key.as_ref()).await?
     } else {
         None
     };
@@ -853,17 +997,54 @@ pub fn resolve_for_endpoint(
     loopback: bool,
     governed: Option<&EndpointKey>,
 ) -> Option<OsString> {
+    resolve_for_endpoint_checked(env, home, loopback, governed)
+        .ok()
+        .flatten()
+}
+
+fn resolve_for_endpoint_checked(
+    env: Option<OsString>,
+    home: Option<&Path>,
+    loopback: bool,
+    governed: Option<&EndpointKey>,
+) -> Result<Option<OsString>, KeyRefusal> {
+    match plan_for_endpoint(env, home, loopback, governed) {
+        Plan::Done(key) => Ok(key),
+        Plan::Settings(home) => settings_api_key(&home).map(|key| key.map(OsString::from)),
+    }
+}
+
+/// What a resolution still needs: the answer, or a read of `settings.json` under this home. The decision is pure, so the sync and the async
+/// callers share it and differ only in how they read the file.
+enum Plan {
+    Done(Option<OsString>),
+    Settings(std::path::PathBuf),
+}
+
+fn plan_for_endpoint(
+    env: Option<OsString>,
+    home: Option<&Path>,
+    loopback: bool,
+    governed: Option<&EndpointKey>,
+) -> Plan {
     match governed {
-        // 封上的端点：什么都不发，回退链（环境变量、`settings.json`）不适用。
-        Some(EndpointKey::Blocked) => None,
-        Some(EndpointKey::Private(key)) => Some(OsString::from(key)),
-        Some(EndpointKey::External {
-            settings_key_verified,
-        }) => match resolve_with_source(env, home)? {
-            (key, KeySource::Env) => Some(key),
-            (key, KeySource::Settings) => (loopback && *settings_key_verified).then_some(key),
-        },
-        None => resolve_from_for(env, home, loopback),
+        Some(EndpointKey::Blocked) => return Plan::Done(None),
+        Some(EndpointKey::Private(key)) => return Plan::Done(Some(OsString::from(key))),
+        _ => {}
+    }
+    if let Some(key) = env.filter(|value| !value.is_empty()) {
+        return Plan::Done(Some(key));
+    }
+    let settings_allowed = loopback
+        && !matches!(
+            governed,
+            Some(EndpointKey::External {
+                settings_key_verified: false
+            })
+        );
+    match home.filter(|_| settings_allowed) {
+        Some(home) => Plan::Settings(home.to_owned()),
+        None => Plan::Done(None),
     }
 }
 
@@ -887,7 +1068,10 @@ pub fn resolve_with_source(
     if let Some(value) = env.filter(|value| !value.is_empty()) {
         return Some((value, KeySource::Env));
     }
-    settings_api_key(home?).map(|key| (OsString::from(key), KeySource::Settings))
+    settings_api_key(home?)
+        .ok()
+        .flatten()
+        .map(|key| (OsString::from(key), KeySource::Settings))
 }
 
 /// [`resolve_with_source`] 再按目标是否 loopback 过滤：文件 key 只发给 loopback。
@@ -907,47 +1091,868 @@ pub fn resolve_from(env: Option<OsString>, home: Option<&Path>) -> Option<OsStri
     resolve_from_for(env, home, true)
 }
 
-/// 打开 `settings.json`：先打开、再对**已打开的句柄** `fstat` 判类型，不是「先 `stat` 路径、再按路径 `open`」
-/// （那样检查与打开之间路径可以被换成符号链接或 FIFO，即 TOCTOU）。
-///
-/// `O_NOFOLLOW` 让最后一段是符号链接时直接失败（`ELOOP`），`O_NONBLOCK` 让打开 FIFO 不会阻塞等写端；
-/// 常规文件上两个标志都无效果。**`O_NOFOLLOW` 只管最后一段**：`~/.omlx` 本身是符号链接（例如指向别的盘）时
-/// 仍然会被跟随，这与此前 `symlink_metadata` 的行为一致，不在本规范的保证范围内。
+/// Who the settings file and the directories on its way must belong to (three uids: the file, the link and its directory, the link
+/// target). Production passes the effective uid for all three; tests pass a different one to exercise each refusal without a second account.
 #[cfg(unix)]
-fn open_settings_file(path: &Path) -> Option<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let flags = nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(flags.bits())
-        .open(path)
-        .ok()?;
-    file.metadata().ok()?.is_file().then_some(file)
+#[derive(Debug, Clone, Copy)]
+struct Trust {
+    file_uid: u32,
+    /// The directory the link is in (`$HOME`) and the link itself.
+    dir_uid: u32,
+    /// The directory the link points at (`~/.omlx` after following it).
+    target_uid: u32,
+}
+
+#[cfg(unix)]
+impl Trust {
+    fn current() -> Self {
+        let uid = crate::engine::effective_uid();
+        Self {
+            file_uid: uid,
+            dir_uid: uid,
+            target_uid: uid,
+        }
+    }
+}
+
+/// A directory we accept as the place of a symlink or as its target: owned by `uid`, not writable by others, and without an ACL entry
+/// that gives somebody else write access. Group write is tolerated (a user-private-group umask of 002 makes it common): replacing
+/// `settings.json` there produces a file owned by someone else, which the file check refuses.
+#[cfg(unix)]
+fn trusted_directory(metadata: &fs::Metadata, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o002 == 0
+}
+
+/// Is the opened object free of an extended ACL entry that grants somebody other than its owner a write-like permission? macOS only, by
+/// `acl_get_fd_np` (`idoris-sockprobe`; no subprocess). Where the platform cannot tell (Linux, or a failed call) the answer is yes: the
+/// permission bits were already checked, and an ACL check that cannot run must not make a legitimate file unusable.
+#[cfg(unix)]
+fn acl_is_clean(file: &fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = file.metadata() else {
+        return true;
+    };
+    idoris_sockprobe::acl_grants_others_write(file.as_raw_fd(), metadata.uid()) != Some(true)
+}
+
+/// Pin the directory `~/.omlx` and open `settings.json` inside it. `~/.omlx` may be a symlink (dotfile managers, an encrypted volume):
+/// the opened directory is what is verified and pinned, and the file is opened relative to it (`openat`), so a later swap of the path
+/// cannot redirect the read. A symlink is accepted only when the directory it sits in and the directory it leads to are ours (owner,
+/// not writable by others, no foreign ACL write grant) and the link itself is ours. `settings.json` itself is never followed.
+#[cfg(unix)]
+fn open_settings_file(home: &Path, trust: Trust) -> std::io::Result<fs::File> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+
+    let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let directory = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let home_fd = open(home, directory, Mode::empty())?;
+    let link_path = home.join(".omlx");
+    let base = match openat(
+        &home_fd,
+        ".omlx",
+        directory | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(base) => fs::File::from(base),
+        Err(Errno::ELOOP | Errno::ENOTDIR) => {
+            // Maybe a symlink: its location and the link must be ours before it is followed at all.
+            let link = fs::symlink_metadata(&link_path)?;
+            if !link.file_type().is_symlink() {
+                return Err(Errno::ENOTDIR.into());
+            }
+            let place = fs::File::from(home_fd.try_clone()?).metadata()?;
+            {
+                use std::os::unix::fs::MetadataExt;
+                if link.uid() != trust.dir_uid || !trusted_directory(&place, trust.dir_uid) {
+                    return Err(denied());
+                }
+            }
+            if !acl_is_clean(&fs::File::from(home_fd.try_clone()?))
+                || idoris_sockprobe::acl_grants_others_write_at(
+                    &link_path,
+                    std::os::unix::fs::MetadataExt::uid(&link),
+                ) == Some(true)
+            {
+                return Err(denied());
+            }
+            let base = fs::File::from(openat(&home_fd, ".omlx", directory, Mode::empty())?);
+            if !trusted_directory(&base.metadata()?, trust.target_uid) || !acl_is_clean(&base) {
+                return Err(denied());
+            }
+            base
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
+    let file = openat(&base, "settings.json", flags, Mode::empty()).map(fs::File::from)?;
+    if !acl_is_clean(&file) {
+        return Err(denied());
+    }
+    Ok(file)
 }
 
 #[cfg(not(unix))]
-fn open_settings_file(path: &Path) -> Option<fs::File> {
-    if !fs::symlink_metadata(path).ok()?.is_file() {
-        return None;
+fn open_settings_file(home: &Path) -> std::io::Result<fs::File> {
+    let path = home.join(".omlx/settings.json");
+    if !fs::symlink_metadata(&path)?.is_file() {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
     }
-    let file = fs::File::open(path).ok()?;
-    file.metadata().ok()?.is_file().then_some(file)
+    let file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    Ok(file)
 }
 
-/// `<home>/.omlx/settings.json` 的 `auth.api_key`；任何问题都是 `None`。
-pub fn settings_api_key(home: &Path) -> Option<String> {
-    let path = home.join(".omlx").join("settings.json");
-    let mut raw = Vec::new();
-    open_settings_file(&path)?
-        .take(SETTINGS_MAX_BYTES + 1)
-        .read_to_end(&mut raw)
-        .ok()?;
-    if raw.len() as u64 > SETTINGS_MAX_BYTES {
-        return None;
+#[cfg(unix)]
+fn trusted_settings(metadata: &fs::Metadata, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.is_file() && settings_owner_and_mode_ok(metadata.uid(), metadata.mode(), uid)
+}
+
+/// 属主须是 iDoris 的有效 UID，或 root（`sudo omlx …` 且保留 HOME 会留下 root 属主的文件，root 不构成攻击者信号）；
+/// 无论谁拥有，组或其他用户可写都拒绝。
+#[cfg(unix)]
+fn settings_owner_and_mode_ok(owner: u32, mode: u32, euid: u32) -> bool {
+    (owner == euid || owner == 0) && mode & 0o022 == 0
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SettingsError {
+    Unreadable,
+    InvalidJson,
+}
+
+/// The homes whose settings file was opened and parsed (tests count how often).
+#[cfg(test)]
+static FILE_READS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+fn read_settings_once(
+    home: &Path,
+    missing_is_absent: bool,
+) -> Result<Option<String>, SettingsError> {
+    #[cfg(unix)]
+    return read_settings_once_with(home, missing_is_absent, Trust::current());
+    #[cfg(not(unix))]
+    read_settings_once_with(home, missing_is_absent)
+}
+
+fn read_settings_once_with(
+    home: &Path,
+    missing_is_absent: bool,
+    #[cfg(unix)] trust: Trust,
+) -> Result<Option<String>, SettingsError> {
+    #[cfg(unix)]
+    return read_settings_stamped(home, missing_is_absent, trust).0;
+    #[cfg(not(unix))]
+    read_settings_stamped(home, missing_is_absent).0
+}
+
+/// [`read_settings_once_with`], and the state of the **opened** file after it was read (`fstat` of the descriptor: what was read is what
+/// this describes), for the cache to compare with what the path said before and after.
+fn read_settings_stamped(
+    home: &Path,
+    missing_is_absent: bool,
+    #[cfg(unix)] trust: Trust,
+) -> (Result<Option<String>, SettingsError>, Option<FileStamp>) {
+    let mut opened_stamp = None;
+    let result = read_settings_inner(
+        home,
+        missing_is_absent,
+        #[cfg(unix)]
+        trust,
+        &mut opened_stamp,
+    );
+    (result, opened_stamp)
+}
+
+fn read_settings_inner(
+    home: &Path,
+    missing_is_absent: bool,
+    #[cfg(unix)] trust: Trust,
+    opened_stamp: &mut Option<FileStamp>,
+) -> Result<Option<String>, SettingsError> {
+    #[cfg(test)]
+    FILE_READS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(home.to_owned());
+    #[cfg(unix)]
+    let opened = open_settings_file(home, trust);
+    #[cfg(not(unix))]
+    let opened = open_settings_file(home);
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if missing_is_absent && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(_) => return Err(SettingsError::Unreadable),
+    };
+    #[cfg(unix)]
+    if !trusted_settings(
+        &file.metadata().map_err(|_| SettingsError::Unreadable)?,
+        trust.file_uid,
+    ) {
+        return Err(SettingsError::Unreadable);
     }
-    let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-    let key = value.get("auth")?.get("api_key")?.as_str()?;
-    let key = key.trim();
-    (!key.is_empty() && !key.chars().any(|c| c.is_control() || c.is_whitespace()))
-        .then(|| key.to_owned())
+    let mut raw = Vec::new();
+    #[cfg(unix)]
+    let file_after_read = file.try_clone().map_err(|_| SettingsError::Unreadable)?;
+    file.take(SETTINGS_MAX_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| SettingsError::Unreadable)?;
+    if raw.len() as u64 > SETTINGS_MAX_BYTES {
+        return Err(SettingsError::Unreadable);
+    }
+    #[cfg(unix)]
+    {
+        *opened_stamp = file_after_read.metadata().ok().map(|m| FileStamp::of(&m));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|_| SettingsError::InvalidJson)?;
+    Ok(value
+        .get("auth")
+        .and_then(|auth| auth.get("api_key"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty() && !key.chars().any(|c| c.is_control() || c.is_whitespace()))
+        .map(str::to_owned))
+}
+
+fn read_settings_key(home: &Path) -> Result<Option<String>, SettingsError> {
+    retry_invalid_settings(home, || {
+        std::thread::sleep(std::time::Duration::from_millis(10))
+    })
+}
+
+fn retry_invalid_settings(
+    home: &Path,
+    pause: impl FnOnce(),
+) -> Result<Option<String>, SettingsError> {
+    match read_settings_once(home, true) {
+        Err(SettingsError::InvalidJson) => {
+            pause();
+            // The first read established that a file existed. If it vanishes during
+            // the retry, the configuration is still unsettled for this request.
+            read_settings_once(home, false)
+        }
+        result => result,
+    }
+}
+
+/// What identifies the state of the settings file and of the path leading to it, from a handful of `stat`s: device, inode, mode, owner,
+/// size, modification and change time (nanoseconds) of the home directory, of `.omlx` itself (a symlink is not followed) and of what it
+/// leads to, and of `settings.json` itself (not followed either). An in-place rewrite changes modification and change time, a `chmod`,
+/// an ACL edit or a swapped directory changes the change time or the identity: any difference is a miss.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettingsStamp([FileStamp; 4]);
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+#[cfg(unix)]
+impl FileStamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            size: metadata.size(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn settings_stamp(home: &Path) -> Option<SettingsStamp> {
+    let base = home.join(".omlx");
+    Some(SettingsStamp([
+        FileStamp::of(&fs::metadata(home).ok()?),
+        FileStamp::of(&fs::symlink_metadata(&base).ok()?),
+        FileStamp::of(&fs::metadata(&base).ok()?),
+        FileStamp::of(&fs::symlink_metadata(base.join("settings.json")).ok()?),
+    ]))
+}
+
+/// How long a cached parse may be reused at most, whatever the stamps say: a file system with coarse timestamps can leave every stamp field
+/// equal across an in-place rewrite of the same length within one tick, so a rotated key is picked up within this bound at the latest.
+#[cfg(unix)]
+const SETTINGS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(unix)]
+struct CachedSettings {
+    home: std::path::PathBuf,
+    stamp: SettingsStamp,
+    key: Option<String>,
+    at: std::time::Instant,
+}
+
+/// The parsed result of the last successful read per home, valid while the [`SettingsStamp`] is unchanged **and** younger than
+/// [`SETTINGS_CACHE_TTL`]: the request path asks the file system only a few `stat`s instead of opening, checking and parsing the file every
+/// time. A change (which includes a rewrite in place, on a file system with fine timestamps) is seen by the very next request; an upstream
+/// 401 drops the cache at once ([`invalidate_settings_cache`]). Failures are never cached.
+#[cfg(unix)]
+static SETTINGS_CACHE: Mutex<Vec<CachedSettings>> = Mutex::new(Vec::new());
+
+/// How many times the cache was dropped on purpose (tests bound the reads they expect by it).
+#[cfg(unix)]
+static SETTINGS_INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Forget every cached `settings.json` parse: an upstream answered 401 to a request that carried (or should have carried) a key from there,
+/// so the next request reads the file again whatever the timestamps say.
+pub(crate) fn invalidate_settings_cache() {
+    #[cfg(unix)]
+    {
+        SETTINGS_INVALIDATIONS.fetch_add(1, Ordering::SeqCst);
+        SETTINGS_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+}
+
+#[cfg(unix)]
+fn cached_settings(home: &Path, stamp: &SettingsStamp) -> Option<Option<String>> {
+    SETTINGS_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|entry| {
+            entry.home == home && &entry.stamp == stamp && entry.at.elapsed() < SETTINGS_CACHE_TTL
+        })
+        .map(|entry| entry.key.clone())
+}
+
+/// May the result of a read be cached? Only when the file that was **opened and read** is the file the path named before the read and still
+/// names after it: the descriptor's state after the read equals the path's `settings.json` stamp before and after, and the whole stamp
+/// (directories included) did not move.
+#[cfg(unix)]
+fn cacheable(
+    before: &SettingsStamp,
+    opened: Option<&FileStamp>,
+    after: Option<&SettingsStamp>,
+) -> bool {
+    match (opened, after) {
+        (Some(opened), Some(after)) => before == after && *opened == before.0[3],
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn remember_settings(home: &Path, stamp: SettingsStamp, key: &Option<String>) {
+    let mut cache = SETTINGS_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    cache.retain(|entry| entry.home != home);
+    if cache.len() >= 16 {
+        cache.clear();
+    }
+    cache.push(CachedSettings {
+        home: home.to_owned(),
+        stamp,
+        key: key.clone(),
+        at: std::time::Instant::now(),
+    });
+}
+
+/// The async twin of [`read_settings_key`] for the request path: an unchanged, fresh file (a few `stat`s, no blocking pool) answers from the
+/// cache; otherwise every file operation runs on the blocking pool and the retry pause is a timer, so no runtime worker is held while a
+/// truncated snapshot settles.
+async fn read_settings_key_async(home: &Path) -> Result<Option<String>, SettingsError> {
+    // The stamp is taken **before** the read: a change after it makes the next request's stamp differ, never the other way round.
+    #[cfg(unix)]
+    let stamp = settings_stamp(home);
+    #[cfg(unix)]
+    if let Some(stamp) = &stamp
+        && let Some(hit) = cached_settings(home, stamp)
+    {
+        return Ok(hit);
+    }
+    let first = home.to_owned();
+    let (result, opened) = tokio::task::spawn_blocking(move || {
+        #[cfg(unix)]
+        return read_settings_stamped(&first, true, Trust::current());
+        #[cfg(not(unix))]
+        (read_settings_once(&first, true), None::<()>)
+    })
+    .await
+    .map_err(|_| SettingsError::Unreadable)?;
+    #[cfg(unix)]
+    let mut opened = opened;
+    let result = match result {
+        Err(SettingsError::InvalidJson) => {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let again = home.to_owned();
+            let (result, again_opened) = tokio::task::spawn_blocking(move || {
+                #[cfg(unix)]
+                return read_settings_stamped(&again, false, Trust::current());
+                #[cfg(not(unix))]
+                (read_settings_once(&again, false), None::<()>)
+            })
+            .await
+            .map_err(|_| SettingsError::Unreadable)?;
+            #[cfg(unix)]
+            {
+                opened = again_opened;
+            }
+            let _ = &opened;
+            result
+        }
+        result => result,
+    };
+    #[cfg(unix)]
+    if let (Some(stamp), Ok(key)) = (stamp, &result)
+        && cacheable(&stamp, opened.as_ref(), settings_stamp(home).as_ref())
+    {
+        remember_settings(home, stamp, key);
+    }
+    result
+}
+
+/// 读取 `<home>/.omlx/settings.json` 的 `auth.api_key`。文件缺失或合法 JSON 中没有可用的 key 时返回 `Ok(None)`。
+pub fn settings_api_key(home: &Path) -> Result<Option<String>, KeyRefusal> {
+    read_settings_key(home).map_err(|_| KeyRefusal::SettingsUnverifiable)
+}
+
+#[cfg(all(test, unix))]
+mod settings_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use super::*;
+
+    #[test]
+    fn settings_owner_and_mode_predicate() {
+        // euid 501: own file and root-owned file pass, other users' files do not.
+        assert!(settings_owner_and_mode_ok(501, 0o100600, 501));
+        assert!(settings_owner_and_mode_ok(0, 0o100644, 501));
+        assert!(!settings_owner_and_mode_ok(502, 0o100600, 501));
+        // group or other write is refused whoever owns the file.
+        assert!(!settings_owner_and_mode_ok(501, 0o100620, 501));
+        assert!(!settings_owner_and_mode_ok(0, 0o100602, 501));
+        assert!(!settings_owner_and_mode_ok(0, 0o100666, 501));
+    }
+
+    #[test]
+    fn settings_rejects_foreign_ownership() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let metadata = file.as_file().metadata().unwrap();
+        assert!(!trusted_settings(&metadata, metadata.uid().wrapping_add(1)));
+    }
+
+    #[test]
+    fn settings_rejects_group_or_world_write_bits() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(".omlx");
+        fs::create_dir(&base).unwrap();
+        let path = base.join("settings.json");
+        fs::write(&path, r#"{"auth":{"api_key":"key"}}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_settings_key(home.path()).unwrap().as_deref(),
+            Some("key")
+        );
+        for mode in [0o620, 0o602] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                read_settings_key(home.path()),
+                Err(SettingsError::Unreadable)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_json_is_retried_once_then_reported_as_unverified() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(".omlx");
+        fs::create_dir(&base).unwrap();
+        let path = base.join("settings.json");
+        fs::write(&path, "{").unwrap();
+        let result = retry_invalid_settings(home.path(), || {
+            fs::write(&path, r#"{"auth":{"api_key":"finished"}}"#).unwrap();
+        });
+        assert_eq!(result.unwrap().as_deref(), Some("finished"));
+
+        fs::write(&path, "{").unwrap();
+        let mut pauses = 0;
+        let result = retry_invalid_settings(home.path(), || pauses += 1);
+        assert_eq!(pauses, 1);
+        assert_eq!(result, Err(SettingsError::InvalidJson));
+        assert_eq!(
+            resolve_for_endpoint_checked(
+                None,
+                Some(home.path()),
+                true,
+                Some(&EndpointKey::External {
+                    settings_key_verified: true
+                })
+            ),
+            Err(KeyRefusal::SettingsUnverifiable)
+        );
+        fs::write(&path, "{}").unwrap();
+        assert_eq!(read_settings_key(home.path()), Ok(None));
+    }
+
+    fn write_settings(base: &Path) -> std::path::PathBuf {
+        fs::create_dir_all(base).unwrap();
+        let path = base.join("settings.json");
+        fs::write(&path, r#"{"auth":{"api_key":"k-link"}}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    fn symlinked_home() -> (tempfile::TempDir, std::path::PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("dotfiles-omlx");
+        write_settings(&target);
+        std::os::unix::fs::symlink(&target, home.path().join(".omlx")).unwrap();
+        (home, target)
+    }
+
+    #[test]
+    fn a_symlinked_omlx_directory_of_ours_is_accepted() {
+        let (home, _target) = symlinked_home();
+        assert_eq!(
+            read_settings_key(home.path()).unwrap().as_deref(),
+            Some("k-link")
+        );
+    }
+
+    #[test]
+    fn a_symlinked_omlx_directory_owned_by_someone_else_is_refused() {
+        let (home, _target) = symlinked_home();
+        let uid = crate::engine::effective_uid();
+        let foreign_dirs = Trust {
+            file_uid: uid,
+            dir_uid: uid.wrapping_add(1),
+            target_uid: uid,
+        };
+        assert_eq!(
+            read_settings_once_with(home.path(), true, foreign_dirs),
+            Err(SettingsError::Unreadable)
+        );
+        let ours = Trust {
+            file_uid: uid,
+            dir_uid: uid,
+            target_uid: uid,
+        };
+        assert_eq!(
+            read_settings_once_with(home.path(), true, ours)
+                .unwrap()
+                .as_deref(),
+            Some("k-link")
+        );
+    }
+
+    #[test]
+    fn a_symlink_of_ours_to_a_directory_owned_by_someone_else_is_refused() {
+        // The link and the directory it is in are ours (so the link-owner check passes); only the target directory belongs to someone else.
+        let (home, _target) = symlinked_home();
+        let uid = crate::engine::effective_uid();
+        let foreign_target = Trust {
+            file_uid: uid,
+            dir_uid: uid,
+            target_uid: uid.wrapping_add(1),
+        };
+        assert_eq!(
+            read_settings_once_with(home.path(), true, foreign_target),
+            Err(SettingsError::Unreadable)
+        );
+    }
+
+    #[test]
+    fn a_symlinked_target_writable_by_others_is_refused() {
+        let (home, target) = symlinked_home();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(
+            read_settings_key(home.path()),
+            Err(SettingsError::Unreadable)
+        );
+    }
+
+    #[test]
+    fn the_settings_file_itself_is_never_followed() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(".omlx");
+        let real = write_settings(&home.path().join("elsewhere"));
+        fs::create_dir(&base).unwrap();
+        std::os::unix::fs::symlink(real, base.join("settings.json")).unwrap();
+        assert_eq!(
+            read_settings_key(home.path()),
+            Err(SettingsError::Unreadable)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_foreign_acl_write_grant_on_the_settings_file_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let path = write_settings(&home.path().join(".omlx"));
+        // control: no ACL
+        assert_eq!(
+            read_settings_key(home.path()).unwrap().as_deref(),
+            Some("k-link")
+        );
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow write"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            read_settings_key(home.path()),
+            Err(SettingsError::Unreadable)
+        );
+        // the verdict follows the ACL: removing it restores acceptance (the cache is keyed by change time)
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["-N"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            read_settings_key(home.path()).unwrap().as_deref(),
+            Some("k-link")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_foreign_acl_write_grant_on_a_symlink_target_directory_is_refused() {
+        let (home, target) = symlinked_home();
+        assert!(read_settings_key(home.path()).is_ok());
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow add_file"])
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            read_settings_key(home.path()),
+            Err(SettingsError::Unreadable)
+        );
+    }
+
+    /// Codex re-review H2: an inherit-only write entry on the directory `~/.omlx` leads to is a template for what gets created inside it; it
+    /// gives nobody access to the directory or to the existing, protected `settings.json`, and must not make the engine unusable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_inherit_only_acl_entry_on_the_target_directory_is_accepted() {
+        let (home, target) = symlinked_home();
+        let status = std::process::Command::new("/bin/chmod")
+            .args([
+                "+a",
+                "everyone allow add_file,add_subdirectory,file_inherit,directory_inherit,only_inherit",
+            ])
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            read_settings_key(home.path()).unwrap().as_deref(),
+            Some("k-link")
+        );
+    }
+
+    fn reads_of(home: &Path) -> usize {
+        FILE_READS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|read| read.as_path() == home)
+            .count()
+    }
+
+    /// An unchanged settings file is read and parsed once; the request path then only `stat`s. Every kind of change is seen by the very next
+    /// request: an in-place rewrite (same size), a different size, a `chmod` that makes the file group-writable (now refused), and the
+    /// file's disappearance.
+    #[tokio::test]
+    async fn an_unchanged_settings_file_is_read_once_and_every_change_is_seen_at_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let path = write_settings(&home.path().join(".omlx"));
+        let invalidations = SETTINGS_INVALIDATIONS.load(Ordering::SeqCst);
+        let first = read_settings_key_async(home.path()).await.unwrap();
+        assert_eq!(first.as_deref(), Some("k-link"));
+        for _ in 0..50 {
+            assert_eq!(
+                read_settings_key_async(home.path()).await,
+                Ok(first.clone())
+            );
+        }
+        assert!(
+            reads_of(home.path())
+                <= 1 + (SETTINGS_INVALIDATIONS.load(Ordering::SeqCst) - invalidations),
+            "fifty more requests read nothing"
+        );
+
+        // rewritten in place with the same length
+        fs::write(&path, r#"{"auth":{"api_key":"k-lonk"}}"#).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("k-lonk")
+        );
+        // a different size
+        fs::write(&path, r#"{"auth":{"api_key":"k-much-longer"}}"#).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("k-much-longer")
+        );
+        // permissions change: the cached verdict must not outlive the trust it was based on
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path()).await,
+            Err(SettingsError::Unreadable)
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("k-much-longer")
+        );
+        // a completed rename-replace (a new inode, as editors and dotfile managers write it)
+        let staged = home.path().join("staged.json");
+        fs::write(&staged, r#"{"auth":{"api_key":"k-renamed"}}"#).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&staged, &path).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("k-renamed")
+        );
+        // the file replaced by a symlink to an identical file is not followed, cache or not
+        let copy = home.path().join("copy.json");
+        fs::copy(&path, &copy).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&copy, &path).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path()).await,
+            Err(SettingsError::Unreadable)
+        );
+        fs::remove_file(&path).unwrap();
+        assert_eq!(read_settings_key_async(home.path()).await, Ok(None));
+    }
+
+    /// The cache has two more bounds than the timestamps: a cached parse is dropped when an upstream answers 401 (a rotation the timestamps
+    /// did not show), and it is never older than [`SETTINGS_CACHE_TTL`].
+    #[tokio::test]
+    async fn a_401_or_the_ttl_drops_the_cached_settings() {
+        let home = tempfile::tempdir().unwrap();
+        write_settings(&home.path().join(".omlx"));
+        let reads = || reads_of(home.path());
+        read_settings_key_async(home.path()).await.unwrap();
+        read_settings_key_async(home.path()).await.unwrap();
+        let steady = reads();
+
+        // a 401 seen by `send_authorized`
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let response = send_authorized(None, client.get(server.uri()).send())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        read_settings_key_async(home.path()).await.unwrap();
+        assert!(
+            reads() > steady,
+            "a 401 must make the next request read the file"
+        );
+
+        // the TTL, with the stamps unchanged
+        let steady = reads();
+        read_settings_key_async(home.path()).await.unwrap();
+        tokio::time::sleep(SETTINGS_CACHE_TTL + std::time::Duration::from_millis(100)).await;
+        let before = reads();
+        read_settings_key_async(home.path()).await.unwrap();
+        assert!(
+            reads() > before,
+            "a parse older than the TTL is read again ({steady} -> {before} -> {})",
+            reads()
+        );
+    }
+
+    /// What is cached must be what was read: the descriptor's state after the read has to be the state the path named before **and** after.
+    #[test]
+    fn a_parse_is_cacheable_only_if_the_opened_file_is_the_one_the_path_named() {
+        let home = tempfile::tempdir().unwrap();
+        let path = write_settings(&home.path().join(".omlx"));
+        let before = settings_stamp(home.path()).unwrap();
+        let opened = FileStamp::of(&fs::metadata(&path).unwrap());
+        assert!(cacheable(&before, Some(&opened), Some(&before)));
+        // another file was opened than the one the path named before
+        let other = FileStamp {
+            ino: opened.ino + 1,
+            ..opened.clone()
+        };
+        assert!(!cacheable(&before, Some(&other), Some(&before)));
+        // the opened file changed while it was read (its state moved)
+        let moved = FileStamp {
+            size: opened.size + 1,
+            ..opened.clone()
+        };
+        assert!(!cacheable(&before, Some(&moved), Some(&before)));
+        // the path now names something else
+        fs::write(&path, r#"{"auth":{"api_key":"k-other-longer"}}"#).unwrap();
+        let after = settings_stamp(home.path()).unwrap();
+        assert!(!cacheable(&before, Some(&opened), Some(&after)));
+        // nothing was opened (a failed read), nothing to cache
+        assert!(!cacheable(&before, None, Some(&before)));
+    }
+
+    /// With the clock paused, a retry pause that is a runtime timer advances the virtual clock by exactly its length, while a thread
+    /// sleep (which holds a runtime worker) leaves it where it was.
+    #[tokio::test(start_paused = true)]
+    async fn the_async_retry_pause_is_a_timer_not_a_blocked_worker() {
+        let home = tempfile::tempdir().unwrap();
+        let path = write_settings(&home.path().join(".omlx"));
+        fs::write(&path, "{").unwrap();
+        let before = tokio::time::Instant::now();
+        assert_eq!(
+            read_settings_key_async(home.path()).await,
+            Err(SettingsError::InvalidJson)
+        );
+        assert!(
+            before.elapsed() >= std::time::Duration::from_millis(10),
+            "the pause did not go through the runtime timer"
+        );
+        fs::write(&path, r#"{"auth":{"api_key":"settled"}}"#).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("settled")
+        );
+    }
 }

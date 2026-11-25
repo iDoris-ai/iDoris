@@ -17,7 +17,8 @@ use idoris_upstream::omlx::engine::{
     BASE_PATH_ENV, OMLX_TEAM_ID, OmlxRecipe, base_path_in, prepare_base_dir,
 };
 use idoris_upstream::omlx::key::{
-    EndpointGuard, EndpointKey, block_endpoint, govern_endpoint_guarded, resolve_omlx_api_key_for,
+    EndpointGuard, EndpointKey, KeyRefusal, block_endpoint, govern_endpoint_guarded,
+    resolve_omlx_api_key_checked,
 };
 
 use crate::readiness::UpstreamReason;
@@ -66,7 +67,7 @@ pub trait EngineBackend: Send + Sync + std::fmt::Debug {
     fn block(&self, endpoint: &str);
 
     /// 现在发往这个 endpoint 的 key（私有 key，或外部引擎按这种引擎自己的顺序解析出来的）。
-    fn current_key(&self, endpoint: &str) -> Option<String>;
+    fn current_key(&self, endpoint: &str) -> Result<Option<String>, KeyRefusal>;
 
     /// 一次拉起的摘要，管理器拉起引擎时写成一行日志（IDORIS-CORE S6）。引擎会改写自己的进程标题（oMLX 就是），`ps` 里看不到端口、
     /// 模型目录、内存护栏、base 目录，排查时只能靠这一行。**只能含不是秘密的值**：私有 key 经环境变量交给引擎，命令行里
@@ -216,8 +217,8 @@ impl EngineBackend for OmlxBackend {
         block_endpoint(endpoint);
     }
 
-    fn current_key(&self, endpoint: &str) -> Option<String> {
-        resolve_omlx_api_key_for(endpoint)
+    fn current_key(&self, endpoint: &str) -> Result<Option<String>, KeyRefusal> {
+        resolve_omlx_api_key_checked(endpoint, None)
     }
 
     /// 可执行文件、端口、内存护栏（有额度是 `--memory-guard-gb` 的整数 GiB，没有额度是 `balanced`）、模型目录、iDoris 自己的 base
@@ -345,8 +346,8 @@ mod tests {
         }
         fn govern_external(&self, _endpoint: &str, _guard: Arc<dyn EndpointGuard>) {}
         fn block(&self, _endpoint: &str) {}
-        fn current_key(&self, _endpoint: &str) -> Option<String> {
-            None
+        fn current_key(&self, _endpoint: &str) -> Result<Option<String>, KeyRefusal> {
+            Ok(None)
         }
     }
 
