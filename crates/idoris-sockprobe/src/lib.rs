@@ -432,7 +432,10 @@ for line in sys.stdin:
     }
 
     fn spawn_sleep_from(path: &std::path::Path) -> Child {
+        use std::os::unix::process::CommandExt as _;
+        // argv[0] stays "sleep": a multi-call coreutils (uutils on Ubuntu 26.04) picks the utility from argv[0] and exits 1 for "engine".
         Command::new(path)
+            .arg0("sleep")
             .arg("30")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
