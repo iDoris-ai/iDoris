@@ -607,7 +607,7 @@ mod tests {
             &self,
             _pid: u32,
         ) -> Result<Option<super::super::inspect::ExecutableIdentity>, InspectError> {
-            Ok(self.executable.lock().unwrap().clone())
+            Ok(*self.executable.lock().unwrap())
         }
         async fn signing_team(&self, _pid: u32) -> Result<Option<String>, InspectError> {
             Ok(self.team.lock().unwrap().clone())
