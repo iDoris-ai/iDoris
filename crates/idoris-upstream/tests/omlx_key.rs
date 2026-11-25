@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use idoris_upstream::omlx::key::{
-    KeySource, OMLX_KEY_REMEDIATION, SETTINGS_MAX_BYTES, is_loopback_base_url, resolve_from,
-    resolve_from_for, resolve_with_source, settings_api_key,
+    KeyRefusal, KeySource, OMLX_KEY_REMEDIATION, SETTINGS_MAX_BYTES, is_loopback_base_url,
+    resolve_from, resolve_from_for, resolve_with_source, settings_api_key,
 };
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -88,7 +88,7 @@ fn a_non_utf8_env_value_is_kept_so_callers_can_reject_it() {
 }
 
 #[test]
-fn bad_settings_files_are_just_absent() {
+fn unreadable_settings_are_distinct_from_valid_json_without_a_key() {
     let big_pad = "x".repeat(SETTINGS_MAX_BYTES as usize);
     let oversize = format!(r#"{{"pad":"{big_pad}","auth":{{"api_key":"k"}}}}"#);
     let cases: Vec<(&str, String)> = vec![
@@ -114,31 +114,43 @@ fn bad_settings_files_are_just_absent() {
     for (name, content) in cases {
         let home = Home::new();
         home.settings(&content);
-        assert_eq!(settings_api_key(home.path()), None, "{name}");
+        let expected = match name {
+            "empty file" | "not json" | "truncated" | "oversize file" => {
+                Err(KeyRefusal::SettingsUnverifiable)
+            }
+            _ => Ok(None),
+        };
+        assert_eq!(settings_api_key(home.path()), expected, "{name}");
         assert_eq!(resolve_from(None, Some(home.path())), None, "{name}");
     }
     // 目录、缺文件、缺 .omlx。
     let home = Home::new();
     fs::create_dir_all(home.path().join(".omlx/settings.json")).unwrap();
-    assert_eq!(settings_api_key(home.path()), None);
-    assert_eq!(settings_api_key(&home.path().join("nope")), None);
+    assert_eq!(
+        settings_api_key(home.path()),
+        Err(KeyRefusal::SettingsUnverifiable)
+    );
+    assert_eq!(settings_api_key(&home.path().join("nope")), Ok(None));
     // 64 KiB 以内仍可读。
     let ok_pad = "x".repeat(SETTINGS_MAX_BYTES as usize - 100);
     let home = Home::new();
     home.settings(format!(r#"{{"pad":"{ok_pad}","auth":{{"api_key":"k"}}}}"#));
-    assert_eq!(settings_api_key(home.path()).as_deref(), Some("k"));
+    assert_eq!(settings_api_key(home.path()).unwrap().as_deref(), Some("k"));
 }
 
 #[test]
 fn extra_fields_and_whitespace_around_json_are_fine() {
     let home = Home::new();
     home.settings("\n  {\"server\":{\"port\":8088},\"auth\":{\"api_key\":\"abc-123\",\"x\":1}}\n");
-    assert_eq!(settings_api_key(home.path()).as_deref(), Some("abc-123"));
+    assert_eq!(
+        settings_api_key(home.path()).unwrap().as_deref(),
+        Some("abc-123")
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn a_fifo_settings_file_is_ignored_without_blocking() {
+fn a_fifo_settings_file_is_refused_without_blocking() {
     let home = Home::new();
     let status = std::process::Command::new("mkfifo")
         .arg(home.path().join(".omlx/settings.json"))
@@ -146,7 +158,10 @@ fn a_fifo_settings_file_is_ignored_without_blocking() {
         .unwrap();
     assert!(status.success());
     // 若实现去打开 FIFO，这里会一直阻塞。
-    assert_eq!(settings_api_key(home.path()), None);
+    assert_eq!(
+        settings_api_key(home.path()),
+        Err(KeyRefusal::SettingsUnverifiable)
+    );
 }
 
 #[test]
@@ -160,7 +175,10 @@ fn remediation_names_both_sources() {
 fn settings_key_is_returned_trimmed() {
     let home = Home::new();
     home.settings("{\"auth\":{\"api_key\":\"  \\tkey-1\\n \"}}");
-    assert_eq!(settings_api_key(home.path()).as_deref(), Some("key-1"));
+    assert_eq!(
+        settings_api_key(home.path()).unwrap().as_deref(),
+        Some("key-1")
+    );
     assert_eq!(resolve_from(None, Some(home.path())), os("key-1"));
 }
 
@@ -172,22 +190,28 @@ fn env_value_is_not_trimmed() {
 
 #[cfg(unix)]
 #[test]
-fn a_symlinked_settings_file_is_ignored() {
+fn a_symlinked_settings_file_is_refused() {
     let home = Home::new();
     let target = home.path().join("real.json");
     fs::write(&target, r#"{"auth":{"api_key":"via-link"}}"#).unwrap();
     std::os::unix::fs::symlink(&target, home.path().join(".omlx/settings.json")).unwrap();
-    assert_eq!(settings_api_key(home.path()), None);
+    assert_eq!(
+        settings_api_key(home.path()),
+        Err(KeyRefusal::SettingsUnverifiable)
+    );
     assert_eq!(resolve_from(None, Some(home.path())), None);
     // 同一内容放成常规文件就能读到，说明被忽略的原因是符号链接。
     fs::remove_file(home.path().join(".omlx/settings.json")).unwrap();
     fs::copy(&target, home.path().join(".omlx/settings.json")).unwrap();
-    assert_eq!(settings_api_key(home.path()).as_deref(), Some("via-link"));
+    assert_eq!(
+        settings_api_key(home.path()).unwrap().as_deref(),
+        Some("via-link")
+    );
 }
 
 /// #609：检查与打开之间没有窗口——类型由已打开的句柄说了算。测试自己先开着一个读端（让管道里的数据留得住），
 /// 再开写端写入合法的、带 key 的 JSON 并关掉写端：这时 FIFO 里躺着完整内容、也没有写端，实现若不核对句柄类型，
-/// `O_NONBLOCK` 打开后能读到内容并遇到 EOF，就会返回 key。正确的实现因为不是常规文件而返回 `None`。
+/// `O_NONBLOCK` 打开后能读到内容并遇到 EOF，就会返回 key。正确的实现因为不是常规文件而拒绝。
 #[cfg(unix)]
 #[test]
 fn a_fifo_with_valid_content_is_rejected_by_the_opened_handles_type() {
@@ -217,15 +241,16 @@ fn a_fifo_with_valid_content_is_rejected_by_the_opened_handles_type() {
         .write_all(br#"{"auth":{"api_key":"from-fifo"}}"#)
         .unwrap();
     drop(writer);
-    assert_eq!(settings_api_key(home.path()), None);
+    assert_eq!(
+        settings_api_key(home.path()),
+        Err(KeyRefusal::SettingsUnverifiable)
+    );
     assert_eq!(resolve_from(None, Some(home.path())), None);
 }
 
-/// 「不跟随符号链接」只对最后一段成立（规范与注释已收窄）：`~/.omlx` 本身是符号链接（常见：模型与配置放在别的盘）
-/// 时，里面的常规文件照常读取。这条钉住的是已知口径，不是承诺的安全属性。
 #[cfg(unix)]
 #[test]
-fn only_the_final_path_component_is_not_followed() {
+fn a_symlinked_omlx_directory_is_refused() {
     let home = Home::new();
     let real = home.path().join("elsewhere");
     fs::create_dir_all(&real).unwrap();
@@ -236,7 +261,10 @@ fn only_the_final_path_component_is_not_followed() {
     .unwrap();
     fs::remove_dir_all(home.path().join(".omlx")).unwrap();
     std::os::unix::fs::symlink(&real, home.path().join(".omlx")).unwrap();
-    assert_eq!(settings_api_key(home.path()).as_deref(), Some("k-dir"));
+    assert_eq!(
+        settings_api_key(home.path()),
+        Err(KeyRefusal::SettingsUnverifiable)
+    );
 }
 
 #[test]

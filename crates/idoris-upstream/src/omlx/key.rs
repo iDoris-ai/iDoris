@@ -10,9 +10,9 @@
 //! - 来自 `settings.json` 的 key 只发给 loopback 的 oMLX：非 loopback 的 base URL 下，文件 key 视为没有
 //!   （环境变量的 key 维持原行为，不受此限）。[`KeySource`] 标明 key 来自哪里。
 //! - `settings.json` 只从文件读取，最多读 64 KiB；必须是常规文件（最后一段是符号链接、或是 FIFO、设备，一律不要）：
-//!   用 `O_NOFOLLOW|O_NONBLOCK` 打开后对句柄 `fstat`，不是先 `stat` 再 `open`（没有检查与打开之间的窗口）；
-//!   `O_NOFOLLOW` 只对最后一段成立，`~/.omlx` 本身是符号链接时仍被跟随；读不了、不是 JSON、没有 `auth.api_key`、值不是非空字符串
-//!   一律当作没有，往下走无鉴权，不报错、不记日志。返回的是 trim 后的值；trim 后含空白或控制字符同样当作没有。
+//!   以 HOME 为起点，逐段用 `O_NOFOLLOW` 打开 `.omlx` 与 `settings.json`，再用 `fstat` 核对文件类型、有效 UID 与权限位。
+//!   文件必须属于当前用户，组和其他用户不能有写权限。解析失败时等 10 毫秒，重新打开并读取一次；再次失败会拒绝发送。
+//!   文件缺失、或合法 JSON 中没有可用的 `auth.api_key` 时，可以匿名连接。key 取 trim 后的值，含空白或控制字符视为没有。
 //! - 不打印、不写日志、不进 argv 或响应体；错误信息里不带文件内容。
 //! - 不硬编码任何默认 key。
 //! - **引擎管理器接管的端点**（IDORIS-CORE S5，规范 §2.7.7）：[`govern_endpoint`] 登记之后，iDoris 自己拉起的引擎只用它的
@@ -455,6 +455,8 @@ pub enum KeyRefusal {
     ListenerChanged,
     /// 发送前的重新校验读不出来（工具超时、出错）：确认不了就不发（fail closed）。
     Unverified,
+    /// The selected settings file could not be read and verified.
+    SettingsUnverifiable,
     /// 托管端点的专用 HTTP 客户端（不保留空闲连接）建不出来：不退到别的客户端（池里可能有通往旧进程的连接，调用方注入的客户端还可能有别的
     /// 代理、重定向策略），什么都不发（Codex 预审 L2 的 M4）。
     TransportUnavailable,
@@ -478,6 +480,9 @@ impl std::fmt::Display for KeyRefusal {
             ),
             Self::Unverified => f.write_str(
                 "what listens on this endpoint could not be confirmed right before sending: the request was not sent",
+            ),
+            Self::SettingsUnverifiable => f.write_str(
+                "oMLX settings.json could not be verified: the request was not sent",
             ),
             Self::TransportUnavailable => f.write_str(
                 "the HTTP client for managed endpoints could not be built: the request was not sent",
@@ -531,14 +536,17 @@ pub fn resolve_omlx_api_key_checked(
 ) -> Result<Option<String>, KeyRefusal> {
     let snapshot = snapshot_of(base_url);
     refuse_stale_or_blocked(&snapshot, admitted_generation)?;
-    Ok(resolve_from_snapshot(base_url, snapshot.key.as_ref())
+    Ok(resolve_from_snapshot(base_url, snapshot.key.as_ref())?
         .and_then(|key| key.into_string().ok()))
 }
 
-fn resolve_from_snapshot(base_url: &str, governed: Option<&EndpointKey>) -> Option<OsString> {
+fn resolve_from_snapshot(
+    base_url: &str,
+    governed: Option<&EndpointKey>,
+) -> Result<Option<OsString>, KeyRefusal> {
     note_resolution();
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
-    resolve_for_endpoint(
+    resolve_for_endpoint_checked(
         std::env::var_os(OMLX_API_KEY_ENV),
         home.as_deref().map(Path::new),
         is_loopback_base_url(base_url),
@@ -841,7 +849,7 @@ async fn authorize(
     let client = if guarded { Some(fresh_client()?) } else { None };
     // 登记口径一旦是私有或外部，key 在这里按这一次读到的口径取好；校验之后口径若变了，下面的代际重读会拒绝，key 不会被用。
     let key = if with_key {
-        resolve_from_snapshot(base_url, before.key.as_ref())
+        resolve_from_snapshot(base_url, before.key.as_ref())?
     } else {
         None
     };
@@ -888,17 +896,35 @@ pub fn resolve_for_endpoint(
     loopback: bool,
     governed: Option<&EndpointKey>,
 ) -> Option<OsString> {
+    resolve_for_endpoint_checked(env, home, loopback, governed)
+        .ok()
+        .flatten()
+}
+
+fn resolve_for_endpoint_checked(
+    env: Option<OsString>,
+    home: Option<&Path>,
+    loopback: bool,
+    governed: Option<&EndpointKey>,
+) -> Result<Option<OsString>, KeyRefusal> {
     match governed {
-        // 封上的端点：什么都不发，回退链（环境变量、`settings.json`）不适用。
-        Some(EndpointKey::Blocked) => None,
-        Some(EndpointKey::Private(key)) => Some(OsString::from(key)),
-        Some(EndpointKey::External {
-            settings_key_verified,
-        }) => match resolve_with_source(env, home)? {
-            (key, KeySource::Env) => Some(key),
-            (key, KeySource::Settings) => (loopback && *settings_key_verified).then_some(key),
-        },
-        None => resolve_from_for(env, home, loopback),
+        Some(EndpointKey::Blocked) => return Ok(None),
+        Some(EndpointKey::Private(key)) => return Ok(Some(OsString::from(key))),
+        _ => {}
+    }
+    if let Some(key) = env.filter(|value| !value.is_empty()) {
+        return Ok(Some(key));
+    }
+    let settings_allowed = loopback
+        && !matches!(
+            governed,
+            Some(EndpointKey::External {
+                settings_key_verified: false
+            })
+        );
+    match home.filter(|_| settings_allowed) {
+        Some(home) => settings_api_key(home).map(|key| key.map(OsString::from)),
+        None => Ok(None),
     }
 }
 
@@ -922,7 +948,10 @@ pub fn resolve_with_source(
     if let Some(value) = env.filter(|value| !value.is_empty()) {
         return Some((value, KeySource::Env));
     }
-    settings_api_key(home?).map(|key| (OsString::from(key), KeySource::Settings))
+    settings_api_key(home?)
+        .ok()
+        .flatten()
+        .map(|key| (OsString::from(key), KeySource::Settings))
 }
 
 /// [`resolve_with_source`] 再按目标是否 loopback 过滤：文件 key 只发给 loopback。
@@ -942,47 +971,173 @@ pub fn resolve_from(env: Option<OsString>, home: Option<&Path>) -> Option<OsStri
     resolve_from_for(env, home, true)
 }
 
-/// 打开 `settings.json`：先打开、再对**已打开的句柄** `fstat` 判类型，不是「先 `stat` 路径、再按路径 `open`」
-/// （那样检查与打开之间路径可以被换成符号链接或 FIFO，即 TOCTOU）。
-///
-/// `O_NOFOLLOW` 让最后一段是符号链接时直接失败（`ELOOP`），`O_NONBLOCK` 让打开 FIFO 不会阻塞等写端；
-/// 常规文件上两个标志都无效果。**`O_NOFOLLOW` 只管最后一段**：`~/.omlx` 本身是符号链接（例如指向别的盘）时
-/// 仍然会被跟随，这与此前 `symlink_metadata` 的行为一致，不在本规范的保证范围内。
+// Pin the directory beneath HOME and reject symlinks when opening both components.
 #[cfg(unix)]
-fn open_settings_file(path: &Path) -> Option<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let flags = nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(flags.bits())
-        .open(path)
-        .ok()?;
-    file.metadata().ok()?.is_file().then_some(file)
+fn open_settings_file(home: &Path) -> std::io::Result<fs::File> {
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+
+    let directory = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let home = open(home, directory, Mode::empty())?;
+    let base = openat(&home, ".omlx", directory | OFlag::O_NOFOLLOW, Mode::empty())?;
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
+    openat(&base, "settings.json", flags, Mode::empty())
+        .map(fs::File::from)
+        .map_err(Into::into)
 }
 
 #[cfg(not(unix))]
-fn open_settings_file(path: &Path) -> Option<fs::File> {
-    if !fs::symlink_metadata(path).ok()?.is_file() {
-        return None;
+fn open_settings_file(home: &Path) -> std::io::Result<fs::File> {
+    let path = home.join(".omlx/settings.json");
+    if !fs::symlink_metadata(&path)?.is_file() {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
     }
-    let file = fs::File::open(path).ok()?;
-    file.metadata().ok()?.is_file().then_some(file)
+    let file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    Ok(file)
 }
 
-/// `<home>/.omlx/settings.json` 的 `auth.api_key`；任何问题都是 `None`。
-pub fn settings_api_key(home: &Path) -> Option<String> {
-    let path = home.join(".omlx").join("settings.json");
-    let mut raw = Vec::new();
-    open_settings_file(&path)?
-        .take(SETTINGS_MAX_BYTES + 1)
-        .read_to_end(&mut raw)
-        .ok()?;
-    if raw.len() as u64 > SETTINGS_MAX_BYTES {
-        return None;
+#[cfg(unix)]
+fn trusted_settings(metadata: &fs::Metadata, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.is_file() && metadata.uid() == uid && metadata.mode() & 0o022 == 0
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SettingsError {
+    Unreadable,
+    InvalidJson,
+}
+
+fn read_settings_once(
+    home: &Path,
+    missing_is_absent: bool,
+) -> Result<Option<String>, SettingsError> {
+    let file = match open_settings_file(home) {
+        Ok(file) => file,
+        Err(error) if missing_is_absent && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(_) => return Err(SettingsError::Unreadable),
+    };
+    #[cfg(unix)]
+    if !trusted_settings(
+        &file.metadata().map_err(|_| SettingsError::Unreadable)?,
+        crate::engine::effective_uid(),
+    ) {
+        return Err(SettingsError::Unreadable);
     }
-    let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-    let key = value.get("auth")?.get("api_key")?.as_str()?;
-    let key = key.trim();
-    (!key.is_empty() && !key.chars().any(|c| c.is_control() || c.is_whitespace()))
-        .then(|| key.to_owned())
+    let mut raw = Vec::new();
+    file.take(SETTINGS_MAX_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| SettingsError::Unreadable)?;
+    if raw.len() as u64 > SETTINGS_MAX_BYTES {
+        return Err(SettingsError::Unreadable);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|_| SettingsError::InvalidJson)?;
+    Ok(value
+        .get("auth")
+        .and_then(|auth| auth.get("api_key"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty() && !key.chars().any(|c| c.is_control() || c.is_whitespace()))
+        .map(str::to_owned))
+}
+
+fn read_settings_key(home: &Path) -> Result<Option<String>, SettingsError> {
+    retry_invalid_settings(home, || {
+        std::thread::sleep(std::time::Duration::from_millis(10))
+    })
+}
+
+fn retry_invalid_settings(
+    home: &Path,
+    pause: impl FnOnce(),
+) -> Result<Option<String>, SettingsError> {
+    match read_settings_once(home, true) {
+        Err(SettingsError::InvalidJson) => {
+            pause();
+            // The first read established that a file existed. If it vanishes during
+            // the retry, the configuration is still unsettled for this request.
+            read_settings_once(home, false)
+        }
+        result => result,
+    }
+}
+
+/// 读取 `<home>/.omlx/settings.json` 的 `auth.api_key`。文件缺失或合法 JSON 中没有可用的 key 时返回 `Ok(None)`。
+pub fn settings_api_key(home: &Path) -> Result<Option<String>, KeyRefusal> {
+    read_settings_key(home).map_err(|_| KeyRefusal::SettingsUnverifiable)
+}
+
+#[cfg(all(test, unix))]
+mod settings_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use super::*;
+
+    #[test]
+    fn settings_rejects_foreign_ownership() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let metadata = file.as_file().metadata().unwrap();
+        assert!(!trusted_settings(&metadata, metadata.uid().wrapping_add(1)));
+    }
+
+    #[test]
+    fn settings_rejects_group_or_world_write_bits() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(".omlx");
+        fs::create_dir(&base).unwrap();
+        let path = base.join("settings.json");
+        fs::write(&path, r#"{"auth":{"api_key":"key"}}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_settings_key(home.path()).unwrap().as_deref(),
+            Some("key")
+        );
+        for mode in [0o620, 0o602] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                read_settings_key(home.path()),
+                Err(SettingsError::Unreadable)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_json_is_retried_once_then_reported_as_unverified() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(".omlx");
+        fs::create_dir(&base).unwrap();
+        let path = base.join("settings.json");
+        fs::write(&path, "{").unwrap();
+        let result = retry_invalid_settings(home.path(), || {
+            fs::write(&path, r#"{"auth":{"api_key":"finished"}}"#).unwrap();
+        });
+        assert_eq!(result.unwrap().as_deref(), Some("finished"));
+
+        fs::write(&path, "{").unwrap();
+        let mut pauses = 0;
+        let result = retry_invalid_settings(home.path(), || pauses += 1);
+        assert_eq!(pauses, 1);
+        assert_eq!(result, Err(SettingsError::InvalidJson));
+        assert_eq!(
+            resolve_for_endpoint_checked(
+                None,
+                Some(home.path()),
+                true,
+                Some(&EndpointKey::External {
+                    settings_key_verified: true
+                })
+            ),
+            Err(KeyRefusal::SettingsUnverifiable)
+        );
+        fs::write(&path, "{}").unwrap();
+        assert_eq!(read_settings_key(home.path()), Ok(None));
+    }
 }

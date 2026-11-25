@@ -452,8 +452,11 @@ impl EngineBackend for TestBackend {
     fn block(&self, endpoint: &str) {
         self.inner.block(endpoint);
     }
-    fn current_key(&self, _endpoint: &str) -> Option<String> {
-        self.external_key.lock().unwrap().clone()
+    fn current_key(
+        &self,
+        _endpoint: &str,
+    ) -> Result<Option<String>, idoris_upstream::omlx::key::KeyRefusal> {
+        Ok(self.external_key.lock().unwrap().clone())
     }
 }
 
@@ -3013,7 +3016,10 @@ impl EngineBackend for ScriptedProbeBackend {
     fn block(&self, endpoint: &str) {
         self.inner.block(endpoint);
     }
-    fn current_key(&self, endpoint: &str) -> Option<String> {
+    fn current_key(
+        &self,
+        endpoint: &str,
+    ) -> Result<Option<String>, idoris_upstream::omlx::key::KeyRefusal> {
         self.inner.current_key(endpoint)
     }
 }

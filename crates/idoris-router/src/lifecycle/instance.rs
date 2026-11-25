@@ -1740,7 +1740,11 @@ impl Actor {
             _ => {
                 let key = backend.current_key(&self.plan.endpoint);
                 match key {
-                    None => {
+                    Err(refusal) => {
+                        self.log(&format!("外部引擎的凭证无法核验（{refusal}）"));
+                        return Attempt::Failure { reason: None };
+                    }
+                    Ok(None) => {
                         return Attempt::Terminal {
                             state: UpstreamState::Unavailable,
                             reason: Some(UpstreamReason::AuthRequired),
@@ -1748,7 +1752,7 @@ impl Actor {
                     }
                     // key 先取好（上面），再经授权路径探测：守卫重新确认监听者、只拨核验过的地址、走新开的连接（Codex 复审 L2 的 M2'）。
                     // 授权被拒绝（校验通过之后、发出之前监听者变了或确认不了）是 `Unavailable`：什么都没发，退避之后从头再来。
-                    Some(key) => match self.probe_authorized(recipe, &key).await {
+                    Ok(Some(key)) => match self.probe_authorized(recipe, &key).await {
                         EngineProbe::Ready => true,
                         EngineProbe::AuthRejected(_) => {
                             return Attempt::Terminal {
@@ -2482,7 +2486,14 @@ impl Actor {
         let recipe = backend.probe_recipe();
         // key 先取好，再经授权路径探测（守卫重新确认监听者、只拨核验过的地址、走新开的连接；Codex 复审 L2 的 M2'）。授权不过（监听者变了、读不出来）
         // 就这一轮没有结论（`Unavailable`，记一行日志）：下一个周期的校验会把监听者的变化分清楚。
-        let key = backend.current_key(&self.plan.endpoint);
+        let key = match backend.current_key(&self.plan.endpoint) {
+            Ok(key) => key,
+            Err(refusal) => {
+                self.log(&format!("外部引擎的凭证无法核验（{refusal}）"));
+                self.publish(UpstreamState::Unavailable, None);
+                return;
+            }
+        };
         // 带 key 的周期探测走授权（监听者重新确认、代际、核验过的拨号地址与新开的连接），不是对着端口直接发一个裸的 bearer：换主人的窗口里
         // 它不会把 key 发给端口上的另一个进程（Codex 复审四 H）。授权不过（监听者变了、读不出来）就这一轮没有结论，下一个周期重新核对。
         let probed = match key.as_deref() {
