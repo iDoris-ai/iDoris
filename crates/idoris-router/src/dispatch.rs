@@ -68,6 +68,33 @@ impl BoundSupervisor {
         self.handle.is_ready(model_id).await
     }
 
+    /// 引擎进程被换掉了（IDORIS-CORE S6，引擎管理器调用）：让 Supervisor 的账本跟上，见
+    /// [`idoris_backend::SupervisorHandle::engine_replaced`]。一个绝对的截止时间管入队、等安静、回答；到点还没开始的复位被 Supervisor
+    /// 丢弃，什么也不改（Codex 终审 M5）。见 [`idoris_backend::SupervisorHandle::engine_replaced_before`]。
+    pub(crate) async fn engine_replaced_before(
+        &self,
+        sample: bool,
+        deadline: std::time::Instant,
+    ) -> Result<(), BackendError> {
+        self.handle.engine_replaced_before(sample, deadline).await
+    }
+
+    /// 关 Supervisor 的门（引擎管理器在停止、替换引擎之前调用）：之后新的加载、卸载、聊天一律被拒绝，已经准入的做到完。见
+    /// [`idoris_backend::SupervisorHandle::close_admission`]。
+    pub(crate) async fn close_admission(&self) -> Result<(), BackendError> {
+        self.handle.close_admission().await
+    }
+
+    /// 开门（账本复位之后）。见 [`idoris_backend::SupervisorHandle::reopen_admission`]。
+    pub(crate) async fn reopen_admission(&self) -> Result<(), BackendError> {
+        self.handle.reopen_admission().await
+    }
+
+    /// 没有在途的加载与聊天了吗（关门之后才算「排空」）。见 [`idoris_backend::SupervisorHandle::is_quiescent`]。
+    pub(crate) async fn is_quiescent(&self) -> Result<bool, BackendError> {
+        self.handle.is_quiescent().await
+    }
+
     /// Constructs the adapter from the same card used for the binding. The load fence lives under the state
     /// directory resolved from `IDORIS_STATE_DIR` / `HOME`; tests use [`Self::spawn_omlx_in_state_dir`].
     pub fn spawn_omlx(card: &ComponentCard) -> Result<Self, String> {
@@ -88,10 +115,11 @@ impl BoundSupervisor {
         card: &ComponentCard,
         state_dir: Option<&std::path::Path>,
     ) -> Result<Self, String> {
-        let mut adapter = idoris_upstream::OmlxAdapter::new(
-            idoris_upstream::OmlxAdapterConfig::for_base_url(card.endpoint.clone()),
-        )
-        .map_err(|err| format!("无法构造 oMLX 适配器（{}）：{err}", card.provider.id))?;
+        // 与生产同一条构造路径（`idoris_upstream::factory`）：这张卡能不能带 key 按代理同一个判据（`models::is_loopback_omlx`）
+        // 定；能带的，每个请求按引擎管理器此刻的登记取 key，引擎换了、停了、端口换了主人，之前读到的 key 都不能再用；不能带的，
+        // 什么 key 都不发。
+        let mut adapter = idoris_upstream::factory::create_omlx_adapter(card)
+            .map_err(|err| format!("无法构造 oMLX 适配器（{}）：{err}", card.provider.id))?;
         if let Some(state_dir) = state_dir {
             let fence = idoris_upstream::omlx::load_fence_path_in(state_dir, &card.endpoint)
                 .map_err(|err| format!("无法确定加载围栏路径（{}）：{err}", card.provider.id))?;

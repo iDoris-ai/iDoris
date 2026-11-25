@@ -359,11 +359,12 @@ pub struct AppState {
     /// `phase`、`ready`、`started_at_ms`、`registered`、`upstreams`。默认没有任何上游（库调用方与测试）；
     /// 启动时由 `idoris` 二进制按组件卡装配并起后台探测器（`readiness::spawn_prober`）。
     /// `/health` 只读它，O(1)，不做任何上游 I/O。
+    ///
+    /// 它也是数据面判断「这张托管卡现在能不能把请求交给引擎」的依据（[`readiness::HealthState::managed_failure`]，IDORIS-CORE
+    /// S6）：**每个请求读此刻的快照**，没有就绪的托管引擎（降级放行时就没起来的，或者运行期失败、被 Admin 停下、重启中、
+    /// 端口换了主人的）路由到它的请求不碰引擎，直接 503 `local_only_unavailable`，原因码是 `reason`（没有稳定原因码的失败
+    /// 沿用已有的 `supervisor_unavailable`），见 [`managed_unavailable_response`]。
     pub health_state: readiness::HealthState,
-    /// 门控降级放行时没有就绪的托管上游（接口规范 §2.7.6，勘误六）：上游 id → 状态与原因。路由到这些卡的请求不碰引擎，
-    /// 直接 503 `local_only_unavailable`，原因码是 `reason`（没有稳定原因码的失败沿用已有的 `supervisor_unavailable`），见
-    /// [`managed_unavailable_response`]。默认空：没有托管卡，或者托管引擎都就绪了。
-    pub managed_failures: Arc<std::collections::BTreeMap<String, readiness::ManagedFailure>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -413,7 +414,6 @@ impl std::fmt::Debug for AppState {
                 &self.cloud_tier.as_ref().map(|_| "configured"),
             )
             .field("health_state", &self.health_state)
-            .field("managed_failures", &self.managed_failures)
             .finish()
     }
 }
@@ -460,7 +460,6 @@ impl Default for AppState {
             cloud_ingress: None,
             cloud_tier: None,
             health_state: readiness::HealthState::default(),
-            managed_failures: Arc::default(),
             http_client,
         }
     }
@@ -966,6 +965,10 @@ async fn embeddings(
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
     };
+    // 这个请求是为哪一代引擎准入的：**在状态门之前读**（Codex 终审 H3），所以它只可能比状态门看到的那一刻旧，不会新；之后绑定到首次发送、
+    // 每一次重试（`generation::scoped`：`outbound` 读它）。请求通过状态门后可以停在事件日志的写入、连接失败后的退避里，那时
+    // restart 若完成了，下一次发送就会拿到新引擎的 key、把旧请求的正文发给新进程；绑定之后它被拒绝，不发。
+    let admitted = models::admission_generation(&selected.card);
     if let Some(response) = managed_unavailable_response(&state, &selected) {
         return response;
     }
@@ -1032,9 +1035,9 @@ async fn embeddings(
     let dispatched_ref = &dispatched;
     let events_ref = events.as_ref();
     let selected_ref = &selected;
-    let outcome = match state
-        .proxy
-        .forward_buffered_path_finalized(
+    let outcome = match idoris_backend::generation::scoped(
+        admitted,
+        state.proxy.forward_buffered_path_finalized(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::EMBEDDINGS,
             &value,
@@ -1057,8 +1060,9 @@ async fn embeddings(
                     Ok::<(), ()>(())
                 },
             ),
-        )
-        .await
+        ),
+    )
+    .await
     {
         Ok(outcome) => outcome,
         Err(()) => return event_log_unavailable_response(),
@@ -1218,6 +1222,10 @@ async fn rerank(
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
     };
+    // 这个请求是为哪一代引擎准入的：**在状态门之前读**（Codex 终审 H3），所以它只可能比状态门看到的那一刻旧，不会新；之后绑定到首次发送、
+    // 每一次重试（`generation::scoped`：`outbound` 读它）。请求通过状态门后可以停在事件日志的写入、连接失败后的退避里，那时
+    // restart 若完成了，下一次发送就会拿到新引擎的 key、把旧请求的正文发给新进程；绑定之后它被拒绝，不发。
+    let admitted = models::admission_generation(&selected.card);
     if let Some(response) = managed_unavailable_response(&state, &selected) {
         return response;
     }
@@ -1281,9 +1289,9 @@ async fn rerank(
     let dispatched_ref = &dispatched;
     let events_ref = events.as_ref();
     let selected_ref = &selected;
-    let outcome = match state
-        .proxy
-        .forward_buffered_path_finalized(
+    let outcome = match idoris_backend::generation::scoped(
+        admitted,
+        state.proxy.forward_buffered_path_finalized(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::RERANK,
             &value,
@@ -1306,8 +1314,9 @@ async fn rerank(
                     Ok::<(), ()>(())
                 },
             ),
-        )
-        .await
+        ),
+    )
+    .await
     {
         Ok(outcome) => outcome,
         Err(()) => return event_log_unavailable_response(),
@@ -1481,6 +1490,10 @@ async fn messages(
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
     };
+    // 这个请求是为哪一代引擎准入的：**在状态门之前读**（Codex 终审 H3），所以它只可能比状态门看到的那一刻旧，不会新；之后绑定到首次发送、
+    // 每一次重试（`generation::scoped`：`outbound` 读它）。请求通过状态门后可以停在事件日志的写入、连接失败后的退避里，那时
+    // restart 若完成了，下一次发送就会拿到新引擎的 key、把旧请求的正文发给新进程；绑定之后它被拒绝，不发。
+    let admitted = models::admission_generation(&selected.card);
     if let Some(response) = managed_unavailable_response(&state, &selected) {
         return response;
     }
@@ -1529,7 +1542,11 @@ async fn messages(
     };
 
     if stream_requested {
-        return messages_stream(&state, &selected, &value, events.as_ref()).await;
+        return idoris_backend::generation::scoped(
+            admitted,
+            messages_stream(&state, &selected, &value, events.as_ref()),
+        )
+        .await;
     }
     let opts = proxy::ForwardOpts {
         request_id: headers
@@ -1547,9 +1564,9 @@ async fn messages(
     let dispatched_ref = &dispatched;
     let events_ref = events.as_ref();
     let selected_ref = &selected;
-    let outcome = match state
-        .proxy
-        .forward_buffered_path_finalized(
+    let outcome = match idoris_backend::generation::scoped(
+        admitted,
+        state.proxy.forward_buffered_path_finalized(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::MESSAGES,
             &value,
@@ -1572,8 +1589,9 @@ async fn messages(
                     Ok::<(), ()>(())
                 },
             ),
-        )
-        .await
+        ),
+    )
+    .await
     {
         Ok(outcome) => outcome,
         Err(()) => return event_log_unavailable_response(),
@@ -1962,24 +1980,28 @@ async fn get_capabilities(State(state): State<Arc<AppState>>) -> Response {
 /// `provider.id`, matching `server.ts`). Delegates to [`models::list_models`];
 /// authentication failures surface as structured upstream errors.
 async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // 降级放行时没就绪的托管卡不探测（接口规范 §2.7.6，勘误六）：它的引擎没起来，或者那个端口上的东西没有通过属主校验、
-    // 不能给它发 key；探测只会得到错误（一个 401 就会把整个列表变成 502）。别的卡照常列出。
-    let cards: std::borrow::Cow<'_, [idoris_contracts::ComponentCard]> =
-        if state.managed_failures.is_empty() {
-            std::borrow::Cow::Borrowed(state.cards.as_slice())
-        } else {
-            std::borrow::Cow::Owned(
-                state
-                    .cards
-                    .iter()
-                    .filter(|card| !state.managed_failures.contains_key(&card.provider.id))
-                    .cloned()
-                    .collect(),
-            )
-        };
-    match models::list_models_with_subscriptions(
+    // 此刻没在服务的托管卡不探测（接口规范 §2.7.6，勘误六、勘误十）：它的引擎没起来、被停下了、在重启，或者那个端口上的东西没有
+    // 通过属主校验、不能给它发 key；探测只会得到错误（一个 401 就会把整个列表变成 502）。别的卡照常列出。
+    // 每次请求读此刻的状态，不用完整的 Router 创建时拍下的名单（IDORIS-CORE S6，G1）。
+    // 每张卡被准入时的引擎代际**先于**挑选这批卡的状态检查读（Codex 终审 M6）：逐卡请求发出前，端点被停了或者换了代就不发。
+    let admitted: models::AdmittedGenerations = state
+        .cards
+        .iter()
+        .filter_map(|card| {
+            models::admission_generation(card)
+                .map(|generation| (card.provider.id.clone(), generation))
+        })
+        .collect();
+    let cards: Vec<idoris_contracts::ComponentCard> = state
+        .cards
+        .iter()
+        .filter(|card| state.health_state.failure_of_card(card).is_none())
+        .cloned()
+        .collect();
+    match models::list_models_with_subscriptions_admitted(
         &state.http_client,
         &cards,
+        &admitted,
         &state.models_health,
         &state.subscriptions,
         state.remote_kill_switch.load(Ordering::SeqCst),
@@ -2253,17 +2275,21 @@ fn headroom_breach_confirmed(headers: &HeaderMap) -> bool {
     )
 }
 
-/// 路由到了一个没有就绪的托管引擎（门控降级放行，接口规范 §2.7.6，勘误六）：不碰引擎，直接 503 `local_only_unavailable`
-/// （和别的本地失败同一个 `type`），原因码是该上游在 `/health` 里的 `reason`（`engine_not_found`、`budget_zero`、
-/// `crash_loop`……都是已有的原因码，不新增错误码）；没有稳定原因码的失败（例如模型目录取不到）沿用这条路径上已有的
-/// `supervisor_unavailable`。这张卡不是没就绪的托管卡时返回 `None`。
+/// 路由到了一个此刻没在服务的托管引擎（降级放行时就没起来的，或者运行期失败、被 Admin 停下、重启中、端口换了主人的；接口规范
+/// §2.7.6 勘误六、勘误十）：不碰引擎，直接 503 `local_only_unavailable`（和别的本地失败同一个 `type`），原因码是该上游在
+/// `/health` 里的 `reason`（`engine_not_found`、`budget_zero`、`crash_loop`、`port_in_use`……都是已有的原因码，不新增错误码）；
+/// 没有稳定原因码的失败（例如模型目录取不到、被停下、重启中）沿用这条路径上已有的 `supervisor_unavailable`。这张卡不是
+/// 没在服务的托管卡时返回 `None`。
 ///
-/// 这一步在选定候选之后、转发之前：resident 的托管卡也走这里，所以**请求不会发给一个没有通过属主校验、或者根本没起来的端口**。
+/// **每个请求读此刻的状态**（[`readiness::HealthState::managed_failure`]），不用完整的 Router 创建时拍下的名单：名单在引擎
+/// 运行期失败之后就是错的（请求还会发给已经换了主人的端口）。这一步在选定候选之后、转发之前：resident 的托管卡也走这里，所以
+/// **请求不会发给一个没有通过属主校验、被停下、或者根本没起来的端口**。
 fn managed_unavailable_response(
     state: &AppState,
     selected: &dispatch::Selected,
 ) -> Option<Response> {
-    let failure = state.managed_failures.get(&selected.card.provider.id)?;
+    // 共用这个引擎的卡（伴生卡）继承它的失败：见 [`readiness::HealthState::failure_of_card`]。
+    let failure = state.health_state.failure_of_card(&selected.card)?;
     let reason_code = failure
         .reason
         .map_or("supervisor_unavailable", readiness::UpstreamReason::as_str);
@@ -2272,7 +2298,7 @@ fn managed_unavailable_response(
         "local_only_unavailable",
         reason_code,
         format!(
-            "the managed {} engine behind \"{}\" is {} and does not serve requests until iDoris is restarted",
+            "the managed {} engine behind \"{}\" is {} and does not serve requests now",
             failure.engine_kind,
             selected.card.provider.id,
             failure.state.as_str()
@@ -3113,6 +3139,8 @@ async fn chat_completions(
             }
             return response;
         }
+        // 这个请求是为哪一代引擎准入的：在状态门之前读（Codex 终审 H3），之后绑定到首次发送、流式首发与每一次重试（`chat_via_proxy` 一整条）。
+        let admitted = models::admission_generation(&selected.card);
         // 选中了一个没有就绪的托管引擎（门控降级放行）：不碰引擎，503 带原因；和别的本地失败一样，云端兜底（如果配置了）
         // 照常有机会接手。
         if let Some(original) = managed_unavailable_response(&state, selected) {
@@ -3205,19 +3233,22 @@ async fn chat_completions(
                 Ok(body) => body,
                 Err(error) => return model_resolution_error(error),
             };
-            return chat_via_proxy(
-                &state,
-                selected,
-                &headers,
-                &parsed,
-                &upstream_body,
-                &record_id,
-                ProxyEventContexts {
-                    budget_reserved: budget_event_context.as_ref(),
-                    dispatched: dispatched_event_context.as_ref(),
-                    completed: completed_event_context.as_ref(),
-                },
-                budget_key_id.as_deref(),
+            return idoris_backend::generation::scoped(
+                admitted,
+                chat_via_proxy(
+                    &state,
+                    selected,
+                    &headers,
+                    &parsed,
+                    &upstream_body,
+                    &record_id,
+                    ProxyEventContexts {
+                        budget_reserved: budget_event_context.as_ref(),
+                        dispatched: dispatched_event_context.as_ref(),
+                        completed: completed_event_context.as_ref(),
+                    },
+                    budget_key_id.as_deref(),
+                ),
             )
             .await;
         }
@@ -4253,6 +4284,8 @@ mod budget_reserved_wiring_tests;
 
 #[cfg(test)]
 mod dispatched_wiring_tests;
+#[cfg(test)]
+mod final_review_tests;
 
 #[cfg(test)]
 mod completed_wiring_tests;
@@ -4681,6 +4714,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
+    }
+
+    /// Codex 预审 M1：`/health` 在每一个 phase 里都是 200（Agent24 靠 `phase` 字段而不是状态码判断）。
+    #[tokio::test]
+    async fn health_is_200_in_every_phase() {
+        use crate::readiness::{HealthState, UpstreamState, UpstreamStatus};
+        for (state, phase) in [
+            (UpstreamState::Starting, "starting"),
+            (UpstreamState::Restarting, "starting"),
+            (UpstreamState::Ready, "ready"),
+            (UpstreamState::Failed, "degraded"),
+        ] {
+            let health = HealthState::with_upstreams(
+                0,
+                vec![UpstreamStatus {
+                    id: "omlx".into(),
+                    engine_kind: "omlx".into(),
+                    state,
+                    reason: None,
+                    managed: true,
+                    owned: false,
+                }],
+            );
+            let app = build_app(AppState {
+                health_state: health,
+                ..AppState::default()
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{state:?}");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["phase"], phase, "{state:?}");
+        }
     }
 
     #[tokio::test]

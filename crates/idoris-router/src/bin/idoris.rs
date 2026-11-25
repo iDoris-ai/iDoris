@@ -21,7 +21,7 @@ use idoris_router::{
     AppState, BIND_HOST,
     admin::{
         ADMIN_PORT_ENV, AdminBindConfig, AdminSessionToken, SharedAdminToken,
-        build_admin_app_with_token,
+        build_admin_app_with_engines, build_admin_app_with_token,
     },
     auth::VirtualKeyAuthenticator,
     build_app,
@@ -1050,6 +1050,8 @@ async fn run(options: cli::ServeOptions, exit_deadline: &ExitDeadline) -> Result
             ));
             let finalize: lifecycle::gate::Finalize = {
                 let admin_token = admin_token.clone();
+                // 完整的 Admin 经它给 `upstreams` 的写接口下命令（`start|stop|restart`，规范 §2.11.4），读接口取它的只读快照。
+                let admin_engines = engines.clone();
                 let prober_slot = prober_slot.clone();
                 let prober_cancel = prober_cancel.clone();
                 let mut state = state.clone();
@@ -1062,7 +1064,8 @@ async fn run(options: cli::ServeOptions, exit_deadline: &ExitDeadline) -> Result
                 );
                 Box::new(move |outcome: &lifecycle::GateOutcome| {
                     // 降级放行（有托管引擎终局失败，接口规范 §2.7.6 勘误六）：没就绪的托管卡不建 Supervisor——它会去采样一个没起来、
-                    // 或者没通过属主校验的端点；路由到这些卡的请求由 `managed_failures` 直接 503（带原因），别的卡照常服务。
+                    // 或者没通过属主校验的端点；路由到这些卡的请求由 `/health` 的实时快照（`HealthState::managed_failure`）直接
+                    // 503（带原因），别的卡照常服务。
                     // 本地 runtime 配置从不绑托管卡（启动时 `validate_local_configs` 已拒绝，勘误十二（3））：配置表原样交给它，不需要投影；
                     // 适配器参数用启动时按原始卡集解析好的，建表走启动时干跑过的同一条路径（勘误十二（3））。
                     let runtimes = RuntimeRegistry::spawn_after_gate(
@@ -1074,7 +1077,6 @@ async fn run(options: cli::ServeOptions, exit_deadline: &ExitDeadline) -> Result
                         &adapter_params,
                     )?;
                     state.runtimes = runtimes.clone();
-                    state.managed_failures = Arc::new(outcome.degraded.clone());
                     state.capabilities = capabilities_inputs.take().map(|(catalog, facts)| {
                         Arc::new(
                             LiveCapabilitiesProvider::new(catalog, facts, runtimes.clone())
@@ -1096,7 +1098,11 @@ async fn run(options: cli::ServeOptions, exit_deadline: &ExitDeadline) -> Result
                     *prober_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(prober);
                     Ok(lifecycle::gate::Finalized {
                         data: build_app(state.clone()),
-                        admin: build_admin_app_with_token(state, admin_token),
+                        admin: build_admin_app_with_engines(
+                            state,
+                            admin_token,
+                            Some(admin_engines),
+                        ),
                         runtimes,
                     })
                 })

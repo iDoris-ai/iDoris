@@ -450,6 +450,18 @@ impl OwnedEngine {
         }
     }
 
+    /// 用一份**留着的**所有权记录重建一个认回的句柄（不读记录文件）。给「记录文件没了、作废了，进程却可能还在」的收尾用：调用方在停
+    /// 引擎之前留了一份完整的记录（pid、启动时间、「代」标识、进程组、命令），停的时候照样过身份闸（[`gate`]：对不上就什么信号也不发），
+    /// 不靠磁盘上那份文件还在不在（Codex 复审四 H）。
+    pub fn from_record(
+        instance: &EngineInstance,
+        record: OwnershipRecord,
+        inspector: &Arc<dyn ProcessInspector>,
+    ) -> Self {
+        let store = instance.store();
+        Self::recovered(instance, record, store, inspector)
+    }
+
     pub fn instance(&self) -> &EngineInstance {
         &self.instance
     }
@@ -574,7 +586,7 @@ impl OwnedEngine {
     /// 认回的孤儿身份对不上（进程已经没了、pid 被复用）时什么信号都不发，直接 `Ok`：没有我们的东西在跑。
     /// 身份读不出来 → [`EngineError::IdentityUnreadable`]，同样不发信号。
     pub async fn stop(self, grace: Duration) -> Result<(), EngineError> {
-        self.stop_with(move || (grace, grace)).await
+        self.stop_with(move || (grace, grace), None).await
     }
 
     /// [`Self::stop`] against an **absolute deadline**: the SIGTERM grace and the confirmation window are worked out
@@ -586,13 +598,16 @@ impl OwnedEngine {
         grace: Duration,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(), EngineError> {
-        self.stop_with(move || match deadline {
-            None => (grace, grace),
-            Some(deadline) => stop_windows(
-                grace,
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            ),
-        })
+        self.stop_with(
+            move || match deadline {
+                None => (grace, grace),
+                Some(deadline) => stop_windows(
+                    grace,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                ),
+            },
+            None,
+        )
         .await
     }
 
@@ -606,7 +621,30 @@ impl OwnedEngine {
         term_grace: Duration,
         confirm: Duration,
     ) -> Result<(), EngineError> {
-        self.stop_with(move || (term_grace, confirm)).await
+        self.stop_with(move || (term_grace, confirm), None).await
+    }
+
+    /// [`Self::stop_until`] whose SIGTERM wait can be **cut short** while it runs (`cut` turns `true`): the stop goes straight on to the SIGKILL
+    /// sweep with the same identity checks and, for a child, the same handle pinning the group. For a caller that started a stop with a long
+    /// grace and then has to be done by a deadline (iDoris is stopping) without cancelling the stop, which would drop the handle (a recovered
+    /// orphan or a `stop_on_exit: never` child is not killed by a drop).
+    pub async fn stop_until_cut(
+        self,
+        grace: Duration,
+        deadline: Option<tokio::time::Instant>,
+        cut: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), EngineError> {
+        self.stop_with(
+            move || match deadline {
+                None => (grace, grace),
+                Some(deadline) => stop_windows(
+                    grace,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                ),
+            },
+            Some(cut),
+        )
+        .await
     }
 
     /// The one implementation behind [`Self::stop`], [`Self::stop_bounded`] and [`Self::stop_until`]: `windows` gives
@@ -614,6 +652,7 @@ impl OwnedEngine {
     async fn stop_with(
         self,
         windows: impl FnOnce() -> (Duration, Duration),
+        cut: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(), EngineError> {
         let Self {
             backing,
@@ -628,12 +667,16 @@ impl OwnedEngine {
                 // Every signalling rescan happens inside `shutdown_bounded`, while the unreaped child still pins the
                 // group id. If it fails, that is only reported: after the reap the numeric group id may belong to an
                 // unrelated process group, so there is no second sweep by number here.
-                if process.shutdown_bounded(term_grace, confirm).await.is_err() {
+                if process
+                    .shutdown_bounded_cut(term_grace, confirm, cut)
+                    .await
+                    .is_err()
+                {
                     return Err(EngineError::StopFailed);
                 }
             }
             Backing::Recovered => {
-                stop_recovered(inspector.as_ref(), &record, windows).await?;
+                stop_recovered(inspector.as_ref(), &record, windows, cut).await?;
             }
         }
         // 进程已确认消失。记录删不掉也无妨：下一个 iDoris 读到它会因进程不在而作废。
@@ -779,6 +822,7 @@ async fn stop_recovered(
     inspector: &dyn ProcessInspector,
     record: &OwnershipRecord,
     windows: impl FnOnce() -> (Duration, Duration),
+    mut cut: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), EngineError> {
     match gate(inspector, record).await {
         // 没有我们的东西在跑（或 pid 已经给了别人）：什么都不发。
@@ -789,7 +833,16 @@ async fn stop_recovered(
     let (term_grace, confirm) = windows();
     let group = signal_target(record)?;
     signal_group(group, Signal::SIGTERM).map_err(|_| EngineError::Signal)?;
-    if wait_group_gone(group, term_grace).await? {
+    // The SIGTERM wait can be cut short (`stop_until_cut`): then straight on to the SIGKILL sweep below.
+    let gone = match cut.as_mut() {
+        Some(cut) => tokio::select! {
+            biased;
+            _ = cut.wait_for(|cut| *cut) => false,
+            gone = wait_group_gone(group, term_grace) => gone?,
+        },
+        None => wait_group_gone(group, term_grace).await?,
+    };
+    if gone {
         return Ok(());
     }
     // 组里仍有活成员：组 id 此刻没有被重新分配（成员检查与 SIGKILL 之间有微秒级的非原子窗口），整组 SIGKILL。
@@ -1246,12 +1299,12 @@ mod tests {
         mine.generation = Some("gen-1".into());
         let mut other = Fake::matching();
         other.generation = Ok("gen-2".into());
-        stop_recovered(&other, &mine, || (grace, grace))
+        stop_recovered(&other, &mine, || (grace, grace), None)
             .await
             .unwrap();
         let blind = Fake::matching();
         assert!(matches!(
-            stop_recovered(&blind, &mine, || (grace, grace)).await,
+            stop_recovered(&blind, &mine, || (grace, grace), None).await,
             Err(EngineError::IdentityUnreadable(
                 UnreadableReason::Generation
             ))
@@ -1270,10 +1323,15 @@ mod tests {
         slow.group = Ok(std::process::id());
         let begun = std::time::Instant::now();
         let asked_after = std::cell::Cell::new(None);
-        let result = stop_recovered(&slow, &mine, || {
-            asked_after.set(Some(begun.elapsed()));
-            (Duration::from_millis(10), Duration::from_millis(10))
-        })
+        let result = stop_recovered(
+            &slow,
+            &mine,
+            || {
+                asked_after.set(Some(begun.elapsed()));
+                (Duration::from_millis(10), Duration::from_millis(10))
+            },
+            None,
+        )
         .await;
         assert!(
             matches!(result, Err(EngineError::UnsafeRecord)),
@@ -1529,14 +1587,14 @@ mod tests {
         ] {
             let mut fake = Fake::matching();
             tweak(&mut fake);
-            stop_recovered(&fake, &mine, || (grace, grace))
+            stop_recovered(&fake, &mine, || (grace, grace), None)
                 .await
                 .unwrap();
         }
         let mut blind = Fake::matching();
         blind.start = Err(InspectError::TimedOut);
         assert!(matches!(
-            stop_recovered(&blind, &mine, || (grace, grace)).await,
+            stop_recovered(&blind, &mine, || (grace, grace), None).await,
             Err(EngineError::IdentityUnreadable(UnreadableReason::StartTime))
         ));
     }

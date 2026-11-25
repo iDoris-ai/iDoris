@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/admin-v0-upstreams.schema.json",
+  "title": "AdminV0UpstreamsResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["upstreams"],
+  "properties": {
+    "upstreams": {
+      "type": "array",
+      "items": { "$ref": "admin-v0-upstream.schema.json" }
+    }
+  }
+}

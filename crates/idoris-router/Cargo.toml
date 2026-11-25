@@ -75,6 +75,9 @@ tower = { version = "0.5", features = ["util"] }
 nix = { workspace = true, features = ["poll", "resource", "fs", "user", "dir"] }
 
 [dev-dependencies]
+# 测试清理进程全局的 key 登记表要用 `forget_endpoint`（整条删掉，代际也回到 0）与 `release_endpoint`（撤销口径）（IDORIS-CORE S6，Codex 终审 L3：
+# 它们不在生产的公开接口里）。
+idoris-upstream = { workspace = true, features = ["test-support"] }
 rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 http-body-util = "0.1"

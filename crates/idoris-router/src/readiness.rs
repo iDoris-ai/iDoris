@@ -42,6 +42,7 @@
 //! （单次调用上限是 `adapter_call_timeout`，默认 30 秒）。期间数据面照常服务（没有托管卡时行为不变，规范 §2.7.6）。
 //! `status` 仍恒为 `"ok"`。
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -141,6 +142,24 @@ pub struct ManagedFailure {
     pub reason: Option<UpstreamReason>,
 }
 
+/// 一个托管上游处于这个状态与原因时，数据面是不是该把请求交给它（IDORIS-CORE S6，G1；接口规范 §2.7.6 勘误六（9）、勘误十）。
+///
+/// 只有就绪的才交；正在拉起（`starting`、`restarting`）、没有引擎（`absent`）、失败（`failed`，含外部引擎的端口换了主人：
+/// `port_in_use`）、被停下（`stopped`）的不交：请求不碰那个端口，直接 503 带原因。`unavailable` 要看有没有确定的原因：
+/// 有（要 key、key 被拒、围栏还在、Supervisor 粘滞、等不到就绪）是确定的失败，不交；没有（引擎活着、探测没答上来，例如 oMLX
+/// 正忙着加载大模型，`/v1/models` 变慢）还是交：那只是慢，Supervisor 自己的调用有超时，不能因为一次探测慢就让整张卡 503。
+pub fn upstream_serves(state: UpstreamState, reason: Option<UpstreamReason>) -> bool {
+    match state {
+        UpstreamState::Ready => true,
+        UpstreamState::Unavailable => reason.is_none(),
+        UpstreamState::Starting
+        | UpstreamState::Restarting
+        | UpstreamState::Failed
+        | UpstreamState::Stopped
+        | UpstreamState::Absent => false,
+    }
+}
+
 /// `/health.upstreams[]` 的元素。`reason` 出现时 `state` 不是 `ready`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpstreamStatus {
@@ -220,6 +239,24 @@ fn gated_phase(upstreams: &[UpstreamStatus]) -> Phase {
 /// 门控已开（或没有门控）而仍有上游没有第一次观测时 `phase` 可以是 `starting`，这时数据面已经在服务（只有门控未开时才 503
 /// `idoris_starting`，规范 §2.11.1）。取值集合不变：`starting`、`ready`、`degraded`。
 pub fn phase_of(upstreams: &[UpstreamStatus]) -> Phase {
+    // 有托管上游时 `phase` 只反映托管上游（与 Agent24 商定的契约，IDORIS-CORE S6，Codex 预审 M1）：别的上游（resident、云）是否就绪、是否还没
+    // 第一次观测，既不能在托管引擎重启时把 `phase` 撑成 `ready`，也不能在托管引擎就绪时把它拉回 `starting`。次序：终态（`degraded`，哪怕另一个
+    // 托管上游还在启动：Agent24 据此做有界等待）> 启动或重启中（`starting`）> 全部就绪（`ready`）。
+    if upstreams.iter().any(|upstream| upstream.managed) {
+        let managed = || upstreams.iter().filter(|upstream| upstream.managed);
+        return if managed().any(|upstream| is_terminal(upstream.state)) {
+            Phase::Degraded
+        } else if managed().any(|upstream| {
+            matches!(
+                upstream.state,
+                UpstreamState::Starting | UpstreamState::Restarting
+            )
+        }) {
+            Phase::Starting
+        } else {
+            Phase::Ready
+        };
+    }
     if upstreams
         .iter()
         .any(|upstream| upstream.managed && is_terminal(upstream.state))
@@ -265,6 +302,9 @@ struct Inner {
     registered: AtomicBool,
     gate: RwLock<GateState>,
     upstreams: RwLock<Vec<UpstreamStatus>>,
+    /// 引擎管理器登记的：托管引擎的 endpoint（规范化的标识）→ 管着它的托管上游的 id。共用这个引擎的别的卡（同一个 endpoint：伴生卡
+    /// `omlx-embed`）据此继承它的失败（[`HealthState::failure_of_card`]）。
+    managed_endpoints: RwLock<BTreeMap<String, String>>,
 }
 
 /// 共享的就绪状态。克隆很便宜（一个 `Arc`），`/health` 与探测器各持一份。
@@ -300,6 +340,7 @@ impl HealthState {
                 registered: AtomicBool::new(false),
                 gate: RwLock::new(GateState::NotGated),
                 upstreams: RwLock::new(upstreams),
+                managed_endpoints: RwLock::new(BTreeMap::new()),
             }),
         }
     }
@@ -362,6 +403,58 @@ impl HealthState {
             upstream.reason = reason;
             upstream.owned = owned;
         }
+    }
+
+    /// 引擎管理器登记：`endpoint` 上的引擎归托管上游 `id` 管（IDORIS-CORE S6，Codex 审计 H1）。引擎管理器启动时对每个托管上游登记一次，
+    /// 先于它的第一次探测。`endpoint` 不是 http(s) URL 时什么也不做。
+    pub fn register_managed_endpoint(&self, endpoint: &str, id: &str) {
+        if let Some(identity) = idoris_upstream::omlx::key::endpoint_identity(endpoint) {
+            self.inner
+                .managed_endpoints
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(identity, id.to_owned());
+        }
+    }
+
+    /// 这张卡此刻没在服务就给出状态与原因，否则 `None`。两种情况：它自己是没在服务的托管上游（[`Self::managed_failure`]）；或者它与
+    /// 一个这样的托管上游**共用同一个引擎**（同一个 endpoint：伴生卡 `omlx-embed` 与主卡 `omlx`）——共用引擎的卡**继承**那个引擎的
+    /// 失败状态，所以主卡的端口被别的东西占了（`failed` + `port_in_use`）时，伴生卡的后台探测、`/v1/models`、预热与转发同样不碰那个
+    /// 端口（IDORIS-CORE S6，Codex 审计 H1）。不共用引擎的上游不受影响，照常服务。每次调用都读此刻的状态。
+    pub fn failure_of_card(&self, card: &ComponentCard) -> Option<ManagedFailure> {
+        if let Some(failure) = self.managed_failure(&card.provider.id) {
+            return Some(failure);
+        }
+        let identity = idoris_upstream::omlx::key::endpoint_identity(&card.endpoint)?;
+        let owner = self
+            .inner
+            .managed_endpoints
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&identity)
+            .cloned()?;
+        if owner == card.provider.id {
+            return None;
+        }
+        self.managed_failure(&owner)
+    }
+
+    /// 这个托管上游此刻没在服务就给出它的状态与原因（[`upstream_serves`]），否则（在服务、不是托管上游、没有这个 id）`None`。
+    /// **每次调用都读此刻的快照**：数据面据此在每个请求上决定要不要把它交给引擎，引擎在运行期失败、被 Admin 停下、重启中、
+    /// 端口换了主人，下一个请求就 503，不靠完整的 Router 创建时拍下的名单（IDORIS-CORE S6，G1）。
+    pub fn managed_failure(&self, id: &str) -> Option<ManagedFailure> {
+        self.inner
+            .upstreams
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|upstream| upstream.managed && upstream.id == id)
+            .filter(|upstream| !upstream_serves(upstream.state, upstream.reason))
+            .map(|upstream| ManagedFailure {
+                engine_kind: upstream.engine_kind.clone(),
+                state: upstream.state,
+                reason: upstream.reason,
+            })
     }
 
     pub fn view(&self) -> HealthView {
@@ -506,28 +599,87 @@ pub async fn probe_resident(
     card: &ComponentCard,
     timeout: Duration,
 ) -> Observation {
+    probe_resident_admitted(client, card, None, timeout).await
+}
+
+/// 同 [`probe_resident`]，带着这一轮观测开始时读到的这张卡的引擎代际（`crate::models::admission_generation`，先于状态检查读）：
+/// 能带 oMLX key 的卡**在发出请求之前**经 `authorize_omlx_request`（Codex 终审 H1、M6）：核对代际与封上、让引擎管理器的守卫重新确认
+/// 监听者，被拒绝就不发，这一轮的观测是「不可用」。之前被封上的端点会被当成「没有 key」照样发一个匿名的 GET。
+pub async fn probe_resident_admitted(
+    client: &reqwest::Client,
+    card: &ComponentCard,
+    admitted_generation: Option<u64>,
+    timeout: Duration,
+) -> Observation {
     if !idoris_upstream::omlx::key::is_loopback_base_url(&card.endpoint) {
         return Observation::Unavailable(None);
     }
     let url = format!("{}/v1/models", card.endpoint.trim_end_matches('/'));
-    let mut request = client.get(&url).timeout(timeout);
     let mut key_sent = false;
-    if crate::models::is_loopback_omlx(card)
-        && let Some(key) = idoris_upstream::omlx::key::resolve_omlx_api_key_os_for(&card.endpoint)
-            .filter(|key| !key.is_empty())
-    {
-        // 非 UTF-8、放不进请求头的 key 是无效凭证，不是「没有凭证」（与 `GET /v1/models` 同口径）。
-        let Some(mut authorization) = key
-            .to_str()
-            .and_then(|key| HeaderValue::from_str(&format!("Bearer {key}")).ok())
+    // 持有到响应读完：端点上的一个在途操作。被管理的端点由端点决定（Codex 预审 L2 的 H1）：不能带 key 的卡也过同一道授权，只是不带凭证。
+    let carries_key = crate::models::is_loopback_omlx(card);
+    let authorization = if carries_key {
+        let Ok(authorization) =
+            idoris_upstream::omlx::key::authorize_omlx_request(&card.endpoint, admitted_generation)
+                .await
         else {
-            return Observation::Unavailable(Some(UpstreamReason::AuthFailed));
+            return Observation::Unavailable(None);
         };
-        authorization.set_sensitive(true);
-        request = request.header(AUTHORIZATION, authorization);
-        key_sent = true;
+        Some(authorization)
+    } else if idoris_upstream::omlx::key::is_governed_endpoint(&card.endpoint) {
+        let Ok(authorization) = idoris_upstream::omlx::key::authorize_omlx_request_without_key(
+            &card.endpoint,
+            admitted_generation,
+        )
+        .await
+        else {
+            return Observation::Unavailable(None);
+        };
+        Some(authorization)
+    } else {
+        None
+    };
+    // 托管的端点：发往授权核验过的拨号地址（不是卡里写的别名），用不保留空闲连接的客户端（Codex 专项评审 H1、H6）。
+    let (client, send_url) = match &authorization {
+        Some(authorization) => (authorization.client(client), authorization.dial_url(&url)),
+        None => (client.clone(), url.clone()),
+    };
+    let mut request = client.get(&send_url).timeout(timeout);
+    let held = if let Some(authorization) = authorization {
+        if let Some(key) = carries_key
+            .then(|| authorization.key_os())
+            .flatten()
+            .filter(|key| !key.is_empty())
+        {
+            // 非 UTF-8、放不进请求头的 key 是无效凭证，不是「没有凭证」（与 `GET /v1/models` 同口径）。
+            let Some(mut header) = key
+                .to_str()
+                .and_then(|key| HeaderValue::from_str(&format!("Bearer {key}")).ok())
+            else {
+                return Observation::Unavailable(Some(UpstreamReason::AuthFailed));
+            };
+            header.set_sensitive(true);
+            request = request.header(AUTHORIZATION, header);
+            key_sent = true;
+        }
+        Some(authorization)
+    } else {
+        None
+    };
+    // 请求**建好之后**、发出前最后同步看一眼端点（Codex 预审 L2 的 H3；复审 L2 的 M1'）。
+    let (client, built) = request.build_split();
+    let Ok(built) = built else {
+        return Observation::Unavailable(None);
+    };
+    #[cfg(test)]
+    idoris_upstream::omlx::key::test_hooks::between_build_and_send(built.url().as_str());
+    if held
+        .as_ref()
+        .is_some_and(|authorization| authorization.ensure_current().is_err())
+    {
+        return Observation::Unavailable(None);
     }
-    let Ok(response) = request.send().await else {
+    let Ok(response) = client.execute(built).await else {
         return Observation::Unavailable(None);
     };
     let status = response.status();
@@ -602,7 +754,19 @@ impl ProberContext {
                 }
             }
             UpstreamKind::Resident => {
-                probe_resident(&self.client, plan.card(), self.timings.probe_timeout).await
+                // 这一轮观测准入时的引擎代际，先于状态检查读（Codex 终审 M6）。
+                let admitted = crate::models::admission_generation(plan.card());
+                // 与一个没在服务的托管引擎共用 endpoint 的卡（伴生卡）继承它的失败，一个请求都不发（Codex 审计 H1）。
+                if let Some(failure) = self.health.failure_of_card(plan.card()) {
+                    return Observation::Unavailable(failure.reason);
+                }
+                probe_resident_admitted(
+                    &self.client,
+                    plan.card(),
+                    admitted,
+                    self.timings.probe_timeout,
+                )
+                .await
             }
         }
     }
@@ -696,6 +860,55 @@ mod tests {
             managed: false,
             owned: false,
         }
+    }
+
+    /// Codex 预审 M1：有托管上游时 `phase` 只反映托管上游。
+    #[test]
+    fn phase_reflects_only_the_managed_upstreams_when_there_are_any() {
+        use UpstreamState::*;
+        // 托管引擎在重启：别的上游就绪不能让 `phase` 成为 `ready`（修复前：Ready）。
+        assert_eq!(
+            phase_of(&[
+                status("cloud", Ready, None),
+                managed_status("omlx", Restarting)
+            ]),
+            Phase::Starting
+        );
+        // 托管引擎在启动：同上。
+        assert_eq!(
+            phase_of(&[
+                status("cloud", Ready, None),
+                managed_status("omlx", Starting)
+            ]),
+            Phase::Starting
+        );
+        // 托管引擎就绪：别的上游还没第一次观测也不拉回 `starting`（修复前：Starting）。
+        assert_eq!(
+            phase_of(&[
+                status("cloud", Starting, None),
+                managed_status("omlx", Ready)
+            ]),
+            Phase::Ready
+        );
+        // 托管的失败与另一个托管上游的启动并存：保持 `degraded`（Agent24 据此有界等待）。
+        assert_eq!(
+            phase_of(&[managed_status("a", Failed), managed_status("b", Starting)]),
+            Phase::Degraded
+        );
+        assert_eq!(
+            phase_of(&[managed_status("a", Failed), managed_status("b", Restarting)]),
+            Phase::Degraded
+        );
+        // 全部托管都在重启：不是 `degraded`（那是终态），是 `starting`。
+        assert_eq!(
+            phase_of(&[managed_status("a", Restarting)]),
+            Phase::Starting
+        );
+        // 没有托管上游：与 v0.5.0 一致。
+        assert_eq!(
+            phase_of(&[status("a", Ready, None), status("b", Starting, None)]),
+            Phase::Starting
+        );
     }
 
     #[test]
@@ -833,6 +1046,130 @@ mod tests {
         assert_eq!(health.view().phase, Phase::Ready);
     }
 
+    /// IDORIS-CORE S6 (G1): which managed states keep a request away from the engine.
+    #[test]
+    fn only_a_ready_engine_or_one_that_is_merely_slow_to_answer_is_handed_requests() {
+        use UpstreamReason::*;
+        use UpstreamState::*;
+        assert!(upstream_serves(Ready, None));
+        // Alive but the probe did not answer, no definite reason (oMLX busy loading a big model): still served.
+        assert!(upstream_serves(Unavailable, None));
+        // A definite reason for `unavailable` is a definite failure.
+        for reason in [
+            AuthRequired,
+            AuthFailed,
+            FencePending,
+            StartupLatched,
+            StartupTimeout,
+            PortInUse,
+        ] {
+            assert!(!upstream_serves(Unavailable, Some(reason)), "{reason:?}");
+        }
+        // Not running, or running a state that has not served yet: never, with or without a reason.
+        for state in [Starting, Restarting, Failed, Stopped, Absent] {
+            assert!(!upstream_serves(state, None), "{state:?}");
+            assert!(!upstream_serves(state, Some(CrashLoop)), "{state:?}");
+        }
+    }
+
+    /// IDORIS-CORE S6 (Codex audit H1): a card that shares a managed engine's endpoint (the companion card) inherits that
+    /// engine's failure; a card that does not share it, and a card whose engine is serving, are untouched.
+    #[test]
+    fn a_card_that_shares_a_failed_managed_engine_inherits_its_failure_and_an_independent_one_does_not()
+     {
+        use UpstreamReason::*;
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", Starting),
+                status("omlx-embed", Ready, None),
+                status("lmstudio", Ready, None),
+            ],
+        );
+        health.register_managed_endpoint("http://127.0.0.1:8088", "omlx");
+        let companion = resident_card("omlx-embed", "http://127.0.0.1:8088/", "omlx@0.6.4");
+        let independent =
+            resident_card("lmstudio", "http://127.0.0.1:1234", "openai_compat@unknown");
+        let main = omlx_card();
+
+        // Not serving yet (`starting`): the companion is held back with the managed card's state.
+        for card in [&main, &companion] {
+            assert_eq!(
+                health.failure_of_card(card).map(|failure| failure.state),
+                Some(Starting),
+                "{}",
+                card.provider.id
+            );
+        }
+        assert_eq!(health.failure_of_card(&independent), None);
+
+        // A terminal failure with a reason: the companion reports the same reason (the endpoint match ignores a
+        // trailing slash, as the governance table does).
+        health.set_managed("omlx", Failed, Some(PortInUse), false);
+        let inherited = health.failure_of_card(&companion).unwrap();
+        assert_eq!(
+            (inherited.state, inherited.reason),
+            (Failed, Some(PortInUse))
+        );
+        assert_eq!(
+            health.failure_of_card(&independent),
+            None,
+            "independent upstreams keep serving"
+        );
+
+        // The engine serves: nobody is held back.
+        health.set_managed("omlx", Ready, None, true);
+        for card in [&main, &companion, &independent] {
+            assert_eq!(health.failure_of_card(card), None, "{}", card.provider.id);
+        }
+
+        // An engine whose endpoint was never registered shares nothing.
+        let unregistered = HealthState::with_upstreams(0, vec![managed_status("omlx", Failed)]);
+        assert_eq!(unregistered.failure_of_card(&companion), None);
+    }
+
+    #[test]
+    fn managed_failure_reads_the_live_snapshot_for_managed_upstreams_only() {
+        use UpstreamState::*;
+        let health = HealthState::with_upstreams(
+            0,
+            vec![
+                managed_status("omlx", Ready),
+                status("lmstudio", Ready, None),
+            ],
+        );
+        assert_eq!(health.managed_failure("omlx"), None, "ready: served");
+        // The engine fails at run time: the very next read says so (nothing was snapshotted at gate time).
+        health.set_managed("omlx", Failed, Some(UpstreamReason::PortInUse), false);
+        assert_eq!(
+            health.managed_failure("omlx"),
+            Some(ManagedFailure {
+                engine_kind: "omlx".to_owned(),
+                state: Failed,
+                reason: Some(UpstreamReason::PortInUse),
+            })
+        );
+        health.set_managed("omlx", Stopped, None, false);
+        assert_eq!(
+            health.managed_failure("omlx").map(|failure| failure.state),
+            Some(Stopped)
+        );
+        health.set_managed("omlx", Ready, None, true);
+        assert_eq!(
+            health.managed_failure("omlx"),
+            None,
+            "and it is served again once ready"
+        );
+        // Not managed: never (the prober's cards keep their v0.5.0 path), however bad the state; unknown id: none.
+        health.apply(
+            "lmstudio",
+            Observation::Unavailable(Some(UpstreamReason::AuthRequired)),
+        );
+        assert_eq!(health.managed_failure("lmstudio"), None);
+        assert_eq!(health.managed_failure("nope"), None);
+    }
+
     /// 规范勘误十二（4）(a)：门控已开之后，托管上游的终局失败优先于「别的上游还没有第一次观测」。探测器在门控放行之后才起，
     /// 放行那一刻别的上游还是 `starting`；此前这个 `starting` 遮住了托管引擎的 `degraded`，直到别的上游有了第一次观测。
     #[test]
@@ -868,14 +1205,19 @@ mod tests {
             ]),
             Phase::Degraded
         );
-        // 反过来：托管上游没有终局失败（就绪，或还在往前走）时，没有第一次观测的上游仍让 `phase` 停在 `starting`。
-        for state in [Ready, Starting, Restarting] {
+        // 反过来：托管上游没有终局失败时，`phase` 只看托管上游（Codex 预审 M1）：就绪就是 `ready`（别的上游还没有第一次观测不拉回
+        // `starting`），启动或重启中就是 `starting`。
+        for (state, phase) in [
+            (Ready, Phase::Ready),
+            (Starting, Phase::Starting),
+            (Restarting, Phase::Starting),
+        ] {
             assert_eq!(
                 phase_of(&[
                     managed_status("omlx", state),
                     status("lmstudio", Starting, None)
                 ]),
-                Phase::Starting,
+                phase,
                 "{state:?}"
             );
         }
@@ -893,7 +1235,7 @@ mod tests {
         plain.apply("lmstudio", Observation::Ready);
         assert_eq!(plain.view().phase, Phase::Ready);
 
-        // 有托管卡，门控已开，托管引擎就绪，别的上游刚起探测器：`starting`，一次观测之后 `ready`。
+        // 有托管卡，门控已开，托管引擎就绪，别的上游刚起探测器：`phase` 只看托管上游，已经是 `ready`（Codex 预审 M1）。
         let managed = HealthState::with_upstreams(
             0,
             vec![
@@ -903,7 +1245,7 @@ mod tests {
         );
         managed.set_gate(GateState::Open);
         let view = managed.view();
-        assert_eq!((view.phase, view.ready), (Phase::Starting, false));
+        assert_eq!((view.phase, view.ready), (Phase::Ready, true));
         managed.apply("lmstudio", Observation::Ready);
         let view = managed.view();
         assert_eq!((view.phase, view.ready), (Phase::Ready, true));
@@ -1234,15 +1576,14 @@ mod tests {
 
     #[tokio::test]
     async fn probe_never_sends_a_request_to_an_endpoint_that_is_not_a_loopback_literal() {
-        // 监听在 127.0.0.1 的服务器；卡的 endpoint 写成 IPv4-mapped IPv6 字面量，`is_loopback_base_url` 不认它是
-        // loopback：探测器必须一个请求都不发（出站纪律：宁可报 unavailable，也不对「不确定是不是本机」的地址发流量）。
+        // 一个不是 loopback 的 IPv4 映射写法（`::ffff:8.8.8.8`）：探测器必须一个请求都不发（出站纪律：宁可报 unavailable，也不对「不是本机」的地址发流量）。
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
             .expect(0)
             .mount(&server)
             .await;
-        let endpoint = format!("http://[::ffff:127.0.0.1]:{}", server.address().port());
+        let endpoint = format!("http://[::ffff:8.8.8.8]:{}", server.address().port());
         assert!(!idoris_upstream::omlx::key::is_loopback_base_url(&endpoint));
         let card = resident_card("r", &endpoint, "fixture@1");
         assert_eq!(
@@ -1250,6 +1591,148 @@ mod tests {
             Observation::Unavailable(None)
         );
         server.verify().await;
+    }
+
+    /// 登记表把 IPv4 映射的写法（`::ffff:127.0.0.1`）并进同一个端口，key 的资格与「是不是 loopback」也这样认（Codex 预审 L2 的 H1：此前它们对同一个
+    /// 套接字各说各的）。所以映射写法的卡落在一个封上的、被管理的端口上，探测器**一个请求都不发**，不管这张卡能不能带 key。
+    #[tokio::test]
+    async fn probe_of_an_ipv4_mapped_loopback_card_on_a_blocked_governed_port_sends_nothing() {
+        use idoris_upstream::omlx::key::{block_endpoint, forget_endpoint};
+
+        struct Governed(String);
+        impl Drop for Governed {
+            fn drop(&mut self) {
+                forget_endpoint(&self.0);
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let canonical = server.uri();
+        let endpoint = format!("http://[::ffff:127.0.0.1]:{}", server.address().port());
+        assert!(
+            idoris_upstream::omlx::key::is_loopback_base_url(&endpoint),
+            "the same socket as {canonical}"
+        );
+        let _governed = Governed(canonical.clone());
+        block_endpoint(&canonical);
+        // A card that may carry the key, and one that may not: both are the managed port as far as the registry is concerned.
+        for pin in ["omlx@0.6.4", "fixture@1"] {
+            let card = resident_card("r", &endpoint, pin);
+            let admitted = crate::models::admission_generation(&card);
+            assert!(
+                admitted.is_some(),
+                "{pin}: bound to the governed endpoint's generation"
+            );
+            assert_eq!(
+                probe_resident_admitted(&client(), &card, admitted, Duration::from_millis(500))
+                    .await,
+                Observation::Unavailable(None),
+                "{pin}"
+            );
+        }
+        server.verify().await;
+    }
+
+    /// Codex 预审 L2 的 H1：不能带 key 的卡（别的产品名、`idoris_upstream`）发往一个被管理的端点，探测与别的发送走同一道授权：封上的端点一个请求都不发；放开之后
+    /// 请求发出，**不带** bearer（登记的私有 key 不是这张卡的）。
+    #[tokio::test]
+    async fn probe_of_a_card_that_may_not_carry_the_key_is_gated_by_its_governed_endpoint_and_sends_no_key()
+     {
+        use idoris_upstream::omlx::key::{
+            EndpointKey, block_endpoint, forget_endpoint, govern_endpoint,
+        };
+
+        struct Governed(String);
+        impl Drop for Governed {
+            fn drop(&mut self) {
+                forget_endpoint(&self.0);
+            }
+        }
+
+        let server =
+            models_server(ResponseTemplate::new(200).set_body_json(json!({"data": []}))).await;
+        let endpoint = server.uri();
+        let _governed = Governed(endpoint.clone());
+        let card = resident_card("lm", &endpoint, "lmstudio@1");
+        block_endpoint(&endpoint);
+        assert_eq!(
+            probe_resident_admitted(
+                &client(),
+                &card,
+                crate::models::admission_generation(&card),
+                Duration::from_secs(2)
+            )
+            .await,
+            Observation::Unavailable(None)
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a probe went to a blocked governed endpoint"
+        );
+
+        // Registered again (a replacement verified): the probe goes out, without any credential.
+        govern_endpoint(&endpoint, EndpointKey::Private("engine-key".to_owned()));
+        assert_eq!(
+            probe_resident(&client(), &card, Duration::from_secs(2)).await,
+            Observation::Ready
+        );
+        let seen = server.received_requests().await.unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].headers.get("authorization").is_none(),
+            "the engine's private key went to a card that may not carry it"
+        );
+    }
+
+    /// 复审 L2 终检：resident 卡的就绪探测，请求**建好之后、最后一眼之前**换掉引擎：不发，这一轮的观测是「不可用」。
+    #[tokio::test]
+    async fn a_probe_built_for_a_replaced_engine_is_not_sent() {
+        use idoris_upstream::omlx::key::test_hooks::between_build_and_send_for;
+        use idoris_upstream::omlx::key::{EndpointKey, forget_endpoint, govern_endpoint};
+
+        struct Governed(String);
+        impl Drop for Governed {
+            fn drop(&mut self) {
+                forget_endpoint(&self.0);
+            }
+        }
+
+        let server =
+            models_server(ResponseTemplate::new(200).set_body_json(json!({"data": []}))).await;
+        let endpoint = server.uri();
+        let _governed = Governed(endpoint.clone());
+        govern_endpoint(&endpoint, EndpointKey::Private("first-engine".to_owned()));
+        let card = resident_card("omlx-card", &endpoint, "omlx@0.6.4");
+        let admitted = crate::models::admission_generation(&card);
+        assert!(admitted.is_some());
+
+        // 对照：没有换引擎，探测发得出去。
+        assert_eq!(
+            probe_resident_admitted(&client(), &card, admitted, Duration::from_secs(2)).await,
+            Observation::Ready
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        let _hook = between_build_and_send_for(&format!("{endpoint}/v1/models"), {
+            let endpoint = endpoint.clone();
+            move || {
+                govern_endpoint(&endpoint, EndpointKey::Private("replacement".to_owned()));
+            }
+        });
+        assert_eq!(
+            probe_resident_admitted(&client(), &card, admitted, Duration::from_secs(2)).await,
+            Observation::Unavailable(None)
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the probe built for the replaced engine was sent"
+        );
     }
 
     #[tokio::test]
