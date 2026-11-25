@@ -431,17 +431,39 @@ for line in sys.stdin:
         }
     }
 
+    /// Copy a long-running program to `to`. macOS: `/bin/sleep`. Linux: this test binary itself (run as the ignored `fixture_sleeper`
+    /// test), because a distribution's coreutils may be a multi-call binary that misbehaves when copied and renamed (uutils on Ubuntu 26.04).
+    fn copy_sleeper(to: &std::path::Path) {
+        #[cfg(target_os = "linux")]
+        std::fs::copy(std::env::current_exe().unwrap(), to).unwrap();
+        #[cfg(not(target_os = "linux"))]
+        copy_of("/bin/sleep", to);
+    }
+
     fn spawn_sleep_from(path: &std::path::Path) -> Child {
-        use std::os::unix::process::CommandExt as _;
-        // argv[0] stays "sleep": a multi-call coreutils (uutils on Ubuntu 26.04) picks the utility from argv[0] and exits 1 for "engine".
-        Command::new(path)
-            .arg0("sleep")
-            .arg("30")
+        let mut command = Command::new(path);
+        #[cfg(target_os = "linux")]
+        command.args([
+            "--exact",
+            "native_tests::fixture_sleeper",
+            "--ignored",
+            "--test-threads=1",
+        ]);
+        #[cfg(not(target_os = "linux"))]
+        command.arg("30");
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap()
+    }
+
+    /// Not a test: the long-running process `spawn_sleep_from` starts on Linux.
+    #[test]
+    #[ignore = "fixture process for the identity tests, started by them"]
+    fn fixture_sleeper() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
     }
 
     fn copy_of(program: &str, to: &std::path::Path) {
@@ -469,7 +491,7 @@ for line in sys.stdin:
     fn the_identity_survives_the_deletion_of_the_executable() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("engine");
-        copy_of("/bin/sleep", &exe);
+        copy_sleeper(&exe);
         let child = spawn_sleep_from(&exe);
         let before = executable_identity(child.id()).expect("a running process has an identity");
         std::fs::remove_file(&exe).unwrap();
@@ -486,7 +508,7 @@ for line in sys.stdin:
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("engine");
         let other = dir.path().join("other");
-        copy_of("/bin/sleep", &exe);
+        copy_sleeper(&exe);
         copy_of("/bin/cat", &other);
         let mut child = spawn_sleep_from(&exe);
         assert_alive(&mut child, "before the first identity read");
