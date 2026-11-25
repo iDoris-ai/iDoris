@@ -28,21 +28,93 @@ pub(crate) fn process_generation(pid: u32) -> Option<String> {
     watch::process_generation(pid)
 }
 
-pub(crate) fn executable_identity(pid: u32) -> Option<super::ExecutableIdentity> {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::PathBuf;
+/// `csops(2)` operation `CS_OPS_CDHASH`: the code-directory hash (20 bytes) of the image the kernel is running for a process.
+const CS_OPS_CDHASH: u32 = 5;
+/// The size of a code-directory hash as `csops` returns it.
+const CDHASH_LEN: usize = 20;
+/// `PROC_PIDUNIQIDENTIFIERINFO` (sys/proc_info.h): the flavor of `proc_pidinfo` that returns a `struct proc_uniqidentifierinfo`.
+const PROC_PIDUNIQIDENTIFIERINFO: c_int = 17;
 
+/// `struct proc_uniqidentifierinfo` (sys/proc_info.h): `p_uuid` is the Mach-O UUID of the process's main executable image.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcUniqIdentifierInfo {
+    p_uuid: [u8; 16],
+    p_uniqueid: u64,
+    p_puniqueid: u64,
+    p_idversion: i32,
+    p_reserve2: u32,
+    p_reserve3: u64,
+    p_reserve4: u64,
+}
+
+const _: () = assert!(size_of::<ProcUniqIdentifierInfo>() == 56);
+
+unsafe extern "C" {
+    /// `int csops(pid_t pid, uint32_t ops, void *useraddr, size_t usersize)` (sys/codesign.h; libSystem).
+    fn csops(pid: libc::pid_t, ops: u32, useraddr: *mut c_void, usersize: usize) -> c_int;
+}
+
+/// The Mach-O UUID of the main image the kernel runs for `pid`: `Ok(None)` when the kernel does not give one (not allowed to look at that
+/// process, or an unexpected failure: no identity, **not** "gone"), `Err(())` when the process does not exist.
+fn image_uuid(pid: i32) -> Result<Option<[u8; 16]>, ()> {
+    // SAFETY: `ProcUniqIdentifierInfo` is plain old data; the all-zero value is valid.
+    let mut info: ProcUniqIdentifierInfo = unsafe { zeroed() };
+    let Ok(size) = c_int::try_from(size_of::<ProcUniqIdentifierInfo>()) else {
+        return Ok(None);
+    };
+    clear_errno();
+    // SAFETY: the pointer is to `info`, `size` is its size; `proc_pidinfo` writes at most `size` bytes and returns how many.
+    let written = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDUNIQIDENTIFIERINFO,
+            0,
+            (&mut info as *mut ProcUniqIdentifierInfo).cast::<c_void>(),
+            size,
+        )
+    };
+    if written == size {
+        Ok(Some(info.p_uuid))
+    } else if written <= 0 && last_errno() == libc::ESRCH {
+        Err(())
+    } else {
+        Ok(None)
+    }
+}
+
+/// The code-directory hash of the image the kernel runs for `pid` (`None`: unsigned, not allowed to look, or gone).
+fn code_directory_hash(pid: i32) -> Option<[u8; CDHASH_LEN]> {
+    let mut hash = [0_u8; CDHASH_LEN];
+    // SAFETY: `csops` writes at most `usersize` bytes into the live array it is given.
+    let rc = unsafe {
+        csops(
+            pid,
+            CS_OPS_CDHASH,
+            hash.as_mut_ptr().cast::<c_void>(),
+            hash.len(),
+        )
+    };
+    (rc == 0).then_some(hash)
+}
+
+/// What the **kernel** says is running in `pid` (no path, no `stat`: nothing here depends on the file still being where it was, and
+/// nothing is sampled in two steps that an `exec` could split): the code-directory hash of the running image and its Mach-O UUID.
+/// A snapshot that an `exec` straddled (the UUID read before differs from the one read after) is not an answer. A process the kernel gives
+/// neither to (unsigned and not readable) still has an identity, an empty one: the caller's other checks (start time, signature) apply, the
+/// identity does not turn it into a refusal. `None` only when the process does not exist.
+pub(crate) fn executable_identity(pid: u32) -> Option<super::ExecutableIdentity> {
     let pid = i32::try_from(pid).ok()?;
-    let mut bytes = [0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    // SAFETY: libproc writes at most the supplied buffer size into this live byte array.
-    let written = unsafe { libc::proc_pidpath(pid, bytes.as_mut_ptr().cast(), bytes.len() as u32) };
-    let written = usize::try_from(written).ok().filter(|n| *n > 0)?;
-    let path = PathBuf::from(OsStr::from_bytes(
-        bytes.get(..written)?.split(|b| *b == 0).next()?,
-    ));
-    let metadata = std::fs::metadata(&path).ok()?;
-    super::ExecutableIdentity::from_metadata(path, &metadata)
+    let before = image_uuid(pid).ok()?;
+    let cdhash = code_directory_hash(pid);
+    let after = image_uuid(pid).ok()?;
+    if before != after {
+        return None;
+    }
+    Some(super::ExecutableIdentity {
+        cdhash,
+        image: before,
+    })
 }
 
 /// `PROC_PIDFDSOCKETINFO` (sys/proc_info.h): the flavor of `proc_pidfdinfo` that returns a `struct socket_fdinfo`.

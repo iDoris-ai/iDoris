@@ -119,9 +119,11 @@ pub async fn probe_authorized(
     let base = authorization.dial_url(endpoint);
     authorization.ensure_current()?;
     let probe = recipe.probe_ready(&client, &base, bearer, timeout).await;
+    // `Unavailable` includes the probe that the outer deadline cut off in a phase nobody knows (possibly the connect phase): conservative,
+    // the next request re-checks the listener (Codex pre-review M3).
     if matches!(
         probe,
-        EngineProbe::ConnectionRefused | EngineProbe::ConnectionFailed
+        EngineProbe::ConnectionRefused | EngineProbe::ConnectionFailed | EngineProbe::Unavailable
     ) {
         authorization.connection_failed();
     }

@@ -25,11 +25,12 @@
 //!
 //! 确认不了（读不出来）就是 [`Verification::Unverifiable`]，调用方拒绝发送（fail closed）：读一次不行的立刻再问一遍，仍不行才算。
 //!
-//! **没有消除的间隙**：确认与发送之间仍有毫秒级的间隙；「并存的监听者」到监督的下一次检查才被发现；原生身份没有绑到通过签名校验的
-//! 那个身份上（pid 复用的窗口）；`exec` 之后保留监听 fd 的进程沿用旧的校验；连接失败不使退路的缓存作废。这些是 v0.6.1 的已知限制，
-//! 原生监视绑定签名通过时的进程启动标识，外部引擎每次请求还核对可执行文件身份。连接失败会清除该端点代际的
-//! 退路肯定缓存，也使尚未完成的旧检查无法重新填入旧结果。Unix domain socket 待确认 oMLX 支持后再评估（#646）。
-//! 规范勘误十（8）及勘误十五说明对外行为。
+//! **没有消除的间隙**：确认与发送之间仍有毫秒级的间隙；「并存的监听者」到监督的下一次检查才被发现。原生监视绑定签名通过时的进程
+//! 启动标识；进程身份用内核给出的运行映像（macOS 的代码目录哈希与映像 UUID，Linux 的 `/proc/<pid>/exe` 设备与 inode），不依赖可执行文件
+//! 路径，磁盘上的文件被删除也不影响合法引擎；`exec` 成另一份程序会被每次请求的身份核对发现，同一份二进制重新 `exec` 自己沿用原来的
+//! 签名结论。内核没有给出身份的进程（身份全空）不因此被拒绝，由启动时间与签名核验把关。认回旧记录时先绑定并落盘原生启动标识，
+//! 请求路径稳态不起子进程。连接失败、或发送被外层期限截断，都会清除该端点代际的退路肯定缓存，也使尚未完成的旧检查无法重新填入旧结果。
+//! Unix domain socket 待确认 oMLX 支持后再评估（#646）。规范勘误十（8）及勘误十五说明对外行为。
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -629,6 +630,136 @@ mod tests {
         OwnedListenerGuard::new(fake.clone(), 42, dial(), START.to_owned(), None)
     }
 
+    /// The real system inspector with one exception: the signing team is whatever the test says (a copy of a system tool has no team).
+    /// Everything else (listening sockets, start time, generation, executable identity, uid, the native watch) is read from the system.
+    #[cfg(target_os = "macos")]
+    struct RealWithTeam(super::super::inspect::SystemInspector);
+
+    #[cfg(target_os = "macos")]
+    #[async_trait]
+    impl ProcessInspector for RealWithTeam {
+        fn pid_state(&self, pid: u32) -> PidState {
+            self.0.pid_state(pid)
+        }
+        async fn start_time(&self, pid: u32) -> Result<String, InspectError> {
+            self.0.start_time(pid).await
+        }
+        async fn command(&self, pid: u32) -> Result<String, InspectError> {
+            self.0.command(pid).await
+        }
+        async fn process_group(&self, pid: u32) -> Result<u32, InspectError> {
+            self.0.process_group(pid).await
+        }
+        async fn listens_on(&self, pid: u32, port: u16) -> Result<bool, InspectError> {
+            self.0.listens_on(pid, port).await
+        }
+        async fn listeners_on(&self, port: u16) -> Result<Vec<u32>, InspectError> {
+            self.0.listeners_on(port).await
+        }
+        async fn listening_sockets(&self, port: u16) -> Result<Vec<ListeningSocket>, InspectError> {
+            self.0.listening_sockets(port).await
+        }
+        async fn uid_of(&self, pid: u32) -> Result<u32, InspectError> {
+            self.0.uid_of(pid).await
+        }
+        fn watch_listener(&self, pid: u32, dial: SocketAddr) -> Option<Arc<dyn ListenerWatch>> {
+            self.0.watch_listener(pid, dial)
+        }
+        fn fallback_ttl(&self) -> Duration {
+            self.0.fallback_ttl()
+        }
+        async fn generation(&self, pid: u32) -> Result<String, InspectError> {
+            self.0.generation(pid).await
+        }
+        fn listener_generation(&self, pid: u32) -> Result<Option<String>, InspectError> {
+            self.0.listener_generation(pid)
+        }
+        fn executable_identity(
+            &self,
+            pid: u32,
+        ) -> Result<Option<super::super::inspect::ExecutableIdentity>, InspectError> {
+            self.0.executable_identity(pid)
+        }
+        async fn signing_team(&self, _pid: u32) -> Result<Option<String>, InspectError> {
+            Ok(Some(TEAM.to_owned()))
+        }
+    }
+
+    /// Not a test: the body of the listener process of the test below (a copy of this binary run with the port in the environment).
+    /// Under a normal run (no variable) it does nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn listener_helper() {
+        let Ok(port) = std::env::var("IDORIS_GUARD_TEST_LISTEN_PORT") else {
+            return;
+        };
+        let _listener = std::net::TcpListener::bind(("127.0.0.1", port.parse().unwrap())).unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// Codex pre-review H2: a running listener whose executable was deleted from disk (an app update replaced it, a package manager cleaned
+    /// it up) is the same legitimate engine: it must still be accepted, by a fresh verification and by the guard built before the deletion.
+    /// The identity is what the kernel runs, not a file at a path.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_listener_whose_executable_was_deleted_is_still_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("engine");
+        // A copy of this test binary (ad-hoc signed, runs from anywhere) acts as the listener: see `listener_helper`.
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let mut child = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "engine::guard::tests::listener_helper",
+                "--nocapture",
+            ])
+            .env("IDORIS_GUARD_TEST_LISTEN_PORT", port.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let real = || -> Arc<dyn ProcessInspector> {
+            Arc::new(RealWithTeam(super::super::inspect::SystemInspector::new()))
+        };
+        let policy = || {
+            let uid = rustix::process::getuid().as_raw();
+            ListenerPolicy::new(TEAM).with_uid(uid)
+        };
+        let verifier = ListenerVerifier::new(real(), policy());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let listeners = loop {
+            if let ListenerVerdict::Verified { listeners } = verifier.check(port).await {
+                break listeners;
+            }
+            assert!(Instant::now() < deadline, "the listener never came up");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let guard = ExternalListenerGuard::new(
+            verifier.clone(),
+            SocketAddr::new(MANAGED_DIAL, port),
+            listeners,
+        );
+        assert_eq!(guard.verify().await, Verification::Verified);
+        std::fs::remove_file(&exe).unwrap();
+        assert_eq!(
+            guard.verify().await,
+            Verification::Verified,
+            "the guard built before the deletion"
+        );
+        let fresh = ListenerVerifier::new(real(), policy());
+        assert!(
+            fresh.check(port).await.is_verified(),
+            "a fresh verification after the deletion"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[tokio::test]
     async fn an_owned_fallback_does_not_authorize_a_recycled_pid() {
         let fake = Fake::new();
@@ -718,6 +849,52 @@ mod tests {
             KeyRefusal::ListenerChanged
         );
         assert_eq!(next.listens_asked(), 2);
+        forget_endpoint(url);
+    }
+
+    /// Codex pre-review M3: a send that the caller's own deadline cancelled (possibly in the connect phase, where no connection error is ever
+    /// produced) must not leave the generation's positive cache standing: the retry checks the listener again.
+    #[tokio::test]
+    async fn a_send_cancelled_by_an_outer_deadline_invalidates_its_generation() {
+        use crate::omlx::key::{
+            EndpointKey, KeyRefusal, authorize_omlx_request, forget_endpoint,
+            govern_endpoint_guarded, send_authorized,
+        };
+
+        let url = "http://127.0.0.1:1";
+        let fake = Fake::new();
+        fake.reuse_for(Duration::from_secs(60));
+        fake.script_listens(vec![Ok(true)]);
+        govern_endpoint_guarded(
+            url,
+            EndpointKey::Private("k".into()),
+            Some(Arc::new(owned(&fake))),
+        );
+        let current = authorize_omlx_request(url, None).await.unwrap();
+        assert_eq!(fake.listens_asked(), 1);
+        fake.script_listens(vec![Ok(false)]);
+        // Still cached: no second question.
+        assert!(
+            authorize_omlx_request(url, Some(current.generation()))
+                .await
+                .is_ok()
+        );
+        assert_eq!(fake.listens_asked(), 1);
+
+        let never = std::future::pending::<Result<reqwest::Response, reqwest::Error>>();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            send_authorized(Some(&current), never),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the deadline cut the send off");
+        assert_eq!(
+            authorize_omlx_request(url, Some(current.generation()))
+                .await
+                .unwrap_err(),
+            KeyRefusal::ListenerChanged
+        );
+        assert_eq!(fake.listens_asked(), 2);
         forget_endpoint(url);
     }
 

@@ -371,6 +371,9 @@ impl ProcessInspector for SystemInspector {
     }
 
     fn executable_identity(&self, pid: u32) -> Result<Option<ExecutableIdentity>, InspectError> {
+        if !self.native_probe {
+            return Ok(None);
+        }
         native::executable_identity(pid)
             .map(Some)
             .ok_or(InspectError::NoAnswer)
@@ -1639,12 +1642,19 @@ mod tests {
         // The window of a yes starts when the check **starts**: warm the tool up first (the first `exec` of a freshly written file is slow
         // on macOS, slower than the whole window), then count from zero.
         assert_eq!(inspector.listens_on(4242, 19999).await, Ok(true));
+        assert_eq!(inspector.start_time(4242).await, Ok("start".to_owned()));
         std::fs::remove_file(&log).unwrap();
         let guard = OwnedListenerGuard::new(inspector, 4242, dial(19999), "start".into(), None);
-        for _ in 0..20 {
+        // Every request also re-confirms the start time (`ps`, a subprocess here: the guard has no generation), which takes a few
+        // milliseconds each on a busy machine: send requests only while well inside the window, not a fixed twenty.
+        let window_start = std::time::Instant::now();
+        let mut sent = 0;
+        while sent < 20 && window_start.elapsed() < FALLBACK_TTL / 2 {
             assert_eq!(guard.verify().await, Verification::Verified);
+            sent += 1;
         }
-        assert_eq!(calls(&log), 1, "twenty requests inside the window");
+        assert!(sent >= 2, "too slow a machine to test a window: {sent}");
+        assert_eq!(calls(&log), 1, "{sent} requests inside the window");
         tokio::time::sleep(FALLBACK_TTL + Duration::from_millis(100)).await;
         assert_eq!(guard.verify().await, Verification::Verified);
         assert_eq!(calls(&log), 2, "a request after the window asks again");

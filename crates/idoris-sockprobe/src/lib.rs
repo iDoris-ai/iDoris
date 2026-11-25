@@ -62,27 +62,16 @@ use macos as platform;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use unsupported as platform;
 
-/// Filesystem identity of the running executable. The path detects exec into a different
-/// program and the metadata detects replacement or modification at that path.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// What the **kernel** says is running in a process, read without a path and without a `stat` (so it does not depend on the executable
+/// still being at the path it was started from, and an `exec` cannot split it into two samples taken of different programs). macOS: the
+/// code-directory hash of the running image and its Mach-O UUID. Linux: the device and inode of `/proc/<pid>/exe`. A field the kernel does
+/// not give for this process is `None`; an identity with every field `None` still equals itself (no reliable identity is not a refusal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExecutableIdentity {
-    pub path: std::path::PathBuf,
-    pub device: u64,
-    pub inode: u64,
-    pub modified: std::time::SystemTime,
-}
-
-impl ExecutableIdentity {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn from_metadata(path: std::path::PathBuf, metadata: &std::fs::Metadata) -> Option<Self> {
-        use std::os::unix::fs::MetadataExt;
-        Some(Self {
-            path,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            modified: metadata.modified().ok()?,
-        })
-    }
+    /// The code-directory hash of the running image (macOS; `None` for an unsigned image the kernel has no hash for).
+    pub cdhash: Option<[u8; 20]>,
+    /// The identity of the image itself (macOS: Mach-O UUID; Linux: device and inode, 8 bytes each).
+    pub image: Option<[u8; 16]>,
 }
 
 pub fn executable_identity(pid: u32) -> Option<ExecutableIdentity> {
@@ -409,6 +398,94 @@ for line in sys.stdin:
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+
+    fn spawn_sleep_from(path: &std::path::Path) -> Child {
+        Command::new(path)
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn copy_of(program: &str, to: &std::path::Path) {
+        std::fs::copy(program, to).unwrap();
+    }
+
+    fn kill(mut child: Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The identity is what the kernel runs, not a file at a path (Codex pre-review H2): the process keeps running after its executable was
+    /// deleted, and it is still the same, readable identity.
+    #[test]
+    fn the_identity_survives_the_deletion_of_the_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("engine");
+        copy_of("/bin/sleep", &exe);
+        let child = spawn_sleep_from(&exe);
+        let before = executable_identity(child.id()).expect("a running process has an identity");
+        std::fs::remove_file(&exe).unwrap();
+        let after = executable_identity(child.id())
+            .expect("the identity must not depend on the path still existing");
+        assert_eq!(before, after);
+        kill(child);
+    }
+
+    /// The identity is of the running image, not of whatever file is at its path now (H1): the file at the path being replaced while the
+    /// process keeps running changes nothing about the process.
+    #[test]
+    fn replacing_the_file_does_not_change_the_identity_of_the_running_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("engine");
+        let other = dir.path().join("other");
+        copy_of("/bin/sleep", &exe);
+        copy_of("/bin/cat", &other);
+        let child = spawn_sleep_from(&exe);
+        let before = executable_identity(child.id()).unwrap();
+        std::fs::rename(&other, &exe).unwrap();
+        assert_eq!(executable_identity(child.id()).unwrap(), before);
+        kill(child);
+    }
+
+    /// The same pid that `exec`s a different program has a different identity (H1), and one `exec` is observed in one read of the kernel's
+    /// state.
+    #[test]
+    fn an_exec_into_another_program_changes_the_identity_of_the_same_pid() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read line; exec /bin/sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let before = executable_identity(pid).unwrap();
+        assert_eq!(executable_identity(pid).unwrap(), before, "stable");
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, "go").unwrap();
+        stdin.flush().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if executable_identity(pid).is_some_and(|now| now != before) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exec was never seen"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        kill(child);
+    }
+
+    /// No such process: no identity (the caller's generation check says why).
+    #[test]
+    fn a_process_that_does_not_exist_has_no_identity() {
+        assert!(executable_identity(i32::MAX as u32).is_none());
     }
 
     /// The listening socket of this very process on the loopback address: held while it is open, **not held on the very next check** once

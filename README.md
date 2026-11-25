@@ -45,7 +45,7 @@ IDORIS_SUBSCRIPTION_CLI=claude \
 
 `IDORIS_SUBSCRIPTION_CLI` 目前只接受 `claude` 或 `codex`；未设置时默认 Claude。`IDORIS_DISABLE_SUBSCRIPTION=1` 优先于 enable，是需要重启生效的 kill switch。订阅能力只接受 loopback 来源，并始终按 remote locality 处理；`local_only` 请求不会 spawn CLI。源码构建不会自动复制配置，需要自行准备相同目录布局。
 
-默认卡连接 oMLX 的 `http://127.0.0.1:8000`（[oMLX 官方默认端口](https://github.com/jundot/omlx#installation)）。若 oMLX 开启认证，可通过 `IDORIS_OMLX_API_KEY` 把推理 API key 传给 iDoris。未设置时，iDoris 对回环端点读取 `~/.omlx/settings.json` 的 `auth.api_key`。在 Unix 上，文件须由当前用户拥有，组和其他用户不可写，`.omlx` 与 `settings.json` 均须是实际路径组件。文件解析失败时会短暂等待并重读，仍无法核验时拒绝发送。自定义端口（如旧工作站使用的 8088）需修改包内 `config/components/omlx.yaml` 的 endpoint。上游恢复或补充 key 后重启 iDoris，让 Supervisor 重新核对后端状态。
+默认卡连接 oMLX 的 `http://127.0.0.1:8000`（[oMLX 官方默认端口](https://github.com/jundot/omlx#installation)）。若 oMLX 开启认证，可通过 `IDORIS_OMLX_API_KEY` 把推理 API key 传给 iDoris。未设置时，iDoris 对回环端点读取 `~/.omlx/settings.json` 的 `auth.api_key`。在 Unix 上，文件须由当前用户拥有，组和其他用户不可写，`settings.json` 本身不能是符号链接；`.omlx` 可以是指向本人目录的符号链接，其所在目录与目标目录须由当前用户拥有且其他用户不可写，macOS 上授予他人写权限的 ACL 同样被拒绝。文件解析失败时会短暂等待并重读，仍无法核验时拒绝发送。自定义端口（如旧工作站使用的 8088）需修改包内 `config/components/omlx.yaml` 的 endpoint。上游恢复或补充 key 后重启 iDoris，让 Supervisor 重新核对后端状态。
 
 > macOS 对未签名的下载二进制默认会拦一下（Gatekeeper 隔离属性）。如果双击或直接执行时被系统拒绝，跑一次 `xattr -d com.apple.quarantine idoris` 再重试即可，这一步不算"改配置文件"，只是解除下载文件的隔离标记。
 

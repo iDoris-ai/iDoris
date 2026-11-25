@@ -60,10 +60,16 @@ pub(crate) fn process_generation(pid: u32) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn executable_identity(pid: u32) -> Option<crate::ExecutableIdentity> {
-    let exe = Path::new(PROC).join(pid.to_string()).join("exe");
-    let path = fs::read_link(&exe).ok()?;
-    let metadata = fs::metadata(exe).ok()?;
-    crate::ExecutableIdentity::from_metadata(path, &metadata)
+    use std::os::unix::fs::MetadataExt;
+    // `stat` of the magic link resolves to the inode the process is running, also after the file was deleted or renamed.
+    let metadata = fs::metadata(Path::new(PROC).join(pid.to_string()).join("exe")).ok()?;
+    let mut image = [0_u8; 16];
+    image[..8].copy_from_slice(&metadata.dev().to_ne_bytes());
+    image[8..].copy_from_slice(&metadata.ino().to_ne_bytes());
+    Some(crate::ExecutableIdentity {
+        cdhash: None,
+        image: Some(image),
+    })
 }
 
 /// Pin the identity of `pid`: one read of its `stat`. Nothing is scanned.

@@ -2153,6 +2153,60 @@ async fn external_liveness_detects_a_second_listener_before_the_http_probe_is_du
     h.manager.shutdown(true).await;
 }
 
+/// Codex pre-review M2: a hung HTTP probe must not delay the verification of the listener. The probe hangs (30 s); a second listener
+/// appears; the endpoint is sealed and the state is failed within a few liveness ticks, while the probe is still in flight.
+#[tokio::test]
+async fn a_hung_http_probe_does_not_delay_the_listener_verification() {
+    let rig = Rig::with_port(&Behavior::default(), 64601);
+    let mut inspector = Scripted::new();
+    Arc::get_mut(&mut inspector)
+        .unwrap()
+        .synthetic_listener_identity = true;
+    let owner = std::process::id();
+    inspector.external_listener(rig.port, owner, Some(TEAM));
+    let script = ProbeScript::new(|_| Some(EngineProbe::Ready));
+    let h = Harness::start(
+        &rig,
+        ScriptedProbeBackend::new(default_backend(&rig), script.clone()),
+        inspector.clone(),
+        Timings {
+            liveness_interval: Duration::from_millis(50),
+            probe_interval: Duration::from_millis(200),
+            ..fast()
+        },
+        StopOnExit::Owned,
+    );
+    tokio::time::timeout(Duration::from_secs(3), h.until_state(UpstreamState::Ready))
+        .await
+        .unwrap();
+    // The next probe call hangs.
+    let calls = script.calls();
+    script.slow_from(calls, Duration::from_secs(30));
+    let hung = std::time::Instant::now() + Duration::from_secs(3);
+    while script.calls() <= calls {
+        assert!(
+            std::time::Instant::now() < hung,
+            "the hung probe never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let second = std::os::unix::process::parent_id();
+    inspector
+        .listeners
+        .lock()
+        .unwrap()
+        .insert(rig.port, vec![owner, second]);
+    let failed = tokio::time::timeout(Duration::from_secs(2), h.until_state(UpstreamState::Failed))
+        .await
+        .expect("the listener check waited for the hung probe");
+    assert_eq!(failed.reason, Some(UpstreamReason::PortInUse));
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
+    h.manager.shutdown(true).await;
+}
+
 #[tokio::test]
 async fn an_external_listener_that_stops_passing_the_owner_check_is_failed_and_the_settings_key_goes_off()
  {
@@ -2902,6 +2956,9 @@ struct ProbeScript {
     answer: Box<dyn Fn(ProbeCall) -> Option<EngineProbe> + Send + Sync>,
     keyless: AtomicUsize,
     keyed: AtomicUsize,
+    /// Every probe call from this (0-based, both kinds counted together) one on first sleeps for `delay` before it answers.
+    slow_from: AtomicUsize,
+    delay: Mutex<Duration>,
 }
 
 impl std::fmt::Debug for ProbeScript {
@@ -2916,7 +2973,19 @@ impl ProbeScript {
             answer: Box::new(answer),
             keyless: AtomicUsize::new(0),
             keyed: AtomicUsize::new(0),
+            slow_from: AtomicUsize::new(usize::MAX),
+            delay: Mutex::new(Duration::ZERO),
         })
+    }
+
+    /// From the `n`th probe call on, every answer takes `delay` (a hung HTTP probe).
+    fn slow_from(&self, n: usize, delay: Duration) {
+        *self.delay.lock().unwrap() = delay;
+        self.slow_from.store(n, Ordering::SeqCst);
+    }
+
+    fn calls(&self) -> usize {
+        self.keyless.load(Ordering::SeqCst) + self.keyed.load(Ordering::SeqCst)
     }
 
     fn next(&self, bearer: Option<&str>) -> Option<EngineProbe> {
@@ -2958,7 +3027,13 @@ impl EngineRecipe for ScriptedRecipe {
         bearer: Option<&str>,
         timeout: Duration,
     ) -> EngineProbe {
-        if let Some(answer) = self.script.next(bearer) {
+        let call = self.script.calls();
+        let answer = self.script.next(bearer);
+        if call >= self.script.slow_from.load(Ordering::SeqCst) {
+            let delay = *self.script.delay.lock().unwrap();
+            tokio::time::sleep(delay).await;
+        }
+        if let Some(answer) = answer {
             return answer;
         }
         self.inner

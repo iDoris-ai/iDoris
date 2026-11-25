@@ -420,6 +420,7 @@ impl OwnedEngine {
             Classified::Stale(reason) => Recovery::Stale(reason),
             Classified::Unverifiable(reason) => Recovery::Unverifiable(reason),
             Classified::Verified { record, sealed } => {
+                let record = bind_native_generation(&store, inspector.as_ref(), record).await;
                 let engine = Self::recovered(instance, record, store, inspector);
                 if sealed {
                     Recovery::Adopted(engine)
@@ -756,6 +757,40 @@ pub async fn verify_identity(
         Ok(false) => IdentityVerdict::Mismatch(MismatchReason::Port),
         Ok(true) => IdentityVerdict::Match,
     }
+}
+
+/// An old record (written before records carried a process generation) names a process by pid and a start time to the second. Once the
+/// process is confirmed to be ours, bind the finer, kernel-given generation to the record **and write it back**: without it the guards
+/// built from the recovered engine cannot use the per-request native check (their watch is pinned to a generation the record does not
+/// have), and every authorization would start `ps` or `lsof` instead (Codex pre-review H3). The binding is bracketed by two ownership
+/// checks (`record` just passed the first, in [`classify`]; the second runs after the generation was read, and the generation is read
+/// again): a process that was swapped in between is not bound, the record stays as it was. A generation that cannot be read, or a write
+/// that fails, leaves the record as it was on disk; a failed write still uses the bound record for this run.
+async fn bind_native_generation(
+    store: &OwnershipStore,
+    inspector: &dyn ProcessInspector,
+    record: OwnershipRecord,
+) -> OwnershipRecord {
+    if record.generation.is_some() {
+        return record;
+    }
+    let Ok(generation) = inspector.generation(record.pid).await else {
+        return record;
+    };
+    if !matches!(
+        verify_identity(inspector, &record).await,
+        IdentityVerdict::Match | IdentityVerdict::Unsealed
+    ) {
+        return record;
+    }
+    match inspector.generation(record.pid).await {
+        Ok(again) if again == generation => {}
+        _ => return record,
+    }
+    let mut bound = record;
+    bound.generation = Some(generation);
+    let _ = store.write(&bound);
+    bound
 }
 
 enum Classified {
@@ -1539,6 +1574,151 @@ mod tests {
         store.write(&starting).unwrap();
         let recovery = OwnedEngine::recover(&inst, &inspector).await.unwrap();
         assert!(matches!(recovery, Recovery::Starting(_)), "{recovery:?}");
+    }
+
+    /// An inspector for the request path of a recovered engine: it offers a native watch pinned to `gen-1` and counts every question that
+    /// stands for a subprocess (`ps`, `lsof`).
+    struct Counting {
+        subprocess_questions: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct HoldingWatch;
+
+    #[async_trait]
+    impl crate::engine::ListenerWatch for HoldingWatch {
+        fn generation(&self) -> Option<&str> {
+            Some("gen-1")
+        }
+        async fn holds(&self) -> Result<bool, InspectError> {
+            Ok(true)
+        }
+    }
+
+    impl Counting {
+        fn ask(&self) {
+            self.subprocess_questions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ProcessInspector for Counting {
+        fn pid_state(&self, _pid: u32) -> PidState {
+            PidState::Alive
+        }
+        async fn start_time(&self, _pid: u32) -> Result<String, InspectError> {
+            self.ask();
+            Ok("Fri Nov 20 08:14:05 2026".into())
+        }
+        async fn command(&self, _pid: u32) -> Result<String, InspectError> {
+            self.ask();
+            Ok("fake-server".into())
+        }
+        async fn process_group(&self, _pid: u32) -> Result<u32, InspectError> {
+            self.ask();
+            Ok(51234)
+        }
+        async fn listens_on(&self, _pid: u32, _port: u16) -> Result<bool, InspectError> {
+            self.ask();
+            Ok(true)
+        }
+        async fn generation(&self, _pid: u32) -> Result<String, InspectError> {
+            self.ask();
+            Ok("gen-1".into())
+        }
+        fn watch_listener(
+            &self,
+            _pid: u32,
+            _dial: std::net::SocketAddr,
+        ) -> Option<Arc<dyn crate::engine::ListenerWatch>> {
+            Some(Arc::new(HoldingWatch))
+        }
+    }
+
+    /// Codex pre-review H3: recovering an old record (no generation) binds the native generation and writes it back, so the guard built
+    /// from the recovered engine keeps the per-request native check: in steady state an authorization starts no subprocess at all.
+    #[tokio::test]
+    async fn recovering_an_old_record_binds_and_persists_the_generation_and_keeps_the_native_path()
+    {
+        use crate::engine::OwnedListenerGuard;
+        use crate::omlx::key::{EndpointGuard, Verification};
+
+        let (_state, inst, store) = fixture();
+        let counting = Arc::new(Counting {
+            subprocess_questions: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let inspector: Arc<dyn ProcessInspector> = counting.clone();
+        store.write(&record()).unwrap();
+        assert_eq!(store.read().unwrap().unwrap().generation, None);
+        let Recovery::Adopted(engine) = OwnedEngine::recover(&inst, &inspector).await.unwrap()
+        else {
+            panic!("expected Adopted");
+        };
+        assert_eq!(engine.record().generation.as_deref(), Some("gen-1"));
+        assert_eq!(
+            store.read().unwrap().unwrap().generation.as_deref(),
+            Some("gen-1"),
+            "persisted, so a restart does not have to bind again"
+        );
+        let guard = OwnedListenerGuard::new(
+            inspector,
+            engine.pid(),
+            std::net::SocketAddr::new(crate::engine::MANAGED_DIAL, engine.port()),
+            engine.record().started_at.clone(),
+            engine.record().generation.clone(),
+        );
+        let before = counting
+            .subprocess_questions
+            .load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..50 {
+            assert_eq!(guard.verify().await, Verification::Verified);
+        }
+        assert_eq!(
+            counting
+                .subprocess_questions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "the request path must not start a subprocess in steady state"
+        );
+    }
+
+    /// The binding is bracketed: a process swapped in while it is read (another generation the second time) is not bound.
+    #[tokio::test]
+    async fn a_generation_that_changes_while_binding_is_not_bound() {
+        struct Flipping(Mutex<u32>);
+        #[async_trait]
+        impl ProcessInspector for Flipping {
+            fn pid_state(&self, _pid: u32) -> PidState {
+                PidState::Alive
+            }
+            async fn start_time(&self, _pid: u32) -> Result<String, InspectError> {
+                Ok("Fri Nov 20 08:14:05 2026".into())
+            }
+            async fn command(&self, _pid: u32) -> Result<String, InspectError> {
+                Ok("fake-server".into())
+            }
+            async fn process_group(&self, _pid: u32) -> Result<u32, InspectError> {
+                Ok(51234)
+            }
+            async fn listens_on(&self, _pid: u32, _port: u16) -> Result<bool, InspectError> {
+                Ok(true)
+            }
+            async fn generation(&self, _pid: u32) -> Result<String, InspectError> {
+                let mut n = self.0.lock().unwrap();
+                *n += 1;
+                Ok(format!("gen-{n}"))
+            }
+        }
+        let (_state, inst, store) = fixture();
+        let inspector: Arc<dyn ProcessInspector> = Arc::new(Flipping(Mutex::new(0)));
+        store.write(&record()).unwrap();
+        let recovery = OwnedEngine::recover(&inst, &inspector).await.unwrap();
+        let Recovery::Adopted(engine) = recovery else {
+            panic!("expected Adopted: {recovery:?}");
+        };
+        assert_eq!(engine.record().generation, None);
+        assert_eq!(store.read().unwrap().unwrap().generation, None);
     }
 
     #[tokio::test]

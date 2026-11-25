@@ -390,8 +390,7 @@ mod tests {
                 .unwrap()
                 .get(&pid)
                 .ok_or(InspectError::NoAnswer)?
-                .executable
-                .clone())
+                .executable)
         }
         async fn signing_team(&self, pid: u32) -> Result<Option<String>, InspectError> {
             self.team_calls.fetch_add(1, Ordering::SeqCst);
@@ -738,10 +737,8 @@ mod tests {
     async fn an_exec_with_the_same_pid_and_start_time_rechecks_the_signature() {
         let mut proc = Proc::ok();
         proc.executable = Some(ExecutableIdentity {
-            path: "/fake/signed".into(),
-            device: 1,
-            inode: 12,
-            modified: std::time::SystemTime::UNIX_EPOCH,
+            cdhash: Some([12; 20]),
+            image: Some([1; 16]),
         });
         let (verifier, scripted) = rig(Scripted::default()
             .listening(19731, &[42])
@@ -750,7 +747,7 @@ mod tests {
         {
             let mut procs = scripted.procs.lock().unwrap();
             let proc = procs.get_mut(&42).unwrap();
-            proc.executable.as_mut().unwrap().inode = 13;
+            proc.executable.as_mut().unwrap().cdhash = Some([13; 20]);
             proc.team = Ok(None);
         }
         assert_eq!(

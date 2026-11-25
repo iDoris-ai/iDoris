@@ -250,7 +250,7 @@ fn a_fifo_with_valid_content_is_rejected_by_the_opened_handles_type() {
 
 #[cfg(unix)]
 #[test]
-fn a_symlinked_omlx_directory_is_refused() {
+fn a_symlinked_omlx_directory_of_ours_is_accepted() {
     let home = Home::new();
     let real = home.path().join("elsewhere");
     fs::create_dir_all(&real).unwrap();
@@ -262,8 +262,8 @@ fn a_symlinked_omlx_directory_is_refused() {
     fs::remove_dir_all(home.path().join(".omlx")).unwrap();
     std::os::unix::fs::symlink(&real, home.path().join(".omlx")).unwrap();
     assert_eq!(
-        settings_api_key(home.path()),
-        Err(KeyRefusal::SettingsUnverifiable)
+        settings_api_key(home.path()).unwrap().as_deref(),
+        Some("k-dir")
     );
 }
 

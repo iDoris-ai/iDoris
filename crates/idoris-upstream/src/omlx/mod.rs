@@ -178,6 +178,30 @@ pub(crate) fn upstream_error(message: impl Into<String>) -> BackendError {
     }
 }
 
+/// What a fixed-key config carries when `settings.json` could not be verified (wrong owner or permissions, two truncated reads). The adapter
+/// built from it ([`OmlxAdapter::new`]) refuses every request locally instead of going out anonymously; the value itself is never sent.
+const SETTINGS_UNVERIFIABLE_MARKER: &str = "\u{0}idoris-settings-unverifiable\u{0}";
+
+fn construction_key(base_url: &str) -> Option<String> {
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    construction_key_in(
+        base_url,
+        std::env::var_os(OMLX_API_KEY_ENV),
+        home.as_deref().map(std::path::Path::new),
+    )
+}
+
+fn construction_key_in(
+    base_url: &str,
+    env: Option<std::ffi::OsString>,
+    home: Option<&std::path::Path>,
+) -> Option<String> {
+    match key::resolve_checked_in(base_url, env, home) {
+        Ok(key) => key,
+        Err(_) => Some(SETTINGS_UNVERIFIABLE_MARKER.to_owned()),
+    }
+}
+
 #[derive(Clone)]
 pub struct OmlxAdapterConfig {
     pub base_url: String,
@@ -201,7 +225,7 @@ impl OmlxAdapterConfig {
     pub fn for_base_url(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
         Self {
-            api_key: key::resolve_omlx_api_key_for(&base_url),
+            api_key: construction_key(&base_url),
             base_url,
             call_timeout: DEFAULT_CALL_TIMEOUT,
         }
@@ -228,7 +252,7 @@ impl Default for OmlxAdapterConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
-            api_key: key::resolve_omlx_api_key_for(DEFAULT_BASE_URL),
+            api_key: construction_key(DEFAULT_BASE_URL),
             call_timeout: DEFAULT_CALL_TIMEOUT,
         }
     }
@@ -241,6 +265,8 @@ pub struct OmlxAdapter {
     api_key: Option<String>,
     /// Look the key up on **every request** ([`Self::with_per_request_key`]) instead of using `api_key`.
     per_request_key: bool,
+    /// The config was resolved while `settings.json` could not be verified: every request is refused (see [`SETTINGS_UNVERIFIABLE_MARKER`]).
+    settings_unverifiable: bool,
     call_timeout: Duration,
     /// Deadline of one whole load (the `POST .../load` and the pin/state verification after it); `None` =
     /// use `call_timeout` for the POST and, as before, `call_timeout` for each later call (see
@@ -299,7 +325,10 @@ impl OmlxAdapter {
             .map_err(|_| BackendError::internal("failed to build the oMLX HTTP client"))?;
         Ok(Self {
             base_url: config.base_url.trim_end_matches('/').to_string(),
-            api_key: config.api_key,
+            settings_unverifiable: config.api_key.as_deref() == Some(SETTINGS_UNVERIFIABLE_MARKER),
+            api_key: config
+                .api_key
+                .filter(|key| key != SETTINGS_UNVERIFIABLE_MARKER),
             per_request_key: false,
             call_timeout: config.call_timeout,
             load_timeout: None,
@@ -369,6 +398,7 @@ impl OmlxAdapter {
         // its generation, right before each send. A key string read at construction is the old engine's the moment
         // the engine is replaced, and must not even be held.
         self.api_key = None;
+        self.settings_unverifiable = false;
         self
     }
 
@@ -397,6 +427,11 @@ impl OmlxAdapter {
     /// per-request adapter.
     async fn credential(&self) -> Result<Credential, BackendError> {
         let per_request = self.per_request_key;
+        if self.settings_unverifiable && !per_request {
+            return Err(upstream_error(
+                key::KeyRefusal::SettingsUnverifiable.to_string(),
+            ));
+        }
         if !per_request && !key::is_governed_endpoint(&self.base_url) {
             return Ok(Credential {
                 key: self.api_key.clone(),
@@ -928,6 +963,38 @@ mod tests {
             .mount(&server)
             .await;
         server
+    }
+
+    /// A fixed-key adapter built while `settings.json` cannot be verified (two truncated reads) must refuse locally: it used to fold the
+    /// refusal into "no key" and go out anonymously.
+    #[tokio::test]
+    async fn a_fixed_key_adapter_refuses_when_settings_cannot_be_verified() {
+        let server = models_server().await;
+        let endpoint = server.uri();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".omlx")).unwrap();
+        let settings = home.path().join(".omlx/settings.json");
+        std::fs::write(&settings, "{").unwrap();
+        let adapter = OmlxAdapter::new(OmlxAdapterConfig {
+            api_key: construction_key_in(&endpoint, None, Some(home.path())),
+            base_url: endpoint.clone(),
+            call_timeout: Duration::from_millis(500),
+        })
+        .unwrap();
+        assert!(adapter.list().await.is_err());
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "nothing may be sent"
+        );
+        // a readable file with no key is still an anonymous engine
+        std::fs::write(&settings, "{}").unwrap();
+        let adapter = OmlxAdapter::new(OmlxAdapterConfig {
+            api_key: construction_key_in(&endpoint, None, Some(home.path())),
+            base_url: endpoint,
+            call_timeout: Duration::from_millis(500),
+        })
+        .unwrap();
+        adapter.list().await.unwrap();
     }
 
     /// IDORIS-CORE S6 (G1): the engine manager's adapters look the key up on every request. A key read once at
