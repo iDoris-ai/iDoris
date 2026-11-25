@@ -1023,3 +1023,38 @@ fn an_entry_at_i64_min_is_counted_before_and_after_the_first_fold() {
     assert_eq!(net(&store, NOW), 516);
     full_replay(&db, &store, &[T0, NOW]);
 }
+
+#[test]
+fn a_retained_hold_starting_at_i64_min_blocks_the_fold_instead_of_being_folded() {
+    let db = TempDb::new("checkpoint-hold-at-min");
+    let store = setup(&db, 160);
+    set_ttl(&store, 4 * HOUR);
+    admit(&store, "pinned", T0, 100);
+    set_ttl(&store, HOUR / 2);
+    // 这个仍开着的预留在 emp 上的 reserve 分录序号是 i64::MIN：「在它之前停下」没有可表示的值。
+    let conn = Connection::open(db.path()).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS ledger_entries_append_only_update;
+         DROP TRIGGER IF EXISTS ledger_entries_append_only_delete;",
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE ledger_entries SET entry_id = ?1
+          WHERE hold_id = 'pinned#0' AND account_id = 'emp' AND kind = 'reserve'",
+        [i64::MIN],
+    )
+    .unwrap();
+    seed_funds(&db, "seed-", T0 - DAY);
+    let before = net(&store, NOW);
+    compact(&store, "advance", NOW);
+    // 不能前进：预留还开着，它的第一条分录就是 i64::MIN。
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM ledger_checkpoints WHERE account_id = 'emp'"
+        ),
+        0
+    );
+    assert_eq!(net(&store, NOW), before);
+    full_replay(&db, &store, &[T0, NOW]);
+}

@@ -63,6 +63,7 @@ pub(super) const COMPACTION_BATCH: i64 = 1024;
 
 /// A spend-order prefix containing whole, final holds. The raw entries remain
 /// authoritative for historical windows which cut through the prefix.
+#[derive(Default)]
 pub(super) struct Checkpoint {
     pub(super) through: Option<i64>,
     held: i64,
@@ -72,21 +73,6 @@ pub(super) struct Checkpoint {
     first_at: i64,
     last_at: i64,
     bucket_remaining: HashMap<String, i64>,
-}
-
-impl Default for Checkpoint {
-    fn default() -> Self {
-        Self {
-            through: None,
-            held: 0,
-            committed: 0,
-            funds: 0,
-            uncovered: 0,
-            first_at: 0,
-            last_at: 0,
-            bucket_remaining: HashMap::new(),
-        }
-    }
 }
 
 impl Checkpoint {
@@ -220,12 +206,19 @@ impl Checkpoint {
         // Retaining a hold also retains its original position in the replay.
         // A late or legacy spend after that position pins its entire hold.
         // Descending spend ID handles chains of overlapping split settlements.
+        // "Stop before entry X" has no representation when X is i64::MIN: no progress.
         if first_retained != i64::MAX {
-            through = through.min(first_retained.saturating_sub(1));
+            let Some(before) = first_retained.checked_sub(1) else {
+                return Ok(());
+            };
+            through = through.min(before);
         }
         for (first, _, _, last_spend) in &ranges {
             if last_spend.is_some_and(|spend| spend > through) {
-                through = through.min(first.saturating_sub(1));
+                let Some(before) = first.checked_sub(1) else {
+                    return Ok(());
+                };
+                through = through.min(before);
             }
         }
         // Advance only over at least one entry (live, or already spilled by an earlier step).
