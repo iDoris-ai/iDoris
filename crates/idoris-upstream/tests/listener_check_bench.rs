@@ -199,6 +199,8 @@ async fn per_request_recheck_p50_p99_idle_and_under_load() {
         inspector.clone(),
         pid,
         std::net::SocketAddr::new(MANAGED_DIAL, port),
+        inspector.start_time(pid).await.unwrap(),
+        inspector.generation(pid).await.ok(),
     ));
     let url = format!("http://127.0.0.1:{port}");
     let _governed = Governed(url.clone());
@@ -217,6 +219,11 @@ async fn per_request_recheck_p50_p99_idle_and_under_load() {
         Arc::new(SystemInspector::new().with_native_probe(false)),
         fallback_engine.child.id(),
         std::net::SocketAddr::new(MANAGED_DIAL, fallback_engine.port),
+        inspector
+            .start_time(fallback_engine.child.id())
+            .await
+            .unwrap(),
+        inspector.generation(fallback_engine.child.id()).await.ok(),
     ));
     govern_endpoint_guarded(
         &fallback_url,

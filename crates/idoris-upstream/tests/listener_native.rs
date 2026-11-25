@@ -171,6 +171,22 @@ fn counting_inspector(dir: &Path, native: bool) -> (Arc<SystemInspector>, PathBu
     (Arc::new(inspector), log)
 }
 
+async fn guard_for(
+    inspector: Arc<SystemInspector>,
+    pid: u32,
+    dial: std::net::SocketAddr,
+) -> idoris_upstream::engine::OwnedListenerGuard {
+    use idoris_upstream::engine::{OwnedListenerGuard, ProcessInspector};
+    let system = SystemInspector::new();
+    OwnedListenerGuard::new(
+        inspector,
+        pid,
+        dial,
+        system.start_time(pid).await.unwrap(),
+        system.generation(pid).await.ok(),
+    )
+}
+
 fn has_lsof() -> bool {
     ["/usr/sbin/lsof", "/usr/bin/lsof"]
         .iter()
@@ -183,10 +199,10 @@ mod native {
     use std::net::{IpAddr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
 
-    use idoris_upstream::engine::{OwnedListenerGuard, ProcessInspector, SystemInspector};
+    use idoris_upstream::engine::{ProcessInspector, SystemInspector};
     use idoris_upstream::omlx::key::{EndpointGuard, Verification};
 
-    use super::{Engine, calls, counting_inspector, has_lsof};
+    use super::{Engine, calls, counting_inspector, guard_for, has_lsof};
 
     /// **The owner's requirement.** A request's re-check starts no child process (not one `ps`, not one `lsof`) however many requests there
     /// are, and the engine letting go of its port (it is still alive) is seen by the very next request; whoever binds the port afterwards is
@@ -197,7 +213,7 @@ mod native {
         let mut engine = Engine::start("127.0.0.1");
         let dir = tempfile::tempdir().unwrap();
         let (inspector, log) = counting_inspector(dir.path(), true);
-        let guard = OwnedListenerGuard::new(inspector.clone(), engine.pid(), engine.dial());
+        let guard = guard_for(inspector.clone(), engine.pid(), engine.dial()).await;
 
         // What the manager asks at a state change (and at every tick): the expensive question, one `lsof`.
         let tick_question = has_lsof();
@@ -254,7 +270,7 @@ mod native {
         let mut engine = Engine::start("127.0.0.1");
         let dir = tempfile::tempdir().unwrap();
         let (inspector, log) = counting_inspector(dir.path(), true);
-        let guard = OwnedListenerGuard::new(inspector, engine.pid(), engine.dial());
+        let guard = guard_for(inspector, engine.pid(), engine.dial()).await;
         assert_eq!(guard.verify().await, Verification::Verified);
         engine.kill();
         assert_eq!(guard.verify().await, Verification::Mismatch);
@@ -271,16 +287,15 @@ mod native {
         let inspector = Arc::new(SystemInspector::new());
         let dial = |port| SocketAddr::new(idoris_upstream::engine::MANAGED_DIAL, port);
         // The engine's guard on the port this process holds.
-        let wrong_port = OwnedListenerGuard::new(inspector.clone(), engine.pid(), dial(other_port));
+        let wrong_port = guard_for(inspector.clone(), engine.pid(), dial(other_port)).await;
         assert_eq!(wrong_port.verify().await, Verification::Mismatch);
         // A guard for this process on the engine's port.
-        let wrong_pid =
-            OwnedListenerGuard::new(inspector.clone(), std::process::id(), dial(engine.port));
+        let wrong_pid = guard_for(inspector.clone(), std::process::id(), dial(engine.port)).await;
         assert_eq!(wrong_pid.verify().await, Verification::Mismatch);
         // And the real pairs verify.
-        let right = OwnedListenerGuard::new(inspector.clone(), engine.pid(), dial(engine.port));
+        let right = guard_for(inspector.clone(), engine.pid(), dial(engine.port)).await;
         assert_eq!(right.verify().await, Verification::Verified);
-        let mine = OwnedListenerGuard::new(inspector, std::process::id(), dial(other_port));
+        let mine = guard_for(inspector, std::process::id(), dial(other_port)).await;
         assert_eq!(mine.verify().await, Verification::Verified);
     }
 
@@ -309,7 +324,7 @@ mod native {
         let _second_listener = socket.listen(16).unwrap();
 
         let inspector = Arc::new(SystemInspector::new());
-        let guard = OwnedListenerGuard::new(inspector.clone(), engine.pid(), engine.dial());
+        let guard = guard_for(inspector.clone(), engine.pid(), engine.dial()).await;
         assert_eq!(
             guard.verify().await,
             Verification::Verified,
@@ -335,7 +350,7 @@ mod native {
             return;
         };
         let inspector = Arc::new(SystemInspector::new());
-        let v4 = OwnedListenerGuard::new(inspector.clone(), engine.pid(), engine.dial());
+        let v4 = guard_for(inspector.clone(), engine.pid(), engine.dial()).await;
         assert_eq!(v4.dial(), Some(engine.dial()));
         assert_eq!(
             v4.verify().await,
@@ -343,7 +358,7 @@ mod native {
             "a connection to 127.0.0.1 does not reach a socket bound to ::1"
         );
         let v6_address = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), engine.port);
-        let v6 = OwnedListenerGuard::new(inspector, engine.pid(), v6_address);
+        let v6 = guard_for(inspector, engine.pid(), v6_address).await;
         assert_eq!(v6.dial(), Some(v6_address));
         assert_eq!(v6.verify().await, Verification::Verified);
     }
@@ -363,7 +378,7 @@ mod native {
             return;
         };
         let inspector = Arc::new(SystemInspector::new());
-        let guard = OwnedListenerGuard::new(inspector.clone(), v6_only.pid(), v6_only.dial());
+        let guard = guard_for(inspector.clone(), v6_only.pid(), v6_only.dial()).await;
         for _ in 0..3 {
             assert_eq!(
                 guard.verify().await,
@@ -372,7 +387,7 @@ mod native {
             );
         }
         let dual = Engine::start_v6("::", "0", 0).unwrap();
-        let guard = OwnedListenerGuard::new(inspector, dual.pid(), dual.dial());
+        let guard = guard_for(inspector, dual.pid(), dual.dial()).await;
         let expected = if cfg!(target_os = "macos") {
             Verification::Verified
         } else {
@@ -393,7 +408,7 @@ mod native {
         let mut engine = Engine::start("127.0.0.1");
         let dir = tempfile::tempdir().unwrap();
         let (inspector, log) = counting_inspector(dir.path(), true);
-        let guard = OwnedListenerGuard::new(inspector, engine.pid(), engine.dial());
+        let guard = guard_for(inspector, engine.pid(), engine.dial()).await;
         assert_eq!(guard.verify().await, Verification::Verified);
         assert_eq!(engine.tell("shutdown"), "shutdown");
         for _ in 0..3 {
@@ -434,16 +449,22 @@ mod fallback {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use idoris_upstream::engine::{FALLBACK_TTL, OwnedListenerGuard, ProcessInspector};
+    use idoris_upstream::engine::{FALLBACK_TTL, ProcessInspector};
     use idoris_upstream::omlx::key::{EndpointGuard, Verification};
 
-    use super::{Engine, SystemInspector, calls, counting_inspector, has_lsof};
+    use super::{Engine, SystemInspector, counting_inspector, guard_for, has_lsof};
+
+    fn lsof_calls(log: &std::path::Path) -> usize {
+        std::fs::read_to_string(log).map_or(0, |text| {
+            text.lines().filter(|line| *line == "lsof").count()
+        })
+    }
 
     /// The window of a yes starts when the check **starts**, so the first `exec` of a freshly written tool (slow on macOS, slower than
     /// the whole window) must not be part of what is measured: run it once, and count from there. Returns the count so far.
     async fn warm_up(inspector: &Arc<SystemInspector>, log: &std::path::Path, port: u16) -> usize {
         let _ = inspector.listening_sockets(port).await.unwrap();
-        calls(log)
+        lsof_calls(log)
     }
 
     /// The engine lets go of its port: the fallback sees it by the first request after the reuse window, with the real `lsof`; and a
@@ -463,15 +484,19 @@ mod fallback {
         );
         assert_eq!(inspector.fallback_ttl(), FALLBACK_TTL);
         let warm = warm_up(&inspector, &log, engine.port).await;
-        let guard = OwnedListenerGuard::new(inspector, engine.pid(), engine.dial());
+        let guard = guard_for(inspector, engine.pid(), engine.dial()).await;
         for _ in 0..30 {
             assert_eq!(guard.verify().await, Verification::Verified);
         }
-        assert_eq!(calls(&log) - warm, 1, "thirty requests inside the window");
+        assert_eq!(
+            lsof_calls(&log) - warm,
+            1,
+            "thirty requests inside the window"
+        );
         engine.release_port();
         tokio::time::sleep(FALLBACK_TTL + Duration::from_millis(100)).await;
         assert_eq!(guard.verify().await, Verification::Mismatch);
-        assert!(calls(&log) - warm >= 2);
+        assert!(lsof_calls(&log) - warm >= 2);
     }
 
     /// **H7 with the real tools.** Many requests that arrive together when the window is closed start **one** `lsof` between them, not one
@@ -485,11 +510,7 @@ mod fallback {
         let dir = tempfile::tempdir().unwrap();
         let (inspector, log) = counting_inspector(dir.path(), false);
         let warm = warm_up(&inspector, &log, engine.port).await;
-        let guard = Arc::new(OwnedListenerGuard::new(
-            inspector,
-            engine.pid(),
-            engine.dial(),
-        ));
+        let guard = Arc::new(guard_for(inspector, engine.pid(), engine.dial()).await);
         let tasks: Vec<_> = (0..32)
             .map(|_| {
                 let guard = guard.clone();
@@ -500,10 +521,10 @@ mod fallback {
             assert_eq!(task.await.unwrap(), Verification::Verified);
         }
         assert_eq!(
-            calls(&log) - warm,
+            lsof_calls(&log) - warm,
             1,
             "32 concurrent requests, {} lsof invocations",
-            calls(&log) - warm
+            lsof_calls(&log) - warm
         );
     }
 }

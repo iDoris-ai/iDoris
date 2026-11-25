@@ -39,8 +39,8 @@
 //!
 //! The workspace sets `unsafe_code = "forbid"` and the design had chosen subprocesses (`ps`, `lsof`) over libproc for exactly that reason.
 //! Making the request path cheap needs libproc, which has no safe wrapper in `libc`, `nix` or `rustix`. So the FFI lives here, in one file
-//! (`macos_ffi.rs`, compiled on macOS only) behind a narrow `allow`; this crate `deny`s `unsafe_code` everywhere else — the logic on top of
-//! the FFI (`macos.rs`) is safe code, tested against a scripted fake of the system calls — and every other crate keeps its `forbid`. The
+//! (`macos.rs`, compiled on macOS only) behind a narrow `allow`; this crate `deny`s `unsafe_code` everywhere else — the logic on top of
+//! the FFI (`macos/watch.rs`) is safe code, tested against a scripted fake of the system calls — and every other crate keeps its `forbid`. The
 //! calls only pass pointers to zero-initialised plain-old-data buffers that the callee fills in; the mirrored C structs are checked against
 //! the sizes and offsets the kernel documents (compile-time asserts) and against real sockets (tests).
 
@@ -50,10 +50,8 @@ use std::sync::Mutex;
 #[cfg(any(target_os = "linux", test))]
 mod linux;
 #[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
-mod macos_ffi;
+mod macos;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod unsupported;
 
@@ -63,6 +61,38 @@ use linux as platform;
 use macos as platform;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use unsupported as platform;
+
+/// Filesystem identity of the running executable. The path detects exec into a different
+/// program and the metadata detects replacement or modification at that path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExecutableIdentity {
+    pub path: std::path::PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    pub modified: std::time::SystemTime,
+}
+
+impl ExecutableIdentity {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn from_metadata(path: std::path::PathBuf, metadata: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            modified: metadata.modified().ok()?,
+        })
+    }
+}
+
+pub fn executable_identity(pid: u32) -> Option<ExecutableIdentity> {
+    platform::executable_identity(pid)
+}
+
+/// The kernel start time in the same format used by ownership records.
+pub fn process_generation(pid: u32) -> Option<String> {
+    platform::process_generation(pid)
+}
 
 /// What a listening TCP socket is bound to: the address family and the address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +168,11 @@ impl ListenerWatch {
             inner,
             hint: Mutex::new(None),
         })
+    }
+
+    /// Start time captured at establishment, before any descriptor observation.
+    pub fn generation(&self) -> Option<String> {
+        self.inner.generation()
     }
 
     fn hint(&self) -> Option<platform::Hint> {

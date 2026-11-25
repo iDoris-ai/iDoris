@@ -250,6 +250,8 @@ impl Owned {
             inspector,
             engine.pid(),
             std::net::SocketAddr::new(MANAGED_DIAL, engine.port()),
+            engine.record().started_at.clone(),
+            engine.record().generation.clone(),
         ));
         Self { engine, key, guard }
     }
