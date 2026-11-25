@@ -526,7 +526,7 @@ impl std::fmt::Display for KeyRefusal {
                 "what listens on this endpoint could not be confirmed right before sending: the request was not sent",
             ),
             Self::SettingsUnverifiable => f.write_str(
-                "oMLX settings.json could not be verified (not valid JSON, not owned by this user or root, writable by group or others, or an ACL grants others write): the request was not sent",
+                "oMLX settings.json could not be verified (for example: not valid JSON, not owned by this user or root, writable by group or others, an ACL grants others write, an untrusted directory on its path, or a read error): the request was not sent",
             ),
             Self::TransportUnavailable => f.write_str(
                 "the HTTP client for managed endpoints could not be built: the request was not sent",
@@ -1091,8 +1091,8 @@ pub fn resolve_from(env: Option<OsString>, home: Option<&Path>) -> Option<OsStri
     resolve_from_for(env, home, true)
 }
 
-/// Who the settings file and the directories on its way must belong to. Production passes the effective uid for both; tests pass a
-/// different one for the directories to exercise the refusal without needing a second account.
+/// Who the settings file and the directories on its way must belong to (three uids: the file, the link and its directory, the link
+/// target). Production passes the effective uid for all three; tests pass a different one to exercise each refusal without a second account.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 struct Trust {
