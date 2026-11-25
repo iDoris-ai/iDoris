@@ -211,6 +211,9 @@ pub enum Verification {
 pub trait EndpointGuard: Send + Sync + std::fmt::Debug {
     async fn verify(&self) -> Verification;
 
+    /// Clear positive fallback evidence synchronously. Called under the endpoint registry lock.
+    fn invalidate_positive(&self) {}
+
     /// **经过核验的拨号地址**：守卫验证的就是「登记时认的进程握着一个**这个地址**连得到的 LISTEN 套接字」，授权结果把它带给发送端，
     /// 发送端只拨它（[`Authorization::dial_url`]），不拨卡里写的别名（`localhost`、`[::1]`、`127.0.0.2`：登记表把它们并成同一个端口
     /// 身份，但它们不是同一个地址，各自可以有不同的监听者；Codex 专项评审 H1）。`None`：这个守卫不限定地址（测试里的假守卫）。
@@ -316,6 +319,9 @@ pub fn govern_endpoint_guarded(
         _ => false,
     };
     if slot.key.as_ref() != Some(&policy) || !same_guard {
+        if let Some(previous) = &slot.guard {
+            previous.invalidate_positive();
+        }
         slot.key = Some(policy);
         slot.guard = guard;
         slot.advance();
@@ -716,6 +722,20 @@ impl Authorization {
         Ok(())
     }
 
+    /// Invalidate only the guard for the generation whose connection failed.
+    pub(crate) fn connection_failed(&self) {
+        let Some(identity) = endpoint_identity(&self.endpoint) else {
+            return;
+        };
+        let governed = GOVERNED.read().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = governed.get(&identity)
+            && slot.generation == self.generation
+            && let Some(guard) = &slot.guard
+        {
+            guard.invalidate_positive();
+        }
+    }
+
     /// 守卫核验过的拨号地址（托管的端点）。
     pub fn dial(&self) -> Option<std::net::SocketAddr> {
         self.dial
@@ -758,6 +778,21 @@ impl Authorization {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+}
+
+/// Observe a reqwest send before the caller can retry. A connection error invalidates
+/// the corresponding generation's positive fallback cache; response and body errors do not.
+pub async fn send_authorized(
+    authorization: Option<&Authorization>,
+    send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    send.await.inspect_err(|error| {
+        if error.is_connect()
+            && let Some(authorization) = authorization
+        {
+            authorization.connection_failed();
+        }
+    })
 }
 
 /// **每个要发往 oMLX 端点的请求在发出之前**调用（IDORIS-CORE S6，Codex 终审 H1；owner 2026-11-22 拍板）：在同一个任务里，紧挨着

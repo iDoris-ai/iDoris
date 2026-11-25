@@ -1635,7 +1635,7 @@ impl Actor {
                     reason: Some(UpstreamReason::PortInUse),
                 };
             }
-            EngineProbe::Unavailable => {
+            EngineProbe::Unavailable | EngineProbe::ConnectionFailed => {
                 // 有东西在监听但还答不上来（外部引擎正在启动或很忙，或别的什么）：等它，不拉起第二个。
                 self.external_path = true;
                 return self.wait_for_answer(&probe_recipe).await;
@@ -1765,7 +1765,7 @@ impl Actor {
                         // 连接被拒：端口上已经没有监听者了（确定地消失了）。
                         EngineProbe::ConnectionRefused => false,
                         // 有东西在监听、带 key 却答不上来：是不是还是刚才校验通过的那个，下面再确认一次。
-                        EngineProbe::Unavailable => {
+                        EngineProbe::Unavailable | EngineProbe::ConnectionFailed => {
                             return self
                                 .after_inconclusive_keyed_probe(&verifier, &listeners)
                                 .await;
@@ -1830,7 +1830,7 @@ impl Actor {
             }
             interval = interval.saturating_mul(2).min(t.ready_max_interval);
             match self.probe(recipe, None).await {
-                EngineProbe::Unavailable => {}
+                EngineProbe::Unavailable | EngineProbe::ConnectionFailed => {}
                 // 监听者没了：回到决策的开头（可能要拉起）。这不是引擎失败：刚才答不上来的是别的东西（或者一个正在退出的
                 // 进程，连接被它接受了又被重置），现在端口上什么都没有，**还没有哪个我们拉起的进程出过问题**，所以不记入熔断窗口、
                 // 不退避（Codex 预审 6）。
@@ -2014,7 +2014,8 @@ impl Actor {
                     }
                     EngineProbe::ConnectionRefused
                     | EngineProbe::NotThisEngine
-                    | EngineProbe::Unavailable => {}
+                    | EngineProbe::Unavailable
+                    | EngineProbe::ConnectionFailed => {}
                 }
             }
             let now = Instant::now();
@@ -2261,9 +2262,7 @@ impl Actor {
                     return step;
                 }
             } else if self.external.is_some() {
-                if probe_due {
-                    self.supervise_external().await;
-                }
+                self.supervise_external(probe_due).await;
             } else {
                 return Step::Attempt;
             }
@@ -2331,7 +2330,11 @@ impl Actor {
             ),
             None => return Some(Step::Attempt),
         };
-        let (state, reason) = match self.probe(&recipe, key.as_deref()).await {
+        let probe = match key.as_deref() {
+            Some(key) => self.probe_authorized(&recipe, key).await,
+            None => self.probe(&recipe, None).await,
+        };
+        let (state, reason) = match probe {
             EngineProbe::Ready => {
                 if self.supervisor_latched().await {
                     (
@@ -2347,7 +2350,8 @@ impl Actor {
             }
             EngineProbe::ConnectionRefused
             | EngineProbe::NotThisEngine
-            | EngineProbe::Unavailable => (UpstreamState::Unavailable, None),
+            | EngineProbe::Unavailable
+            | EngineProbe::ConnectionFailed => (UpstreamState::Unavailable, None),
         };
         self.publish(state, reason);
         None
@@ -2427,12 +2431,12 @@ impl Actor {
         self.close_admission().await;
     }
 
-    /// 一个周期的外部引擎监管：探测失败只报 `unavailable`，iDoris 永远不重启它，也不给它发信号。
+    /// 外部引擎在存活节拍核验监听者，HTTP 探测沿用独立的探测周期。探测失败时 iDoris 不重启外部引擎，也不给它发信号。
     ///
     /// 每个周期先确认监听者还是校验过的那个**进程**（pid 加启动时间都比：只比 pid，pid 被复用就分不出来了）。换了进程，
     /// Supervisor 的账本就是对着旧进程建的，不能直接回 `ready`：先封上端点、关门、排空、复位、开门，之后才发布 `ready`
     /// （[`Self::external_replaced`]，Codex 预审 4）。
-    async fn supervise_external(&mut self) {
+    async fn supervise_external(&mut self, probe_due: bool) {
         let Some(external) = &self.external else {
             return;
         };
@@ -2472,6 +2476,9 @@ impl Actor {
                 return;
             }
         }
+        if !probe_due {
+            return;
+        }
         let recipe = backend.probe_recipe();
         // key 先取好，再经授权路径探测（守卫重新确认监听者、只拨核验过的地址、走新开的连接；Codex 复审 L2 的 M2'）。授权不过（监听者变了、读不出来）
         // 就这一轮没有结论（`Unavailable`，记一行日志）：下一个周期的校验会把监听者的变化分清楚。
@@ -2502,9 +2509,9 @@ impl Actor {
                 }),
             ),
             EngineProbe::NotThisEngine => (UpstreamState::Failed, Some(UpstreamReason::PortInUse)),
-            EngineProbe::ConnectionRefused | EngineProbe::Unavailable => {
-                (UpstreamState::Unavailable, None)
-            }
+            EngineProbe::ConnectionRefused
+            | EngineProbe::Unavailable
+            | EngineProbe::ConnectionFailed => (UpstreamState::Unavailable, None),
         };
         self.publish(state, reason);
     }

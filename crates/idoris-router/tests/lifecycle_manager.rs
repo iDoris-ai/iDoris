@@ -96,6 +96,7 @@ async fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
 /// 身份信息（启动时间、命令行、进程组、uid）读真的 `ps`；「谁在监听」「谁签的名」按测试编排。
 struct Scripted {
     real: SystemInspector,
+    synthetic_listener_identity: bool,
     /// 对这些端口声称「被问到的 pid 正在监听」（假引擎真的在监听，但不依赖 `lsof` 来证明）。
     claims: Mutex<Vec<u16>>,
     /// `listeners_on(port)`：端口上的监听者。没编排的端口没有监听者。
@@ -124,6 +125,7 @@ impl Scripted {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             real: SystemInspector::new(),
+            synthetic_listener_identity: false,
             claims: Mutex::new(Vec::new()),
             listeners: Mutex::new(BTreeMap::new()),
             teams: Mutex::new(BTreeMap::new()),
@@ -197,6 +199,9 @@ impl ProcessInspector for Scripted {
         self.real.pid_state(pid)
     }
     async fn start_time(&self, pid: u32) -> Result<String, InspectError> {
+        if self.synthetic_listener_identity {
+            return Ok(format!("test process {pid}"));
+        }
         self.dawdle().await;
         if self.identity_unreadable.load(Ordering::SeqCst) {
             return Err(InspectError::NoAnswer);
@@ -243,6 +248,9 @@ impl ProcessInspector for Scripted {
             .unwrap_or_default())
     }
     async fn uid_of(&self, pid: u32) -> Result<u32, InspectError> {
+        if self.synthetic_listener_identity {
+            return Ok(nix::unistd::geteuid().as_raw());
+        }
         self.real.uid_of(pid).await
     }
     async fn signing_team(&self, pid: u32) -> Result<Option<String>, InspectError> {
@@ -284,13 +292,17 @@ struct Rig {
 
 impl Rig {
     fn new(behavior: &Behavior) -> Self {
+        Self::with_port(behavior, free_port())
+    }
+
+    fn with_port(behavior: &Behavior, port: u16) -> Self {
         let work = tempfile::tempdir().unwrap();
         let fake = FakeOmlx::create(work.path(), behavior);
         Self {
             state: tempfile::tempdir().unwrap(),
             work,
             fake,
-            port: free_port(),
+            port,
         }
     }
 
@@ -2089,6 +2101,52 @@ async fn an_external_listener_that_turns_into_another_service_is_failed_with_por
     assert!(pid_alive(u64::from(external.pid())));
     external.fake.answer_normally();
     h.until_state(UpstreamState::Ready).await;
+    h.manager.shutdown(true).await;
+}
+
+#[tokio::test]
+async fn external_liveness_detects_a_second_listener_before_the_http_probe_is_due() {
+    let rig = Rig::with_port(&Behavior::default(), 64600);
+    let mut inspector = Scripted::new();
+    Arc::get_mut(&mut inspector)
+        .unwrap()
+        .synthetic_listener_identity = true;
+    let owner = std::process::id();
+    inspector.external_listener(rig.port, owner, Some(TEAM));
+    let script = ProbeScript::new(|_| Some(EngineProbe::Ready));
+    let h = Harness::start(
+        &rig,
+        ScriptedProbeBackend::new(default_backend(&rig), script.clone()),
+        inspector.clone(),
+        Timings {
+            liveness_interval: Duration::from_millis(50),
+            probe_interval: Duration::from_secs(30),
+            ..fast()
+        },
+        StopOnExit::Owned,
+    );
+    tokio::time::timeout(Duration::from_secs(3), h.until_state(UpstreamState::Ready))
+        .await
+        .unwrap();
+    let second = std::os::unix::process::parent_id();
+    inspector
+        .listeners
+        .lock()
+        .unwrap()
+        .insert(rig.port, vec![owner, second]);
+    let failed = tokio::time::timeout(Duration::from_secs(3), h.until_state(UpstreamState::Failed))
+        .await
+        .unwrap();
+    assert_eq!(failed.reason, Some(UpstreamReason::PortInUse));
+    assert_eq!(
+        governed_endpoint(&rig.endpoint()),
+        Some(EndpointKey::Blocked)
+    );
+    assert_eq!(
+        script.keyless.load(Ordering::SeqCst) + script.keyed.load(Ordering::SeqCst),
+        1,
+        "only the startup HTTP probe was due"
+    );
     h.manager.shutdown(true).await;
 }
 

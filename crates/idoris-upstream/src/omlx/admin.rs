@@ -65,9 +65,12 @@ impl OmlxAdapter {
         // The last look, after the request (with the main key in its body) is built: a refusal means nothing was sent.
         http::check_before_send(credential.authorization(), &request)
             .map_err(|refusal| AdminRequestError::Definite(upstream_error(refusal.to_string())))?;
-        let response = client.execute(request).await.map_err(|_| {
-            AdminRequestError::Unknown(upstream_error("oMLX admin login transport failure"))
-        })?;
+        let response =
+            super::key::send_authorized(credential.authorization(), client.execute(request))
+                .await
+                .map_err(|_| {
+                    AdminRequestError::Unknown(upstream_error("oMLX admin login transport failure"))
+                })?;
         admin_check_status(&response)?;
         let mut cookie = response
             .headers()
@@ -193,9 +196,14 @@ impl OmlxAdapter {
             http::check_before_send(credential.authorization(), &request).map_err(|refusal| {
                 AdminRequestError::Definite(upstream_error(refusal.to_string()))
             })?;
-            let response = client.execute(request).await.map_err(|_| {
-                AdminRequestError::Unknown(upstream_error("oMLX admin request transport failure"))
-            })?;
+            let response =
+                super::key::send_authorized(credential.authorization(), client.execute(request))
+                    .await
+                    .map_err(|_| {
+                        AdminRequestError::Unknown(upstream_error(
+                            "oMLX admin request transport failure",
+                        ))
+                    })?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 *session = None;
                 if attempt == 0 {

@@ -679,7 +679,9 @@ pub async fn probe_resident_admitted(
     {
         return Observation::Unavailable(None);
     }
-    let Ok(response) = client.execute(built).await else {
+    let Ok(response) =
+        idoris_upstream::omlx::key::send_authorized(held.as_ref(), client.execute(built)).await
+    else {
         return Observation::Unavailable(None);
     };
     let status = response.status();

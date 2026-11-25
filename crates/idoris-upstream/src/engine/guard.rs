@@ -12,7 +12,7 @@
 //! - **每个监督节拍和每次状态变化（引擎管理器，不在请求路径上）**：贵的那些——自有引擎「这个端口上只有它一个监听者」（`lsof`，
 //!   [`ProcessInspector::listens_on`]），外部引擎的 uid、签名团队与「每个**能接这个连接**的监听者」的身份（[`ListenerVerifier::check`]）。
 //!   引擎还握着它自己的套接字、另一个进程在同一个端口上绑了一个更具体的地址（一个并存的监听者），每个请求的确认看不见，要等
-//!   监督的下一次检查才看见（自有引擎每个 `liveness_interval`，外部引擎每个探测间隔；各自的上限见规范勘误十（8））。
+//!   监督的下一次检查才看见（自有引擎每个 `liveness_interval`，外部引擎也每个 `liveness_interval`；各自的上限见规范勘误十（8））。
 //!
 //! **退路**（原生监视建不出来：别的 unix、读不了那个进程；或某一次读不出来）：每个请求问那个贵的问题——自有引擎 `listens_on`，外部
 //! 引擎 [`ListenerVerifier::check`]——而肯定的答案至多重用 [`ProcessInspector::fallback_ttl`]（真的检查器是 [`super::FALLBACK_TTL`]，
@@ -27,8 +27,9 @@
 //!
 //! **没有消除的间隙**：确认与发送之间仍有毫秒级的间隙；「并存的监听者」到监督的下一次检查才被发现；原生身份没有绑到通过签名校验的
 //! 那个身份上（pid 复用的窗口）；`exec` 之后保留监听 fd 的进程沿用旧的校验；连接失败不使退路的缓存作废。这些是 v0.6.1 的已知限制，
-//! 原生监视绑定签名通过时的进程启动标识，外部引擎每次请求还核对可执行文件身份。
-//! 规范勘误十（8）说明对外行为。
+//! 原生监视绑定签名通过时的进程启动标识，外部引擎每次请求还核对可执行文件身份。连接失败会清除该端点代际的
+//! 退路肯定缓存，也使尚未完成的旧检查无法重新填入旧结果。Unix domain socket 待确认 oMLX 支持后再评估（#646）。
+//! 规范勘误十（8）及勘误十五说明对外行为。
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -280,6 +281,10 @@ impl EndpointGuard for OwnedListenerGuard {
         identity
     }
 
+    fn invalidate_positive(&self) {
+        self.reuse.invalidate();
+    }
+
     fn dial(&self) -> Option<SocketAddr> {
         Some(self.dial)
     }
@@ -399,6 +404,10 @@ impl EndpointGuard for ExternalListenerGuard {
             Ok(false) => {}
         }
         self.reuse.verify(|| self.ask()).await
+    }
+
+    fn invalidate_positive(&self) {
+        self.reuse.invalidate();
     }
 
     fn dial(&self) -> Option<SocketAddr> {
@@ -655,6 +664,61 @@ mod tests {
             2,
             "the original is checked via the fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn a_connect_failure_invalidates_only_its_generation_before_retry() {
+        use crate::omlx::key::{
+            EndpointKey, KeyRefusal, authorize_omlx_request, forget_endpoint,
+            govern_endpoint_guarded, send_authorized,
+        };
+
+        let url = "http://127.0.0.1:0";
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let first = Fake::new();
+        first.script_listens(vec![Ok(true)]);
+        govern_endpoint_guarded(
+            url,
+            EndpointKey::Private("first".into()),
+            Some(Arc::new(owned(&first))),
+        );
+        let old = authorize_omlx_request(url, None).await.unwrap();
+
+        let next = Fake::new();
+        next.reuse_for(Duration::from_secs(60));
+        next.script_listens(vec![Ok(true)]);
+        govern_endpoint_guarded(
+            url,
+            EndpointKey::Private("next".into()),
+            Some(Arc::new(owned(&next))),
+        );
+        let current = authorize_omlx_request(url, None).await.unwrap();
+        assert_eq!(next.listens_asked(), 1);
+        next.script_listens(vec![Ok(false)]);
+
+        let error = send_authorized(Some(&old), client.get(url).send())
+            .await
+            .unwrap_err();
+        assert!(error.is_connect());
+        assert!(
+            authorize_omlx_request(url, Some(current.generation()))
+                .await
+                .is_ok()
+        );
+        assert_eq!(next.listens_asked(), 1);
+
+        let error = send_authorized(Some(&current), client.get(url).send())
+            .await
+            .unwrap_err();
+        assert!(error.is_connect());
+        assert_eq!(
+            authorize_omlx_request(url, Some(current.generation()))
+                .await
+                .unwrap_err(),
+            KeyRefusal::ListenerChanged
+        );
+        assert_eq!(next.listens_asked(), 2);
+        forget_endpoint(url);
     }
 
     // ----- the slow question (no watch, no reuse window): what the guards asked before the per-request watch existed -----------------

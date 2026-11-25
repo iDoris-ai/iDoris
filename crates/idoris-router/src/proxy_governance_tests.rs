@@ -260,6 +260,62 @@ async fn a_card_that_cannot_carry_the_key_is_still_governed_by_the_endpoint_it_a
     assert_eq!(authorization(&requests[2]), None);
 }
 
+#[tokio::test]
+async fn a_connection_failure_retry_rechecks_the_listener_in_the_same_generation() {
+    use idoris_upstream::omlx::key::{EndpointGuard, Verification, govern_endpoint_guarded};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct CachedListener {
+        invalidated: AtomicBool,
+        checks: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl EndpointGuard for CachedListener {
+        async fn verify(&self) -> Verification {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            if self.invalidated.load(Ordering::SeqCst) {
+                Verification::Mismatch
+            } else {
+                Verification::Verified
+            }
+        }
+
+        fn invalidate_positive(&self) {
+            self.invalidated.store(true, Ordering::SeqCst);
+        }
+
+        fn dial(&self) -> Option<std::net::SocketAddr> {
+            Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        }
+    }
+
+    let uri = "http://127.0.0.1:0";
+    let _governed = Governed(uri.to_owned());
+    let guard = Arc::new(CachedListener::default());
+    govern_endpoint_guarded(
+        uri,
+        EndpointKey::Private("fake-key".into()),
+        Some(guard.clone()),
+    );
+    let admitted = endpoint_generation(uri);
+    let proxy =
+        ChatProxy::with_config(reqwest::Client::new(), DEFAULT_WINDOW, vec![Duration::ZERO]);
+    let outcome = generation::scoped(
+        Some(admitted),
+        proxy.forward_buffered(uri, &body(), &opts()),
+    )
+    .await;
+    assert_eq!(
+        outcome.status, 503,
+        "retry refused locally after a failed connection"
+    );
+    assert_eq!(outcome.execution, ExecutionDisposition::NotExecuted);
+    assert_eq!(guard.checks.load(Ordering::SeqCst), 2);
+    assert_eq!(endpoint_generation(uri), admitted);
+}
+
 /// 一次连接失败的重试，落在引擎已经被换掉之后：不发。第一次发送（还是准入时的那一代）连接被拒；等重试的时候引擎换了，端口上
 /// 起来了新引擎，重试**不能**把请求（与新引擎的 key）发给它。对照：引擎没换，同一个重试正常到达。
 #[tokio::test]

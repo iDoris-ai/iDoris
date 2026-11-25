@@ -27,6 +27,8 @@ pub enum EngineProbe {
     Ready,
     /// 连接被拒：这个端口上没有任何服务在监听。
     ConnectionRefused,
+    /// TCP connection failed without proving the port was unbound.
+    ConnectionFailed,
     /// 401 / 403：有服务，但不认我们给的 key（或我们没有 key）。
     AuthRejected(u16),
     /// 有服务在答，但不像这个引擎（响应体不对、过大、其他 4xx、重定向）。
@@ -117,13 +119,22 @@ pub async fn probe_authorized(
     let base = authorization.dial_url(endpoint);
     authorization.ensure_current()?;
     let probe = recipe.probe_ready(&client, &base, bearer, timeout).await;
-    drop(authorization);
+    if matches!(
+        probe,
+        EngineProbe::ConnectionRefused | EngineProbe::ConnectionFailed
+    ) {
+        authorization.connection_failed();
+    }
     Ok(probe)
 }
 
 fn classify_transport_error(error: &reqwest::Error) -> EngineProbe {
     if error.is_timeout() {
-        return EngineProbe::Unavailable;
+        return if error.is_connect() {
+            EngineProbe::ConnectionFailed
+        } else {
+            EngineProbe::Unavailable
+        };
     }
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(current) = source {
@@ -135,7 +146,11 @@ fn classify_transport_error(error: &reqwest::Error) -> EngineProbe {
         }
         source = current.source();
     }
-    EngineProbe::Unavailable
+    if error.is_connect() {
+        EngineProbe::ConnectionFailed
+    } else {
+        EngineProbe::Unavailable
+    }
 }
 
 #[cfg(test)]
