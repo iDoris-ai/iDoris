@@ -29,7 +29,7 @@ use idoris_compute_contracts::request::split_overage;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::error::{LedgerError, sub};
-use super::project::{credit_headroom, project_chain};
+use super::project::{credit_headroom, project_chain_for_write};
 use super::types::{
     AlertKind, HoldRow, HoldState, LedgerConfig, PLATFORM_LOSS_ACCOUNT, SettleOutcome, SettleResult,
 };
@@ -740,7 +740,7 @@ pub(super) fn settle_hold_in(
     // 担保人能吸收多少：整条链在「钱」这个维度上的余量（读的是结算这一刻生效、此刻已经存在的额度）。没有 overage 用不着读。
     // 整条链在「钱」这个维度上一点限制都没有（付款账户就是平台根）：没有谁需要承担，也没有损失。
     let (sponsor, loss) = if overage > 0 {
-        let views = project_chain(conn, &chain, now_ms, config)?;
+        let (views, _) = project_chain_for_write(conn, &chain, now_ms, config)?;
         let headroom = credit_headroom(&views)?;
         let absorbable = headroom.map_or(overage, |room| room.max(0));
         let split = split_overage(

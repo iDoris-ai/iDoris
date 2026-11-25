@@ -6,7 +6,7 @@
 //!
 //! * `a_long_history_projects_correctly_and_quickly`：2 万笔 × 120 笔额度，每次 `cargo test` 都跑，核对账 + 宽松的耗时上限（防止回到
 //!   「每笔花费扫一遍全部额度」的量级以上，不是基准）；
-//! * `projecting_100k_spends_against_120_allowances`：10 万笔 × 120 笔额度，`#[ignore]`，手动跑并把耗时打出来：
+//! * `admission_latency_with_compacted_history`：每账户 1 千、10 万、20 万条分录与 120 笔额度，`#[ignore]`，手动跑并把耗时打出来：
 //!   `cargo test -p idoris-tenancy --release --test ledger_projection_perf -- --ignored --nocapture`。
 //!
 //! * 补贴池账期（Codex 四复审 Low）：`a_pool_period_reads_only_the_period_and_matches_the_hand_computed_consumption`（每次都跑，核对数）和
@@ -45,13 +45,13 @@ fn spend_at(j: i64, spends: i64, buckets: i64) -> i64 {
     if j % 10 == 0 {
         START - 1 - j
     } else {
-        START + j * (buckets * WINDOW_MS / spends)
+        START + j * ((buckets * WINDOW_MS - 2 * DAY) / spends)
     }
 }
 
 /// 一个有 `buckets` 笔月度额度、`spends` 笔已结算花费的 `emp`。返回（账户库，读的时刻，手算的 `ceiling_remaining`）。
 ///
-/// 手算：读的时刻取最后一个窗口里（第 `buckets - 1` 个窗口的起点 + 1 天），只有最后一个窗口的额度此刻可花；
+/// 手算：读的时刻取最后一个窗口里（最后一个窗口结束前 1 天），只有最后一个窗口的额度此刻可花；
 /// 它的剩余 = 容量 - 落在这个窗口里的花费 × 100；授信债务 = 没被额度覆盖的花费（`j` 是 10 的倍数的那些）× 100（没有充值），
 /// 小于授信额度，所以净头寸 = 额度剩余 - 债务。
 fn build(db: &TempDb, spends: i64, buckets: i64) -> (AccountStore, i64, i64) {
@@ -98,12 +98,14 @@ fn build(db: &TempDb, spends: i64, buckets: i64) -> (AccountStore, i64, i64) {
             .unwrap();
     }
 
-    // 批量写预留和分录（一个事务，触发器照常跑）
-    let step = buckets * WINDOW_MS / spends;
+    // 批量写入已经核对过形状的历史。省掉造数时逐行执行的分录触发器；
+    // 在提交之前恢复它们，计时的准入与结算仍经过完整写入路径。
+    let step = (buckets * WINDOW_MS - 2 * DAY) / spends;
     let at_sql = format!("CASE WHEN i % 10 = 0 THEN {START} - 1 - i ELSE {START} + i * {step} END");
     let conn = rusqlite::Connection::open(db.path()).unwrap();
     conn.busy_timeout(Duration::from_secs(30)).unwrap();
     conn.execute_batch("BEGIN").unwrap();
+    let triggers = remove_entry_triggers(&conn);
     conn.execute(
         &format!(
             "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < {spends})
@@ -141,10 +143,13 @@ fn build(db: &TempDb, spends: i64, buckets: i64) -> (AccountStore, i64, i64) {
         [],
     )
     .unwrap();
+    for sql in triggers {
+        conn.execute_batch(&sql).unwrap();
+    }
     conn.execute_batch("COMMIT").unwrap();
     drop(conn);
 
-    let now = START + (buckets - 1) * WINDOW_MS + DAY;
+    let now = START + buckets * WINDOW_MS - DAY;
     let last_window_from = START + (buckets - 1) * WINDOW_MS;
     let in_last_window = (0..spends)
         .filter(|j| j % 10 != 0 && spend_at(*j, spends, buckets) >= last_window_from)
@@ -152,6 +157,26 @@ fn build(db: &TempDb, spends: i64, buckets: i64) -> (AccountStore, i64, i64) {
     let uncovered = (0..spends).filter(|j| j % 10 == 0).count() as i64;
     let expected = (CAP - in_last_window * AMOUNT) - uncovered * AMOUNT;
     (store, now, expected)
+}
+
+fn remove_entry_triggers(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'ledger_entries' ORDER BY rowid")
+        .unwrap();
+    let triggers = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    triggers
+        .into_iter()
+        .map(|(name, sql)| {
+            conn.execute_batch(&format!("DROP TRIGGER {name}")).unwrap();
+            sql
+        })
+        .collect()
 }
 
 /// 量一次账户投影（取 `rounds` 次里最短的），顺带核对读出来的账。
@@ -189,32 +214,69 @@ fn a_long_history_projects_correctly_and_quickly() {
 }
 
 #[test]
-#[ignore = "perf: 100k spends, run by hand with --ignored --nocapture (see the module docs)"]
-fn projecting_100k_spends_against_120_allowances() {
-    let db = TempDb::new("perf-100k");
-    let started = Instant::now();
-    let (store, now, expected) = build(&db, 100_000, 120);
-    let build_time = started.elapsed();
-    let best = project_once(&store, now, expected, 5);
-    eprintln!(
-        "PERF 100k spends x 120 allowances: build {build_time:?}, one account projection (best of 5) {best:?}"
-    );
+#[ignore = "perf: 100k entries/account, run by hand with --ignored --nocapture (see the module docs)"]
+fn admission_latency_with_compacted_history() {
+    let mut medians = Vec::new();
+    for spends in [500, 50_000, 100_000] {
+        let db = TempDb::new(&format!("perf-{spends}"));
+        let (store, now, expected) = build(&db, spends, 120);
+        project_once(&store, now, expected, 1);
 
-    // 整条准入：付款账户链上三个账户各投影一遍，再写预留（写事务里）
-    let req = Req::new(&store, "perf-new", 0, "cred-e", 45).at(now);
-    let admit_started = Instant::now();
-    let decision = store.admit_attempt(&req.input()).unwrap();
-    let admit_time = admit_started.elapsed();
-    assert!(decision.is_admitted(), "{decision:?}");
-    let settle_started = Instant::now();
-    store
-        .settle_attempt(&req.attempt, &price(100), ts(now + 500))
-        .unwrap();
-    let settle_time = settle_started.elapsed();
-    eprintln!("PERF 100k: one admission {admit_time:?}, one settlement {settle_time:?}");
+        // Same fixture as the timed requests. This first write includes building
+        // the checkpoint over the existing history.
+        let warmup = Req::new(&store, "warmup", 0, "cred-e", 45).at(now);
+        let started = Instant::now();
+        assert!(store.admit_attempt(&warmup.input()).unwrap().is_admitted());
+        let cold = started.elapsed();
+        store
+            .settle_attempt(&warmup.attempt, &price(0), ts(now))
+            .unwrap();
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM ledger_checkpoints"), 3);
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM ledger_entries e JOIN ledger_checkpoints c
+                                USING (account_id) WHERE e.account_id = 'emp'
+                                AND e.entry_id <= c.through_entry"
+            ),
+            2 * spends
+        );
+
+        let mut admits = Vec::new();
+        let mut settlements = Vec::new();
+        for run in 0..7 {
+            let req = Req::new(&store, &format!("perf-{run}"), 0, "cred-e", 45).at(now);
+            let started = Instant::now();
+            assert!(store.admit_attempt(&req.input()).unwrap().is_admitted());
+            admits.push(started.elapsed());
+
+            // Overage forces settlement to project the chain inside its write transaction.
+            let started = Instant::now();
+            let outcome = store
+                .settle_attempt(&req.attempt, &price(101), ts(now + 500))
+                .unwrap();
+            settlements.push(started.elapsed());
+            assert_eq!(outcome.sponsor_covered, thb(1));
+            assert_eq!(outcome.platform_loss, thb(0));
+        }
+        project_once(&store, now, expected - 7 * 101, 1);
+        admits.sort_unstable();
+        settlements.sort_unstable();
+        eprintln!(
+            "PERF {} entries/account: cold admission {cold:?}, warm admission {:?} [{:?}–{:?}], overage settlement {:?} [{:?}–{:?}] (median of 7)",
+            2 * spends,
+            admits[3],
+            admits[0],
+            admits[6],
+            settlements[3],
+            settlements[0],
+            settlements[6]
+        );
+        medians.push(admits[3]);
+    }
     assert!(
-        best < Duration::from_secs(10),
-        "one projection of a 100k-spend history took {best:?}"
+        medians[1] < medians[0] * 5 + Duration::from_millis(2),
+        "{medians:?}"
     );
 }
 
@@ -245,18 +307,7 @@ fn build_pool(db: &TempDb, history: i64, this_month: i64) -> AccountStore {
         .unwrap();
     let conn = rusqlite::Connection::open(db.path()).unwrap();
     conn.busy_timeout(Duration::from_secs(30)).unwrap();
-    let triggers: Vec<String> = {
-        let mut stmt = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'ledger_entries'")
-            .unwrap();
-        stmt.query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    };
-    for name in triggers {
-        conn.execute_batch(&format!("DROP TRIGGER {name}")).unwrap();
-    }
+    remove_entry_triggers(&conn);
     conn.execute_batch("BEGIN").unwrap();
     for (prefix, count, at_sql) in [
         ("h", history, format!("{DEC1} - {MINUTE_MS} * (i + 1)")),

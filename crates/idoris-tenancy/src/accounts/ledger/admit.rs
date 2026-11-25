@@ -43,7 +43,7 @@ use super::holds::{
 use super::period::period_of;
 use super::project::{
     Books, SPENDABLE_PURPOSES, available_of, load_config, not_revoked_clause, owes_credit,
-    project_chain_with_books,
+    project_chain_for_write,
 };
 use super::types::{AdmitInput, AlertKind, MODEL_COMPONENT};
 use crate::accounts::rows::{load_ancestors, load_credential};
@@ -297,7 +297,7 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
     }
 
     let full = reserve(input.policy, &input.sizing, input.price_rates)?;
-    let (views, books) = project_chain_with_books(conn, &chain, now_ms, &config)?;
+    let (views, books) = project_chain_for_write(conn, &chain, now_ms, &config)?;
     let report = evaluate_admission(&full.amount, &views)?;
     let period = period_of(now_ms, &config.billing_timezone)?;
 
@@ -605,7 +605,7 @@ pub(super) fn check_extra(
             credit_used: Vec::new(),
         });
     }
-    let (views, books) = project_chain_with_books(conn, &chain, now_ms, config)?;
+    let (views, books) = project_chain_for_write(conn, &chain, now_ms, config)?;
     let report = evaluate_admission(amount, &views)?;
     if report.passed() {
         let credit_used = credit_users(&report, &chain, &books, amount.micros())?;
