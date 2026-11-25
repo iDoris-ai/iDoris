@@ -484,3 +484,136 @@ async fn an_adapter_without_generations_is_never_bound() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Codex 终审 M1：排空要看见已准入的目录读取；M5：复位受一个绝对的截止时间约束
+// ---------------------------------------------------------------------------------------------
+
+/// M1：一个已准入的 `list` 只持有 Supervisor 的调用许可，不在任何模型的 `inflight` 里，也不是 `active_op`。之前 `is_quiescent` 对它看不见，
+/// 排空以为没有在途的、就去停进程，慢列表被停机打断。现在它在途期间不是静止的，复位也被挡回（`Busy`）。
+#[tokio::test]
+async fn an_admitted_list_keeps_the_supervisor_from_being_quiescent_and_a_reset_busy_until_it_is_done()
+ {
+    let adapter = GenAdapter::with_list_gate(1);
+    let handle = Supervisor::spawn(adapter.clone(), config()).unwrap();
+    assert!(handle.is_quiescent().await.unwrap());
+    let listing = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.list().await })
+    };
+    wait_for("the catalog read to be admitted and running", || {
+        adapter.list_entered.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    handle.close_admission().await.unwrap();
+    assert!(
+        !handle.is_quiescent().await.unwrap(),
+        "a catalog read in flight is not quiet"
+    );
+    let busy = handle.engine_replaced(false).await.unwrap_err();
+    assert_eq!(busy.reason_code(), "supervisor_busy", "{busy}");
+
+    adapter.list_gate.as_ref().unwrap().add_permits(1);
+    listing.await.unwrap().unwrap();
+    wait_quiescent(&handle, true).await;
+    handle.engine_replaced(false).await.unwrap();
+}
+
+/// 一个 `status()` 可以卡住的适配器：卡住的时候 Supervisor 的 actor 正忙在复位的采样里，邮箱里的命令得不到处理。报告的驻留是模型 `a`。
+struct StatusGate {
+    inner: MockAdapter,
+    gated: std::sync::atomic::AtomicBool,
+    gate: tokio::sync::Semaphore,
+    entered: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl RuntimeAdapter for StatusGate {
+    fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+        self.inner.load_fence_path()
+    }
+    async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+        self.inner.list().await
+    }
+    async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+        self.inner.load(id, policy).await
+    }
+    async fn unload(&self, id: &str) -> Result<(), BackendError> {
+        self.inner.unload(id).await
+    }
+    async fn status(&self) -> Result<BackendStatus, BackendError> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        if self.gated.load(Ordering::SeqCst) {
+            self.gate.acquire().await.unwrap().forget();
+        }
+        Ok(BackendStatus {
+            pressure: idoris_backend::Pressure::Ok,
+            used_gb: 2.0,
+            model_memory_max_gb: 24.0,
+            loaded: vec!["a".to_owned()],
+        })
+    }
+    async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+        self.inner.probe_ready(id).await
+    }
+    async fn chat(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatResponse, BackendError> {
+        self.inner.chat(req, cancel).await
+    }
+}
+
+/// M5：一个带截止时间的复位，到点还没被 actor 开始，就回 `Busy`、而且**之后也不会被执行**：调用方已经放弃了，它的复位若在放行之后才跑，会
+/// 对着一个它不再担保的引擎重建账本。这里让 actor 卡在另一个复位的采样里（邮箱里的命令得不到处理），再排一个带截止时间的复位，等它超时，
+/// 之后放开：账本里还是第一个复位采样到的驻留，不是第二个复位要的「空」。
+#[tokio::test]
+async fn a_reset_that_could_not_start_before_its_deadline_is_busy_and_is_never_executed_later() {
+    let adapter = Arc::new(StatusGate {
+        inner: MockAdapter::new(catalog()),
+        gated: std::sync::atomic::AtomicBool::new(false),
+        gate: tokio::sync::Semaphore::new(0),
+        entered: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let handle = Supervisor::spawn(adapter.clone(), config()).unwrap();
+    // The startup sample has been taken (ungated); from now on the sample blocks.
+    adapter.gated.store(true, Ordering::SeqCst);
+    let first = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.engine_replaced(true).await })
+    };
+    wait_for("the first reset to be sampling the engine", || {
+        adapter.entered.load(Ordering::SeqCst) == 2
+    })
+    .await;
+
+    // The actor is inside the first reset: this one is enqueued, cannot start, and answers Busy at its deadline.
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let late = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.engine_replaced_before(false, deadline),
+    )
+    .await
+    .expect("the call is bounded by its deadline, whatever the actor is busy with")
+    .unwrap_err();
+    assert_eq!(late.reason_code(), "supervisor_busy", "{late}");
+    assert!(Instant::now() >= deadline, "it waited for its deadline");
+
+    // Release the sample: the first reset completes, the ledger now holds what it sampled (model `a`).
+    adapter.gate.add_permits(1);
+    first.await.unwrap().unwrap();
+    let status = handle.status().await.unwrap();
+    assert_eq!(
+        status.loaded,
+        vec!["a".to_owned()],
+        "the late reset (nothing loaded) did not run after its caller had given up"
+    );
+    // A reset whose deadline is in the future runs as usual.
+    handle
+        .engine_replaced_before(false, Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(handle.status().await.unwrap().loaded.is_empty());
+}

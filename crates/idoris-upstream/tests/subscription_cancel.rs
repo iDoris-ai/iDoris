@@ -19,9 +19,20 @@ use nix::unistd::Pid;
 use support::subscription_cli::FakeSubscriptionCli;
 use tokio_util::sync::CancellationToken;
 
-// CI macOS runners can take materially longer than local machines to reap
-// process groups; keep this comfortably above the observed scheduling jitter.
-const TEST_TERMINATION_GRACE: Duration = Duration::from_millis(500);
+// Loaded hosts (CI macOS runners, a busy `cargo test --workspace`) can take
+// seconds to reap process groups; a too-small grace turns scheduling delay
+// into CleanupFailed. Only the term-ignoring test actually waits it out.
+const TEST_TERMINATION_GRACE: Duration = Duration::from_secs(3);
+/// Hung-test guard for the observation waits. They return as soon as their
+/// condition holds; the value must never be a correctness criterion.
+const WAIT_GUARD: Duration = Duration::from_secs(60);
+/// Relay-side timeout for tests whose behaviour under test is NOT the timeout;
+/// it must never fire before the fixture has published its marker.
+const NOT_UNDER_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Relay timeout for the test that DOES exercise the timeout path. Long enough
+/// that the fixture is certain to have published its marker first on a loaded
+/// host (otherwise the group id would never be observable).
+const TIMEOUT_UNDER_TEST: Duration = Duration::from_secs(8);
 
 fn spec(program: std::path::PathBuf) -> CommandSpec {
     let leaked: &'static str = Box::leak(program.to_string_lossy().into_owned().into_boxed_str());
@@ -44,7 +55,7 @@ fn env(fixture: &FakeSubscriptionCli, mode: &str, marker: &str) -> BTreeMap<OsSt
 }
 
 async fn wait_group(marker: &std::path::Path) -> i32 {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(WAIT_GUARD, async {
         loop {
             if let Ok(text) = std::fs::read_to_string(marker)
                 && let Some(line) = text.lines().find(|line| line.starts_with("parent:"))
@@ -61,7 +72,7 @@ async fn wait_group(marker: &std::path::Path) -> i32 {
 }
 
 async fn wait_gone(group: i32) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(WAIT_GUARD, async {
         while killpg(Pid::from_raw(group), None).is_ok() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -106,7 +117,7 @@ async fn timeout_reaps_even_a_term_ignoring_group() {
         fixture.bin_dir(),
         &env(&fixture, "ignore-term", "timeout"),
         DEFAULT_MAX_OUTPUT_BYTES,
-        Duration::from_secs(1),
+        TIMEOUT_UNDER_TEST,
         TEST_TERMINATION_GRACE,
         CancellationToken::new(),
     )
@@ -126,7 +137,7 @@ async fn output_limit_reaps_a_process_that_would_otherwise_hang() {
         fixture.bin_dir(),
         &env(&fixture, "limit-hang", "limit"),
         11,
-        Duration::from_secs(5),
+        NOT_UNDER_TEST_TIMEOUT,
         TEST_TERMINATION_GRACE,
         CancellationToken::new(),
     )
@@ -155,7 +166,7 @@ async fn cancellation_reaps_the_owned_group() {
         fixture.bin_dir(),
         &run_env,
         DEFAULT_MAX_OUTPUT_BYTES,
-        Duration::from_secs(5),
+        NOT_UNDER_TEST_TIMEOUT,
         TEST_TERMINATION_GRACE,
         cancel,
     );
@@ -193,7 +204,7 @@ async fn cancelling_one_request_does_not_kill_another_group() {
         fixture.bin_dir(),
         &env_a,
         DEFAULT_MAX_OUTPUT_BYTES,
-        Duration::from_secs(5),
+        NOT_UNDER_TEST_TIMEOUT,
         TEST_TERMINATION_GRACE,
         cancel_a,
     );
@@ -202,7 +213,7 @@ async fn cancelling_one_request_does_not_kill_another_group() {
         fixture.bin_dir(),
         &env_b,
         DEFAULT_MAX_OUTPUT_BYTES,
-        Duration::from_secs(5),
+        NOT_UNDER_TEST_TIMEOUT,
         TEST_TERMINATION_GRACE,
         cancel_b,
     );

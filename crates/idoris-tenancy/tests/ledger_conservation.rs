@@ -212,6 +212,63 @@ fn a_grace_round_inside_the_credit_floor_is_still_the_users_own_debt() {
     assert_clean(&store);
 }
 
+#[test]
+fn a_top_up_inside_the_ttl_covers_the_overage_of_a_grace_round_instead_of_freezing_the_credential()
+{
+    // Codex 复审（2026-11-22，7c5a03fe）High 2。余额 20（没有授信），组织 paid 有 100 万。宽限预留 210（放行时下限 20，平台承担缺口 190）。
+    // TTL 之内充值 90，随后按 300 结算（超出预留 90）。
+    //
+    // 手算：宽限承担 G = min(300, 210) - 20 = 190（平台批准的例外，不进用户和担保人的账）；记到链上 300 - 190 = 110，
+    // 其中预留之内 210 - 190 = 20（用户自己的），超出 90。
+    // 担保人能吸收多少要在预留之内的 20 记账**之后**读：余额 20 + 90 - 20 = 90，授信 0，能吸收 90 >= 超出 90：担保人承担 90，
+    // 平台损失 0，凭证不冻结。
+    // 旧代码先读余量、后放掉平台承担的 190：余额 110 - 在途 210 = -100，能吸收 0，超出的 90 全是平台损失，凭证被冻结。
+    // 结算之后：余额 110 - 已花 110 = 0，本月的宽限已经用掉，下一笔被拒。
+    let db = TempDb::new("conserve-grace-topup-overage");
+    let store = paid_chain(&db, 20);
+    let decision = admit_with_ladder(&store, "r-1", "cred-e", 100, T0);
+    assert!(
+        matches!(decision, AdmissionDecision::Grace { .. }),
+        "{decision:?}"
+    );
+    store
+        .fund_account(&aid("emp"), &thb(90), &key("f-emp-2"), ts(T0 + 500))
+        .unwrap();
+    let outcome = store
+        .settle_attempt(&attempt("r-1", 0), &price(300), ts(T0 + 1_000))
+        .unwrap();
+    assert!(!outcome.late, "{outcome:?}");
+    assert_eq!(outcome.grace_absorbed, thb(190), "{outcome:?}");
+    assert_eq!(outcome.user_borne, thb(20), "{outcome:?}");
+    assert_eq!(outcome.overage, thb(90), "{outcome:?}");
+    assert_eq!(outcome.sponsor_covered, thb(90), "{outcome:?}");
+    assert_eq!(outcome.platform_loss, thb(0), "{outcome:?}");
+    assert!(!outcome.credential_frozen, "{outcome:?}");
+    assert_conserved(&db, "r-1#0", "emp", 300, &outcome);
+    assert_eq!(store.loss_total("platform_loss").unwrap(), 0);
+    assert_eq!(
+        balance(&store, "emp", T0 + 2_000),
+        0,
+        "funds 110 - 20 inside the reservation - 90 overage"
+    );
+    assert_eq!(balance(&store, "paid", T0 + 2_000), 1_000_000 - 110);
+
+    // 端到端：凭证没冻结，还能解析出付款上下文；但余额 0、本月宽限已经用过，下一笔被拒
+    let next = Req::try_new(&store, "r-2", 0, "cred-e", 10, T0 + 2_000)
+        .expect("the credential is still active");
+    let decision = store.admit_attempt(&next.input()).unwrap();
+    assert!(
+        matches!(&decision, AdmissionDecision::Reject { reason } if reason.code() == ReasonCode::BudgetExhausted),
+        "{decision:?}"
+    );
+    let decision = store.admit_attempt(&next.clone().grace().input()).unwrap();
+    assert!(
+        matches!(&decision, AdmissionDecision::Reject { reason } if reason.code() == ReasonCode::BudgetExhausted),
+        "the one grace round of the month was used: {decision:?}"
+    );
+    assert_clean(&store);
+}
+
 // ------------------------------------------------------------------------------------------
 // #4 迟到的宽限结算不重复计算平台责任
 // ------------------------------------------------------------------------------------------
@@ -257,6 +314,65 @@ fn a_late_settlement_of_a_grace_hold_counts_the_platform_share_once_and_freezes_
     assert_eq!(split.sponsor + split.loss + split.absorbed, 100);
     assert_conserved(&db, "r-1#0", "emp", 100, &outcome);
     assert_eq!(balance(&store, "emp", late_at), 0);
+    assert_clean(&store);
+}
+
+#[test]
+fn a_late_settlement_that_the_platform_absorbs_whole_still_records_its_zero_late_settle_entry() {
+    // v0.5.0 / main 的迟到结算总是记一条 `late_settle`，哪怕记到链上的金额是 0；重排结算顺序（再复审 High 2）的时候不能让它悄悄消失，
+    // 审计看分录：预留、过期、迟到结算各一条。
+    //
+    // 余额 20 的账户先花掉 20（预留 10 + 2 * 5 = 20，按 20 结算），余额 0；T0 + 1 000 宽限预留 210（余额 0，缺口 210 不超过一次预留，
+    // 下限 0，平台承担缺口 210），TTL 之后才按 100 结算：宽限承担 G = min(100, 210) - 0 = 100，记到链上 100 - 100 = 0，
+    // 没有超出预留的部分：用户承担 0、担保人 0、平台损失 0。`emp` 名下这个预留的分录：reserve +210、expire -210（都在预留创建的
+    // 时刻 T0 + 1 000），late_settle 0 / 0（在结算的时刻）。
+    let db = TempDb::new("conserve-late-grace-zero");
+    let store = paid_chain(&db, 20);
+    let first = Req::new(&store, "r-0", 0, "cred-e", 5).at(T0);
+    let decision = store.admit_attempt(&first.input()).unwrap();
+    assert!(decision.is_admitted(), "{decision:?}");
+    store
+        .settle_attempt(&attempt("r-0", 0), &price(20), ts(T0 + 100))
+        .unwrap();
+    assert_eq!(balance(&store, "emp", T0 + 500), 0);
+
+    let decision = admit_with_ladder(&store, "r-1", "cred-e", 100, T0 + 1_000);
+    assert!(
+        matches!(decision, AdmissionDecision::Grace { .. }),
+        "{decision:?}"
+    );
+    let late_at = T0 + 1_000 + ttl(&store) + 1_000;
+    let outcome = store
+        .settle_attempt(&attempt("r-1", 0), &price(100), ts(late_at))
+        .unwrap();
+    assert!(outcome.late, "{outcome:?}");
+    assert_eq!(outcome.grace_absorbed, thb(100), "{outcome:?}");
+    assert_eq!(outcome.user_borne, thb(0), "{outcome:?}");
+    assert_eq!(outcome.overage, thb(0), "{outcome:?}");
+    assert_eq!(outcome.sponsor_covered, thb(0), "{outcome:?}");
+    assert_eq!(outcome.platform_loss, thb(0), "{outcome:?}");
+    assert!(!outcome.credential_frozen, "{outcome:?}");
+    assert_conserved(&db, "r-1#0", "emp", 100, &outcome);
+    assert_eq!(
+        store
+            .entries_of_hold(&attempt("r-1", 0), "model")
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.account == "emp")
+            .map(|entry| (
+                entry.kind,
+                entry.held,
+                entry.spent,
+                entry.window_at.millis()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("reserve".to_string(), 210, 0, T0 + 1_000),
+            ("expire".to_string(), -210, 0, T0 + 1_000),
+            ("late_settle".to_string(), 0, 0, late_at),
+        ],
+        "the late settlement is on the books even though it cost the chain nothing"
+    );
     assert_clean(&store);
 }
 

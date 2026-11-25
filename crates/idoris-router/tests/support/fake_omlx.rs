@@ -38,6 +38,12 @@ pub struct Behavior {
     /// 第 `n` 次（从 0 起）及以后拉起的进程，`GET /api/status` 回 500（引擎起来了、`/v1/models` 也答，但 Supervisor 采样它的
     /// 驻留失败：模拟引擎换代之后账本复位采样不到新进程）。`None` = 从不。
     pub api_status_fails_from_launch: Option<usize>,
+    /// 一个最小的 Admin API（IDORIS-CORE S6，Codex 终审 H4）：`POST /admin/api/login`（key 对就发一个**这个进程独有**的会话 cookie）与
+    /// `GET /admin/api/activity`（要有效的 cookie，否则 401）。每个 Admin 请求记进 `admin.log`：`<pid> <方法> <路径> <none|ok|bad>`（带的
+    /// cookie 是不是这个进程签发的），测试据此断言「旧进程的会话 cookie 没有发给新进程」。`false` = 没有 `/admin/api/*`（404）。
+    pub admin_api: bool,
+    /// 收到 SIGTERM 怎么办。
+    pub on_sigterm: OnSigterm,
 }
 
 /// 引擎可以「收下请求、记进 `requests.log`，然后不回答」的几类请求（IDORIS-CORE S6，[`FakeOmlx::hold`]）。
@@ -51,6 +57,12 @@ pub enum Hold {
     Status,
     /// `GET /v1/models/status`：模型目录（聊天、预热在加载之前读的那一步）。
     List,
+    /// `GET /v1/models`：公共的模型列表对这个引擎的读取（管理器自己的探测也读这个路径：用例要把监督的节拍拉到小时级）。
+    Models,
+    /// `POST /v1/embeddings`：一个经代理（resident 的伴生卡、后台预热）转发、还在途的请求（IDORIS-CORE S6，Codex 终审 M1）。
+    Embeddings,
+    /// 流式的 `POST /v1/chat/completions`：响应头与第一块已经发出，之后的字节被扣着（一个仍在输出的流式响应体）。
+    Stream,
 }
 
 impl Hold {
@@ -60,8 +72,48 @@ impl Hold {
             Self::Load => "hold-load",
             Self::Status => "hold-status",
             Self::List => "hold-list",
+            Self::Models => "hold-models",
+            Self::Embeddings => "hold-embeddings",
+            Self::Stream => "hold-stream",
         }
     }
+}
+
+/// 引擎把端口放掉、但不退出的几种办法（[`FakeOmlx::release_port_as`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Release {
+    /// 关掉监听套接字（[`FakeOmlx::release_port`]）：端口空了。
+    Close,
+    /// 关掉监听套接字，随后在**同一个端口**上以 `IPV6_V6ONLY` 绑一个 IPv6 通配地址（`::`）并监听：进程还握着这个端口上的一个 LISTEN
+    /// 套接字，但连到 `127.0.0.1` 的连接到不了它（Codex 专项评审 H2）。
+    Ipv6Only,
+    /// 不关套接字，对它 `shutdown(SHUT_RD)`：Linux 上监听套接字离开 LISTEN 状态、描述符还开着（Codex 专项评审 H3）；别的系统拒绝这个调用
+    /// （结果是 `error <errno>`）。
+    ShutdownRead,
+    /// 关掉监听套接字，在**同一个进程、同一个端口**上重新监听（新的描述符）：进程自己重建了它的监听套接字（Codex 专项评审 M9：要重新定位）。
+    Relisten,
+}
+
+/// 一条 Admin 请求的记录（[`FakeOmlx::admin_requests`]）：`cookie` 是 `none`（没带）、`ok`（是这个进程签发的会话）、`bad`（别的进程签发的）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminRequest {
+    pub pid: u64,
+    pub method: String,
+    pub path: String,
+    pub cookie: String,
+}
+
+/// 假引擎收到 SIGTERM 的反应。非 `Die` 的两种都在 `records/sigterm.log` 里记一行收到的时刻（Unix 秒），测试据此知道信号是否到过、
+/// 什么时候到的；它们都只有 SIGKILL 杀得掉。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnSigterm {
+    /// 照常：SIGTERM 终止进程（解释器的默认动作）。
+    #[default]
+    Die,
+    /// 记下来，然后什么也不做，照常服务（引擎卡住了，对 SIGTERM 没有反应）。
+    Ignore,
+    /// 记下来，关掉监听 socket，然后赖着不走（模拟「正在退出」的引擎：关了监听、在等在途的生成结束，而那一刻起端口上已经没有它）。
+    CloseListenerAndLinger,
 }
 
 /// 一个生成好的假引擎。
@@ -128,6 +180,38 @@ impl FakeOmlx {
         std::fs::write(self.record_dir.join("release-port"), "1").unwrap();
     }
 
+    /// 同 [`Self::release_port`]，但可以选办法（[`Release`]）。等引擎做完再返回，返回它报告的结果：`ok`，或者 `error <errno>`（这个系统不
+    /// 允许那一步：比如没有 IPv6，或者 macOS 上对监听套接字 `shutdown`）。
+    pub fn release_port_as(&self, how: Release) -> String {
+        let result = self.record_dir.join("release-result");
+        let _ = std::fs::remove_file(&result);
+        let mode = match how {
+            Release::Close => "1",
+            Release::Ipv6Only => "v6only",
+            Release::ShutdownRead => "shutdown",
+            Release::Relisten => "relisten",
+        };
+        // Atomic: the engine reads the mode the moment the file exists.
+        let flag = self.record_dir.join("release-port");
+        let temporary = self.record_dir.join("release-port.tmp");
+        std::fs::write(&temporary, mode).unwrap();
+        std::fs::rename(&temporary, &flag).unwrap();
+        if how == Release::Close {
+            return "ok".to_owned();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&result) {
+                return text.trim().to_owned();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the engine never reported how it let go of the port"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// 放开 [`Self::hold`] 的那一类请求：被扣着的请求这就回答。
     pub fn release(&self, what: Hold) {
         let _ = std::fs::remove_file(self.record_dir.join(what.file()));
@@ -136,6 +220,15 @@ impl FakeOmlx {
     /// `requests.log` 里路径是 `path` 的请求有几条（`POST:` 前缀的是 POST）。
     pub fn requests_of(&self, path: &str) -> usize {
         self.requests().iter().filter(|(p, _)| p == path).count()
+    }
+
+    /// 引擎收到 SIGTERM 的时刻（Unix 秒），按先后；没收到过就是空（`on_sigterm` 为 `Die` 时进程直接没了，也不记）。
+    pub fn sigterm_times(&self) -> Vec<f64> {
+        std::fs::read_to_string(self.record_dir.join("sigterm.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
     }
 
     /// 已经启动过几次（`launch-*.json` 的个数）。
@@ -188,6 +281,23 @@ impl FakeOmlx {
             .iter()
             .filter(|(path, _)| path.starts_with("POST:/v1/models/") && path.ends_with("/load"))
             .count()
+    }
+
+    /// Admin 请求记录（[`Behavior::admin_api`]）：哪个进程收到了什么、带的 cookie 是不是它自己签发的。
+    pub fn admin_requests(&self) -> Vec<AdminRequest> {
+        std::fs::read_to_string(self.record_dir.join("admin.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split(' ');
+                Some(AdminRequest {
+                    pid: parts.next()?.parse().ok()?,
+                    method: parts.next()?.to_owned(),
+                    path: parts.next()?.to_owned(),
+                    cookie: parts.next()?.to_owned(),
+                })
+            })
+            .collect()
     }
 
     /// 请求记录：每行 `<路径> <none|ok|bad>`（有没有带 `Authorization`，带的是不是引擎的私有 key）。
@@ -245,7 +355,7 @@ pub fn spawn_retrying(command: &mut Command) -> std::io::Result<ChildGuard> {
 
 fn python_source(behavior: &Behavior, record_dir: &Path) -> String {
     format!(
-        r#"import http.server, json, os, signal, sys, threading, time
+        r#"import http.server, json, os, signal, socket, sys, threading, time
 
 RECORDS = {records}
 LISTEN_DELAY = {delay}
@@ -253,8 +363,10 @@ NEVER_LISTEN = {never}
 EXIT_AFTER = {exit_after}
 EXIT_IMMEDIATELY = {exit_now}
 TRAP_SIGTERM = {trap}
+ON_SIGTERM = {on_sigterm}
 STATEFUL = {stateful}
 STATUS_FAILS_FROM = {status_fails_from}
+ADMIN_API = {admin_api}
 MODEL = "fake-model"
 SIZE = 1000000000
 LOADED = set()
@@ -269,8 +381,28 @@ def hold(name):
     while os.path.exists(path):
         time.sleep(0.02)
 
-# One record per launch: what the engine was started with. Numbered by the files already there.
 os.makedirs(RECORDS, exist_ok=True)
+
+# The SIGTERM reaction is in place BEFORE the launch record exists: a test that has seen the record can signal the engine
+# and know it will react as configured (not die in the interpreter's start-up).
+server = None
+
+def on_sigterm_reaction(signum, frame):
+    # One line per SIGTERM: the moment it arrived. Then what this engine does with it (see `OnSigterm`).
+    with open(os.path.join(RECORDS, "sigterm.log"), "a") as f:
+        f.write("%f\n" % time.time())
+    if ON_SIGTERM == "linger" and server is not None:
+        # The listener goes away at once (the port has no listener from here on) while the process stays.
+        # `shutdown()` waits for `serve_forever()` to return and that runs in this very (main) thread: from a helper thread.
+        def close_listener():
+            server.shutdown()
+            server.server_close()
+        threading.Thread(target=close_listener, daemon=True).start()
+
+if ON_SIGTERM != "die":
+    signal.signal(signal.SIGTERM, on_sigterm_reaction)
+
+# One record per launch: what the engine was started with. Numbered by the files already there.
 index = len([n for n in os.listdir(RECORDS) if n.startswith("launch-")])
 tmp = os.path.join(RECORDS, "tmp-%04d-%d" % (index, os.getpid()))
 with open(tmp, "w") as f:
@@ -293,6 +425,8 @@ if EXIT_IMMEDIATELY is not None:
 
 KEY = os.environ.get("OMLX_API_KEY")
 LOCK = threading.Lock()
+# The admin session this process issues: another process never accepts it.
+SESSION = "fake-session-%d-%s" % (os.getpid(), os.urandom(4).hex())
 
 if TRAP_SIGTERM is not None:
     def on_term(signum, frame):
@@ -317,7 +451,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def cookie_state(self):
+        cookie = self.headers.get("Cookie")
+        if cookie is None:
+            return "none"
+        return "ok" if ("omlx_admin_session=" + SESSION) in cookie else "bad"
+
+    def admin_log(self, method, state):
+        with LOCK:
+            with open(os.path.join(RECORDS, "admin.log"), "a") as f:
+                f.write("%d %s %s %s\n" % (os.getpid(), method, self.path, state))
+
+    def login(self, payload):
+        self.admin_log("POST", "none")
+        if KEY is not None and payload.get("api_key") != KEY:
+            return self.reply(401, {{"error": "bad key"}})
+        data = json.dumps({{"success": True}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", "omlx_admin_session=" + SESSION + "; Path=/; HttpOnly")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def admin(self, method):
+        state = self.cookie_state()
+        self.admin_log(method, state)
+        if state != "ok":
+            return self.reply(401, {{"error": "not logged in"}})
+        if self.path == "/admin/api/activity":
+            return self.reply(200, {{"active_models": {{"memory_pressure": {{"enabled": False}}}}}})
+        return self.reply(404, {{"error": "not found"}})
+
     def do_GET(self):
+        if ADMIN_API and self.path.startswith("/admin/api/"):
+            return self.admin("GET")
         header = self.headers.get("Authorization")
         if header is None:
             auth = "none"
@@ -336,6 +504,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if KEY is not None and auth != "ok":
             return self.reply(401, {{"error": {{"message": "invalid api key"}}}})
         if self.path == "/v1/models":
+            hold("hold-models")
             return self.reply(200, {{"object": "list", "data": [{{"id": "fake-model", "object": "model"}}]}})
         if self.path == "/v1/models/status":
             hold("hold-list")
@@ -353,8 +522,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw) if raw else {{}}
+        except ValueError:
+            payload = {{}}
+        if ADMIN_API and self.path == "/admin/api/login":
+            return self.login(payload)
         if not STATEFUL:
             return self.reply(404, {{"error": "not found"}})
         header = self.headers.get("Authorization")
@@ -379,6 +553,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 LOADED.discard(MODEL)
             return self.reply(200, {{}})
+        if self.path == "/v1/embeddings":
+            hold("hold-embeddings")
+            return self.reply(200, {{"object": "list", "model": "embed-model", "data": [{{"object": "embedding", "index": 0, "embedding": [0.0]}}]}})
+        if self.path == "/v1/chat/completions" and isinstance(payload, dict) and payload.get("stream") is True:
+            # A streamed answer: the headers and the first chunk go out at once, the rest is held until the test lets go.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b'data: {{"choices":[{{"delta":{{"content":"hel"}}}}]}}\n\n')
+            self.wfile.flush()
+            hold("hold-stream")
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            self.close_connection = True
+            return
         if self.path == "/v1/chat/completions":
             hold("hold-chat")
             if MODEL in LOADED:
@@ -401,17 +591,67 @@ port = int(arg("--port"))
 server = http.server.ThreadingHTTPServer((host, port), Handler)
 server.daemon_threads = True
 
+KEEP = []
+
+def report(outcome):
+    # Atomic: the test polls for this file.
+    tmp = os.path.join(RECORDS, "release-result.tmp-%d" % os.getpid())
+    with open(tmp, "w") as f:
+        f.write(outcome)
+    os.rename(tmp, os.path.join(RECORDS, "release-result"))
+
 def release_port_on_request():
     # The test asked the engine to give the port back **without exiting**: the process lives on, the port is free.
+    global server
     flag = os.path.join(RECORDS, "release-port")
     while not os.path.exists(flag):
         time.sleep(0.02)
+    time.sleep(0.05)
+    with open(flag) as f:
+        mode = f.read().strip() or "1"
     server.shutdown()
+    if mode == "shutdown":
+        # Keep the descriptor, leave the LISTEN state (Linux: shutdown(SHUT_RD) on a listening socket does that; elsewhere it fails).
+        try:
+            server.socket.shutdown(socket.SHUT_RD)
+            report("ok")
+        except OSError as error:
+            report("error %s" % error.errno)
+        return
     server.server_close()
+    if mode == "v6only":
+        # Another socket on the same port: IPv6 only, so a connection to 127.0.0.1 cannot reach it.
+        try:
+            other = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            other.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            other.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            other.bind(("::", port))
+            other.listen(16)
+            KEEP.append(other)
+            report("ok")
+        except OSError as error:
+            report("error %s" % error.errno)
+    elif mode == "relisten":
+        # The same process listens again on the same port with a new descriptor: **another number** (the lowest free numbers are taken first,
+        # so the new socket would get the old one's; three open files in between move it), so whoever remembers the old number finds a file.
+        try:
+            for _ in range(3):
+                KEEP.append(open(os.devnull))
+            server = http.server.ThreadingHTTPServer((host, port), Handler)
+            server.daemon_threads = True
+            KEEP.append(server)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            report("ok")
+        except OSError as error:
+            report("error %s" % error.errno)
 
 threading.Thread(target=release_port_on_request, daemon=True).start()
-server.serve_forever()
-# serve_forever returned: the port was released. The process stays alive (and not listening) until it is killed.
+try:
+    server.serve_forever()
+except BaseException:
+    pass
+# serve_forever returned: the port was released (the test asked, or the SIGTERM reaction closed the listener) and every in-flight request is done.
+# The process stays alive (and not listening) until it is killed.
 while True:
     time.sleep(3600)
 "#,
@@ -440,6 +680,12 @@ while True:
         status_fails_from = match behavior.api_status_fails_from_launch {
             Some(launch) => launch.to_string(),
             None => "None".to_owned(),
+        },
+        admin_api = if behavior.admin_api { "True" } else { "False" },
+        on_sigterm = match behavior.on_sigterm {
+            OnSigterm::Die => "\"die\"",
+            OnSigterm::Ignore => "\"ignore\"",
+            OnSigterm::CloseListenerAndLinger => "\"linger\"",
         },
     )
 }

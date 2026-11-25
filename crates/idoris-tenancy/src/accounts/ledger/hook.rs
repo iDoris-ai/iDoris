@@ -104,6 +104,18 @@ fn bind_attempt(conn: &Connection, attempt: &Attempt, at: TimestampMs) -> Result
 }
 
 /// 按结算计划把每个尝试的预留结算 / 释放：发布了的那次按向用户收的钱结算，其余释放。幂等。
+///
+/// **分两步，先放后收**（Codex 三复审 High 2；main 上就有）：
+///
+/// 1. 这次收尾已经决定按 0 收尾的预留先放掉：没有向用户收钱的尝试（失败的、没发布的），和每个尝试下还没结算的附加成本
+///    （留一条 `extra_unsettled` 告警）；
+/// 2. 再结算向用户收钱的那一次。
+///
+/// 顺序要紧：要收钱的主要预留结算时，超出预留的部分（overage）能由担保人吸收多少，读的是整条链此刻的余量。附加成本、没发布的
+///    尝试的预留这时候还占着在途，可它们马上就按 0 放回去，根本不会花掉：先结算主要预留，余量被它们占着，担保人能吸收的被算小了，
+///    本来吸收得了的 overage 变成平台损失、冻结凭证。余额 200，主要预留 100，附加成本预留 100，收尾时主要预留实际 200，附加成本按
+///    0 释放：先结算主要预留，余量 `200 - 100（附加成本在途）- 100（已花）= 0`，超出的 100 全是平台损失；先放掉附加成本，
+///    余量 100，超出的 100 由担保人吸收，没有损失，凭证不冻结。
 pub(super) fn settle_plan(
     conn: &Connection,
     plan: &SettlementPlan,
@@ -111,6 +123,8 @@ pub(super) fn settle_plan(
 ) -> Result<Vec<String>, LedgerError> {
     let config = load_config(conn)?;
     let mut logs = Vec::new();
+    // 第二步要结算的：（尝试 id，向用户收的钱）。第一步里顺手检查每个尝试的预留和收费的币种。
+    let mut to_charge: Vec<(String, i64)> = Vec::new();
     for line in &plan.lines {
         let attempt_id = line.attempt.to_string();
         let charged = match &plan.user_charge {
@@ -128,14 +142,13 @@ pub(super) fn settle_plan(
                 hold.unit
             )));
         }
-        let outcome = settle_hold_in(
-            conn,
-            &attempt_id,
-            charged.as_ref().map_or(0, |c| c.micros()),
-            at.millis(),
-            &config,
-        )?;
-        logs.extend(outcome.logs);
+        let micros = charged.as_ref().map_or(0, |c| c.micros());
+        if micros > 0 {
+            to_charge.push((attempt_id.clone(), micros));
+        } else {
+            let outcome = settle_hold_in(conn, &attempt_id, 0, at.millis(), &config)?;
+            logs.extend(outcome.logs);
+        }
         for extra in open_extra_holds(conn, &attempt_id)? {
             let Some(extra_hold) = load_hold(conn, &extra)? else {
                 continue;
@@ -161,6 +174,10 @@ pub(super) fn settle_plan(
                 extra_hold.reserved, extra_hold.unit
             ));
         }
+    }
+    for (attempt_id, micros) in to_charge {
+        let outcome = settle_hold_in(conn, &attempt_id, micros, at.millis(), &config)?;
+        logs.extend(outcome.logs);
     }
     Ok(logs)
 }

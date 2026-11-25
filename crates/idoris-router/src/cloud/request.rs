@@ -13,8 +13,14 @@ use super::executor::CallPrivacy;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InvalidPrivacy;
 
-/// 请求头 `X-iDoris-Privacy` 里的声明：没有头 = `Undeclared`；恰好一个值：`any` 或 `local_only`（`local_only` 不分大小写，
-/// 宁可多拒也不放过）；多个值、非 UTF-8、空白、别的值 = 不合法。
+/// 去掉首尾的 ASCII 空格和水平制表符：HTTP 头可选空白（OWS）的范围。`any` 是允许发往云端的那个值，识别它只认这两种空白；
+/// 不换行空格、换行、回车、其它 Unicode 空白都不算（Codex 预审 M4）。
+fn trim_ows(text: &str) -> &str {
+    text.trim_matches(|c| c == ' ' || c == '\t')
+}
+
+/// 请求头 `X-iDoris-Privacy` 里的声明：没有头 = `Undeclared`；恰好一个值：`any` 或 `local_only`（`local_only` 不分大小写、
+/// 去掉任何首尾空白，宁可多拒也不放过）；多个值、非 UTF-8、空白、别的值 = 不合法。
 fn header_privacy(headers: &HeaderMap) -> Result<CallPrivacy, InvalidPrivacy> {
     let mut values = headers.get_all("x-idoris-privacy").iter();
     let Some(first) = values.next() else {
@@ -23,23 +29,24 @@ fn header_privacy(headers: &HeaderMap) -> Result<CallPrivacy, InvalidPrivacy> {
     if values.next().is_some() {
         return Err(InvalidPrivacy);
     }
-    let text = first.to_str().map_err(|_| InvalidPrivacy)?.trim();
-    if text == "any" {
+    let text = first.to_str().map_err(|_| InvalidPrivacy)?;
+    if trim_ows(text) == "any" {
         Ok(CallPrivacy::Any)
-    } else if text.eq_ignore_ascii_case("local_only") {
+    } else if text.trim().eq_ignore_ascii_case("local_only") {
         Ok(CallPrivacy::LocalOnly)
     } else {
         Err(InvalidPrivacy)
     }
 }
 
-/// 请求体里的一处声明（顶层 `privacy` 或 `metadata.privacy`）：没写 / `null` / `any` 不说明任何事（这个字段从来不转发给
-/// 上游）；`local_only`（不分大小写、可带空白）= 显式本地；**写了别的任何东西**（`"local-only"`、`true`、对象……）= 不合法，
-/// 与请求头同样失败即关闭，不当作「没声明」放行。
+/// 请求体里的一处声明（顶层 `privacy` 或 `metadata.privacy`）：没写 / `null` / `any`（首尾只去掉 ASCII 空格和水平制表符，和请求头
+/// 一样，见 [`trim_ows`]）不说明任何事（这个字段从来不转发给上游）；`local_only`（不分大小写、可带任何首尾空白）= 显式本地；
+/// **写了别的任何东西**（`"localonly"`、带不换行空格或换行的 `any`、`true`、对象……）= 不合法，与请求头同样失败即关闭，
+/// 不当作「没声明」放行。
 fn body_field_privacy(value: Option<&Value>) -> Result<bool, InvalidPrivacy> {
     match value {
         None | Some(Value::Null) => Ok(false),
-        Some(Value::String(text)) if text == "any" => Ok(false),
+        Some(Value::String(text)) if trim_ows(text) == "any" => Ok(false),
         Some(Value::String(text)) if text.trim().eq_ignore_ascii_case("local_only") => Ok(true),
         Some(_) => Err(InvalidPrivacy),
     }
@@ -487,6 +494,125 @@ mod tests {
         assert_eq!(
             declared_privacy(&headers(&[]), &ok),
             Ok(CallPrivacy::LocalOnly)
+        );
+    }
+
+    /// PR-Daemon 在 #608 评审里指出：头里带空白的 ` any ` 被接受，请求体里的 ` any ` 却是 400。N5 的要求是「像请求头一样」，
+    /// 两处对 `any` 的宽严要一致：都是去掉首尾空白之后精确匹配 `any`；`Any` / `ANY` 仍然不认（失败即关闭，头和请求体一样）。
+    /// 请求体里的 `any` 和没写一样，不说明任何事（没有变成 `CallPrivacy::Any`）。
+    #[test]
+    fn a_padded_any_is_read_the_same_way_in_the_header_and_in_the_body() {
+        let plain = object(base());
+        for padded in [" any ", "  any", "any  "] {
+            assert_eq!(
+                declared_privacy(&headers(&[padded]), &plain),
+                Ok(CallPrivacy::Any),
+                "header {padded:?}"
+            );
+            let mut top = plain.clone();
+            top.insert("privacy".into(), json!(padded));
+            assert_eq!(
+                declared_privacy(&headers(&[]), &top),
+                Ok(CallPrivacy::Undeclared),
+                "body privacy {padded:?}"
+            );
+            let mut nested = plain.clone();
+            nested.insert("metadata".into(), json!({"privacy": padded}));
+            assert_eq!(
+                declared_privacy(&headers(&[]), &nested),
+                Ok(CallPrivacy::Undeclared),
+                "body metadata.privacy {padded:?}"
+            );
+        }
+        // 大小写不对：头和请求体一样不认
+        for wrong in ["Any", "ANY", " Any "] {
+            assert_eq!(
+                declared_privacy(&headers(&[wrong]), &plain),
+                Err(InvalidPrivacy),
+                "header {wrong:?}"
+            );
+            let mut top = plain.clone();
+            top.insert("privacy".into(), json!(wrong));
+            assert_eq!(
+                declared_privacy(&headers(&[]), &top),
+                Err(InvalidPrivacy),
+                "body privacy {wrong:?}"
+            );
+        }
+        // 空白本身仍然不是取值（头和请求体一样）
+        for blank in ["", " ", "   "] {
+            let mut top = plain.clone();
+            top.insert("privacy".into(), json!(blank));
+            assert_eq!(
+                declared_privacy(&headers(&[]), &top),
+                Err(InvalidPrivacy),
+                "body privacy {blank:?}"
+            );
+        }
+    }
+
+    /// Codex 预审 M4：`any` 是允许发往云端的那个值，识别要比 `local_only` 严：首尾只去掉 ASCII 空格和水平制表符（HTTP 头里可选空白的
+    /// 范围）。请求体里的不换行空格、转义的换行 / 回车、垂直制表、换页、别的 Unicode 空白都不是 `any`；去掉空白之后什么也没有的也不是。
+    /// `local_only` 仍然宽松（去掉任何首尾空白、不分大小写，宁可多拒也不放过）。顶层 `privacy` 和 `metadata.privacy` 一样。
+    #[test]
+    fn any_is_trimmed_like_a_header_value_and_not_like_unicode_text() {
+        let plain = object(base());
+        let with = |value: &str, nested: bool| {
+            let mut body = plain.clone();
+            if nested {
+                body.insert("metadata".into(), json!({"privacy": value}));
+            } else {
+                body.insert("privacy".into(), json!(value));
+            }
+            body
+        };
+        for nested in [false, true] {
+            for ok in ["any", " any", "any ", "\tany", "any\t", " \t any \t "] {
+                assert_eq!(
+                    declared_privacy(&headers(&[]), &with(ok, nested)),
+                    Ok(CallPrivacy::Undeclared),
+                    "{ok:?} nested={nested}"
+                );
+            }
+            for bad in [
+                "\u{00A0}any",
+                "any\u{00A0}",
+                "any\n",
+                "\nany",
+                "any\r\n",
+                "\u{000B}any",
+                "any\u{000C}",
+                "\u{2003}any",
+                "\u{3000}any",
+                " \t ",
+                "\t",
+                "",
+                " ",
+            ] {
+                assert_eq!(
+                    declared_privacy(&headers(&[]), &with(bad, nested)),
+                    Err(InvalidPrivacy),
+                    "{bad:?} nested={nested}"
+                );
+            }
+            for local in [
+                "local_only",
+                "LOCAL_ONLY",
+                " local_only ",
+                "\u{00A0}local_only",
+                "local_only\n",
+            ] {
+                assert_eq!(
+                    declared_privacy(&headers(&[]), &with(local, nested)),
+                    Ok(CallPrivacy::LocalOnly),
+                    "{local:?} nested={nested}"
+                );
+            }
+        }
+        // 请求头里首尾的水平制表符同样认
+        assert_eq!(
+            declared_privacy(&headers(&["\tany"]), &plain),
+            Ok(CallPrivacy::Any)
         );
     }
 

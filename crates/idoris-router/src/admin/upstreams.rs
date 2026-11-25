@@ -11,27 +11,52 @@
 //!
 //! # 写
 //!
-//! 方法 POST，不需要请求体（有也不读），鉴权同 Admin 的其余路由。成功是 **202** 加该上游此刻的元素（字段同 GET）：命令被
-//! 受理就回答，动作可能还在进行（`stop` 要等引擎停下，至多一个 `stop_grace`），调用方轮询 `GET` 或 `/health` 到终态。
-//! 幂等：目标已达成时重复请求仍是 202 加当前状态。
+//! 方法 POST，不需要请求体（有也不读），鉴权同 Admin 的其余路由。成功是 **202** 加该上游**被受理那一刻**的元素：命令被受理就回答，
+//! 动作可能还在进行（`stop` 要等引擎停下，至多一个 `stop_grace`），调用方轮询 `GET` 或 `/health` 到终态。
+//!
+//! **202 体是实例任务自己在受理那一刻的快照**（Codex 预审 L4 的 M1），不是回答之后再读一遍的共享状态：受理之后实例任务还在往前走（排空、
+//! 停进程、换新引擎），也还会收下排在后面的命令，事后去读，`restart` 的 202 可能说 `stopped`，或者快到新引擎已经就绪、`restarting`
+//! 被盖掉。幂等的情形里它就是当前状态。唯一的例外：实例任务已经**认领**了命令（受理了、会执行），但第一步（关 Supervisor 的门）等得比
+//! 命令的截止时间（`command_timeout`）还久、没来得及回答——命令是受理的，不能回 503「没有受理」，也没有受理那一刻的快照可给：回 202，
+//! 体是回答那一刻读到的元素，可能还是命令之前的状态，调用方照常轮询 `GET`（202 本来就不是完成）。**生效的时刻**是实例任务拿到决定锁的那一刻：截止时间的检查与决定
+//! 在同一把锁里做（[`crate::lifecycle`] 里的 `Expiry`），认领成功当且仅当它读到的时钟还没到截止时间，所以到点时还没被认领的命令绝不会被受理。
+//!
+//! 幂等：目标已达成时重复请求仍是 202 加当前状态。**`restart` 的幂等只在第一次操作进行期间成立**：并发的、或在第一次操作员发起的、真的在换自有引擎的
+//! `restart` 进行期间到达的重复 `restart` 并入它（只换一次引擎）；第一次已经做完（新引擎就绪）之后到达的重传是一次**新的** `restart`，再换一次引擎。
+//! 丢了第一个 202 的调用方要确认的话，去读 `GET`（`pid` 变了、状态回到 `ready`），不要重发。
 //!
 //! 错误（体是统一的 `{error:{type,rule_id,reason_code,evidence,remediation}}`）：
 //!
 //! | 状态码 | `type` | `reason_code` | 何时 |
 //! |---|---|---|---|
+//! | 400 | `invalid_upstream_id` | `invalid_upstream_id` | 路径里的 `{id}` 解码之后不是 UTF-8（体里不回显它） |
 //! | 404 | `upstream_not_found` | `upstream_not_found` | 没有这个 id |
 //! | 409 | `upstream_not_owned` | `not_managed` | 卡没有声明托管（resident、`setup upstream` 的卡、伴生卡），三个动作都是 |
 //! | 409 | `upstream_not_owned` | `not_owned` | 托管卡，但引擎不是 iDoris 拉起的（外部引擎、没有引擎）：`stop`、`restart` |
-//! | 409 | `restart_required` | `restart_required` | 放行时没就绪的上游（降级放行，完整的 Router 里没有它的 Supervisor）的 `start`、`restart`（见 [`crate::lifecycle`]） |
-//! | 503 | `idoris_stopping` | `idoris_stopping` | 引擎管理器已经在停止 |
+//! | 409 | `restart_required` | `restart_required` | 放行时没就绪的上游（降级放行，完整的 Router 里没有它的 Supervisor）的 `start`（见 [`crate::lifecycle`]） |
+//! | 503 | `idoris_stopping` | `idoris_stopping` | 引擎管理器已经在停止，或命令没有在截止时间之前被实例任务认领（实例任务忙在排空、复位里；命令没有受理，事后也不会执行，可以重发） |
 //!
 //! 判定的先后：先看 id，再看 `managed`，再看归属（`stop`、`restart` 要 `owned`；已经 `stopped` 的 `stop` 是幂等，不报错），
 //! 最后交给管理器（它回答 `restart_required`）。所以 `owned` 为 false 的上游，`restart` 一律是 `upstream_not_owned`
-//! （规范 §2.11.4「一律」；冻结的上游没有进程，`owned` 恒为 false），`restart_required` 只出现在冻结上游的 `start` 上。
+//! （规范 §2.11.4「一律」；冻结的上游没有进程，`owned` 恒为 false），`restart_required` 只出现在冻结上游的 `start` 上；冻结的上游要不要
+//! 重启 iDoris，读 `GET` 元素的 `restart_required` 字段。归属在这里只是**预检**（读的是 `/health` 同源的快照，读完到命令被收下之间它可以变）：
+//! 状态是 `starting`、`restarting` 的上游，`restart` 放行到实例任务，由它把「归属」与「并入进行中的操作」**一起**决定（Codex 预审 L4 的
+//! M2、复审 M1'）——并入的只有操作员发起的、真的在换 iDoris 自己引擎的 `restart`（进行中的，或刚做完、新引擎已经就绪的；分界是引擎就绪的那一步，
+//! 读水位与发布 `ready` 在盖章的锁里是一步）；接管外部引擎的 `start`、没有拉起引擎就结束的 `start`（找不到可执行文件、终局的失败）、
+//! 外部引擎换了进程时的自动重新同步（也发布 `restarting`）都没有可并入的结果，那里的 `restart` 是 409 `upstream_not_owned`，不是一个没有任何东西跟在后面的 202。
+//!
+//! # `stop` 什么时候算做完
+//!
+//! 202 之后轮询 `GET`：**`state` 是 `stopped` 并且 `owned` 是 false** 才是做完了（进程确认消失、记录删了、端点封上）。`owned` 量的是 iDoris
+//! 此刻**握不握着**一个它拉起的（或认回的）引擎进程，不是「进程一定不在了」：没能确认进程已经消失（读不出它的身份、不能给它发信号）时，
+//! 句柄已经交出去收尾、不再握着，`owned` 也是 false，但收尾的状态是 `unavailable` + `port_in_use`——这是**未确认**，进程可能还占着端口，
+//! 所有权记录与围栏原样保留、端点保持封上。只看 `owned: false` 就收工会把它当成停好了。未确认之后：`stop` 是 409 `not_owned`（没有句柄可
+//! 停），`start` 重新走启动决策、先重读所有权记录：身份此刻读得出，就是**那个之前没能确认停掉的进程**——它被判了「停」，不能因为 `start` 又成了服务中的
+//! 引擎，所以先把它停掉、确认消失，再拉起一个新的（第 3 层的 `condemned`）；读不出仍是 `unavailable` + `port_in_use`。
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, rejection::PathRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -41,7 +66,7 @@ use idoris_contracts::admin_v0::{
 
 use super::AdminHttpState;
 use crate::AppState;
-use crate::lifecycle::{CommandError, EngineManager, ManagedView};
+use crate::lifecycle::{CommandAck, CommandError, EngineManager, ManagedView};
 use crate::readiness::{UpstreamReason, UpstreamState, UpstreamStatus};
 
 /// Admin 的三个动作。
@@ -99,8 +124,12 @@ fn element(state: &AppState, health: UpstreamStatus, view: Option<&ManagedView>)
 }
 
 /// 卡的 endpoint 里的端口（http 与 https 没写端口时是协议的缺省端口）。只取端口：endpoint 里的凭据、路径不会出现在响应里。
+/// 端口 0 不是一个端口（契约的下限是 1）：`http://127.0.0.1:0` 这样的非托管卡不输出 `port`（IDORIS-CORE S6，Codex 终审 L2）。
 fn port_of(endpoint: &str) -> Option<u16> {
-    reqwest::Url::parse(endpoint).ok()?.port_or_known_default()
+    reqwest::Url::parse(endpoint)
+        .ok()?
+        .port_or_known_default()
+        .filter(|port| *port != 0)
 }
 
 /// 路由器的状态到契约的状态：穷尽的 `match`，路由器里加了新状态而契约没跟上，这里编译不过。
@@ -142,16 +171,39 @@ pub(super) async fn list(State(state): State<AdminHttpState>) -> Json<AdminUpstr
     })
 }
 
-pub(super) async fn start(state: State<AdminHttpState>, id: Path<String>) -> Response {
-    act(state.0, id.0, Action::Start).await
+/// 三个写接口共用：`{id}` 取不出来（路径里的百分号编码解码之后不是 UTF-8）时，Axum 自己的提取器会回一个纯文本的 400，绕过统一的错误体，
+/// 按文档解析错误体的调用方在报告输入错误之前就解析失败了（Codex 预审 L4 的 L1）。这里把拒绝接住，回统一的 JSON 400，体里不回显被拒绝的值。
+/// 合法的 id 照旧精确匹配解码之后的值。
+async fn act_on(
+    state: AdminHttpState,
+    id: Result<Path<String>, PathRejection>,
+    action: Action,
+) -> Response {
+    match id {
+        Ok(Path(id)) => act(state, id, action).await,
+        Err(_rejection) => invalid_upstream_id(),
+    }
 }
 
-pub(super) async fn stop(state: State<AdminHttpState>, id: Path<String>) -> Response {
-    act(state.0, id.0, Action::Stop).await
+pub(super) async fn start(
+    state: State<AdminHttpState>,
+    id: Result<Path<String>, PathRejection>,
+) -> Response {
+    act_on(state.0, id, Action::Start).await
 }
 
-pub(super) async fn restart(state: State<AdminHttpState>, id: Path<String>) -> Response {
-    act(state.0, id.0, Action::Restart).await
+pub(super) async fn stop(
+    state: State<AdminHttpState>,
+    id: Result<Path<String>, PathRejection>,
+) -> Response {
+    act_on(state.0, id, Action::Stop).await
+}
+
+pub(super) async fn restart(
+    state: State<AdminHttpState>,
+    id: Result<Path<String>, PathRejection>,
+) -> Response {
+    act_on(state.0, id, Action::Restart).await
 }
 
 /// 为什么一个上游不归 iDoris 管。
@@ -163,7 +215,9 @@ enum Ownership {
     NotOwned,
 }
 
-/// 管理器之前的判定（只看 `/health` 同源的快照）。`None` = 放行，交给管理器。
+/// 管理器之前的判定（只看 `/health` 同源的快照）。`None` = 放行，交给管理器。**只是预检**：读完到命令被实例任务收下之间快照可以变，
+/// 所以凡是「也许能并入一次进行中的操作」的（`restart` 遇到 `starting`、`restarting`），这里一律放行，由实例任务把归属与并入一起决定
+/// （Codex 预审 L4 的 M2：`restarting` 也可能是外部引擎自动重新同步，那里没有可并入的操作，实例任务回 `NotOwned`）。
 fn precheck(action: Action, upstream: &AdminUpstream) -> Option<Ownership> {
     if !upstream.managed {
         return Some(Ownership::NotManaged);
@@ -199,7 +253,7 @@ async fn act(state: AdminHttpState, id: String, action: Action) -> Response {
         Action::Restart => engines.restart_upstream(&id).await,
     };
     match outcome {
-        Ok(()) => accepted(&state, &id),
+        Ok(ack) => accepted(&state, &id, &ack),
         Err(CommandError::NotFound) => upstream_not_found(&id),
         Err(CommandError::NotOwned) => upstream_not_owned(&id, Ownership::NotOwned),
         Err(CommandError::RestartRequired) => restart_required(&id, action),
@@ -207,12 +261,24 @@ async fn act(state: AdminHttpState, id: String, action: Action) -> Response {
     }
 }
 
-/// 202 加该上游此刻的元素（命令受理之后重新读：幂等的情形里它就是目标状态，进行中的情形里是当前状态）。
-fn accepted(state: &AdminHttpState, id: &str) -> Response {
-    match upstreams(&state.app, state.engines.as_deref())
-        .into_iter()
-        .find(|upstream| upstream.id == id)
-    {
+/// 202 加该上游**被受理那一刻**的元素：实例任务回答时带的它自己的快照（[`CommandAck::Snapshot`]；Codex 预审 L4 的 M1），静态的事实
+/// （`engine_kind`、`managed`）来自 `/health`。不重新读共享的状态表：受理之后实例任务还在往前走，也还会收下别的命令。实例任务已经认领了
+/// 命令、却没来得及在截止时间之前回答（[`CommandAck::Accepted`]）时没有这样的快照，就读此刻的元素（可能还是命令之前的状态，见模块文档）。
+fn accepted(state: &AdminHttpState, id: &str, ack: &CommandAck) -> Response {
+    let rendered = match ack {
+        CommandAck::Snapshot(view) => state
+            .app
+            .health_state
+            .view()
+            .upstreams
+            .into_iter()
+            .find(|health| health.id == id)
+            .map(|health| element(&state.app, health, Some(view))),
+        CommandAck::Accepted => upstreams(&state.app, state.engines.as_deref())
+            .into_iter()
+            .find(|upstream| upstream.id == id),
+    };
+    match rendered {
         Some(upstream) => (StatusCode::ACCEPTED, Json(upstream)).into_response(),
         None => upstream_not_found(id),
     }
@@ -242,6 +308,17 @@ fn error_response(
         })),
     )
         .into_response()
+}
+
+/// 路径里的 `{id}` 解码之后不是 UTF-8：体里不回显它（它不是一个合法的字符串，也没有安全的写法）。
+fn invalid_upstream_id() -> Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_upstream_id",
+        "invalid_upstream_id",
+        "the upstream id in the path is not valid UTF-8 once percent-decoded; GET /admin/api/v1/upstreams lists the ids"
+            .to_owned(),
+    )
 }
 
 /// `id` 来自调用方：这里只在响应里回显它（JSON 转义），不进日志。
@@ -274,7 +351,8 @@ fn upstream_not_owned(id: &str, why: Ownership) -> Response {
 }
 
 fn restart_required(id: &str, action: Action) -> Response {
-    // 只有 `start` 与 `restart` 会得到它，而且只在放行时没就绪的上游上（`stop` 不会）。
+    // HTTP 上只有 `start` 会得到它（冻结的上游没有进程，`owned` 恒为 false，`restart` 在预检就是 `upstream_not_owned`）；管理器的接口对冻结的
+    // 上游的 `restart` 也回 `RestartRequired`，所以这里仍按动作写。`stop` 不会。
     let what = if action == Action::Restart {
         "restart"
     } else {
@@ -295,7 +373,7 @@ fn idoris_stopping() -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         "idoris_stopping",
         "idoris_stopping",
-        "iDoris is shutting down its engines; the command was not accepted".to_owned(),
+        "the command was not accepted and nothing was done (it will not run later): either iDoris is shutting down its engines, or this engine's instance task did not take the command before its deadline because it was busy (draining in-flight work, rebuilding the ledger); GET /admin/api/v1/upstreams shows when the upstream has settled, then send the command again".to_owned(),
     )
 }
 
@@ -420,6 +498,55 @@ mod tests {
     // -----------------------------------------------------------------------------------------
     // 读
     // -----------------------------------------------------------------------------------------
+
+    /// Codex 终审 L2：端口 0 不是一个端口（契约的下限是 1）。一张非托管的卡写成 `http://127.0.0.1:0`，`port_or_known_default()` 给出 `Some(0)`，
+    /// `GET` 之前会输出 `port: 0`，违反契约；现在不输出 `port`，响应照样通过契约校验。真实的 `GET`，不是只测 `port_of`。
+    #[tokio::test]
+    async fn a_card_on_port_zero_outputs_no_port_and_the_response_still_validates() {
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_owned();
+        let mut state = state();
+        state.cards.push(card("zero-port", "http://127.0.0.1:0"));
+        state.health_state = HealthState::with_upstreams(
+            1_763_625_330_123,
+            vec![
+                health_entry(
+                    "lmstudio",
+                    "openai_compat",
+                    false,
+                    UpstreamState::Ready,
+                    None,
+                    false,
+                ),
+                health_entry(
+                    "zero-port",
+                    "openai_compat",
+                    false,
+                    UpstreamState::Ready,
+                    None,
+                    false,
+                ),
+            ],
+        );
+        let app = build_admin_app(state, token);
+        let (status, body, _) = send(
+            &app,
+            request("GET", "/admin/api/v1/upstreams", Some(&secret)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            idoris_contracts::parse::<AdminUpstreamsResponse>(&body).is_ok(),
+            "{body}"
+        );
+        assert_eq!(element_by_id(&body, "lmstudio")["port"], 1234);
+        assert!(
+            element_by_id(&body, "zero-port").get("port").is_none(),
+            "{body}"
+        );
+        assert_eq!(port_of("http://127.0.0.1:0"), None);
+        assert_eq!(port_of("https://example.com"), Some(443));
+    }
 
     #[tokio::test]
     async fn get_is_the_health_snapshot_field_for_field_in_the_same_order() {
@@ -766,6 +893,141 @@ mod tests {
     // -----------------------------------------------------------------------------------------
     // 路由表
     // -----------------------------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------------------------
+    // Codex 预审 L4：202 体是受理那一刻的快照（M1）、路径里的 id 不是 UTF-8（L1）
+    // -----------------------------------------------------------------------------------------
+
+    fn admin_state() -> AdminHttpState {
+        AdminHttpState {
+            app: std::sync::Arc::new(state()),
+            token: SharedAdminToken::new(AdminSessionToken::mint()),
+            engines: None,
+        }
+    }
+
+    async fn json_of(response: Response) -> Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// M1：共享的状态（`/health` 的快照）此刻说 `ready`、自有、没有 pid；实例任务回答时说的是它受理那一刻的样子——重启受理了，旧引擎还握在手里
+    /// （`restarting`，旧的 pid）。202 体是后者：之前它在回答之后再读一遍共享状态，受理之后实例任务还在往前走（也还会收下别的命令），读到的
+    /// 可能是另一个命令、或这一次操作更晚的状态。
+    #[tokio::test]
+    async fn the_202_body_is_the_snapshot_the_instance_answered_with_not_a_reread_of_the_shared_state()
+     {
+        let state = admin_state();
+        let answered = ManagedView {
+            state: UpstreamState::Restarting,
+            reason: None,
+            owned: true,
+            port: 19731,
+            pid: Some(4242),
+            restart_required: false,
+            failure_count: 3,
+            last_failure_at_ms: Some(1_763_625_330_999),
+        };
+        let response = accepted(&state, "omlx", &CommandAck::Snapshot(answered));
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = json_of(response).await;
+        assert_eq!(
+            body,
+            json!({
+                "id": "omlx", "engine_kind": "omlx", "state": "restarting", "managed": true,
+                "owned": true, "port": 19731, "pid": 4242, "restart_required": false,
+                "failure_count": 3, "last_failure_at_ms": 1_763_625_330_999_u64
+            }),
+            "the static facts are /health's, everything the instance owns is its own snapshot"
+        );
+        assert!(
+            idoris_contracts::parse::<AdminUpstream>(&body).is_ok(),
+            "{body}"
+        );
+        // The shared state still says `ready` (a re-read would have shown that).
+        assert_eq!(
+            state.app.health_state.view().upstreams[0].state,
+            UpstreamState::Ready
+        );
+    }
+
+    /// 实例任务已经认领了命令、却没来得及在截止时间之前回答：没有受理那一刻的快照，回 202 加回答那一刻读到的元素（模块文档）。一个已经不在的 id
+    /// 仍是 404。
+    #[tokio::test]
+    async fn an_accepted_command_whose_answer_was_late_renders_the_element_as_it_is_now() {
+        let state = admin_state();
+        let response = accepted(&state, "omlx", &CommandAck::Accepted);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = json_of(response).await;
+        assert_eq!(body["state"], "ready", "{body}");
+        assert_eq!(body["id"], "omlx");
+        let gone = accepted(&state, "no-such-upstream", &CommandAck::Accepted);
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+        let gone = accepted(&state, "no-such-upstream", &CommandAck::Snapshot(view()));
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// L1：`{id}` 解码之后不是 UTF-8。Axum 自己的 `Path<String>` 提取器对它回一个纯文本的 400，绕过统一的错误体；三个写接口都接住它，回统一的 JSON
+    /// 400 `invalid_upstream_id`，体里没有被拒绝的字节、也没有它的任何写法。没有 token 仍是 401（鉴权在提取之前，没有 token 的调用方得不到任何信息）。
+    #[tokio::test]
+    async fn an_id_that_is_not_utf8_is_a_json_400_in_the_unified_envelope_for_every_write() {
+        let (app, secret) = app();
+        for hostile in ["%FF", "%C0%AF", "ab%E2%82", "%ED%A0%80", "x%FFy%FE"] {
+            for action in ACTIONS {
+                let path = format!("/admin/api/v1/upstreams/{hostile}/{action}");
+                let (status, body, text) = send(&app, request("POST", &path, Some(&secret))).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {text}");
+                let error = body["error"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{path}: the body is not the JSON envelope: {text}"));
+                assert_eq!(
+                    error.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["type", "rule_id", "reason_code", "evidence", "remediation"]),
+                    "{path}"
+                );
+                assert_eq!(error["type"], "invalid_upstream_id");
+                assert_eq!(error["reason_code"], "invalid_upstream_id");
+                assert!(error["rule_id"].is_null() && error["evidence"].is_null());
+                for echoed in [hostile, "FF", "ff", "%", "\u{fffd}"] {
+                    assert!(!text.contains(echoed), "{path} echoed {echoed:?}: {text}");
+                }
+                // 鉴权在先：没有（或错的）token 得到的是 401，不是 400。
+                let (status, _, _) = send(&app, request("POST", &path, None)).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+            }
+        }
+        // 合法的 id 不受影响，精确匹配**解码之后**的值：`omlx%2Db`、`%6Fmlx%2Db` 都解码成 `omlx-b`，是配置里那个没有自有引擎的托管上游
+        // （409 `not_owned`）；解码成 `omlx-c` 的没有这个上游（404），不是 400。
+        for path in [
+            "/admin/api/v1/upstreams/omlx%2Db/stop",
+            "/admin/api/v1/upstreams/%6Fmlx%2Db/restart",
+        ] {
+            let (status, body, _) = send(&app, request("POST", path, Some(&secret))).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{path}: {body}");
+            assert_eq!(error_of_body(&body), ("upstream_not_owned", "not_owned"));
+        }
+        let (status, body, _) = send(
+            &app,
+            request(
+                "POST",
+                "/admin/api/v1/upstreams/omlx%2Dc/stop",
+                Some(&secret),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(
+            error_of_body(&body),
+            ("upstream_not_found", "upstream_not_found")
+        );
+    }
+
+    fn error_of_body(body: &Value) -> (&str, &str) {
+        (
+            body["error"]["type"].as_str().unwrap(),
+            body["error"]["reason_code"].as_str().unwrap(),
+        )
+    }
 
     #[tokio::test]
     async fn the_family_is_exactly_one_get_and_three_posts() {

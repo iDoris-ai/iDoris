@@ -7,6 +7,10 @@
 //! process (same pattern as `models_auth.rs`).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+use state_isolation::IsolateState;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -419,7 +423,14 @@ async fn run_case(case: &str) {
                 .await;
             let c = card("omlx", &upstream.uri(), LoadMode::OnDemand);
             let app = build_app(AppState {
-                runtimes: Some(BoundSupervisor::spawn_omlx(&c).unwrap()).into(),
+                runtimes: Some(
+                    BoundSupervisor::spawn_omlx_in_state_dir(
+                        &c,
+                        &state_isolation::fresh_state_dir(),
+                    )
+                    .unwrap(),
+                )
+                .into(),
                 cards: vec![c],
                 ..AppState::default()
             });
@@ -529,7 +540,7 @@ async fn resident_omlx_key_attachment_and_auth_error_mapping() {
         if let Some(key) = key {
             cmd.env(KEY_ENV, key);
         }
-        let output = cmd.output().unwrap();
+        let output = cmd.isolate_state().output().unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(

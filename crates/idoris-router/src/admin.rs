@@ -526,6 +526,8 @@ pub async fn models(state: &AppState) -> AdminModelsResponse {
         if card.form != idoris_contracts::component_card::Form::HttpService {
             continue;
         }
+        // 这张卡被准入时的引擎代际，先于状态检查读（Codex 终审 M6）：状态检查之后换了代、被停了，请求发出前被拒绝，不发。
+        let admitted = crate::models::admission_generation(card);
         // 此刻没在服务的托管卡不探测（引擎没起来、被停下、在重启，或者那个端口上的东西没有通过属主校验，不能给它发 key）：
         // 如实报「不可用」。读此刻的状态（IDORIS-CORE S6，G1）。
         if state.health_state.failure_of_card(card).is_some() {
@@ -541,6 +543,7 @@ pub async fn models(state: &AppState) -> AdminModelsResponse {
         let (state_kind, models, error) = match crate::models::observe_http_models(
             &state.http_client,
             card,
+            admitted,
             state.remote_kill_switch.load(Ordering::SeqCst),
         )
         .await

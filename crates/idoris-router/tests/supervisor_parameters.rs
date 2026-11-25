@@ -1,5 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -43,7 +46,11 @@ async fn unsupported_options_are_400_before_any_upstream_call() {
     let upstream = MockServer::start().await;
     let card = card(&upstream.uri());
     let app = build_app(AppState {
-        runtimes: Some(BoundSupervisor::spawn_omlx(&card).unwrap()).into(),
+        runtimes: Some(
+            BoundSupervisor::spawn_omlx_in_state_dir(&card, &state_isolation::fresh_state_dir())
+                .unwrap(),
+        )
+        .into(),
         cards: vec![card],
         ..AppState::default()
     });
@@ -97,7 +104,11 @@ async fn stream_validation_precedes_parameter_validation() {
     let upstream = MockServer::start().await;
     let card = card(&upstream.uri());
     let app = build_app(AppState {
-        runtimes: Some(BoundSupervisor::spawn_omlx(&card).unwrap()).into(),
+        runtimes: Some(
+            BoundSupervisor::spawn_omlx_in_state_dir(&card, &state_isolation::fresh_state_dir())
+                .unwrap(),
+        )
+        .into(),
         cards: vec![card],
         ..AppState::default()
     });

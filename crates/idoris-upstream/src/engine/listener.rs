@@ -5,13 +5,17 @@
 //! 用的都是 [`super::ProcessInspector`]（`lsof` 找监听者，`ps` 读 uid，`codesign` 读进程正在运行的代码的签名团队），
 //! 没有任何 unsafe，也没有新依赖。
 //!
-//! # 判据（issue 的修法，原样）
+//! # 判据（issue 的修法；Codex 专项评审 M13 之后只数**能接这个连接的**）
 //!
-//! 1. 找出监听这个端口的**全部** pid（回环、通配、IPv6 的监听都算：连到 `127.0.0.1:<port>` 的请求可能落在其中任何一个）；
-//!    没有人监听不是通过（[`ListenerVerdict::NoListener`]）；
+//! 1. 找出监听这个端口、并且**绑的地址族与地址是拨号地址（`127.0.0.1`，[`super::MANAGED_DIAL`]）连得到的**全部 pid（绑在 `127.0.0.1`
+//!    或 IPv4 通配上的；IPv6 套接字只在有双栈证据时算）：连到 `127.0.0.1:<port>` 的请求可能落在其中任何一个。绑在别的地址上的监听者
+//!    （比如 `[::1]`、另一个具体的 IPv4 地址）这个连接到不了，**不在里面，也不影响校验**：之前端口上每个 pid 都得是「握着 IPv4
+//!    目标地址的」，一个同样合格的进程只服务 `::1`，守卫就永久拒绝每个请求。没有人能接这个连接不是通过（[`ListenerVerdict::NoListener`]）；
 //! 2. 每个 pid 的 uid 都等于 iDoris 的有效 uid（别的用户的进程不是我们的引擎）；
 //! 3. 每个 pid 正在运行的代码的签名团队都等于要求的那个（oMLX：`PSK5Q5T46L`；签名无效、没有签名、ad-hoc 都不算）；
 //! 4. 校验通过之前不发 key；校验结果按 **pid + 启动时间** 缓存，进程换了（pid 变了，或同一个 pid 的启动时间变了）就重查；
+//!    端口上出现过监听的空档（这个 pid 不在监听者里了）也废弃它的记录：启动时间只到秒（`ps -o lstart`），同一秒内被回收的同一个
+//!    pid 再绑上这个端口，（pid、启动时间）一模一样，不能靠缓存放过它（IDORIS-CORE S6，Codex 终审 L1）；
 //! 5. 读不出来（工具不存在、超时）**不是**通过，也不是被拒：[`ListenerVerdict::Unverifiable`]，调用方按「没有 key」处理。
 //!
 //! 「校验与发送之间的连接复用被关闭」不在这里：它是调用方发请求的方式（每个带 key 的请求都用新开的连接，
@@ -24,7 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::fsutil::effective_uid;
-use super::inspect::{InspectError, ProcessInspector};
+use super::inspect::{InspectError, MANAGED_DIAL, ProcessInspector};
 
 /// 校验要求什么：uid 与签名团队。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +90,7 @@ pub struct ListenerIdentity {
 /// [`ListenerVerifier::check`] 的结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListenerVerdict {
-    /// 监听这个端口的每个进程都通过了：uid 与签名团队都对。`listeners` 按 pid 升序，各带启动时间。
+    /// 每个**能接这个连接的**监听进程都通过了：uid 与签名团队都对。`listeners` 按 pid 升序，各带启动时间。
     Verified { listeners: Vec<ListenerIdentity> },
     /// 此刻没有人监听这个端口。
     NoListener,
@@ -136,6 +140,11 @@ impl ListenerVerifier {
         }
     }
 
+    /// 这个校验器用的检查器：守卫（[`super::ExternalListenerGuard`]）从它为每个被校验的监听者建每个请求的监视。
+    pub fn inspector(&self) -> &Arc<dyn ProcessInspector> {
+        &self.inspector
+    }
+
     fn cached(&self, pid: u32, started_at: &str) -> bool {
         self.verified
             .lock()
@@ -151,14 +160,33 @@ impl ListenerVerifier {
             .insert(pid, started_at);
     }
 
-    /// 校验现在监听 `port` 的是不是合格的引擎进程。每个监听者先读启动时间：缓存里有同样的（pid、启动时间）就直接通过，
-    /// 否则校验 uid 与签名团队，并在**校验之后**再读一次启动时间：两次不同说明校验期间这个 pid 换了进程，不缓存、
+    /// 校验现在**能接 `127.0.0.1:<port>` 这个连接的**监听者是不是合格的引擎进程。每个监听者先读启动时间：缓存里有同样的（pid、启动时间）
+    /// 就直接通过，否则校验 uid 与签名团队，并在**校验之后**再读一次启动时间：两次不同说明校验期间这个 pid 换了进程，不缓存、
     /// 也不算通过（[`ListenerVerdict::Unverifiable`]）。
     pub async fn check(&self, port: u16) -> ListenerVerdict {
-        let pids = match self.inspector.listeners_on(port).await {
-            Ok(pids) => pids,
+        let sockets = match self.inspector.listening_sockets(port).await {
+            Ok(sockets) => sockets,
             Err(error) => return ListenerVerdict::Unverifiable(error),
         };
+        // 只有拨号地址连得到的套接字的主人要紧：绑在别的地址上的监听者（`[::1]`、别的 IPv4 地址）收不到发往 `127.0.0.1` 的连接。
+        let mut pids: Vec<u32> = sockets
+            .iter()
+            .filter(|socket| socket.bind.covers(MANAGED_DIAL))
+            .map(|socket| socket.pid)
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        // 监听上的空档废弃通过记录（IDORIS-CORE S6，Codex 终审 L1）：`ps` 给的启动时间只到秒，同一秒内被回收、又绑上这个端口的
+        // 同一个 pid，读出来的（pid、启动时间）与之前通过校验的那个一模一样，缓存会跳过 uid 与签名团队的复核。端口上没有这个
+        // pid 的那一刻，它的通过记录就不再作数：它之后再出现，要重新过 uid 与签名团队。
+        {
+            let mut verified = self.verified.lock().unwrap_or_else(PoisonError::into_inner);
+            if pids.is_empty() {
+                verified.clear();
+            } else {
+                verified.retain(|pid, _| pids.contains(pid));
+            }
+        }
         if pids.is_empty() {
             return ListenerVerdict::NoListener;
         }
@@ -216,11 +244,12 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use std::collections::BTreeMap;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
 
-    use super::super::inspect::PidState;
+    use super::super::inspect::{Bind, ListeningSocket, PidState};
     use super::*;
 
     const TEAM: &str = "PSK5Q5T46L";
@@ -230,6 +259,8 @@ mod tests {
     #[derive(Default)]
     struct Scripted {
         listeners: Mutex<BTreeMap<u16, Result<Vec<u32>, InspectError>>>,
+        /// 编排了套接字（含绑的地址族与地址）的端口按它回答 `listening_sockets`；没编排的由 `listeners` 的 pid 推出（每个当作 IPv4 通配）。
+        sockets: Mutex<BTreeMap<u16, Vec<ListeningSocket>>>,
         procs: Mutex<BTreeMap<u32, Proc>>,
         team_calls: AtomicUsize,
         uid_calls: AtomicUsize,
@@ -270,6 +301,11 @@ mod tests {
             self.procs.lock().unwrap().insert(pid, proc);
             self
         }
+
+        fn sockets(self, port: u16, sockets: Vec<ListeningSocket>) -> Self {
+            self.sockets.lock().unwrap().insert(port, sockets);
+            self
+        }
     }
 
     #[async_trait]
@@ -304,6 +340,17 @@ mod tests {
                 .get(&port)
                 .cloned()
                 .unwrap_or(Ok(Vec::new()))
+        }
+        async fn listening_sockets(&self, port: u16) -> Result<Vec<ListeningSocket>, InspectError> {
+            if let Some(sockets) = self.sockets.lock().unwrap().get(&port) {
+                return Ok(sockets.clone());
+            }
+            Ok(self
+                .listeners_on(port)
+                .await?
+                .into_iter()
+                .map(ListeningSocket::any)
+                .collect())
         }
         async fn uid_of(&self, pid: u32) -> Result<u32, InspectError> {
             self.uid_calls.fetch_add(1, Ordering::SeqCst);
@@ -350,6 +397,120 @@ mod tests {
             verifier.check(19731).await,
             ListenerVerdict::Verified {
                 listeners: vec![identity(42)]
+            }
+        );
+    }
+
+    // ----- Codex focused review M13: only the listeners that can take the connection count --------------------------------------------
+
+    /// A listener bound where a connection to `127.0.0.1` cannot reach it (`[::1]`, an IPv6 wildcard without dual-stack evidence, another
+    /// IPv4 address) is neither checked nor part of the verdict: the process behind `127.0.0.1` is the one that passes. Nothing is read
+    /// about the bystanders (they are not scripted: reading them would be `Unverifiable`).
+    #[tokio::test]
+    async fn a_listener_bound_where_the_connection_cannot_reach_it_is_not_counted() {
+        let (verifier, scripted) = rig(Scripted::default()
+            .sockets(
+                19731,
+                vec![
+                    ListeningSocket::v4(42, Ipv4Addr::LOCALHOST),
+                    ListeningSocket {
+                        pid: 43,
+                        bind: Bind::v6(Ipv6Addr::LOCALHOST, false),
+                    },
+                    ListeningSocket {
+                        pid: 44,
+                        bind: Bind::v6(Ipv6Addr::UNSPECIFIED, false),
+                    },
+                    ListeningSocket::v4(45, Ipv4Addr::new(10, 1, 2, 3)),
+                ],
+            )
+            .process(42, Proc::ok()));
+        assert_eq!(
+            verifier.check(19731).await,
+            ListenerVerdict::Verified {
+                listeners: vec![identity(42)]
+            }
+        );
+        assert_eq!(
+            scripted.uid_calls.load(Ordering::SeqCst),
+            1,
+            "only the one that can take the connection was read"
+        );
+    }
+
+    /// A listener that **can** take the connection and is not authorized spoils the verdict, wherever it sits among the others: the
+    /// IPv4 wildcard, and an IPv6 wildcard that was shown to be dual-stack (it accepts IPv4 too).
+    #[tokio::test]
+    async fn a_listener_that_can_take_the_connection_must_be_authorized() {
+        let mut unsigned = Proc::ok();
+        unsigned.team = Ok(None);
+        for (stranger, bind) in [
+            (45, Bind::V4(Ipv4Addr::UNSPECIFIED)),
+            (46, Bind::v6(Ipv6Addr::UNSPECIFIED, true)),
+            (47, Bind::V4(Ipv4Addr::LOCALHOST)),
+        ] {
+            let (verifier, _) = rig(Scripted::default()
+                .sockets(
+                    19731,
+                    vec![
+                        ListeningSocket::v4(42, Ipv4Addr::LOCALHOST),
+                        ListeningSocket {
+                            pid: stranger,
+                            bind,
+                        },
+                    ],
+                )
+                .process(42, Proc::ok())
+                .process(stranger, unsigned.clone()));
+            assert_eq!(
+                verifier.check(19731).await,
+                ListenerVerdict::Rejected(ListenerRejection::NoTeam { pid: stranger }),
+                "{bind:?}"
+            );
+        }
+    }
+
+    /// Listeners that are all somewhere the connection does not reach: nobody can take it, which is no listener at all (never a pass).
+    #[tokio::test]
+    async fn listeners_that_are_all_elsewhere_are_no_listener() {
+        let (verifier, _) = rig(Scripted::default()
+            .sockets(
+                19731,
+                vec![
+                    ListeningSocket {
+                        pid: 42,
+                        bind: Bind::v6(Ipv6Addr::LOCALHOST, false),
+                    },
+                    ListeningSocket {
+                        pid: 43,
+                        bind: Bind::v6(Ipv6Addr::UNSPECIFIED, false),
+                    },
+                ],
+            )
+            .process(42, Proc::ok())
+            .process(43, Proc::ok()));
+        assert_eq!(verifier.check(19731).await, ListenerVerdict::NoListener);
+    }
+
+    /// One process with several sockets on the port is one identity (sorted by pid, listed once).
+    #[tokio::test]
+    async fn one_process_with_several_sockets_is_one_identity_and_the_pids_are_sorted() {
+        let (verifier, _) = rig(Scripted::default()
+            .sockets(
+                19731,
+                vec![
+                    ListeningSocket::v4(43, Ipv4Addr::LOCALHOST),
+                    ListeningSocket::v4(42, Ipv4Addr::LOCALHOST),
+                    ListeningSocket::any(42),
+                    ListeningSocket::v4(43, Ipv4Addr::UNSPECIFIED),
+                ],
+            )
+            .process(42, Proc::ok())
+            .process(43, Proc::ok()));
+        assert_eq!(
+            verifier.check(19731).await,
+            ListenerVerdict::Verified {
+                listeners: vec![identity(42), identity(43)]
             }
         );
     }
@@ -537,6 +698,69 @@ mod tests {
         scripted.procs.lock().unwrap().insert(43, Proc::ok());
         assert!(verifier.check(19731).await.is_verified());
         assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Codex final review L1: `ps` gives the start time to the second. A pid recycled within the same second and bound
+    /// to the port again reads exactly like the process that passed before; the pass must not survive a gap in the
+    /// port's listeners.
+    #[tokio::test]
+    async fn a_pass_does_not_survive_a_gap_in_the_ports_listeners() {
+        let (verifier, scripted) = rig(Scripted::default()
+            .listening(19731, &[42])
+            .process(42, Proc::ok()));
+        assert!(verifier.check(19731).await.is_verified());
+        assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 1);
+        // A listener that is still there keeps its pass.
+        assert!(verifier.check(19731).await.is_verified());
+        assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 1);
+        // The port is empty for a moment (the process left)...
+        scripted.listeners.lock().unwrap().insert(19731, Ok(vec![]));
+        assert_eq!(verifier.check(19731).await, ListenerVerdict::NoListener);
+        // ... and a process with the very same pid and the very same start time (the second did not change) is there
+        // again. It is checked from scratch, and this one is unsigned.
+        scripted
+            .listeners
+            .lock()
+            .unwrap()
+            .insert(19731, Ok(vec![42]));
+        {
+            let mut procs = scripted.procs.lock().unwrap();
+            let proc = procs.get_mut(&42).unwrap();
+            proc.team = Ok(None);
+            proc.reads = 0;
+        }
+        assert_eq!(
+            verifier.check(19731).await,
+            ListenerVerdict::Rejected(ListenerRejection::NoTeam { pid: 42 })
+        );
+        assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A pid that is no longer among the port's listeners loses its pass even while others still listen.
+    #[tokio::test]
+    async fn a_pid_that_left_the_port_loses_its_pass_while_the_others_keep_theirs() {
+        let (verifier, scripted) = verifier_two_good();
+        assert!(verifier.check(19731).await.is_verified());
+        assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 2);
+        scripted
+            .listeners
+            .lock()
+            .unwrap()
+            .insert(19731, Ok(vec![42]));
+        assert!(verifier.check(19731).await.is_verified());
+        // 42 kept its pass: no new signature read; 41's was dropped.
+        assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 2);
+        scripted
+            .listeners
+            .lock()
+            .unwrap()
+            .insert(19731, Ok(vec![41, 42]));
+        assert!(verifier.check(19731).await.is_verified());
+        assert_eq!(
+            scripted.team_calls.load(Ordering::SeqCst),
+            3,
+            "41 was checked again"
+        );
     }
 
     #[tokio::test]

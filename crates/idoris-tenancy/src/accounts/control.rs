@@ -57,13 +57,15 @@ use super::pairing::{
     MAX_ACTIVE_DEVICES_PER_MEMBERSHIP, PairingRow, occupied_device_slots, resolve_pairing_caller,
 };
 use super::rows::{
-    AllocationRecord, load_account, load_allocation_record, load_ancestors, load_credential,
-    load_membership, load_memberships_of, load_platform_roots, load_principal, merge_chains,
+    AllocationRecord, load_account, load_allocation_record, load_allocation_record_within,
+    load_ancestors, load_credential, load_credential_within, load_membership,
+    load_membership_within, load_memberships_of, load_platform_roots, load_principal, merge_chains,
+    principal_within_roots,
 };
 use super::store::{
-    AccountStore, AllocationOutcome, create_account_in, create_allocation_in, create_credential_in,
-    create_membership_in, ensure_principal_in, revoke_membership_in, revoke_principal_in,
-    set_account_status_in, set_credential_status_in,
+    AccountStore, AllocationOutcome, check_new_membership_in, create_account_in,
+    create_allocation_in, create_credential_in, create_membership_in, ensure_principal_in,
+    revoke_membership_in, revoke_principal_in, set_account_status_in, set_credential_status_in,
 };
 use crate::virtual_key::VirtualKeyHash;
 
@@ -772,13 +774,19 @@ pub(super) fn authorize_op(
         anchors.push(anchor);
     }
     let dir = slice_directory(conn, &anchors, &[], Vec::new())?;
-    authorize(&dir, credential, now, op, target, amount).map_err(Failure::new)?;
+    // 契约的 `authorize` 对存在的目标先判金额是不是负数（`invalid_amount`），对不存在的目标先判 `out_of_scope`：带负金额的请求能把
+    // 「目标账户存在」和「不存在」区分开。范围先用不小于 0 的金额判，负数留到范围判过之后再拒。
+    let ranged = amount.map(|amount| Money::new(amount.unit.clone(), amount.micros.max(0)));
+    authorize(&dir, credential, now, op, target, ranged.as_ref()).map_err(Failure::new)?;
+    if amount.is_some_and(|amount| amount.micros < 0) {
+        return Err(Failure::new(ControlReason::InvalidAmount));
+    }
     Ok(Some(dir))
 }
 
 /// 与操作**目标**无关的那几步授权判定：凭证此刻可用、绑定账户没被冻结、调用者有没有 `op` 这个操作（任何范围里）。
 ///
-/// 按 id 查的写操作（撤销成员关系 / 额度、改凭证状态）在碰目标之前先做：没有这个操作权限的调用者，无论目标存在与否
+/// 按 id 查的写操作（撤销成员关系 / 额度、改凭证状态、签发成员凭证、创建 / 撤销配对码）在碰目标之前先做：没有这个操作权限的调用者，无论目标存在与否
 /// 都得到同一个答案（契约 `authorize` 的检查顺序：有没有这个操作的权限先于目标存不存在）。否则已有的目标得到
 /// `op_not_granted`，不存在的目标在授权判定之前就得到 `out_of_scope`，靠它能探测别的组织有哪些 id。
 /// 范围问题（`op` 的子树不含自己的绑定账户）不在这里判，交给后面按目标判。本机运维不受授权约束。
@@ -976,6 +984,13 @@ impl AccountStore {
                 &request.org,
                 None,
             )?;
+            // 主体 id 是全局的假名：调用者管不到的已有主体（登记它的组织或它的某个成员关系在调用者的范围之外）和不存在的主体
+            // 一样先按「读不到」处理，数据库执行同样的语句（一条探针），不再先读出整个足迹再去逐个授权
+            if let Some(roots) = manageable_roots(caller, ControlOp::RevokePrincipal)
+                && !principal_within_roots(conn, &request.principal, &roots)?
+            {
+                return Err(out_of_scope());
+            }
             let Some(principal) = load_principal(conn, &request.principal)? else {
                 return Err(out_of_scope());
             };
@@ -1203,6 +1218,91 @@ pub(super) fn authority_is_visible<T>(result: Result<T, Failure>) -> Result<bool
     }
 }
 
+/// 调用者对 `op` 管得到的那些子树的根：凭证身上这个操作的每一条权限的子树。本机运维不受授权约束，是 `None`（读的时候不加限定）；
+/// 配对码身份没有任何授权，是空范围。
+///
+/// 带额度上限的权限对 `grant_allocation` 才有意义，签发时就拒绝别的操作带上限；别的操作照契约 `scope_covers` 的口径再滤一次
+/// （没有金额的请求不认带上限的权限），让「管得到」和授权判定保持一致，将来放宽签发校验时也同步。`grant_allocation` 的「管得到」
+/// 不看上限：上限不够时是 `amount_exceeds_authority`，这个回答涉及的是调用者自己范围里的额度。
+pub(super) fn manageable_roots(caller: &Caller, op: ControlOp) -> Option<Vec<AccountId>> {
+    match &caller.identity {
+        Identity::Operator => None,
+        Identity::Credential { credential, .. } => Some(
+            credential
+                .admin_scopes()
+                .iter()
+                .filter(|scope| {
+                    scope.op == op
+                        && (op == ControlOp::GrantAllocation || scope.max_amount.is_none())
+                })
+                .map(|scope| scope.subtree.clone())
+                .collect(),
+        ),
+        Identity::PairingCode(_) => Some(Vec::new()),
+    }
+}
+
+/// 成员关系 `id`，读的时候限定在调用者对 `op` 管得到的范围里：管不到的和不存在的一样返回 `None`（一条探针语句，见
+/// [`manageable_roots`]、[`load_membership_within`]）。
+///
+/// 管得到的成员关系，行为和以前的「读出来再授权」完全一样；管不到的不再被读出来，所以后面没有已有 id 独有的授权查询
+/// （issue #603 N7 残余，Codex 预审 H1 / M3）。
+pub(super) fn load_manageable_membership(
+    conn: &Connection,
+    caller: &Caller,
+    op: ControlOp,
+    id: &MembershipId,
+) -> Result<Option<Membership>, Failure> {
+    Ok(match manageable_roots(caller, op) {
+        None => load_membership(conn, id)?,
+        Some(roots) => load_membership_within(conn, id, &roots)?,
+    })
+}
+
+/// 凭证 `id`，读的时候限定在它绑定的账户落在调用者对 `op` 管得到的范围里（和 [`load_manageable_membership`] 同一个用意）。
+fn load_manageable_credential(
+    conn: &Connection,
+    caller: &Caller,
+    op: ControlOp,
+    id: &CredentialId,
+) -> Result<Option<Credential>, Failure> {
+    Ok(match manageable_roots(caller, op) {
+        None => load_credential(conn, id)?,
+        Some(roots) => load_credential_within(conn, id, &roots)?,
+    })
+}
+
+/// 额度 `id`（不管有没有被撤销），读的时候限定在授权方（父）账户落在调用者对 `grant_allocation` 管得到的范围里。
+fn load_manageable_allocation(
+    conn: &Connection,
+    caller: &Caller,
+    id: &AllocationId,
+) -> Result<Option<AllocationRecord>, Failure> {
+    Ok(match manageable_roots(caller, ControlOp::GrantAllocation) {
+        None => load_allocation_record(conn, id)?,
+        Some(roots) => load_allocation_record_within(conn, id, &roots)?,
+    })
+}
+
+/// 签发凭证时绑定对应的账户：`Service` / `Node` 是绑定的账户，`Member` 是成员关系的付款账户，成员关系读的时候限定在调用者对 `op`
+/// 管得到的范围里（管不到的和不存在的一样是 `None`）。
+fn manageable_binding_anchor(
+    conn: &Connection,
+    caller: &Caller,
+    op: ControlOp,
+    binding: &CredentialBinding,
+) -> Result<Option<AccountId>, Failure> {
+    match binding {
+        CredentialBinding::Service { account } | CredentialBinding::Node { account } => {
+            Ok(Some(account.clone()))
+        }
+        CredentialBinding::Member { membership } => {
+            Ok(load_manageable_membership(conn, caller, op, membership)?
+                .and_then(|found| found.account))
+        }
+    }
+}
+
 /// 调用者有没有资格知道这个主体现在是什么状态。
 ///
 /// 没有资格时，活跃、已撤销、不存在必须是同一个 `out_of_scope`（细节为空）。状态如果在归属方授权之前就返回，
@@ -1295,7 +1395,7 @@ impl AccountStore {
     /// 建成员关系。授权看成员关系的付款账户（管理员关系看组织）。
     ///
     /// 顺序：授权（付款账户）-> 请求自己声明的结构（`org` 必须是付款账户的祖先，见 [`check_membership_structure`]）-> 成员关系 id 的重放 /
-    /// 冲突 -> 主体。主体状态（没登记、已撤销）只告诉**有资格知道的人**：本机运维，或者这个主体的归属方（登记组织，或老主体已经在用它的
+    /// 冲突（调用者管不到的成员关系对调用者按「不存在」走，最后才以 `out_of_scope` 拒绝）-> 主体。主体状态（没登记、已撤销）只告诉**有资格知道的人**：本机运维，或者这个主体的归属方（登记组织，或老主体已经在用它的
     /// 组织）自己的管理员。其他人——包括调用者对目标账户有 `manage_membership`、但对归属方没有 `revoke_principal` 的外部组织，
     /// 和伪造 `org` 字段的外部组织——对活跃、已撤销、不存在拿到同一个失败（结构错是固定的 `invalid_membership`，可见性授权失败是
     /// 无细节的 `out_of_scope`）。没有归属方的活跃老主体仍可以由第一个组织挂上去。
@@ -1347,20 +1447,15 @@ impl AccountStore {
             )? {
                 return Err(Failure::new(ControlReason::OutOfScope));
             }
-            if let Some(existing) = load_membership(conn, &membership.id)? {
-                // 已有的成员关系可能属于别的付款账户：调用者对它所属的账户没有 `manage_membership` 时，不告诉他它存在
-                // （同样的 `out_of_scope`），只有管得到它的人才看得到 replayed / already_exists。
-                if membership_target(&existing) != &target {
-                    authorize_op(
-                        conn,
-                        caller,
-                        meta.now,
-                        ControlOp::ManageMembership,
-                        membership_target(&existing),
-                        None,
-                    )
-                    .map_err(|_| Failure::new(ControlReason::OutOfScope))?;
-                }
+            // 已有的成员关系读的时候限定在调用者管得到的范围里（一条语句里按子树过滤，见 `load_manageable_membership`）：管不到的和
+            // 不存在的一样得到空结果，这个 id 对调用者按「不存在」走，既不泄露它存在，也不让「读到之后再去做授权」多出一串已有 id
+            // 独有的查询（数据库工作量和响应时间都会把两种 id 区分开，Codex 预审 M3）。replayed / already_exists 留给管得到它的人。
+            if let Some(existing) = load_manageable_membership(
+                conn,
+                caller,
+                ControlOp::ManageMembership,
+                &membership.id,
+            )? {
                 return if existing == *membership {
                     Ok(Written {
                         result: WriteResult::Replayed,
@@ -1391,6 +1486,16 @@ impl AccountStore {
                 }
                 Some(_) => {}
             }
+            // 新成员关系的结构与付款账户占用校验：调用者管不到的已有 id 和不存在的 id 一起先过这一关，两者的失败和数据库执行的
+            // 语句都一样。否则付款账户已被占用时，不存在的 id 走到 `AccountAlreadyBound`（`invalid_membership`），别的组织已有的
+            // id 却是 `out_of_scope`，调用者借一个被占用的付款账户就能探测别的组织有哪些成员关系 id（Codex 预审 H1）。
+            check_new_membership_in(conn, membership)
+                .map_err(|error| Failure::from_store(error, Ctx::Membership))?;
+            // 到这里才区分：id 已经存在（只可能是调用者管不到的，管得到的上面已经处理）就以同样的 `out_of_scope` 拒绝，
+            // 不存在才创建。创建成功与否本身仍可探测（成员关系 id 是客户端自选的全局命名空间），这个残余消除不了，见设计稿 S2-10。
+            if load_membership(conn, &membership.id)?.is_some() {
+                return Err(Failure::new(ControlReason::OutOfScope));
+            }
             create_membership_in(conn, membership, meta.now)
                 .map_err(|error| Failure::from_store(error, Ctx::Membership))?;
             Ok(Written {
@@ -1413,11 +1518,15 @@ impl AccountStore {
         self.control_write(who, meta, spec, |conn, caller, spec| {
             // 先做与目标无关的授权判定，再按 id 去查（见 `require_op_capability`）
             require_op_capability(conn, caller, meta.now, ControlOp::ManageMembership)?;
-            let Some(found) = load_membership(conn, &request.membership)? else {
+            let Some(found) = load_manageable_membership(
+                conn,
+                caller,
+                ControlOp::ManageMembership,
+                &request.membership,
+            )?
+            else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
-            spec.scope_account = Some(membership_target(&found).to_string());
-            spec.related_id = Some(found.principal.to_string());
             authorize_op(
                 conn,
                 caller,
@@ -1426,6 +1535,10 @@ impl AccountStore {
                 membership_target(&found),
                 None,
             )?;
+            // 审计里由目标派生的字段（账户、关联的主体）等目标授权通过之后才填：被拒的请求不论目标存不存在，留下同样的审计行
+            // （Codex 预审 M2）
+            spec.scope_account = Some(membership_target(&found).to_string());
+            spec.related_id = Some(found.principal.to_string());
             if found.status == MembershipStatus::Revoked {
                 return Ok(Written {
                     result: WriteResult::Unchanged,
@@ -1607,10 +1720,17 @@ impl AccountStore {
         let spec =
             AuditSpec::new("issue_credential", TargetKind::Credential).target(&request.key_id);
         self.control_write(who, meta, spec, |conn, caller, spec| {
+            // 先做与目标无关的授权判定，再按成员关系 id 去取付款账户（见 `require_op_capability`）：没有这个操作权限、或绑定账户
+            // 被冻结的调用者，对已有的和不存在的成员关系得到同一个答案，没法靠错误码探测别的组织有哪些成员关系 id（issue #603 N7 同类）
+            require_op_capability(conn, caller, meta.now, ControlOp::IssueCredential)?;
             // 目标账户 = 新凭证的绑定账户。绑定的成员关系不存在，和「不在范围内」是同一个答案。
-            let anchor = binding_anchor(conn, &request.binding)?
-                .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;
-            spec.scope_account = Some(anchor.to_string());
+            let anchor = manageable_binding_anchor(
+                conn,
+                caller,
+                ControlOp::IssueCredential,
+                &request.binding,
+            )?
+            .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;
             // **先授权、后校验**：没有资格的调用者永远得到授权类的答案，不会因为请求体写得不对而得到另一种答案。
             authorize_op(
                 conn,
@@ -1620,6 +1740,8 @@ impl AccountStore {
                 &anchor,
                 None,
             )?;
+            // 审计里由目标派生的账户等目标授权通过之后才填（Codex 预审 M2）
+            spec.scope_account = Some(anchor.to_string());
             let id = CredentialId::new(request.key_id.clone()).map_err(|error| {
                 Failure::with_detail(ControlReason::InvalidRequest, error.to_string())
             })?;
@@ -1722,13 +1844,15 @@ impl AccountStore {
         self.control_write(who, meta, spec, |conn, caller, spec| {
             // 先做与目标无关的授权判定，再按 id 去查（见 `require_op_capability`）
             require_op_capability(conn, caller, meta.now, op)?;
-            let Some(found) = load_credential(conn, &request.credential)? else {
+            let Some(found) = load_manageable_credential(conn, caller, op, &request.credential)?
+            else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
             let anchor = binding_anchor(conn, found.binding())?
                 .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;
-            spec.scope_account = Some(anchor.to_string());
             authorize_op(conn, caller, meta.now, op, &anchor, None)?;
+            // 审计里由目标派生的账户等目标授权通过之后才填（Codex 预审 M2）
+            spec.scope_account = Some(anchor.to_string());
             if found.status() == request.status {
                 return Ok(Written {
                     result: WriteResult::Unchanged,
@@ -1946,12 +2070,9 @@ impl AccountStore {
         self.control_write(who, meta, spec, |conn, caller, spec| {
             // 先做与目标无关的授权判定，再按 id 去查（见 `require_op_capability`）
             require_op_capability(conn, caller, meta.now, ControlOp::GrantAllocation)?;
-            let Some(record) = load_allocation_record(conn, &request.id)? else {
+            let Some(record) = load_manageable_allocation(conn, caller, &request.id)? else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
-            spec.scope_account = Some(record.allocation.parent.to_string());
-            spec.related_id = Some(record.allocation.child.to_string());
-            spec.amount = Some(record.allocation.ceiling.amount().clone());
             authorize_op(
                 conn,
                 caller,
@@ -1960,6 +2081,10 @@ impl AccountStore {
                 &record.allocation.parent,
                 Some(record.allocation.ceiling.amount()),
             )?;
+            // 审计里由目标派生的字段（授权方账户、被授权方、金额）等目标授权通过之后才填（Codex 预审 M2）
+            spec.scope_account = Some(record.allocation.parent.to_string());
+            spec.related_id = Some(record.allocation.child.to_string());
+            spec.amount = Some(record.allocation.ceiling.amount().clone());
             if record.revoked_at_ms.is_some() {
                 return Ok(Written {
                     result: WriteResult::Unchanged,

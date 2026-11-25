@@ -9,7 +9,7 @@ use idoris_backend::{BackendError, ChatMessage, ChatRequest, RuntimeAdapter};
 use idoris_contracts::LoadPolicy;
 use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode};
 use idoris_upstream::omlx::key::{
-    EndpointKey, block_endpoint, endpoint_generation, govern_endpoint, release_endpoint,
+    EndpointKey, block_endpoint, endpoint_generation, forget_endpoint, govern_endpoint,
 };
 use idoris_upstream::{OmlxAdapter, OmlxAdapterConfig};
 use tokio_util::sync::CancellationToken;
@@ -23,6 +23,7 @@ fn adapter(endpoint: &str) -> OmlxAdapter {
         call_timeout: Duration::from_millis(500),
     })
     .unwrap()
+    .with_load_fence_path(idoris_backend::mock::temporary_load_fence_path())
     .with_per_request_key()
 }
 
@@ -117,7 +118,7 @@ async fn work_admitted_for_a_replaced_engine_sends_nothing_to_the_new_one() {
             "Bearer second-engine"
         );
     }
-    release_endpoint(&endpoint);
+    forget_endpoint(&endpoint);
 }
 
 #[tokio::test]
@@ -146,11 +147,16 @@ async fn a_blocked_endpoint_is_sent_nothing_at_all() {
     govern_endpoint(&endpoint, EndpointKey::Private("next-engine".into()));
     adapter.list().await.unwrap();
     assert_eq!(received(&server).await, 1);
-    release_endpoint(&endpoint);
+    forget_endpoint(&endpoint);
 }
 
+/// An adapter built with a fixed key (not per-request) is governed **by the endpoint it aims at, not by its own mode** (Codex
+/// pre-review of layer 2, H1; this test used to pin the opposite, "ignores the registry"). Nobody governs the endpoint: it is what it
+/// always was — no generation, no binding checked, the construction-time key goes out. The engine manager takes the endpoint over: the
+/// adapter now follows its generation, work admitted for a replaced engine and anything aimed at a blocked endpoint is refused before a
+/// byte is sent, and what does go out still carries the adapter's **own** key — the key the manager registered is never handed to it.
 #[tokio::test]
-async fn an_adapter_with_a_fixed_key_has_no_generation_and_ignores_the_registry() {
+async fn an_adapter_with_a_fixed_key_follows_the_endpoint_but_is_never_given_the_registered_key() {
     let server = server().await;
     let endpoint = server.uri();
     let fixed = OmlxAdapter::new(OmlxAdapterConfig {
@@ -158,98 +164,55 @@ async fn an_adapter_with_a_fixed_key_has_no_generation_and_ignores_the_registry(
         api_key: Some("constructed".to_owned()),
         call_timeout: Duration::from_millis(500),
     })
-    .unwrap();
+    .unwrap()
+    .with_load_fence_path(idoris_backend::mock::temporary_load_fence_path());
+
+    // Not governed: no generation, a binding is not looked at, the fixed key is sent.
     assert_eq!(fixed.engine_generation(), None);
-    govern_endpoint(&endpoint, EndpointKey::Private("engine".into()));
-    block_endpoint(&endpoint);
-    // Not per-request: the construction-time key is what it always was, bound generation or not.
     scoped(Some(0), fixed.list()).await.unwrap();
-    assert_eq!(received(&server).await, 1);
-    release_endpoint(&endpoint);
-}
+    scoped(Some(41), fixed.list()).await.unwrap();
+    assert_eq!(received(&server).await, 2);
 
-/// Codex 预审 H2：缓存的管理会话 cookie 不经过登录，登录那一处的核对管不到它。加载的 POST 返回时引擎被换代，随后的钉住（PUT）
-/// 不能带着旧 cookie 发给新引擎；加载按「结果未知」报告，调用方据此保留加载围栏。
-#[tokio::test]
-async fn a_cached_admin_session_is_not_used_after_the_engine_was_replaced_mid_load() {
-    let server = MockServer::start().await;
-    let endpoint = server.uri();
-    Mock::given(method("POST"))
-        .and(path("/v1/models/m/load"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/admin/api/login"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("set-cookie", "omlx_admin_session=cached; HttpOnly")
-                .set_body_json(serde_json::json!({"success": true})),
-        )
-        .mount(&server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path("/admin/api/models/m/settings"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models/status"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "models": [{"id": "m", "loaded": true, "pinned": true, "estimated_size": 1 << 30}]
-        })))
-        .mount(&server)
-        .await;
-    let adapter = adapter(&endpoint);
-    let resident = LoadPolicy {
-        mode: LoadMode::Resident,
-        keepalive: Keepalive::Pinned { pinned: true },
-        admission: Admission::Coexist,
-    };
-    govern_endpoint(&endpoint, EndpointKey::Private("first-engine".into()));
-    let admitted = adapter.engine_generation().unwrap();
-    // The first load logs in and caches the session cookie.
-    scoped(Some(admitted), adapter.load("m", Some(&resident)))
-        .await
-        .unwrap();
-    let puts = |requests: &[wiremock::Request]| {
-        requests
-            .iter()
-            .filter(|r| r.method.as_str() == "PUT")
-            .count()
-    };
-    assert_eq!(puts(&server.received_requests().await.unwrap()), 1);
+    // Governed: the adapter follows the endpoint's generation, and an admitted request goes out with its own key.
+    govern_endpoint(&endpoint, EndpointKey::Private("registered".into()));
+    let admitted = fixed.engine_generation().unwrap();
+    assert_eq!(admitted, endpoint_generation(&endpoint));
+    scoped(Some(admitted), fixed.list()).await.unwrap();
+    assert_eq!(received(&server).await, 3);
 
-    // The second load's POST is in flight (its answer is delayed) when the engine is replaced; its pin must not be sent.
-    let load_posts = |requests: &[wiremock::Request]| {
-        requests
-            .iter()
-            .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/v1/models/m/load")
-            .count()
-    };
-    let swap = async {
-        // Replace the engine only once the second load's POST has reached it.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while load_posts(&server.received_requests().await.unwrap()) < 2 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the second load's POST never reached the engine"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        govern_endpoint(&endpoint, EndpointKey::Private("second-engine".into()));
-    };
-    let (result, ()) = tokio::join!(
-        scoped(Some(admitted), adapter.load("m", Some(&resident))),
-        swap
-    );
-    let error = result.unwrap_err();
-    assert_eq!(error.reason_code(), "load_unconfirmed", "{error}");
-    assert!(error.to_string().contains("was replaced"), "{error}");
-    assert_eq!(
-        puts(&server.received_requests().await.unwrap()),
-        1,
-        "the cached cookie was not sent to the replacement"
-    );
-    release_endpoint(&endpoint);
+    // The engine is replaced: the old work is refused (a list, a load, a chat), nothing reaches the new one.
+    govern_endpoint(&endpoint, EndpointKey::Private("second-engine".into()));
+    for result in [
+        scoped(Some(admitted), fixed.list()).await.map(|_| ()),
+        scoped(Some(admitted), fixed.load("m", Some(&policy()))).await,
+        scoped(Some(admitted), fixed.chat(chat(), CancellationToken::new()))
+            .await
+            .map(|_| ()),
+    ] {
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("was replaced"), "{error}");
+    }
+
+    // A blocked endpoint gets nothing, bound or not.
+    assert!(block_endpoint(&endpoint));
+    let current = endpoint_generation(&endpoint);
+    for bound in [None, Some(current)] {
+        let error = scoped(bound, fixed.list()).await.unwrap_err();
+        assert!(error.to_string().contains("blocked"), "{error}");
+    }
+    assert_eq!(received(&server).await, 3, "no refused request was sent");
+
+    // Never the registered key: every request that did go out carried the adapter's own.
+    for request in server.received_requests().await.unwrap() {
+        assert_eq!(
+            request
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer constructed"
+        );
+    }
+    forget_endpoint(&endpoint);
 }

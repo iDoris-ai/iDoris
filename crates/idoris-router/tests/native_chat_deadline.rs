@@ -1,5 +1,8 @@
 //! Real HTTP + native router + Supervisor path with an eleven-second chat.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "support/state_isolation.rs"]
+mod state_isolation;
+
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -52,7 +55,11 @@ async fn native_router_survives_an_eleven_second_chat() {
         serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
     card.endpoint = upstream.uri();
     let app = build_app(AppState {
-        runtimes: Some(BoundSupervisor::spawn_omlx(&card).unwrap()).into(),
+        runtimes: Some(
+            BoundSupervisor::spawn_omlx_in_state_dir(&card, &state_isolation::fresh_state_dir())
+                .unwrap(),
+        )
+        .into(),
         cards: vec![card],
         ..AppState::default()
     });

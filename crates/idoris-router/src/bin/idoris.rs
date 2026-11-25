@@ -44,6 +44,7 @@ use idoris_router::{
     runtime::RuntimeRegistry,
     runtime_launch_config,
     startup_form::StartupForm,
+    stop::{self, ExitDeadline, StopBudgets, StopLatch, StopPlan, StopSignal, StopVerdict},
     storage,
     subscription::{
         config::SubscriptionConfig,
@@ -68,22 +69,6 @@ const EXIT_ALREADY_RUNNING: i32 = 3;
 /// Upper bound for graceful shutdown after SIGTERM/SIGINT; if in-flight
 /// requests or subscriptions do not finish in time a signal stop exits with code 1 (`stop_report` for the other causes).
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Resolves on SIGINT or (unix) SIGTERM; both take the same graceful path.
-async fn termination_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        if let Ok(mut term) = signal(SignalKind::terminate()) {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-            }
-            return;
-        }
-    }
-    let _ = tokio::signal::ctrl_c().await;
-}
 
 const BIND_HOST_ENV: &str = "IDORIS_BIND_HOST";
 
@@ -181,18 +166,47 @@ fn stop_report(
     }
 }
 
+/// 退出结果：锁存的停止原因 `verdict`（`None` = 停止流程没有走到决定这一步，服务自己倒了）加上排空的结果 `served`。
+/// 引擎的收尾（[`stop::engines_stop_after_drain`]）、退出码与日志行都从这**一个**结果来。
+///
+/// - 启动失败（门控创建完整服务体失败）：`Err`，退出码 1，没有原因行；排空也失败时，它的错误并进同一条退出信息。
+/// - 预期的停止：[`stop_report`]（排空失败不能盖掉已经确定的 3、4、5）。
+fn exit_report(
+    verdict: Option<&StopVerdict>,
+    served: Result<(), String>,
+    orphan_timeout_s: u32,
+) -> StopReport {
+    match verdict {
+        // 排空也失败了就把它的错误并进同一条退出信息，不丢（L2）：启动失败仍是退出码 1，没有原因行。
+        Some(StopVerdict::StartupFailed(message)) => StopReport {
+            lines: Vec::new(),
+            result: Err(match served {
+                Ok(()) => message.clone(),
+                Err(drain) => format!("{message}（排空也失败了：{drain}）"),
+            }),
+        },
+        Some(StopVerdict::Stop(cause)) => stop_report(Some(*cause), served, orphan_timeout_s),
+        None => stop_report(None, served, orphan_timeout_s),
+    }
+}
+
 fn main() -> std::process::ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("[idoris] 启动失败：无法创建异步运行时：{error}");
+            say(
+                std::io::stderr(),
+                &format!("[idoris] 启动失败：无法创建异步运行时：{error}"),
+            );
             return std::process::ExitCode::from(1);
         }
     };
-    let code = runtime.block_on(real_main());
+    // 整个进程必须退出的时刻：`run` 走了停止流程就记在这里（总期限从停止原因锁存起算，引擎、登记、发现文件与这最后一段拆运行时共用，H2）。
+    let exit = ExitDeadline::default();
+    let code = runtime.block_on(real_main(&exit));
     // Not `process::exit`: that skips destructors and would leak local
     // runtime children (own process groups) after a forced stop.
-    stop_runtime(runtime, RUNTIME_DROP_GRACE);
+    stop_runtime(runtime, exit.runtime_grace(RUNTIME_DROP_GRACE));
     std::process::ExitCode::from(code)
 }
 
@@ -200,26 +214,32 @@ fn stop_runtime(runtime: tokio::runtime::Runtime, grace: std::time::Duration) {
     runtime.shutdown_timeout(grace);
 }
 
-async fn real_main() -> u8 {
+/// 一行错误说明写到 stderr，写不出去（launcher 已经走了、管道的另一头关了）就算了：错误路径上 `eprintln!` 会 panic，退出码变成 101，
+/// 而不是这里本来要返回的 1（M8）。
+fn say_error(text: &str) {
+    say(std::io::stderr(), &format!("[idoris] {text}"));
+}
+
+async fn real_main(exit: &ExitDeadline) -> u8 {
     let command = match cli::parse_args(std::env::args_os().skip(1)) {
         Ok(command) => command,
         Err(message) => {
-            eprintln!("[idoris] {message}");
+            say_error(&message);
             return 1;
         }
     };
     match command {
-        cli::Command::Serve(options) => match run(options).await {
+        cli::Command::Serve(options) => match run(options, exit).await {
             // 优雅停止的退出码：0（信号）、3（agent24d 以 `instance_conflict` 拒绝）、4（孤儿超时）。
             Ok(code) => return code,
             Err(message) => {
-                eprintln!("[idoris] {}：{message}", serve_failure_label(&message));
+                say_error(&format!("{}：{message}", serve_failure_label(&message)));
                 return 1;
             }
         },
         cli::Command::Admin(cli::AdminCommand::Read(resource, options)) => {
             if let Err(message) = admin_read(resource, options).await {
-                eprintln!("[idoris] Admin 操作失败：{message}");
+                say_error(&format!("Admin 操作失败：{message}"));
                 return 1;
             }
         }
@@ -255,25 +275,25 @@ async fn real_main() -> u8 {
         // 接口规范 §2.9：只读本机文件系统，不开数据库、不取实例锁、不连 oMLX、不读任何密钥。
         cli::Command::Recommend(options) => {
             if let Err(message) = run_recommend(options) {
-                eprintln!("[idoris] {message}");
+                say_error(&message);
                 return 1;
             }
         }
         cli::Command::ModelsLocal => {
             if let Err(message) = run_models_local() {
-                eprintln!("[idoris] {message}");
+                say_error(&message);
                 return 1;
             }
         }
         cli::Command::Key(command) => {
             if let Err(message) = run_key_command(command) {
-                eprintln!("[idoris] {message}");
+                say_error(&message);
                 return 1;
             }
         }
         cli::Command::Control(command) => {
             if let Err(message) = run_control_command(command) {
-                eprintln!("[idoris] {message}");
+                say_error(&message);
                 return 1;
             }
         }
@@ -285,7 +305,7 @@ async fn real_main() -> u8 {
             Ok(0) => {}
             Ok(code) => return code,
             Err(message) => {
-                eprintln!("[idoris] {message}");
+                say_error(&message);
                 return 1;
             }
         },
@@ -464,8 +484,25 @@ fn validate_bind_authority(
     Ok(())
 }
 
+/// 启动期间（还没有拉起任何引擎、没有发布发现文件、没有登记）收到停止信号（H1）：干净地退出，退出码 0。`stage` 说明在等什么。
+fn stopped_during_startup(stage: &str) -> Result<u8, String> {
+    say_error(&format!(
+        "启动期间收到停止信号（{stage}）：还没有拉起任何引擎、没有发布发现文件，直接退出"
+    ));
+    say(std::io::stdout(), "idoris: 已停止");
+    Ok(0)
+}
+
 /// 返回优雅停止的退出码（接口规范 §2.7.5）：信号 0，`instance_conflict` 3，孤儿超时 4；启动或停止失败是 `Err`（退出码 1）。
-async fn run(options: cli::ServeOptions) -> Result<u8, String> {
+/// `exit_deadline` 记下整个进程必须退出的时刻（走了停止流程才有），`main` 拆运行时时按它算还剩多少时间。
+async fn run(options: cli::ServeOptions, exit_deadline: &ExitDeadline) -> Result<u8, String> {
+    // SIGINT 与 SIGTERM 的处理器启动一开始就注册（勘误十二，L6），不是等停止流程第一次被 poll：`select!` 在更靠前的来源已经就绪时不 poll
+    // 信号那个分支，处理器那时还没装的话，之后到的 SIGTERM 按默认动作直接杀死进程，不走优雅停止，自己拉起的引擎也来不及收尾。
+    // 注册之后到的信号被记下；启动期间那些阻塞的等待（组件目录的锁、launcher 的启动帧、Admin token）每一小段看一眼它（H1），
+    // 看到了就放弃等待、以退出码 0 退出，拉起引擎之前再看一次：已经到过的信号一定在引擎拉起之前处理。
+    let stop = StopSignal::install()
+        .map_err(|error| format!("无法注册 SIGINT/SIGTERM 处理器：{error}"))?;
+    let stop_requested = || stop.is_set();
     // 接口规范 §2.7.3：`started_at_ms` 是 iDoris 开始 `run()` 时的 Unix 毫秒（墙钟），发现文件与 `/health` 用同一个值。
     let started_at_ms = readiness::unix_millis_now();
     // 接口规范 §2.1：`instance_nonce` 每次启动一个，CSPRNG 取 256 位。秘密：只在这个进程的内存和发现文件里，
@@ -513,15 +550,28 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
         parse_bind_host(bind_host_raw.as_deref())?
     };
 
-    let components_dir =
+    let components_dir_raw =
         config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
-    let allow_mock = env_flag("IDORIS_ALLOW_MOCK");
-    let cards = components::load_components(&components_dir, allow_mock).map_err(|err| {
-        format!(
-            "无法加载组件目录 \"{}\"（IDORIS_COMPONENTS_DIR）：{err}",
-            components_dir.display()
+    // 与 `idoris setup` 的校验共用同一个取值与同一个 `dev-mock` 条件。
+    let allow_mock = components::allow_mock_from_env();
+    let lock_wait = components_lock_wait()?;
+    // 接口规范 §2.7.3、§2.7.8（勘误十二（5））：组件目录的 canonical 路径在这里**只确定一次**（`components::canonical_components_dir`），
+    // 对它加共享锁（与 `idoris setup` 的独占锁同一把：不会读到 setup 落盘到一半的卡集合）、相对锁住的目录读卡、发布给 launcher 的
+    // `launch.components_dir` 用的都是这同一个结果。
+    let (components_dir, cards) = match load_serve_components(&components_dir_raw, |canonical| {
+        components::load_components_locked_cancellable(
+            canonical,
+            allow_mock,
+            lock_wait,
+            None,
+            &stop_requested,
         )
-    })?;
+    }) {
+        Ok(loaded) => loaded,
+        // 等 `idoris setup` 放开目录锁的时候收到停止信号（H1）：不等锁等完（最长 30 秒，可配到 10 分钟），launcher 17 秒就 SIGKILL。
+        Err(ServeLoadError::Cancelled) => return stopped_during_startup("等组件目录的锁"),
+        Err(ServeLoadError::Failed(message)) => return Err(message),
+    };
     let subscription_config = SubscriptionConfig::snapshot(
         std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref(),
         std::env::var("IDORIS_ENABLE_SUBSCRIPTION").ok().as_deref(),
@@ -585,10 +635,10 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     let _instance_lock = match storage::acquire_instance_lock() {
         Ok(lock) => Some(lock),
         Err(storage::InstanceLockError::Held(db)) => {
-            eprintln!(
-                "[idoris] 启动失败：已有 iDoris 实例在使用同一数据库 {}",
+            say_error(&format!(
+                "启动失败：已有 iDoris 实例在使用同一数据库 {}",
                 db.display()
-            );
+            ));
             std::process::exit(EXIT_ALREADY_RUNNING);
         }
         Err(storage::InstanceLockError::Deferred(_)) => None,
@@ -597,16 +647,20 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     let remote_kill_switch = env_flag("IDORIS_REMOTE_KILL_SWITCH");
     // 有托管卡时，Supervisor 要等托管引擎落定（就绪，或终局的失败）才能创建（它在创建时对引擎采样一次，引擎还没好就会把启动错误粘滞住）：
     // 这里只做不启动任何任务的校验，完整的 Router（含 Supervisor）在启动门控完成时才创建并替换上去（接口规范 §2.7.6）。
-    let runtimes = if managed.is_some() {
+    // 规范勘误十二（3）：对**原始卡集**一次完整校验本地 runtime 配置，并解析适配器的环境参数（`IDORIS_LOAD_TIMEOUT_S`）：都在启动引擎、
+    // 发布发现文件、登记之前，非法值一律启动失败，不随引擎是否就绪而不同。门控放行时用解析好的参数建适配器，不再读环境。
+    let (runtimes, adapter_params) = if managed.is_some() {
         RuntimeRegistry::validate_local_configs(&cards, &local_runtime_configs)?;
-        RuntimeRegistry::default()
+        let params = RuntimeRegistry::resolve_adapter_params(&cards, &local_runtime_configs)?;
+        (RuntimeRegistry::default(), params)
     } else {
-        RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
+        let runtimes = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
             &cards,
             &local_runtime_configs,
             allocated_budget_bytes,
             remote_kill_switch,
-        )?
+        )?;
+        (runtimes, idoris_upstream::factory::AdapterParams::default())
     };
     // Preserve startup-gate precedence: component/policy/runtime validation
     // (including subscription authorization and fixed card gates) must fail
@@ -671,7 +725,7 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
             Some((catalog, facts))
         }
         Err(error) => {
-            eprintln!("[idoris] capabilities unavailable: {error}");
+            say_error(&format!("capabilities unavailable: {error}"));
             None
         }
     };
@@ -692,7 +746,7 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     let local_chat = match local_chat_source(allocated_budget_bytes) {
         Ok(source) => Some(Arc::new(source)),
         Err(error) => {
-            eprintln!("[idoris] recommendation unavailable: {error}");
+            say_error(&format!("recommendation unavailable: {error}"));
             None
         }
     };
@@ -757,10 +811,10 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
             Some(local_key_probe),
         )?;
         if let Some(tier) = &state.cloud_tier {
-            eprintln!(
-                "[idoris] 云端档已启用：{}（只在调用方带 X-iDoris-Cloud-Fallback: allow、隐私为 any、本机服务不了时才会出网；local_only 永不出网）",
+            say_error(&format!(
+                "云端档已启用：{}（只在调用方带 X-iDoris-Cloud-Fallback: allow、隐私为 any、本机服务不了时才会出网；local_only 永不出网）",
                 tier.config().origin()
-            );
+            ));
         }
     }
     // S6（儿童安全）：配置里有处理儿童数据的租户时，进程要保证正文只在内存里：
@@ -773,11 +827,11 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
             .proxy
             .disable_cache_for_tenants(cloud.child_data_tenant_scopes());
         idoris_router::cloud::safety::hardening::harden_process_for_child_data()?;
-        eprintln!(
-            "[idoris] 儿童数据加固已启用：core dump 已关闭，panic 信息已脱敏（只打位置）；处理儿童数据的租户：静态调用方簿 {} 个，云入口配置 {} 个",
+        say_error(&format!(
+            "儿童数据加固已启用：core dump 已关闭，panic 信息已脱敏（只打位置）；处理儿童数据的租户：静态调用方簿 {} 个，云入口配置 {} 个",
             cloud.child_data_tenant_scopes().len(),
             ingress_child_tenants
-        );
+        ));
     }
 
     // idoris.ai/api cloud ingress (S5): `/api/v1`, credential-derived callers, three-level limits, public abuse
@@ -797,17 +851,17 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
         )?);
         validate_public_bind(bind_host, ingress.config(), has_active_key, BIND_HOST_ENV)?;
         for warning in ingress.startup_warnings(&accounts) {
-            eprintln!("[idoris] 警告：{warning}");
+            say_error(&format!("警告：{warning}"));
         }
-        eprintln!(
-            "[idoris] 云入口已启用：/api/v1；受信反向代理 {} 条；控制面{}",
+        say_error(&format!(
+            "云入口已启用：/api/v1；受信反向代理 {} 条；控制面{}",
             ingress.config().trusted_proxies.len(),
             if ingress.config().control_plane_public {
                 "挂在公网监听上（control_plane.public: true）"
             } else {
                 "不挂在公网监听上（本机运维命令仍可用）"
             }
-        );
+        ));
         state.cloud_ingress = Some(ingress);
     } else if cloud {
         return Err("云形态缺少账户存储或云上游（不应该发生）".to_string());
@@ -841,12 +895,19 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
         .port();
     // stdin 在端口绑定之后、对外服务之前读：帧无效（或超时）在服务任何请求之前以退出码 1 退出，
     // 且只输出固定文案，绝不回显字段值。读取位置与旧的 65 字节帧相同。
+    // 读 stdin 的这两处等待（帧至多 10 秒，Admin token 也是）也能被停止信号打断（H1）：launcher 还没写、或者就是不写的时候，SIGTERM 不用等读超时。
     let (admin_token, launcher): (AdminSessionToken, LauncherConfig) = if options.launcher_stdin {
-        launcher_frame::read_launcher_frame_from_stdin()
+        match launcher_frame::read_launcher_frame_from_stdin_or_cancel(&stop_requested)
             .map_err(|error| error.to_string())?
-            .split()
+        {
+            Some(frame) => frame.split(),
+            None => return stopped_during_startup("等 launcher 的启动帧"),
+        }
     } else if options.admin_token_stdin {
-        (read_admin_token_from_stdin()?, LauncherConfig::default())
+        match read_admin_token_from_stdin_or_cancel(&stop_requested)? {
+            Some(token) => (token, LauncherConfig::default()),
+            None => return stopped_during_startup("等 Admin session token"),
+        }
     } else {
         (AdminSessionToken::mint(), LauncherConfig::default())
     };
@@ -877,6 +938,8 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
             contract_version: idoris_contracts::CONTRACT_VERSION.to_string(),
             started_at_ms,
             launch: Some(launch_snapshot(
+                &storage::canonical_process_db_path()?,
+                discovery::resolve_state_dir().as_deref(),
                 &components_dir,
                 allocated_budget_bytes,
                 &upstream_plans,
@@ -923,24 +986,32 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     };
 
     if dev_no_key_enabled {
-        eprintln!(
-            "[idoris] IDORIS_DEV_NO_KEY=1: unauthenticated chat is limited to free loopback local_only execution"
+        say_error(
+            "IDORIS_DEV_NO_KEY=1: unauthenticated chat is limited to free loopback local_only execution",
         );
     }
     if state
         .remote_kill_switch
         .load(std::sync::atomic::Ordering::SeqCst)
     {
-        eprintln!("[idoris] IDORIS_REMOTE_KILL_SWITCH=1: every request is pinned to local_only");
+        say_error("IDORIS_REMOTE_KILL_SWITCH=1: every request is pinned to local_only");
     }
-    println!(
-        "idoris: 已注册组件 [{}]",
-        if component_list.is_empty() {
-            "无"
-        } else {
-            &component_list
-        }
+    say(
+        std::io::stdout(),
+        &format!(
+            "idoris: 已注册组件 [{}]",
+            if component_list.is_empty() {
+                "无"
+            } else {
+                &component_list
+            }
+        ),
     );
+    // 拉起引擎之前最后看一次信号（H1）：到过的信号一定在引擎拉起之前处理，不先把引擎拉起来、再立刻停掉。此刻还没有任何东西需要收尾
+    // （发现文件没发布、没登记、没有引擎），监听在函数返回时关闭。
+    if stop.is_set() {
+        return stopped_during_startup("拉起引擎之前");
+    }
     // 引擎管理器（接口规范 §2.7.6）：有托管卡时，各托管引擎在后台走启动决策；完整的 Router 等它们都落定（就绪，或终局的失败：降级放行）才替换上去。
     // 启动输入里 launcher 给的 `engine`（可执行文件、`stop_on_exit`）在这里才读到（帧在端口绑定之后读）。
     let engines = match &managed {
@@ -961,14 +1032,14 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     // 有托管卡时探测器等门控完成之后才起（那时 Supervisor 表才有），之前数据面本来就是 503。
     let prober_cancel = CancellationToken::new();
     let prober_slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
-    // 停止的原因：SIGTERM、SIGINT，登记客户端要求停止（`instance_conflict`、孤儿超时），或自己拉起的引擎失效（退出码 5）。
-    // 走同一条停止路径（接口规范 §2.7.5），原因在这里记下来，决定退出码、日志、是否发 `bye`、停不停引擎。
-    let stop_cause: Arc<Mutex<Option<StopCause>>> = Arc::new(Mutex::new(None));
-    // 引擎的停止与 HTTP 排空并行（接口规范 §2.7.5 第 1 到 3 步）：停止原因一确定就在后台开始，之后等它做完。
+    // 停止的原因（接口规范 §2.7.5，勘误十二）：SIGTERM、SIGINT，登记客户端要求停止（`instance_conflict`、孤儿超时），自己拉起的引擎失效
+    // （退出码 5），或门控创建完整服务体失败（启动失败）。它们走同一条停止路径，原因只在这里**锁存一次**（先到先得）；同一轮里几个同时
+    // 成立时按 5 > 4 > 3 > 启动失败 > 信号取一个（`stop::StopSources`）。退出码、是否发 `bye`、对自有引擎的处置都从这一个结果推出；收尾的期限（`stop::STOP_DEADLINE`）从锁存那一刻起算。
+    let stop_latch: Arc<StopLatch> = Arc::new(StopLatch::default());
+    // 引擎的停止与 HTTP 排空并行（接口规范 §2.7.5 第 1 到 3 步）：停止原因一确定就在后台开始，之后等它做完。`stop_on_exit:"never"` 的
+    // 信号停止是例外：排空期间保留所有权句柄，这里一直是空的，排空结束、退出结果出来之后才定（`stop::finish_engines`）。
     let engines_stopping: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(None));
-    // 完整的服务体创建失败（门控完成时）：启动失败，退出码 1。
-    let gate_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let (gate, bodies) = match &engines {
         Some(engines) => {
             // 门控：数据面与 Admin 先服务「starting 体」。
@@ -995,19 +1066,16 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
                     // 降级放行（有托管引擎终局失败，接口规范 §2.7.6 勘误六）：没就绪的托管卡不建 Supervisor——它会去采样一个没起来、
                     // 或者没通过属主校验的端点；路由到这些卡的请求由 `/health` 的实时快照（`HealthState::managed_failure`）直接
                     // 503（带原因），别的卡照常服务。
-                    let runtime_cards: Vec<_> = state
-                        .cards
-                        .iter()
-                        .filter(|card| !outcome.degraded.contains_key(&card.provider.id))
-                        .cloned()
-                        .collect();
-                    let runtimes =
-                        RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
-                            &runtime_cards,
-                            &local_runtime_configs,
-                            allocated_budget_bytes,
-                            remote_kill_switch,
-                        )?;
+                    // 本地 runtime 配置从不绑托管卡（启动时 `validate_local_configs` 已拒绝，勘误十二（3））：配置表原样交给它，不需要投影；
+                    // 适配器参数用启动时按原始卡集解析好的，建表走启动时干跑过的同一条路径（勘误十二（3））。
+                    let runtimes = RuntimeRegistry::spawn_after_gate(
+                        &state.cards,
+                        &local_runtime_configs,
+                        |provider_id| outcome.degraded.contains_key(provider_id),
+                        allocated_budget_bytes,
+                        remote_kill_switch,
+                        &adapter_params,
+                    )?;
                     state.runtimes = runtimes.clone();
                     state.capabilities = capabilities_inputs.take().map(|(catalog, facts)| {
                         Arc::new(
@@ -1079,50 +1147,23 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     let launcher_stop_on_exit = launcher.engine.stop_on_exit;
     let shutdown_signal = {
         let registration = registration.clone();
-        let stop_cause = stop_cause.clone();
+        let stop_latch = stop_latch.clone();
         let engines = engines.clone();
         let engines_stopping = engines_stopping.clone();
-        let gate_failure = gate_failure.clone();
+        let stop = stop.clone();
         async move {
-            // 引擎失效通常只在门控完成之后才会有（之前走重启与熔断；实例任务自己 panic 是例外，也报在这里）。
-            // 没有引擎管理器时永不返回。
-            let engine_failed = async {
-                match &engines {
-                    Some(engines) => engines.engine_failed().await,
-                    None => std::future::pending().await,
-                }
-            };
-            let registration_stop = async {
-                match &registration {
-                    Some(registration) => registration.wants_stop().await,
-                    None => std::future::pending().await,
-                }
-            };
-            let cause = tokio::select! {
-                _ = termination_signal() => Some(StopCause::Signal),
-                cause = registration_stop => Some(cause),
-                _ = engine_failed => Some(StopCause::EngineFailed),
-                message = gate_failed => {
-                    // 启动失败：不是任何一种「预期的停止」，不发 `bye`，退出码 1（调用方读到 `gate_failure` 后返回 `Err`）。
-                    *gate_failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(message);
-                    None
-                }
-            };
-            if let (Some(registration), Some(cause)) = (&registration, cause) {
-                // 立即返回：自愈马上停止；信号与引擎失效时 `bye`（至多 0.5 秒）与下面的 HTTP 排空并行。
-                registration.begin_stop(cause);
-            }
-            // 引擎的停止与 HTTP 排空并行：`stop_on_exit:"never"` 只对退出码 0 有效，退出码 4、5 与 3 一律停（接口规范 §2.7.5）；
-            // 启动失败当作要停（没有对外服务过，留着引擎没有意义）。
-            if let Some(engines) = engines {
-                let stop =
-                    cause.is_none_or(|cause| cause.stops_owned_engines(launcher_stop_on_exit));
-                let handle = tokio::spawn(async move { engines.shutdown(stop).await });
-                *engines_stopping
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(handle);
-            }
-            *stop_cause.lock().unwrap_or_else(PoisonError::into_inner) = cause;
+            // 决定、锁存、开始收尾（通知登记客户端、开始停引擎）都在 `stop::decide_and_begin` 里：优先级、`bye` 与引擎处置从锁存下来的
+            // 那一个结果推出、各来源接哪个 future，都在那里用假的登记客户端与引擎管理器测过。
+            stop::decide_and_begin(
+                engines.as_ref(),
+                registration.as_ref(),
+                gate_failed,
+                stop.wait(),
+                launcher_stop_on_exit,
+                &stop_latch,
+                &engines_stopping,
+            )
+            .await;
         }
     };
     let served = match bodies {
@@ -1154,51 +1195,63 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
             .await
         }
     };
+    // 整个收尾共用一个期限（H2）：从停止原因锁存那一刻起 16 秒（没有锁存原因就从现在起），引擎、登记、发现文件、拆运行时各有一个绝对的结束时刻，
+    // 前面的段超了，后面的段至少还有自己的预留；launcher 在 SIGTERM 之后 17 秒 SIGKILL。`main` 拆运行时只等期限里剩下的。
+    let budgets = StopBudgets::for_latch(&stop_latch);
+    exit_deadline.set(budgets.exit);
     prober_cancel.cancel();
     let prober = prober_slot
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .take();
     if let Some(prober) = prober {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), prober).await;
+        // 取消之后探测任务马上结束，1 秒只是上限；它也不能吃掉引擎那一段的时间。
+        let wait = std::time::Duration::from_secs(1).min(
+            budgets
+                .engines
+                .saturating_duration_since(tokio::time::Instant::now()),
+        );
+        let _ = tokio::time::timeout(wait, prober).await;
     }
-    // 引擎的收尾：停止在停止原因确定时就已经开始（与排空并行），这里等它做完；服务自己倒了（没有走停止原因）时现在才停。
+    // 退出结果只在这里算一次：停止原因（锁存的那一个）与排空的结果都已经知道。引擎的收尾、退出码、日志行都从它来，没有第二处各自再判断。
+    let verdict = stop_latch.get().cloned();
+    let report = exit_report(verdict.as_ref(), served, launcher.orphan_timeout_s);
+    // 引擎的收尾：停止在停止原因确定时就已经开始（与排空并行），这里等它做完；`stop_on_exit:"never"` 的信号停止一直保留着所有权句柄，
+    // 到这里退出结果出来了才定：以 0 退出就移交，排空失败（退出 1）就停止并回收（接口规范 §2.7.5：保留引擎只限退出码 0）；
+    // 服务自己倒了（没有锁存任何原因）时现在才停。
     if let Some(engines) = &engines {
-        let stopping = engines_stopping
+        let started = engines_stopping
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        match stopping {
-            Some(handle) => {
-                let _ = tokio::time::timeout(ENGINE_STOP_WAIT, handle).await;
-            }
-            None => {
-                let _ = tokio::time::timeout(ENGINE_STOP_WAIT, engines.shutdown(true)).await;
-            }
-        }
+        let plan = verdict
+            .as_ref()
+            .map(|verdict| StopPlan::new(verdict, launcher_stop_on_exit).engines);
+        stop::finish_engines(
+            engines.as_ref(),
+            started,
+            plan,
+            &report.result,
+            Some(budgets.engines),
+            &|line| say(std::io::stderr(), line),
+        )
+        .await;
     }
     // 登记客户端与自愈先收尾（`bye` 已在排空期间并行发出），之后才删发现文件：否则自愈可能在删除之后又把它写回来。
-    if let Some(registration) = &registration {
-        registration.finish().await;
+    // 只等到登记那一段的结束时刻：自愈卡在等旁路锁的一次重写里（最多 5 秒）时，不能把整个退出拖过期限。
+    if let Some(registration) = &registration
+        && !registration.finish_by(Some(budgets.registration)).await
+    {
+        say_error(
+            "登记收尾超过期限，不再等待（自愈与登记客户端已中止；发现文件若没能删掉，留给下一个实例覆盖）",
+        );
     }
     // 接口规范 §2.7.3「何时删」：监听关闭之后、实例锁释放之前（`_instance_lock` 在本函数返回时才释放），
     // 仅当文件里的 `instance_id` 等于自己。SIGKILL、panic、掉电走不到这里：那是「崩溃残留」。
+    // 删除只拿到总期限里留给它的那一段：到了还没删成就留着（崩溃残留的语义：下一个拿到实例锁的实例覆盖它）。
     if let Some(target) = discovery_target {
-        remove_discovery_file(target, instance_id).await;
+        remove_discovery_file(target, instance_id, budgets.discovery).await;
     }
-    if let Some(message) = gate_failure
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take()
-    {
-        return Err(message);
-    }
-    let cause = stop_cause
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
-    // 排空失败不能盖掉已经确定的停止原因（3、4、5）：决定在 `stop_report` 里，那里有测试。
-    let report = stop_report(cause, served, launcher.orphan_timeout_s);
     for line in report.lines {
         match line {
             StopLine::Stdout(text) => say(std::io::stdout(), &text),
@@ -1208,13 +1261,29 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
     report.result
 }
 
-/// 等引擎停止的上限：SIGTERM 之后 8 秒宽限，加上 SIGKILL 与收尾（`EngineManager::shutdown` 自己也有上限，这里是外面的兜底）。
-const ENGINE_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(14);
-
-/// 退出时删发现文件：只在文件属于自己时删；删不掉（旁路锁不可用或等锁超时、IO 失败）只留一行日志，文件成为崩溃残留，
-/// 由下一个拿到实例锁的实例覆盖。日志不含路径与文件内容（`launcher_discovery.rs` 里两条进程级测试逐字断言了这两行）。
-async fn remove_discovery_file(target: Arc<discovery::DiscoveryTarget>, instance_id: String) {
-    let outcome = tokio::task::spawn_blocking(move || target.remove_if_owner(&instance_id)).await;
+/// 退出时删发现文件：只在文件属于自己时删；删不掉（旁路锁不可用或等锁超时、IO 失败、预算用完）只留一行日志，文件成为崩溃残留，
+/// 由下一个拿到实例锁的实例覆盖。日志不含路径与文件内容（`launcher_discovery.rs` 里两条进程级测试逐字断言了前两行）。
+///
+/// `deadline` 是总期限里留给这一步的结束时刻（H2）：等旁路锁只拿剩下的时间（上限仍是 `discovery.rs` 的 2 秒），预算为零就只试一次；
+/// 文件系统调用本身卡住（阻塞线程取消不了）时，这里也只多等一点点就放弃，那个线程留给 `main` 拆运行时时处理。
+async fn remove_discovery_file(
+    target: Arc<discovery::DiscoveryTarget>,
+    instance_id: String,
+    deadline: tokio::time::Instant,
+) {
+    let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let removal =
+        tokio::task::spawn_blocking(move || target.remove_if_owner_within(&instance_id, budget));
+    let outcome = match tokio::time::timeout(budget + REMOVE_OVERRUN, removal).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            say(
+                std::io::stderr(),
+                "[idoris] 发现文件未删除：超过收尾期限（文件保留，下一个实例会覆盖）",
+            );
+            return;
+        }
+    };
     match outcome {
         Ok(
             discovery::RemoveOutcome::Removed
@@ -1235,6 +1304,9 @@ async fn remove_discovery_file(target: Arc<discovery::DiscoveryTarget>, instance
         }
     }
 }
+
+/// 删发现文件的阻塞调用本身（读、比对、unlink）在预算之外多等多久：它们是毫秒级的，这只是给调度的余量。
+const REMOVE_OVERRUN: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// 托管卡的计划（接口规范 §2.7.6）：有 `idoris_managed` 声明的卡由引擎管理器托管；没有任何托管卡时没有这个值，
 /// 整个引擎管理与启动门控都不参与，行为与 v0.5.0 字节级一致。
@@ -1287,21 +1359,80 @@ impl ManagedEngines {
     }
 }
 
-/// 发现文件的 `launch`：启动输入快照（接口规范 §2.7.3）。
+/// serve 等 `idoris setup` 放开组件目录锁的上限：默认 [`components::DIR_LOCK_WAIT`]；
+/// `IDORIS_COMPONENTS_LOCK_WAIT_MS`（毫秒，诊断与测试用）可以缩短或延长。
+/// 取值不是毫秒数是启动错误（不悄悄退回默认），过大的值按上限截断（[`components::parse_lock_wait_ms`]）。
+fn components_lock_wait() -> Result<std::time::Duration, String> {
+    components::parse_lock_wait_ms(
+        std::env::var("IDORIS_COMPONENTS_LOCK_WAIT_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// 加载 serve 的组件卡（接口规范 §2.7.3、§2.7.8，勘误十二（5））。`raw_dir` 是 `IDORIS_COMPONENTS_DIR` 的取值；它的 canonical 路径
+/// 由 `components::canonical_components_dir` **只确定一次**（那是全仓唯一的一份），`load` 收到的就是这个路径（生产里是
+/// `components::load_components_locked_canonical`：对它加共享锁、相对锁住的目录读卡），返回值的第一项也是它，调用方原样交给
+/// [`launch_snapshot`]：**加锁、读卡、发布给 launcher 的 `launch.components_dir` 是同一个路径**，目录或符号链接中途被换掉也不会各指各的。
+/// 路径解析或加载失败都是启动失败，说明沿用「无法加载组件目录」那一句（点名 `IDORIS_COMPONENTS_DIR`）。
+fn load_serve_components<L>(
+    raw_dir: &std::path::Path,
+    load: L,
+) -> Result<(std::path::PathBuf, Vec<idoris_contracts::ComponentCard>), ServeLoadError>
+where
+    L: FnOnce(
+        &std::path::Path,
+    ) -> Result<Vec<idoris_contracts::ComponentCard>, components::LoadError>,
+{
+    let failed = |error: &dyn std::fmt::Display| {
+        ServeLoadError::Failed(format!(
+            "无法加载组件目录 \"{}\"（IDORIS_COMPONENTS_DIR）：{error}",
+            raw_dir.display()
+        ))
+    };
+    let canonical =
+        components::canonical_components_dir(raw_dir).map_err(|error| failed(&error))?;
+    let cards = load(&canonical).map_err(|error| match error {
+        // 被停止信号打断不是加载失败：没有读卡，调用方以退出码 0 退出（H1）。
+        components::LoadError::Cancelled => ServeLoadError::Cancelled,
+        other => failed(&other),
+    })?;
+    Ok((canonical, cards))
+}
+
+/// [`load_serve_components`] 没能返回卡集合的两种原因。
+#[derive(Debug)]
+enum ServeLoadError {
+    /// 等组件目录锁的时候收到了停止信号。
+    Cancelled,
+    /// 加载失败（启动失败，退出码 1），带完整的说明。
+    Failed(String),
+}
+
+/// 发现文件的 `launch`：启动输入快照（接口规范 §2.7.3）。`db_path` 是与实例锁用的同一个 canonical 基路径；`components_dir` 必须是
+/// [`load_serve_components`] 返回的那个 canonical 路径（加锁与读卡用的那一个）：这里**不再**解析路径，原样发布。
+///
+/// 发现文件是 UTF-8 JSON：路径必须**原样**写进去（L11：此前用 `to_string_lossy`，非 UTF-8 的字节被悄悄换成 U+FFFD，发布出去的路径指向另一个
+/// 不存在的位置，agent24d 读到的 `launch` 与 iDoris 实际用的不是同一个目录，还没有任何报错）。不是合法 UTF-8 就是启动失败，说明点名是哪个路径。
 fn launch_snapshot(
+    db_path: &std::path::Path,
+    state_dir: Option<&std::path::Path>,
     components_dir: &std::path::Path,
     allocated_budget_bytes: Option<u64>,
     plans: &[readiness::UpstreamPlan],
 ) -> Result<discovery::LaunchSnapshot, String> {
-    let lossy = |path: &std::path::Path| path.to_string_lossy().into_owned();
-    // 与实例锁用的同一个 canonical 基路径；组件目录同样给 canonical（拿不到就退到绝对路径）。
-    let components_dir = std::fs::canonicalize(components_dir)
-        .or_else(|_| std::path::absolute(components_dir))
-        .map_err(|error| format!("无法解析组件目录的绝对路径：{error}"))?;
+    let utf8 = |what: &str, path: &std::path::Path| {
+        path.to_str().map(str::to_owned).ok_or_else(|| {
+            format!(
+                "发现文件的 launch 要原样写出{what}，但它不是合法的 UTF-8（{}）：不能发布一个被悄悄改写过的路径",
+                path.display()
+            )
+        })
+    };
     Ok(discovery::LaunchSnapshot {
-        db_path: lossy(&storage::canonical_process_db_path()?),
-        state_dir: discovery::resolve_state_dir().map(|path| lossy(&path)),
-        components_dir: lossy(&components_dir),
+        db_path: utf8("数据库路径", db_path)?,
+        state_dir: state_dir.map(|path| utf8("状态目录", path)).transpose()?,
+        components_dir: utf8("组件目录", components_dir)?,
         allocated_budget_bytes,
         engines: plans
             .iter()
@@ -1314,10 +1445,22 @@ fn launch_snapshot(
     })
 }
 
+/// `idoris admin ... --token-stdin`：读一个 Admin token，10 秒内；这条命令没有「停止信号」，不会被取消。
 fn read_admin_token_from_stdin() -> Result<AdminSessionToken, String> {
     read_admin_token_with_timeout(
         || read_admin_token(&mut std::io::stdin().lock()),
         std::time::Duration::from_secs(10),
+    )
+}
+
+/// `idoris serve --admin-token-stdin`：同上，但 `cancel()` 为真（停止信号到了）就放弃，返回 `Ok(None)`（H1）。
+fn read_admin_token_from_stdin_or_cancel(
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<AdminSessionToken>, String> {
+    read_admin_token_or_cancel(
+        || read_admin_token(&mut std::io::stdin().lock()),
+        std::time::Duration::from_secs(10),
+        cancel,
     )
 }
 
@@ -1328,23 +1471,29 @@ fn read_admin_token_with_timeout<F>(
 where
     F: FnOnce() -> Result<AdminSessionToken, String> + Send + 'static,
 {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("idoris-admin-token".to_string())
-        .spawn(move || {
-            let _ = sender.send(read());
-        })
-        .map_err(|_| "无法启动 Admin session token 读取任务".to_string())?;
-    receiver
-        .recv_timeout(timeout)
-        .map_err(|error| match error {
-            std::sync::mpsc::RecvTimeoutError::Timeout => {
-                "等待 launcher Admin session token 超时".to_string()
-            }
-            std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                "Admin session token 读取任务异常结束".to_string()
-            }
-        })?
+    // 永不取消，所以 `Ok(None)` 不会出现；真出现了就当作超时，不 panic。
+    read_admin_token_or_cancel(read, timeout, &|| false)?
+        .ok_or_else(|| "等待 launcher Admin session token 超时".to_string())
+}
+
+fn read_admin_token_or_cancel<F>(
+    read: F,
+    timeout: std::time::Duration,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<AdminSessionToken>, String>
+where
+    F: FnOnce() -> Result<AdminSessionToken, String> + Send + 'static,
+{
+    match launcher_frame::wait_on_thread("idoris-admin-token", read, timeout, cancel) {
+        launcher_frame::Waited::Done(result) => result.map(Some),
+        launcher_frame::Waited::Cancelled => Ok(None),
+        launcher_frame::Waited::TimedOut => {
+            Err("等待 launcher Admin session token 超时".to_string())
+        }
+        launcher_frame::Waited::Disconnected => {
+            Err("Admin session token 读取任务异常结束".to_string())
+        }
+    }
 }
 
 fn read_admin_token(reader: &mut impl Read) -> Result<AdminSessionToken, String> {
@@ -1536,8 +1685,14 @@ where
         DEFAULT_WRITE_TIMEOUT,
     );
     let admin_listener = WriteTimeoutListener::new(admin_listener, DEFAULT_WRITE_TIMEOUT);
-    println!("idoris listening on http://{data_addr}");
-    println!("idoris admin listening on http://{admin_addr}");
+    say(
+        std::io::stdout(),
+        &format!("idoris listening on http://{data_addr}"),
+    );
+    say(
+        std::io::stdout(),
+        &format!("idoris admin listening on http://{admin_addr}"),
+    );
     let data_shutdown = shutdown.clone();
     let admin_shutdown = shutdown.clone();
     let data_server = axum::serve(
@@ -1792,6 +1947,266 @@ mod tests {
         );
     }
 
+    /// 退出结果与引擎的处置从同一个锁存的结果来（H4、H5）：门控启动失败是退出 1（排空的结果不重要），预期的停止按原因退出；
+    /// `stop_on_exit:"never"` 的信号停止，引擎只在以退出码 0 退出时保留，排空失败（退出 1）就停止并回收。
+    #[test]
+    fn the_exit_report_and_the_engine_fate_both_come_from_the_one_latched_verdict() {
+        let drain_failed = || Err(shutdown_timeout_message());
+        // 启动失败：`Err`（退出码 1），没有原因行；排空也失败时，它的错误并进同一条退出信息（不丢）；引擎一律停。
+        for (served, message) in [
+            (Ok(()), "门控失败".to_string()),
+            (
+                drain_failed(),
+                format!("门控失败（排空也失败了：{}）", shutdown_timeout_message()),
+            ),
+        ] {
+            let report = exit_report(
+                Some(&StopVerdict::StartupFailed("门控失败".to_string())),
+                served,
+                900,
+            );
+            assert_eq!(
+                report,
+                StopReport {
+                    lines: Vec::new(),
+                    result: Err(message),
+                }
+            );
+            assert!(stop::engines_stop_after_drain(&report.result));
+        }
+        // 信号停止：排空成功是退出码 0，引擎（`never`）保留；排空失败是 `Err`（退出码 1），引擎停止并回收。
+        let clean = exit_report(Some(&StopVerdict::Stop(StopCause::Signal)), Ok(()), 0);
+        assert_eq!(clean.result, Ok(0));
+        assert!(!stop::engines_stop_after_drain(&clean.result));
+        let failed = exit_report(
+            Some(&StopVerdict::Stop(StopCause::Signal)),
+            drain_failed(),
+            0,
+        );
+        assert_eq!(failed.result, Err(shutdown_timeout_message()));
+        assert!(stop::engines_stop_after_drain(&failed.result));
+        // 3、4、5：排空成功与否退出码都不变，引擎都停（这些原因一确定就已经在并行地停了）。
+        for (cause, code) in [
+            (StopCause::InstanceConflict, 3),
+            (StopCause::OrphanTimeout, 4),
+            (StopCause::EngineFailed, 5),
+        ] {
+            for served in [Ok(()), drain_failed()] {
+                let report = exit_report(Some(&StopVerdict::Stop(cause)), served, 900);
+                assert_eq!(report.result, Ok(code), "{cause:?}");
+                assert!(stop::engines_stop_after_drain(&report.result), "{cause:?}");
+            }
+        }
+        // 没有锁存任何原因（服务自己倒了）：排空的错误带出去，退出码 1。
+        assert_eq!(
+            exit_report(None, Err("data server exited unexpectedly".to_string()), 0).result,
+            Err("data server exited unexpectedly".to_string())
+        );
+    }
+
+    /// 勘误十二（5）：发布的 `launch.components_dir` 就是加载用的那个 canonical 路径，`launch_snapshot` 自己从不解析路径。
+    #[cfg(unix)]
+    #[test]
+    fn the_snapshot_publishes_the_path_it_is_given_without_resolving_it_again() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        std::fs::create_dir(&first).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let resolved = components::canonical_components_dir(&link).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&first).unwrap());
+
+        // 发布的是加载用的那个 canonical 路径，数据库路径、状态目录与额度原样带上。
+        let snapshot = launch_snapshot(
+            std::path::Path::new("/db/idoris.sqlite3"),
+            Some(std::path::Path::new("/state")),
+            &resolved,
+            Some(7),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(snapshot.components_dir, resolved.to_string_lossy());
+        assert_eq!(snapshot.db_path, "/db/idoris.sqlite3");
+        assert_eq!(snapshot.state_dir.as_deref(), Some("/state"));
+        assert_eq!(snapshot.allocated_budget_bytes, Some(7));
+        // 给它符号链接本身，发布的就是这个字符串（解析是 `components::canonical_components_dir` 的事，而且只在启动时做一次）。
+        // 再解析一次的实现会在这里把链接换成真实目录，这条断言就红。
+        assert_eq!(
+            launch_snapshot(std::path::Path::new("/db"), None, &link, None, &[])
+                .unwrap()
+                .components_dir,
+            link.to_string_lossy()
+        );
+        // 发布时**不再**做 I/O：一个根本不存在的路径也原样发布（调用方负责给 canonical 的）。
+        let ghost = std::path::Path::new("/definitely/not/there");
+        assert_eq!(
+            launch_snapshot(std::path::Path::new("/db"), None, ghost, None, &[])
+                .unwrap()
+                .components_dir,
+            "/definitely/not/there"
+        );
+    }
+
+    /// L11：发现文件是 UTF-8 JSON，路径要**原样**写进去。不是合法 UTF-8 的路径（unix 的路径是任意字节）此前被 `to_string_lossy` 悄悄把坏字节换成
+    /// U+FFFD，发布出去的 `launch` 指向另一个不存在的位置，没有任何报错。现在是启动失败，说明点名是哪个路径。三个路径各试一次，
+    /// 每一次另外两个都是好的，所以失败只可能来自被试的那一个。（不用真的建这样的文件：macOS 的 APFS 不允许非 UTF-8 的文件名，`Path` 本身可以由字节构造。）
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_path_that_is_not_utf8_is_a_startup_failure_naming_it_never_a_silently_rewritten_path()
+     {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/idoris-\xff\xfe-dir"));
+        assert!(bad.to_str().is_none());
+        let good = std::path::Path::new("/good");
+        let plans: [readiness::UpstreamPlan; 0] = [];
+
+        let error = launch_snapshot(bad, Some(good), good, None, &plans).unwrap_err();
+        assert!(error.contains("数据库路径"), "{error}");
+        assert!(error.contains("UTF-8"), "{error}");
+        let error = launch_snapshot(good, Some(bad), good, None, &plans).unwrap_err();
+        assert!(error.contains("状态目录"), "{error}");
+        let error = launch_snapshot(good, Some(good), bad, None, &plans).unwrap_err();
+        assert!(error.contains("组件目录"), "{error}");
+        // 没有状态目录（`None`）不是错误；三个都是好的就成功，原样发布。
+        let snapshot = launch_snapshot(good, None, good, None, &plans).unwrap();
+        assert_eq!(snapshot.state_dir, None);
+        assert_eq!(snapshot.db_path, "/good");
+    }
+
+    /// 勘误十二（5）、§2.7.8：**加锁、读卡、发布给 launcher 的 `launch.components_dir` 是同一个路径**。加载进行到一半（目录已经打开、锁还没拿）
+    /// 时部署把 `current` 这个符号链接切到另一个目录：
+    /// - 锁：挂钩在「已打开」与「已加锁」两个阶段看到的目录都是 canonical 的那一个，不是符号链接，也不是切过去的那个；
+    /// - 读卡：读到的是原来那个目录里的卡，不是链接此刻指向的目录里的；
+    /// - 发布：快照里的 `components_dir` 就是这个 canonical 路径（再解析一次的实现会拿到切过去的那个）。
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_the_card_reads_and_the_published_components_dir_are_one_and_the_same_path() {
+        use std::cell::RefCell;
+
+        let root = tempfile::tempdir().unwrap();
+        let card = |id: &str| {
+            include_str!("../../../../config/components/omlx.yaml").replacen(
+                "id: omlx",
+                &format!("id: {id}"),
+                1,
+            )
+        };
+        let dir_a = root.path().join("a");
+        let dir_b = root.path().join("b");
+        for (dir, id) in [(&dir_a, "card-a"), (&dir_b, "card-b")] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("card.yaml"), card(id)).unwrap();
+        }
+        let link = root.path().join("current");
+        std::os::unix::fs::symlink(&dir_a, &link).unwrap();
+        let canonical_a = std::fs::canonicalize(&dir_a).unwrap();
+        let canonical_b = std::fs::canonicalize(&dir_b).unwrap();
+
+        let seen = RefCell::new(Vec::new());
+        let hook = |phase: components::LoadPhase, dir: &std::path::Path| {
+            seen.borrow_mut().push((phase, dir.to_path_buf()));
+            if phase == components::LoadPhase::Opened {
+                // 部署此刻把 `current` 切到另一个目录。
+                std::fs::remove_file(&link).unwrap();
+                std::os::unix::fs::symlink(&dir_b, &link).unwrap();
+            }
+        };
+        let (components_dir, cards) = load_serve_components(&link, |canonical| {
+            components::load_components_locked_with_hook(
+                canonical,
+                false,
+                std::time::Duration::from_secs(5),
+                Some(&hook),
+            )
+        })
+        .unwrap();
+
+        // 链接此刻确实指向另一个目录：这个测试里「各指各的」是真的会发生的。
+        assert_eq!(std::fs::canonicalize(&link).unwrap(), canonical_b);
+        // 锁：打开与加锁用的都是 canonical 路径。
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                (components::LoadPhase::Opened, canonical_a.clone()),
+                (components::LoadPhase::Locked, canonical_a.clone()),
+            ]
+        );
+        // 读卡：读到的是原来那个目录里的卡。
+        assert_eq!(
+            cards
+                .iter()
+                .map(|card| card.provider.id.as_str())
+                .collect::<Vec<_>>(),
+            ["card-a"]
+        );
+        // 发布：交给快照的路径就是它，快照原样发布。
+        assert_eq!(components_dir, canonical_a);
+        assert_ne!(components_dir, canonical_b);
+        let snapshot = launch_snapshot(
+            std::path::Path::new("/db/idoris.sqlite3"),
+            None,
+            &components_dir,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(snapshot.components_dir, canonical_a.to_string_lossy());
+    }
+
+    /// 路径解析失败是启动失败（点名 `IDORIS_COMPONENTS_DIR` 与路径，不退回绝对路径），而且不会去加载；相对路径解析成绝对的 canonical 路径。
+    #[test]
+    fn a_components_dir_that_cannot_be_resolved_is_a_startup_failure_and_nothing_is_loaded() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let error = failed_message(
+            load_serve_components(&missing, |_| {
+                panic!("nothing may be loaded when the directory cannot be resolved")
+            })
+            .unwrap_err(),
+        );
+        assert!(error.starts_with("无法加载组件目录"), "{error}");
+        assert!(error.contains("IDORIS_COMPONENTS_DIR"), "{error}");
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        // 一个相对路径：解析成绝对的 canonical 路径（相对 cwd），不是原样保留；加载收到的也是它。
+        let (relative, _) = load_serve_components(std::path::Path::new("."), |canonical| {
+            assert_eq!(canonical, std::fs::canonicalize(".").unwrap());
+            Ok(Vec::new())
+        })
+        .unwrap();
+        assert!(relative.is_absolute());
+        assert_eq!(relative, std::fs::canonicalize(".").unwrap());
+        // 加载失败也是启动失败，说明里带着原始路径。
+        let error = failed_message(
+            load_serve_components(std::path::Path::new("."), |_| {
+                Err(components::LoadError::DirLocked {
+                    dir: "x".to_string(),
+                    waited_ms: 7,
+                })
+            })
+            .unwrap_err(),
+        );
+        assert!(error.starts_with("无法加载组件目录"), "{error}");
+    }
+
+    fn failed_message(error: ServeLoadError) -> String {
+        match error {
+            ServeLoadError::Failed(message) => message,
+            ServeLoadError::Cancelled => panic!("expected a load failure, got a cancellation"),
+        }
+    }
+
+    /// H1：等组件目录锁的时候被停止信号打断，不是加载失败：它有自己的结果（`run` 以退出码 0 退出），不带「启动失败」的说明。
+    #[test]
+    fn a_cancelled_wait_for_the_components_lock_is_not_a_load_failure() {
+        let result = load_serve_components(std::path::Path::new("."), |_| {
+            Err(components::LoadError::Cancelled)
+        });
+        assert!(
+            matches!(result, Err(ServeLoadError::Cancelled)),
+            "{result:?}"
+        );
+    }
+
     #[cfg(unix)]
     fn process_alive(pid: u32) -> bool {
         let out = std::process::Command::new("ps")
@@ -1906,6 +2321,45 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, "等待 launcher Admin session token 超时");
         assert!(!error.contains("SECRET_SENTINEL"));
+    }
+
+    /// H1：`serve --admin-token-stdin` 等 token 的时候被停止信号打断，在一个轮询间隔之内放弃，不等 10 秒的读超时；没取消时照常返回 token。
+    #[test]
+    fn the_admin_token_wait_can_be_cancelled_and_otherwise_reads_the_token() {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            read_admin_token_or_cancel(
+                || {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    Err("never".to_string())
+                },
+                std::time::Duration::from_secs(4),
+                &|| cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        });
+        assert!(matches!(result, Ok(None)), "cancelled is not an error");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "gave up promptly, not at the 4 s limit: {:?}",
+            started.elapsed()
+        );
+        let secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let token = read_admin_token_or_cancel(
+            || {
+                AdminSessionToken::from_launcher_secret(secret.as_bytes())
+                    .map_err(|e| e.to_string())
+            },
+            std::time::Duration::from_secs(5),
+            &|| false,
+        )
+        .unwrap()
+        .unwrap_or_else(|| panic!("not cancelled: the token"));
+        assert!(token.matches(secret));
     }
 
     #[tokio::test]

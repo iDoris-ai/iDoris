@@ -11,6 +11,9 @@
 mod child_guard;
 #[path = "support/fake_omlx.rs"]
 mod fake_omlx;
+// 引擎的端口是事先挑好、过一会儿才由假引擎去绑的：不能用 `bind(0)` 取号再放掉（见 `support/ports.rs`；`port_allocation.rs` 守着）。
+#[path = "support/ports.rs"]
+mod ports;
 
 use std::{
     fs,
@@ -21,21 +24,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use child_guard::ChildGuard;
+use child_guard::{ChildGuard, IsolateState};
 use fake_omlx::{Behavior, FakeOmlx, spawn_retrying};
+use ports::free_port;
 use serde_json::{Value, json};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const FILE_NAME: &str = "idoris.json";
 const PATIENT: Duration = Duration::from_secs(60);
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// 托管卡（on_demand），`idoris/fast` 绑 `fake-model`。
 fn managed_card(port: u16) -> String {
@@ -173,6 +169,7 @@ impl Env {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command.isolate_state();
         command
     }
 

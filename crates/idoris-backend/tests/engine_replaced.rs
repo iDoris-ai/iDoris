@@ -67,6 +67,8 @@ fn request(model: &str) -> ChatRequest {
 struct Engine {
     mock: MockAdapter,
     status_fails: AtomicBool,
+    /// How long `status()` takes (an engine that answers slowly).
+    status_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -74,6 +76,7 @@ impl Engine {
         Arc::new(Self {
             mock: MockAdapter::new(catalog()),
             status_fails: AtomicBool::new(false),
+            status_delay_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -93,6 +96,10 @@ impl RuntimeAdapter for Engine {
         self.mock.unload(id).await
     }
     async fn status(&self) -> Result<BackendStatus, BackendError> {
+        let delay = self.status_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         if self.status_fails.load(Ordering::SeqCst) {
             return Err(BackendError::Upstream {
                 message: "the engine is not answering".into(),
@@ -460,5 +467,48 @@ async fn residency_the_new_process_came_up_with_is_adopted_even_beyond_the_share
         let status = handle.status().await.unwrap();
         assert_eq!(status.used_gb, 20.0, "exact={exact}");
         assert_eq!(status.loaded, vec!["big".to_string()], "exact={exact}");
+    }
+}
+
+/// IDORIS-CORE S6, Codex pre-review H5: a reset whose caller has given up (its deadline passed while the new process was
+/// being sampled) must not commit. Before the fix the sampling was bounded only by `adapter_call_timeout` (1 s here), so a
+/// 600 ms sample against a 200 ms deadline completed after the caller had returned `Busy` and rebuilt the ledger (the new
+/// process's models, its capacity charge) under an owner that had already written the reset off.
+#[tokio::test]
+async fn a_reset_that_outlives_its_deadline_commits_nothing_and_fences_the_ledger() {
+    for exact in [false, true] {
+        let rig = Rig::new(exact);
+        rig.handle.load("a", 2.0, policy()).await.unwrap();
+        assert_eq!(rig.claimed(), 2.0, "exact={exact}");
+        rig.engine.mock.replace_engine();
+        rig.engine.mock.preload("big");
+        rig.engine.status_delay_ms.store(600, Ordering::SeqCst);
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        let outcome = rig.handle.engine_replaced_before(true, deadline).await;
+        assert!(
+            matches!(outcome, Err(BackendError::Busy { .. })),
+            "exact={exact}: {outcome:?}"
+        );
+        // Long past the moment the 600 ms sample would have finished.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        rig.engine.status_delay_ms.store(0, Ordering::SeqCst);
+        assert_eq!(
+            rig.claimed(),
+            2.0,
+            "exact={exact}: the late sample's capacity charge was not committed"
+        );
+        // Fail closed: the ledger describes a process that is gone and nothing replaced it, so it answers an error until a
+        // later reset succeeds (committed, the ledger would have served `big` as loaded and accepted this load).
+        assert!(
+            rig.handle.load("a", 2.0, policy()).await.is_err(),
+            "exact={exact}: an uncommitted reset leaves the ledger fenced"
+        );
+        rig.handle.engine_replaced(true).await.unwrap();
+        assert_eq!(
+            rig.claimed(),
+            20.0,
+            "exact={exact}: a reset in time commits"
+        );
     }
 }

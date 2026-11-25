@@ -348,19 +348,22 @@ impl IngressConfig {
 
     /// 配置层面的启动体检，每条是一句给运维看的警告（不是错误：运维可能有意这么配，比如只有一个来源的内网部署）。
     ///
-    /// 认证之前，单个来源的份额（`per_source_auth_unknown`）如果不小于全局总闸（`auth_unknown`）——突发或速率任何一项——
-    /// 一个来源就能耗光总闸，别的来源冷的合法凭证会跟着被拒（429 `auth_capacity_limited`）：#603 N4 要防的正是这个，
-    /// 比例配反了等于没修。
+    /// 认证之前，单个来源的份额（`per_source_auth_unknown`）超过全局总闸（`auth_unknown`）的一半——突发或速率任何一项——
+    /// 两个来源就能耗光总闸，别的来源冷的合法凭证会跟着被拒（429 `auth_capacity_limited`）：#603 N4 要防的正是这个，
+    /// 份额配得太大等于没修。刚好一半不警告：这时两个来源仍能刚好耗光突发预算，一半是约定的提示线，不是安全边界（份额不小于总闸的
+    /// 三分之一、小于一半要三个来源，更小的要四个以上）。原来份额不小于总闸才警告，119 / 199 对 1200 / 200 静默通过，
+    /// 而这个配置下一个来源能拿走 199 / 200 个令牌（PR-Daemon 在 #607 评审里指出）。
     pub fn budget_warnings(&self) -> Vec<String> {
         let (source, global) = (&self.auth_unknown_per_source, &self.auth_unknown);
+        let over_half = |share: u32, gate: u32| u64::from(share) * 2 > u64::from(gate);
         let mut warnings = Vec::new();
-        if source.burst() >= global.burst()
-            || source.requests_per_minute() >= global.requests_per_minute()
+        if over_half(source.burst(), global.burst())
+            || over_half(source.requests_per_minute(), global.requests_per_minute())
         {
             warnings.push(format!(
-                "abuse.per_source_auth_unknown（每分钟 {}、突发 {}）不小于 abuse.auth_unknown（每分钟 {}、突发 {}）：\
-                 单个来源就能耗光认证之前的全局查询预算，别的来源冷的合法凭证会跟着被拒（429 auth_capacity_limited）；\
-                 建议单来源份额明显小于总闸（默认是总闸的十分之一）",
+                "abuse.per_source_auth_unknown（每分钟 {}、突发 {}）超过 abuse.auth_unknown（每分钟 {}、突发 {}）的一半：\
+                 两个来源就能耗光认证之前的全局查询预算，别的来源冷的合法凭证会跟着被拒（429 auth_capacity_limited）；\
+                 建议单来源份额不超过总闸的一半，越小越好（默认是总闸的十分之一，十个来源一起才耗得光）",
                 source.requests_per_minute(),
                 source.burst(),
                 global.requests_per_minute(),
@@ -840,8 +843,40 @@ tenants:
             assert_eq!(found.len(), 1, "{risky}: {found:?}");
             assert!(found[0].contains("per_source_auth_unknown"), "{found:?}");
         }
+        // 份额小于总闸但超过一半的（119 / 199 对 1200 / 200）原来在这里断言「不警告」；那正是 #607 评审指出的缺口，
+        // 现在见 `a_source_share_above_half_of_the_global_gate_is_warned_about_at_startup`
+    }
+
+    /// PR-Daemon 在 #607 评审里指出：份额不小于总闸才警告，119 / 199 对 1200 / 200 静默通过，而这个配置下一个来源能拿走
+    /// 199 / 200 个令牌，再来一个来源就耗光总闸（等于没分份额）。现在份额超过总闸的一半（突发或速率任何一项）就警告：
+    /// 两个来源就能耗光认证之前的全局查询预算。刚好一半不警告（这时两个来源仍能刚好耗光突发预算，一半只是约定的提示线）；
+    /// 默认（十分之一，十个来源才耗得光）不警告。
+    #[test]
+    fn a_source_share_above_half_of_the_global_gate_is_warned_about_at_startup() {
+        let warnings = |rate: u32, burst: u32| {
+            IngressConfig::parse(&format!(
+                "{MINIMAL}abuse:\n  auth_unknown: {{requests_per_minute: 1200, burst: 200}}\n  \
+                 per_source_auth_unknown: {{requests_per_minute: {rate}, burst: {burst}}}\n"
+            ))
+            .unwrap()
+            .budget_warnings()
+        };
         assert!(
-            warnings("  auth_unknown: {requests_per_minute: 1200, burst: 200}\n  per_source_auth_unknown: {requests_per_minute: 119, burst: 199}\n").is_empty()
+            warnings(600, 100).is_empty(),
+            "exactly half is not warned about, although two sources can exactly exhaust the burst budget"
+        );
+        assert!(warnings(120, 20).is_empty(), "the default is a tenth");
+        for (rate, burst) in [(601, 100), (600, 101), (119, 199), (1199, 199), (1200, 200)] {
+            let found = warnings(rate, burst);
+            assert_eq!(found.len(), 1, "{rate}/{burst}: {found:?}");
+            assert!(found[0].contains("per_source_auth_unknown"), "{found:?}");
+            assert!(found[0].contains("一半"), "{found:?}");
+        }
+        assert!(
+            IngressConfig::parse(MINIMAL)
+                .unwrap()
+                .budget_warnings()
+                .is_empty()
         );
     }
 

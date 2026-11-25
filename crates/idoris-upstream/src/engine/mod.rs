@@ -34,7 +34,9 @@
 //! # 一个引擎从起到停（设计稿 §2.7.2，S5 会这样串起它们）
 //!
 //! 1. [`OwnedEngine::recover`]：有所有权记录就核对身份，认回上一个 iDoris 留下的引擎
-//!    （[`Recovery::Adopted`]）；启动途中被杀的（[`Recovery::Starting`]）停掉重拉；作废的记录已清掉。
+//!    （[`Recovery::Adopted`]）；启动途中被杀的（[`Recovery::Starting`]）停掉重拉；正在退出的（[`Recovery::Exiting`]：身份
+//!    吻合、只是端口上没有它在监听，上一代引擎收到 SIGTERM 之后关了监听、还在收尾）有界地停掉（SIGTERM、宽限、SIGKILL，
+//!    确认消失之后才删记录）再重拉；作废的记录已清掉。
 //!    配置里已经没有的端口，用 [`recorded_ports`] 列出该种类目录里留下的记录再逐个 `recover`；
 //! 2. [`EngineRecipe::discover`]：找可执行文件并校验；[`EngineRecipe::version`] 取版本；
 //! 3. [`EngineLaunch::new`]：配方拼命令，通用层校验并清洗环境；
@@ -48,11 +50,12 @@
 //!
 //! 外部引擎（用户自己的 oMLX.app 之类）没有对应的类型，也就没有任何一条路径能给它发信号。
 //!
-//! 全部只在 unix 上编译。不加依赖：取别的进程的身份用 `ps` / `lsof` 子进程（workspace 禁 unsafe，
-//! 设计稿风险 R5），见 `inspect.rs`。
+//! 全部只在 unix 上编译。取别的进程的身份用 `ps` / `lsof` 子进程（workspace 禁 unsafe，设计稿风险 R5），见 `inspect.rs`；唯一的例外
+//! 是每个请求的监听者确认（要便宜：不起子进程），它用 `idoris-sockprobe`（libproc、`/proc`），见 `guard.rs`。
 
 mod discovery;
 mod fsutil;
+mod guard;
 mod inspect;
 mod instance;
 mod key;
@@ -73,7 +76,11 @@ pub use discovery::{
 // oMLX 配方建自己的私有目录（`crate::omlx::engine::prepare_base_dir`）用的是记录目录、日志目录那一套
 // 「0700、自己的真目录」规则：crate 内可见，不是公开 API。
 pub(crate) use fsutil::{DirError, effective_uid, ensure_private_dir};
-pub use inspect::{InspectError, PidState, ProcessInspector, SystemInspector};
+pub use guard::{ExternalListenerGuard, OwnedListenerGuard};
+pub use inspect::{
+    Bind, FALLBACK_TTL, InspectError, ListenerWatch, ListeningSocket, MANAGED_DIAL, PidState,
+    ProcessInspector, SystemInspector,
+};
 pub use instance::{ENGINES_OWNED_DIR, EngineInstance, InstanceError, LOGS_DIR, RECORD_EXTENSION};
 pub use key::{ENGINE_KEY_HEX_LEN, EngineKey, KeyError};
 pub use launch::{
@@ -86,10 +93,10 @@ pub use listener::{
 };
 pub use logfile::{DEFAULT_KEEP, DEFAULT_MAX_BYTES, EngineLog};
 pub use owned::{
-    DEFAULT_STOP_GRACE, EngineError, IdentityVerdict, MismatchReason, OwnedEngine, ReadyPolicy,
-    Recovery, UnreadableReason, verify_identity,
+    DEFAULT_STOP_GRACE, EngineError, IdentityVerdict, MIN_CONFIRM, MIN_TERM_GRACE, MismatchReason,
+    OwnedEngine, ReadyPolicy, Recovery, UnreadableReason, stop_windows, verify_identity,
 };
-pub use probe::{EngineProbe, probe_http};
+pub use probe::{EngineProbe, probe_authorized, probe_http};
 pub use recipe::{
     EngineKind, EngineKindError, EngineRecipe, LaunchInput, LaunchPlan, RESERVED_ENGINE_KINDS,
     UNKNOWN_ENGINE_KIND,

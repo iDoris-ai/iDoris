@@ -36,6 +36,10 @@ pub struct Timings {
     /// 排空的上限（IDORIS-CORE S6）：`stop`、`restart`（以及 `start` 一个还活着却不答的引擎）先关 Supervisor 的门，再等已经在
     /// 进行的加载、聊天做完，最多等这么久；到点还没做完就切断旧一代的凭证、照样停进程（它们之后发的每个请求都被拒绝）。
     pub drain_timeout: Duration,
+    /// 一条 `start`、`stop`、`restart` 命令从入队到被实例任务收下并回答的**总**上限（IDORIS-CORE S6，Codex 终审 M5）：实例任务忙着排空、
+    /// 停进程、复位的时候，命令在容量有限的邮箱里排队；入队、等回答都算在这一个绝对的截止时间里，到点还没被收下的命令被放弃、
+    /// **之后也不会再执行**（调用方拿到 `CommandError::Closed`，Admin 回 503 `idoris_stopping`，可以重试）。
+    pub command_timeout: Duration,
     /// 身份读不出来的记录（`Recovery::Unverifiable`）：重读几次、每次隔多久，之后按失败处理。
     pub unverifiable_retries: u32,
     pub unverifiable_pause: Duration,
@@ -59,11 +63,17 @@ impl Default for Timings {
             half_open_interval: Duration::from_secs(60),
             stop_grace: Duration::from_secs(8),
             drain_timeout: Duration::from_secs(30),
+            command_timeout: Duration::from_secs(60),
             unverifiable_retries: 3,
             unverifiable_pause: Duration::from_millis(500),
         }
     }
 }
+
+/// 期限之前必须收尾的停止怎么分配时间（`stop_windows`、`MIN_TERM_GRACE`、`MIN_CONFIRM`）：定义在引擎那一层（`idoris_upstream::engine`），
+/// 因为认回的孤儿要先过身份闸才发信号，宽限必须在**真正发信号的那一刻**按期限里剩下的时间算（H3，`OwnedEngine::stop_until`），这个计算不能
+/// 留在身份闸的外面。这里只是转出来，让管理器与收尾的测试用同一份。
+pub use idoris_upstream::engine::{MIN_CONFIRM, MIN_TERM_GRACE, stop_windows};
 
 /// 第 `failures`（从 1 起）次失败之后、重启之前的等待：`base × 2^(failures-1)`，封顶 `cap`，再抖动。
 /// 规范：1、2、4 秒起翻倍，封顶 30 秒，±20%。`failures` 为 0 时不等。
@@ -157,6 +167,43 @@ mod tests {
         assert_eq!(timings.crash_limit, 5);
         assert_eq!(timings.half_open_interval, Duration::from_secs(60));
         assert_eq!(timings.stop_grace, Duration::from_secs(8));
+    }
+
+    /// 期限内的停止怎么分配时间：宽限只拿期限里剩下的，不到 2 秒就不给（SIGTERM 之后立刻 SIGKILL），确认窗口至少 0.5 秒。
+    #[test]
+    fn a_stop_against_a_deadline_gets_the_time_left_and_kills_at_once_when_under_two_seconds_remain()
+     {
+        let secs = Duration::from_secs;
+        let ms = Duration::from_millis;
+        let grace = secs(8);
+        for (remaining, term, confirm) in [
+            // 期限还很远：与没有期限一样（8 秒宽限，SIGKILL 之后至多再等 8 秒）。
+            (secs(16), secs(8), secs(8)),
+            (secs(100), secs(8), secs(8)),
+            // 排空占掉了 10 秒：宽限缩到剩下的 6 秒，确认窗口取下限。
+            (secs(6), secs(6), ms(500)),
+            (secs(2), secs(2), ms(500)),
+            // 不到 2 秒：不给宽限，SIGTERM 之后立刻 SIGKILL，剩下的时间都给确认。
+            (ms(1999), Duration::ZERO, ms(1999)),
+            (ms(1500), Duration::ZERO, ms(1500)),
+            (ms(100), Duration::ZERO, ms(500)),
+            // 期限已经过了：照样 SIGKILL，确认窗口取下限（不是零：零会把「没来得及回收」当成失败）。
+            (Duration::ZERO, Duration::ZERO, ms(500)),
+        ] {
+            assert_eq!(
+                stop_windows(grace, remaining),
+                (term, confirm),
+                "{remaining:?}"
+            );
+        }
+        // 缩短过的宽限（测试）：按自己的宽限算，不被 2 秒的下限一刀切成零。
+        assert_eq!(stop_windows(ms(300), secs(10)), (ms(300), ms(500)));
+        assert_eq!(stop_windows(ms(300), ms(200)), (Duration::ZERO, ms(500)));
+        // 宽限永远不超过原来的宽限，也不超过剩下的时间。
+        for remaining in 0..40 {
+            let (term, _) = stop_windows(grace, ms(remaining * 500));
+            assert!(term <= grace && term <= ms(remaining * 500), "{remaining}");
+        }
     }
 
     #[test]

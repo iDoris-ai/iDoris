@@ -9,7 +9,7 @@ use idoris_backend::generation;
 use idoris_contracts::common::PrivacyClass;
 use idoris_contracts::provider::Locality;
 use idoris_upstream::omlx::key::{
-    EndpointKey, block_endpoint, endpoint_generation, govern_endpoint, release_endpoint,
+    EndpointKey, block_endpoint, endpoint_generation, forget_endpoint, govern_endpoint,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -30,29 +30,14 @@ fn opts() -> ForwardOpts<'static> {
     }
 }
 
-/// 登记表是进程全局的，而端口会被操作系统很快复用给同一个进程里别的用例的假上游：每个用例结束时撤销自己的登记，不留一个
-/// 封上的（或登记着私有 key 的）端点给之后碰巧拿到同一个端口的用例。
+/// 登记表是进程全局的，而端口会被操作系统很快复用给同一个进程里别的用例的假上游：每个用例结束时把自己的登记整条删掉（代际也回到 0），
+/// 不留一个封上的（或登记着私有 key 的）端点给之后碰巧拿到同一个端口的用例。
 struct Governed(String);
 
 impl Drop for Governed {
     fn drop(&mut self) {
-        release_endpoint(&self.0);
+        forget_endpoint(&self.0);
     }
-}
-
-/// 一个此刻没人监听的端口，挑在内核的临时端口范围之外。登记表是进程全局的，而这些用例要在一个没人监听的端口上登记（甚至封上）
-/// 端点好几百毫秒：从临时范围里挑，同一个进程里别的用例的 wiremock 可能恰好被分到同一个端口，撞上这里的登记。
-fn free_port_outside_the_ephemeral_range() -> u16 {
-    // 进程内递增的游标：并行的用例拿到不同的端口（它们挑完就放掉，只靠「此刻能绑上」区分不了）。
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let start = 20_000 + std::process::id() % 5_000;
-    (0..5_000u32)
-        .map(|_| {
-            let step = NEXT.fetch_add(1, Ordering::SeqCst);
-            u16::try_from(20_000 + (start - 20_000 + step) % 10_000).unwrap_or(20_000)
-        })
-        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
-        .unwrap_or_else(|| panic!("a free port outside the ephemeral range"))
 }
 
 fn body() -> Value {
@@ -211,101 +196,68 @@ async fn a_request_bound_to_a_replaced_engine_is_refused_and_never_carries_the_n
     }
 }
 
+/// 是否受登记表管，由**端点**决定，不由这张卡能不能带 key 决定（Codex 预审 L2 的 H1；这个用例原来钉的是反过来的「`attach_omlx_key: false`
+/// 的请求不受登记表管」，那正是同一个端口上不能带 key 的卡绕过整套核对的洞）。登记表里没有的端点：与以前完全一样。被引擎管理器接管的端点：
+/// 不带 key 的卡同样过封上与代际的核对（被封上、换代之后什么都不发），通过了也**不带**登记的那个私有 key（key 只给能带它的卡）。
 #[tokio::test]
-async fn a_request_without_the_omlx_key_is_still_refused_by_a_blocked_endpoint() {
-    // `attach_omlx_key: false`（共用同一个托管端点的别的 resident 卡）：没有 key 可言，但端点被封上、或请求绑定的代际已经被换掉
-    // 时，请求体同样不发（Codex 预审 M1）；端点没有被接管时行为不变（见下一个用例）。
+async fn a_card_that_cannot_carry_the_key_is_still_governed_by_the_endpoint_it_aims_at() {
     let server = engine().await;
     let _governed = Governed(server.uri());
-    govern_endpoint(&server.uri(), EndpointKey::Private("first".into()));
-    let admitted = endpoint_generation(&server.uri());
     let proxy = ChatProxy::new(reqwest::Client::new());
     let mut plain = opts();
     plain.attach_omlx_key = false;
-    // 引擎在，代际对：发出去，不带 key。
-    let outcome = generation::scoped(Some(admitted), async {
-        proxy.forward_buffered(&server.uri(), &body(), &plain).await
-    })
-    .await;
+
+    // 登记表不认识这个端点：什么都不变。
+    let outcome = proxy.forward_buffered(&server.uri(), &body(), &plain).await;
     assert_eq!(outcome.status, 200);
     assert_eq!(authorization(&received(&server).await[0]), None);
-    // 换代：绑定旧代际的请求什么都不发。
-    govern_endpoint(&server.uri(), EndpointKey::Private("second".into()));
-    let outcome = generation::scoped(Some(admitted), async {
-        proxy.forward_buffered(&server.uri(), &body(), &plain).await
-    })
-    .await;
-    assert_eq!(outcome.status, 503);
-    assert_eq!(outcome.execution, ExecutionDisposition::NotExecuted);
-    // 封上：不绑定也不发。
-    block_endpoint(&server.uri());
-    let outcome = proxy.forward_buffered(&server.uri(), &body(), &plain).await;
-    assert_eq!(outcome.status, 503);
-    assert_eq!(
-        received(&server).await.len(),
-        1,
-        "only the first request was sent"
-    );
-}
 
-#[tokio::test]
-async fn a_request_to_an_endpoint_nobody_governs_is_not_subject_to_the_registry() {
-    let server = engine().await;
-    let proxy = ChatProxy::new(reqwest::Client::new());
-    let mut plain = opts();
-    plain.attach_omlx_key = false;
+    // 被接管、登记了私有 key：请求照发，但那个 key 不给这张卡。
+    govern_endpoint(
+        &server.uri(),
+        EndpointKey::Private("key-of-the-engine".into()),
+    );
+    let admitted = endpoint_generation(&server.uri());
     let outcome = proxy.forward_buffered(&server.uri(), &body(), &plain).await;
     assert_eq!(outcome.status, 200);
     let requests = received(&server).await;
-    assert_eq!(requests.len(), 1);
-    assert_eq!(authorization(&requests[0]), None);
-}
+    assert_eq!(requests.len(), 2);
+    assert_eq!(authorization(&requests[1]), None);
 
-/// Codex 预审 M2：重试的间隙里端点被封上，发送被本地拒绝（503，没发出去任何东西）——不是提供方的错，不能计入熔断。
-/// 连着发生比熔断上限（本地类 2 次）多的次数之后，端点恢复，下一个请求直接发出去，而不是 `provider_circuit_open`。
-#[tokio::test]
-async fn a_refusal_between_connection_retries_does_not_count_against_the_provider_breaker() {
-    let port = free_port_outside_the_ephemeral_range();
-    let uri = format!("http://127.0.0.1:{port}");
-    let _governed = Governed(uri.clone());
-    govern_endpoint(&uri, EndpointKey::Private("old".into()));
-    let proxy = Arc::new(ChatProxy::with_config(
-        reqwest::Client::new(),
-        DEFAULT_WINDOW,
-        vec![Duration::from_millis(500)],
-    ));
-    // 本地类提供方的熔断上限是 2 次连续失败；4 次本地拒绝远超它。退避 500 ms、40 ms 处封上：给慢机器留 400 ms 以上的余量。
-    for _ in 0..4 {
-        // 第一次发送连接被拒、在等重试；这时端点被封上，重试被本地拒绝。
-        govern_endpoint(&uri, EndpointKey::Private("old".into()));
-        let request = {
-            let (proxy, uri) = (Arc::clone(&proxy), uri.clone());
-            tokio::spawn(async move { proxy.forward_buffered(&uri, &body(), &opts()).await })
-        };
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        block_endpoint(&uri);
-        let outcome = request.await.unwrap();
+    // 被封上：不管哪张卡，一个字节都不发，也不碰提供方的熔断（`NotExecuted`）。
+    block_endpoint(&server.uri());
+    for _ in 0..12 {
+        let outcome = proxy.forward_buffered(&server.uri(), &body(), &plain).await;
         assert_eq!(outcome.status, 503);
         assert_eq!(outcome.execution, ExecutionDisposition::NotExecuted);
-        assert_eq!(
-            outcome.retries, 1,
-            "refused at the retry, not before the first send"
-        );
     }
-    // 端点上起了一个新引擎：请求直接发出去。
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-    let server = MockServer::builder().listener(listener).start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"choices": []})))
-        .mount(&server)
-        .await;
-    govern_endpoint(&uri, EndpointKey::Private("new".into()));
-    let outcome = proxy.forward_buffered(&uri, &body(), &opts()).await;
-    assert_eq!(
-        outcome.status, 200,
-        "the breaker never heard of the refusals"
+    assert_eq!(received(&server).await.len(), 2, "not a byte was sent");
+
+    // 换了一代的引擎：为上一代准入的请求被拒绝，为当前这一代准入的发得出去，同样不带 key。
+    govern_endpoint(
+        &server.uri(),
+        EndpointKey::Private("key-of-the-next-engine".into()),
     );
+    let stale = generation::scoped(Some(admitted), async {
+        proxy.forward_buffered(&server.uri(), &body(), &plain).await
+    })
+    .await;
+    assert_eq!(stale.status, 503);
+    assert_eq!(stale.execution, ExecutionDisposition::NotExecuted);
+    assert_eq!(
+        received(&server).await.len(),
+        2,
+        "nothing reached the new engine"
+    );
+    let current = endpoint_generation(&server.uri());
+    let outcome = generation::scoped(Some(current), async {
+        proxy.forward_buffered(&server.uri(), &body(), &plain).await
+    })
+    .await;
+    assert_eq!(outcome.status, 200);
+    let requests = received(&server).await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(authorization(&requests[2]), None);
 }
 
 /// 一次连接失败的重试，落在引擎已经被换掉之后：不发。第一次发送（还是准入时的那一代）连接被拒；等重试的时候引擎换了，端口上
@@ -314,8 +266,10 @@ async fn a_refusal_between_connection_retries_does_not_count_against_the_provide
 async fn a_connection_failure_retry_is_not_sent_to_an_engine_that_replaced_the_one_it_was_admitted_for()
  {
     for replaced in [false, true] {
-        // 第一次发送连接被拒：一个此刻没人监听的端口。
-        let port = free_port_outside_the_ephemeral_range();
+        // 先占一个端口再放掉：第一次发送连接被拒。
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
         let uri = format!("http://127.0.0.1:{port}");
         let _governed = Governed(uri.clone());
         govern_endpoint(&uri, EndpointKey::Private("key-of-the-old-engine".into()));

@@ -1,22 +1,86 @@
 //! Construction of adapters for explicitly selected provider cards.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use idoris_backend::{BackendError, RuntimeAdapter};
 use idoris_contracts::ComponentCard;
 
-/// Construct the adapter named by `card`; host detection is only a recommendation.
-pub fn create_adapter(card: &ComponentCard) -> Result<Arc<dyn RuntimeAdapter>, BackendError> {
-    match card.provider.id.as_str() {
-        "omlx" => Ok(Arc::new(create_omlx_adapter(card)?)),
-        provider => Err(BackendError::invalid_request(format!(
-            "no adapter for provider {provider}"
-        ))),
+/// Process-environment parameters an adapter needs at construction, resolved **once at start-up** by
+/// [`AdapterParams::from_env`] (an invalid value is a start-up failure) and handed to [`create_adapter_with`] when
+/// the adapter is built. With managed engines the adapters are only built after the start-up gate settles; reading
+/// the environment then made an invalid `IDORIS_LOAD_TIMEOUT_S` fail start-up only when the engine happened to be
+/// ready (a degraded gate skipped the card and never looked at the variable).
+///
+/// Not in here, on purpose: the oMLX API key. It depends on the engine's state (a managed engine's private key is
+/// only registered after the engine is up), so it is not resolved at construction at all: an eligible oMLX adapter
+/// looks it up on every request (IDORIS-CORE S6), and only parameters that do not depend on the engine are resolved here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdapterParams {
+    /// Deadline of oMLX's `POST /v1/models/{id}/load` (`IDORIS_LOAD_TIMEOUT_S`, IDORIS-CORE S8).
+    pub omlx_load_timeout: Duration,
+}
+
+impl Default for AdapterParams {
+    /// What an unset environment resolves to.
+    fn default() -> Self {
+        Self {
+            omlx_load_timeout: super::omlx::DEFAULT_LOAD_TIMEOUT,
+        }
     }
 }
 
+impl AdapterParams {
+    /// Read and validate every adapter parameter from the process environment. An invalid override fails here
+    /// instead of silently using the default.
+    pub fn from_env() -> Result<Self, BackendError> {
+        Ok(Self {
+            omlx_load_timeout: super::omlx::load_timeout_from_env(
+                std::env::var_os(super::omlx::LOAD_TIMEOUT_ENV).as_deref(),
+            )?,
+        })
+    }
+}
+
+/// Construct the adapter named by `card`; host detection is only a recommendation. Reads the environment
+/// parameters itself (and only for a provider that has any); start-up code that must fail early resolves them with
+/// [`AdapterParams::from_env`] and calls [`create_adapter_with`].
+pub fn create_adapter(card: &ComponentCard) -> Result<Arc<dyn RuntimeAdapter>, BackendError> {
+    match card.provider.id.as_str() {
+        "omlx" => create_adapter_with(card, &AdapterParams::from_env()?),
+        provider => Err(no_adapter(provider)),
+    }
+}
+
+/// [`create_adapter`] with already-resolved parameters: reads nothing from the environment, and no credential either (see
+/// [`AdapterParams`]: an eligible oMLX adapter looks its key up on every request).
+pub fn create_adapter_with(
+    card: &ComponentCard,
+    params: &AdapterParams,
+) -> Result<Arc<dyn RuntimeAdapter>, BackendError> {
+    match card.provider.id.as_str() {
+        "omlx" => Ok(Arc::new(create_omlx_adapter_with(card, params)?)),
+        provider => Err(no_adapter(provider)),
+    }
+}
+
+/// [`create_adapter_with`] for a start-up **dry run**: the same provider check and the same construction (so a card that
+/// has no adapter, or whose parameters are refused, fails the same way), and **no credential is resolved**: the key is not
+/// read from the environment or from `~/.omlx/settings.json`. No adapter this factory builds reads a credential at
+/// construction (an eligible oMLX adapter looks its key up on every request, IDORIS-CORE S6), so this is the same
+/// construction as the real build; it stays a separate entry point because the dry run's contract is named and pinned by
+/// `startup_dry_run_reads_no_key`: credentials are resolved only when a request is really made (a managed engine's private
+/// key is registered only after the engine is up), never by the dry run.
+pub fn create_adapter_unkeyed(
+    card: &ComponentCard,
+    params: &AdapterParams,
+) -> Result<Arc<dyn RuntimeAdapter>, BackendError> {
+    create_adapter_with(card, params)
+}
+
 /// The production oMLX adapter for `card` (IDORIS-CORE S6, Codex audit H2), concrete so a caller can still chain builder
-/// calls on it.
+/// calls on it. Reads the environment parameters itself, like [`create_adapter`]; start-up code that resolved them once uses
+/// [`create_omlx_adapter_with`].
 ///
 /// **Whether it may carry a key at all is decided per card, by the same check the proxy uses**
 /// ([`super::omlx::key::card_may_carry_omlx_key`]) — not by `provider.id`, which a handwritten card can claim. An eligible
@@ -25,23 +89,28 @@ pub fn create_adapter(card: &ComponentCard) -> Result<Arc<dyn RuntimeAdapter>, B
 /// `extensions.idoris_upstream`, a non-loopback endpoint, a different product pin — gets an adapter with **no key and no
 /// registry lookup**: no key from the environment, from `settings.json` or from the engine manager is ever sent to it.
 pub fn create_omlx_adapter(card: &ComponentCard) -> Result<super::OmlxAdapter, BackendError> {
-    // A load is not a management call (IDORIS-CORE S8): it gets its own, much longer deadline.
-    // An invalid override fails here, at construction (start-up), instead of silently using the default.
-    let load_timeout = super::omlx::load_timeout_from_env(
-        std::env::var_os(super::omlx::LOAD_TIMEOUT_ENV).as_deref(),
-    )?;
-    // No key is read at construction either way: an eligible adapter resolves it per request.
-    let config = super::OmlxAdapterConfig {
-        base_url: card.endpoint.clone(),
-        api_key: None,
-        call_timeout: super::omlx::DEFAULT_CALL_TIMEOUT,
-    };
-    let adapter = super::OmlxAdapter::new(config)?.with_load_timeout(load_timeout);
+    create_omlx_adapter_with(card, &AdapterParams::from_env()?)
+}
+
+/// [`create_omlx_adapter`] with already-resolved parameters (the load deadline, resolved once at start-up).
+pub fn create_omlx_adapter_with(
+    card: &ComponentCard,
+    params: &AdapterParams,
+) -> Result<super::OmlxAdapter, BackendError> {
+    // No key is read at construction either way: an eligible adapter resolves it per request. A load is not a management
+    // call (IDORIS-CORE S8): it gets its own, much longer deadline, resolved at start-up (an invalid override is a start-up
+    // failure, not a silent default).
+    let config = super::OmlxAdapterConfig::unkeyed_for_base_url(card.endpoint.clone());
+    let adapter = super::OmlxAdapter::new(config)?.with_load_timeout(params.omlx_load_timeout);
     Ok(if super::omlx::key::card_may_carry_omlx_key(card) {
         adapter.with_per_request_key()
     } else {
         adapter
     })
+}
+
+fn no_adapter(provider: &str) -> BackendError {
+    BackendError::invalid_request(format!("no adapter for provider {provider}"))
 }
 
 #[cfg(test)]
@@ -128,7 +197,7 @@ mod tests {
     /// for the endpoint, an adapter for any other card sends none.
     #[tokio::test]
     async fn only_a_card_the_proxy_would_give_a_key_gets_an_adapter_that_carries_one() {
-        use crate::omlx::key::{EndpointKey, govern_endpoint, release_endpoint};
+        use crate::omlx::key::{EndpointKey, forget_endpoint, govern_endpoint};
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -162,14 +231,16 @@ mod tests {
         ];
         for card in &disguised {
             let adapter = create_adapter(card).unwrap();
+            // The endpoint is one the engine manager governs: the adapter is bound to its generation like any other (Codex pre-review of
+            // layer 2, H1: governed is decided by the endpoint, not the card) — it just never carries the key.
             assert!(
-                adapter.engine_generation().is_none(),
+                adapter.engine_generation().is_some(),
                 "{}",
                 card.version_pin
             );
             adapter.list().await.unwrap();
         }
-        release_endpoint(&endpoint);
+        forget_endpoint(&endpoint);
 
         let sent = authorizations(&server).await;
         assert_eq!(sent.len(), 3);
@@ -182,6 +253,37 @@ mod tests {
             sent[2], None,
             "a card that is not an oMLX product pin never gets a key"
         );
+    }
+
+    /// The parameters resolved at start-up are what the adapter is built with: `create_adapter_with` reads none of
+    /// them from the environment (IDORIS-CORE audit, erratum 12 (3)).
+    #[test]
+    fn create_adapter_with_builds_the_adapter_from_the_resolved_parameters() {
+        let params = AdapterParams {
+            omlx_load_timeout: Duration::from_secs(7),
+        };
+        let adapter = create_adapter_with(&card("omlx", "http://127.0.0.1:8088"), &params)
+            .expect("adapter constructs");
+        assert_eq!(adapter.load_timeout(), Some(Duration::from_secs(7)));
+        // What an unset environment resolves to is the documented 180 seconds.
+        assert_eq!(
+            AdapterParams::default().omlx_load_timeout,
+            Duration::from_secs(180)
+        );
+        let adapter = create_adapter_with(
+            &card("omlx", "http://127.0.0.1:8088"),
+            &AdapterParams::default(),
+        )
+        .expect("adapter constructs");
+        assert_eq!(adapter.load_timeout(), Some(Duration::from_secs(180)));
+        // Same fail-closed answer as `create_adapter` for a provider that has no adapter.
+        let Err(error) = create_adapter_with(
+            &card("vllm", "http://127.0.0.1:8088"),
+            &AdapterParams::default(),
+        ) else {
+            panic!("unknown provider must not fall through to oMLX");
+        };
+        assert!(error.to_string().contains("no adapter for provider vllm"));
     }
 
     #[test]

@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use idoris_contracts::LoadPolicy;
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -144,6 +145,9 @@ enum Command {
     /// for the new process — see [`SupervisorHandle::engine_replaced`] and [`handle_reset`].
     Reset {
         sample: bool,
+        /// A reset that has not started by then is answered `Busy` and changes nothing (IDORIS-CORE S6, Codex final
+        /// review M5): a caller that gave up must not find its reset executed later, on a ledger it no longer owns.
+        deadline: Option<Instant>,
         reply: LoadReply,
     },
     /// Stop admitting new work — see [`SupervisorHandle::close_admission`].
@@ -406,10 +410,44 @@ impl SupervisorHandle {
     /// - A poisoned actor stays poisoned: the answer is its invariant violation.
     pub async fn engine_replaced(&self, sample: bool) -> Result<(), BackendError> {
         let (reply, rx) = oneshot::channel();
-        self.send(ActorMsg::Cmd(Command::Reset { sample, reply }))
-            .await?;
+        self.send(ActorMsg::Cmd(Command::Reset {
+            sample,
+            deadline: None,
+            reply,
+        }))
+        .await?;
         rx.await
             .map_err(|_| BackendError::supervisor_unavailable())?
+    }
+
+    /// [`Self::engine_replaced`] under **one absolute deadline** that covers the enqueue, the wait for quiet and the reply
+    /// (IDORIS-CORE S6, Codex final review M5): past `deadline` the call returns [`BackendError::Busy`] whatever stage it
+    /// is in, and a reset that the actor has not **started** by then is dropped without touching anything, so a caller
+    /// that gave up never finds its reset executed later.
+    pub async fn engine_replaced_before(
+        &self,
+        sample: bool,
+        deadline: Instant,
+    ) -> Result<(), BackendError> {
+        let (reply, rx) = oneshot::channel();
+        let call = async {
+            self.send(ActorMsg::Cmd(Command::Reset {
+                sample,
+                deadline: Some(deadline),
+                reply,
+            }))
+            .await?;
+            rx.await
+                .map_err(|_| BackendError::supervisor_unavailable())?
+        };
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), call).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(BackendError::busy(
+                "the reset did not finish before its deadline; nothing it had not started was changed",
+                None,
+                None,
+            )),
+        }
     }
 
     /// Stop admitting new work (IDORIS-CORE S6): from the moment this returns, a `load`, `unload`,
@@ -439,9 +477,9 @@ impl SupervisorHandle {
             .map_err(|_| BackendError::supervisor_unavailable())?
     }
 
-    /// `true` iff nothing is in flight: no load or unload is active and no chat is running. (The same
-    /// predicate [`Self::engine_replaced`] insists on.) Only meaningful as "drained" while admission is
-    /// closed — otherwise new work can start the next instant.
+    /// `true` iff nothing is in flight: no load or unload is active, no chat is running and no other admitted adapter call
+    /// (a `list`) is still running. (The same predicate [`Self::engine_replaced`] insists on.) Only meaningful as
+    /// "drained" while admission is closed — otherwise new work can start the next instant.
     pub async fn is_quiescent(&self) -> Result<bool, BackendError> {
         let (reply, rx) = oneshot::channel();
         self.send(ActorMsg::Cmd(Command::Quiescent { reply }))
@@ -1851,10 +1889,18 @@ fn handle_unload(
     }
 }
 
-/// Nothing is in flight: no load or unload is active and no chat is running. The one predicate behind
+/// Nothing is in flight: no load or unload is active, no chat is running and no other adapter call holds a call slot (an
+/// admitted `list` only holds its semaphore permit: IDORIS-CORE S6, Codex final review M1). The one predicate behind
 /// both [`SupervisorHandle::is_quiescent`] and the guard of [`handle_reset`].
-fn is_quiescent(models: &HashMap<String, ModelSlot>, active_op: &Option<ActiveOp>) -> bool {
-    active_op.is_none() && models.values().all(|slot| slot.inflight == 0)
+fn is_quiescent(
+    models: &HashMap<String, ModelSlot>,
+    active_op: &Option<ActiveOp>,
+    call_slots: &Semaphore,
+    call_slot_capacity: usize,
+) -> bool {
+    active_op.is_none()
+        && models.values().all(|slot| slot.inflight == 0)
+        && call_slots.available_permits() >= call_slot_capacity
 }
 
 /// An engine-resident model the Supervisor did not load itself (it was already in the process when the
@@ -1929,12 +1975,14 @@ fn rebaseline_runtime_capacity(
 /// of the old generation impossible.
 async fn handle_reset(
     sample: bool,
+    deadline: Option<Instant>,
     startup_probe: bool,
     models: &mut HashMap<String, ModelSlot>,
     active_op_held: bool,
+    adapter_calls_in_flight: bool,
     env: &mut Env<'_>,
 ) -> Result<(), BackendError> {
-    if active_op_held || models.values().any(|slot| slot.inflight != 0) {
+    if active_op_held || adapter_calls_in_flight || models.values().any(|slot| slot.inflight != 0) {
         return Err(BackendError::busy(
             "the engine was replaced but operations of the old one are still in flight; retry shortly",
             None,
@@ -1945,6 +1993,20 @@ async fn handle_reset(
     let latch = |env: &mut Env<'_>, err: BackendError| {
         env.startup_error = Some(err.clone());
         err
+    };
+    // The caller's deadline bounds the sampling and is checked again before anything is committed (IDORIS-CORE S6, Codex
+    // pre-review H5): a reset that outlives its caller must not commit, because the caller has by then written the result
+    // off (it no longer vouches that this ledger belongs to the process it is tracking), and a late commit is exactly what
+    // let an old reset's models and capacity charge land under the wrong owner. Not committing is not enough on its own:
+    // the old ledger describes a process that is gone, so the error latches (fail closed) until a later reset succeeds.
+    let remaining = |now: Instant| deadline.map(|deadline| deadline.saturating_duration_since(now));
+    let expired = |now: Instant| deadline.is_some_and(|deadline| now >= deadline);
+    let past_deadline = || {
+        BackendError::busy(
+            "the reset's deadline passed before it could commit: nothing was changed; the ledger stays fenced until a later reset succeeds",
+            None,
+            None,
+        )
     };
     if sample {
         // The new process has nothing loaded, so a durable marker can only be a stale one.
@@ -1959,7 +2021,9 @@ async fn handle_reset(
     let status = if sample {
         let adapter = env.adapter.clone();
         let ownership = env.load_fence.cloned();
-        let timeout = env.config.adapter_call_timeout;
+        let timeout = remaining(Instant::now()).map_or(env.config.adapter_call_timeout, |left| {
+            left.min(env.config.adapter_call_timeout)
+        });
         // The same isolation as the startup sample: a panic in the adapter is a `JoinError` here, and the
         // timeout bounds a hanging engine.
         let sampled = tokio::spawn(async move {
@@ -1982,6 +2046,10 @@ async fn handle_reset(
             loaded: Vec::new(),
         }
     };
+    // The last look at the clock before the first mutation (the capacity re-baseline is the first one).
+    if expired(Instant::now()) {
+        return Err(latch(env, past_deadline()));
+    }
     if let Err(err) = rebaseline_runtime_capacity(env, &status) {
         return Err(latch(env, err));
     }
@@ -2084,6 +2152,7 @@ async fn run_actor(
             models.insert(id.clone(), inherited_slot());
         }
     }
+    let call_slot_capacity = config.max_concurrent_adapter_calls.max(1);
     let mut env = Env {
         adapter: &adapter,
         config: &config,
@@ -2146,7 +2215,12 @@ async fn run_actor(
             }
 
             ActorMsg::Cmd(Command::Quiescent { reply }) => {
-                let _ = reply.send(Ok(is_quiescent(&models, &active_op)));
+                let _ = reply.send(Ok(is_quiescent(
+                    &models,
+                    &active_op,
+                    &call_slots,
+                    call_slot_capacity,
+                )));
             }
 
             ActorMsg::Cmd(Command::List { reply }) => {
@@ -2334,12 +2408,29 @@ async fn run_actor(
 
             // Not guarded by `startup_error`: a reset is how that latch is cleared (it answers the
             // new sample's error itself, and a poisoned actor never reaches this arm).
-            ActorMsg::Cmd(Command::Reset { sample, reply }) => {
+            ActorMsg::Cmd(Command::Reset {
+                sample,
+                deadline,
+                reply,
+            }) => {
+                // A reset whose caller has given up is not executed: it would rebuild the ledger for an engine the
+                // caller no longer vouches for (IDORIS-CORE S6, Codex final review M5).
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    let _ = reply.send(Err(BackendError::busy(
+                        "the reset's deadline had passed before it started: nothing was changed",
+                        None,
+                        None,
+                    )));
+                    continue;
+                }
+                let adapter_calls_in_flight = call_slots.available_permits() < call_slot_capacity;
                 let result = handle_reset(
                     sample,
+                    deadline,
                     startup_probe,
                     &mut models,
                     active_op.is_some(),
+                    adapter_calls_in_flight,
                     &mut env,
                 )
                 .await;

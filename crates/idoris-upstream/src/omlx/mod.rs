@@ -208,6 +208,18 @@ impl OmlxAdapterConfig {
     }
 }
 
+impl OmlxAdapterConfig {
+    /// 同 [`Self::for_base_url`]，但**不解析任何凭证**（`api_key` 为 `None`，不读环境、不读 `settings.json`）。给只想知道「这张卡能不能
+    /// 建出适配器」的启动干跑用：凭证只在真正建适配器时才解析（托管引擎的私有 key 要等引擎拉起后才登记）。
+    pub fn unkeyed_for_base_url(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            api_key: None,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+        }
+    }
+}
+
 impl Default for OmlxAdapterConfig {
     /// Resolves the API key via [`key::resolve_omlx_api_key_for`] (env, then settings.json for loopback only) — the one place this
     /// adapter touches the environment for it; every other constructor
@@ -239,8 +251,46 @@ pub struct OmlxAdapter {
     confirmation_floor: Duration,
     chat_timeout: Duration,
     client: reqwest::Client,
-    admin_session: tokio::sync::Mutex<Option<reqwest::header::HeaderValue>>,
+    admin_session: tokio::sync::Mutex<Option<admin::AdminSession>>,
     load_fence_path: Option<std::path::PathBuf>,
+}
+
+/// 一个请求的凭证（[`OmlxAdapter::credential`]）：key（没有 = 不带），以及授权那一刻端点的代际。持有它直到响应读完：per-request 模式下它
+/// 同时是端点上的一个在途操作（引擎管理器排空时等它，IDORIS-CORE S6，Codex 终审 M1）。
+struct Credential {
+    key: Option<String>,
+    generation: Option<u64>,
+    authorization: Option<key::Authorization>,
+}
+
+impl Credential {
+    fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
+    /// The authorization behind this credential (`None`: an endpoint nobody governs). The send helpers re-check it **after** the request is
+    /// built, right before it goes out (Codex re-review of layer 2, M1').
+    fn authorization(&self) -> Option<&key::Authorization> {
+        self.authorization.as_ref()
+    }
+
+    /// The base URL to send to: for an endpoint the engine manager governs, the **verified dial address** (the card's own spelling —
+    /// `localhost`, `[::1]` — is not what the guard verified); otherwise the adapter's own. Without a trailing slash.
+    fn base_url(&self, own: &str) -> String {
+        match &self.authorization {
+            Some(authorization) => authorization.dial_url(own).trim_end_matches('/').to_owned(),
+            None => own.to_owned(),
+        }
+    }
+
+    /// The client to send with: for a governed endpoint one that keeps no idle connection, so the request goes over a connection opened
+    /// **after** the authorization, never an earlier one to a process that has since been replaced (Codex focused review H6).
+    fn client(&self, own: &reqwest::Client) -> reqwest::Client {
+        match &self.authorization {
+            Some(authorization) => authorization.client(own),
+            None => own.clone(),
+        }
+    }
 }
 
 impl OmlxAdapter {
@@ -328,45 +378,94 @@ impl OmlxAdapter {
         self.api_key.as_deref()
     }
 
-    /// The credential for the request about to be made — the **one place** this adapter resolves one.
+    /// The authorization for the request about to be made — the **one place** this adapter obtains a credential, and it is
+    /// awaited **right before every send** (IDORIS-CORE S6; Codex final review H1, owner decision 2026-11-22).
     ///
-    /// In per-request mode the request's engine generation (bound by the Supervisor at admission, see
-    /// [`idoris_backend::generation`]) is checked against the endpoint's current one in the same read that
-    /// yields the key: work admitted for an engine that has since been replaced is **refused**, and so is
-    /// anything aimed at a blocked endpoint — nothing is sent, so neither the new engine's credentials nor
-    /// the request body (a prompt) can reach a process the work was not admitted for. An adapter with a
-    /// fixed key is unchanged.
-    fn api_key(&self) -> Result<Option<String>, BackendError> {
-        if !self.per_request_key {
-            return Ok(self.api_key.clone());
+    /// In per-request mode ([`key::authorize_omlx_request`]): the request's engine generation (bound by the Supervisor
+    /// at admission, see [`idoris_backend::generation`]) is checked against the endpoint's current one; work admitted
+    /// for an engine that has since been replaced is **refused**, and so is anything aimed at a blocked endpoint; and
+    /// the engine manager's guard **re-verifies the listener** on this very task, immediately before the send. Nothing
+    /// is sent on a refusal, so neither the new engine's credentials nor the request body (a prompt) can reach a
+    /// process the work was not admitted for. The authorization is also an in-flight operation the engine manager's
+    /// drain waits for, so hold the returned value until the response has been read. An adapter with a fixed key that aims
+    /// at an endpoint nobody governs is unchanged (see the next paragraph for one that aims at a governed endpoint).
+    ///
+    /// **Governed is decided by the endpoint, not by this adapter's mode** (Codex pre-review of layer 2, H1): an adapter that is not
+    /// in per-request mode (built for a card that may not carry the oMLX key, or from an explicit config) but aims at an endpoint
+    /// the engine manager governs goes through the same authorization — generation, blocked endpoint, listener re-verified, verified
+    /// dial address, in-flight registration — and keeps using its own fixed key (or none). The registered key is only ever given to a
+    /// per-request adapter.
+    async fn credential(&self) -> Result<Credential, BackendError> {
+        let per_request = self.per_request_key;
+        if !per_request && !key::is_governed_endpoint(&self.base_url) {
+            return Ok(Credential {
+                key: self.api_key.clone(),
+                generation: None,
+                authorization: None,
+            });
         }
-        key::resolve_omlx_api_key_checked(&self.base_url, idoris_backend::pinned_generation())
-            .map_err(|refusal| upstream_error(refusal.to_string()))
+        let pinned = idoris_backend::pinned_generation();
+        let authorization = if per_request {
+            key::authorize_omlx_request(&self.base_url, pinned).await
+        } else {
+            key::authorize_omlx_request_without_key(&self.base_url, pinned).await
+        }
+        .map_err(|refusal| upstream_error(refusal.to_string()))?;
+        Ok(Credential {
+            key: if per_request {
+                authorization.key().map(str::to_owned)
+            } else {
+                self.api_key.clone()
+            },
+            generation: Some(authorization.generation()),
+            authorization: Some(authorization),
+        })
+    }
+
+    /// The boundary of an operation that sends more than once (a login and the request behind it, a 401 and its retry, a load and its
+    /// pin and verification, a status read and the admin activity read): when the caller (the Supervisor) did not bind the operation to
+    /// an engine generation, bind it **here** to the one in force now, so every authorization inside it is checked against the same
+    /// engine. Without this a rotation between two sends of one operation lets the second land on the new engine — a retry logs in to
+    /// the new process and sends the original settings change to it, or a load goes to the old engine and its pin to the new one
+    /// (Codex pre-review of layer 2, M2). A caller's own binding is kept, and an adapter aimed at an ungoverned endpoint is untouched.
+    async fn operation<F: std::future::Future>(&self, operation: F) -> F::Output {
+        if idoris_backend::pinned_generation().is_some()
+            || !(self.per_request_key || key::is_governed_endpoint(&self.base_url))
+        {
+            return operation.await;
+        }
+        idoris_backend::generation::scoped(
+            Some(key::endpoint_generation(&self.base_url)),
+            operation,
+        )
+        .await
     }
 
     // Thin wrappers binding `http`'s free functions to this instance's
     // client/base_url/api_key/call_timeout — every call site below reads
     // as just "GET/POST/PUT `path`" instead of repeating all four fields.
     async fn get(&self, path: &str) -> Result<serde_json::Value, BackendError> {
-        let key = self.api_key()?;
+        let credential = self.credential().await?;
         http::get_json(
-            &self.client,
-            &self.base_url,
+            &credential.client(&self.client),
+            &credential.base_url(&self.base_url),
             path,
-            key.as_deref(),
+            credential.key(),
             self.call_timeout,
+            credential.authorization(),
         )
         .await
     }
 
     async fn post(&self, path: &str) -> Result<(), BackendError> {
-        let key = self.api_key()?;
+        let credential = self.credential().await?;
         http::post_empty(
-            &self.client,
-            &self.base_url,
+            &credential.client(&self.client),
+            &credential.base_url(&self.base_url),
             path,
-            key.as_deref(),
+            credential.key(),
             self.call_timeout,
+            credential.authorization(),
         )
         .await
     }
@@ -377,14 +476,15 @@ impl OmlxAdapter {
         body: &serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, BackendError> {
-        let key = self.api_key()?;
+        let credential = self.credential().await?;
         http::post_and_parse(
-            &self.client,
-            &self.base_url,
+            &credential.client(&self.client),
+            &credential.base_url(&self.base_url),
             path,
-            key.as_deref(),
+            credential.key(),
             timeout,
             body,
+            credential.authorization(),
         )
         .await
     }
@@ -403,6 +503,10 @@ impl OmlxAdapter {
     /// activity. Missing main key, login rejection or activity failure
     /// preserves the legacy pressure (missing/invalid → `Unknown`).
     pub async fn status(&self) -> Result<BackendStatus, BackendError> {
+        self.operation(self.status_unpinned()).await
+    }
+
+    async fn status_unpinned(&self) -> Result<BackendStatus, BackendError> {
         let mut result = status::parse_status(&self.get("/api/status").await?)?;
         if let Ok(activity) = self
             .admin_request(reqwest::Method::GET, "/admin/api/activity", None)
@@ -427,18 +531,29 @@ impl OmlxAdapter {
     /// after it — returns within that budget (plus at most [`LOAD_CONFIRMATION_FLOOR`] when the POST left
     /// less than that for the confirmation), and running out of it is `LoadUnconfirmed` too.
     pub async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+        self.operation(self.load_unpinned(id, policy)).await
+    }
+
+    async fn load_unpinned(
+        &self,
+        id: &str,
+        policy: Option<&LoadPolicy>,
+    ) -> Result<(), BackendError> {
         let budget = self.load_timeout.unwrap_or(self.call_timeout);
         let started = tokio::time::Instant::now();
-        let key = self.api_key()?;
-        http::post_load(
-            &self.client,
-            &self.base_url,
-            &self.encoded_path("/v1/models/", id, "/load"),
-            key.as_deref(),
-            budget,
-            id,
-        )
-        .await?;
+        {
+            let credential = self.credential().await?;
+            http::post_load(
+                &credential.client(&self.client),
+                &credential.base_url(&self.base_url),
+                &self.encoded_path("/v1/models/", id, "/load"),
+                credential.key(),
+                budget,
+                id,
+                credential.authorization(),
+            )
+            .await?;
+        }
         let confirm = async {
             if policy.map(|p| p.mode) == Some(LoadMode::Resident) {
                 self.pin(id).await
@@ -680,11 +795,12 @@ fn is_ready(raw: &serde_json::Value, id: &str) -> bool {
 /// shadowing rule silently doing the right thing.
 #[async_trait::async_trait]
 impl RuntimeAdapter for OmlxAdapter {
-    /// In per-request mode: the generation of the engine behind this endpoint *now* (the engine manager
-    /// bumps it whenever the credentials it registered for the endpoint change). The Supervisor binds
-    /// every admitted operation to it; see [`Self::api_key`].
+    /// In per-request mode, **or when the endpoint is one the engine manager governs** (an adapter built for a card that may not carry the
+    /// oMLX key but aims at a governed port: Codex pre-review of layer 2, H1): the generation of the engine behind this endpoint *now* (the
+    /// engine manager bumps it whenever the credentials it registered for the endpoint change). The Supervisor binds every admitted
+    /// operation to it; see [`Self::api_key`].
     fn engine_generation(&self) -> Option<u64> {
-        self.per_request_key
+        (self.per_request_key || key::is_governed_endpoint(&self.base_url))
             .then(|| key::endpoint_generation(&self.base_url))
     }
 
@@ -912,7 +1028,7 @@ mod tests {
             authorization_of(&server, 1).await.as_deref(),
             Some("Bearer owned")
         );
-        key::release_endpoint(&endpoint);
+        key::forget_endpoint(&endpoint);
     }
 
     // Per-failure-mode coverage (4xx/5xx/timeout/malformed body) already
