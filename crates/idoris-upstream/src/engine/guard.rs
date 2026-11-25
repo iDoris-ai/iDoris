@@ -760,6 +760,69 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// Codex re-review H1: a **fresh** verifier (an iDoris that restarted while the engine kept running) uses the production signature check,
+    /// which used to be `codesign --verify <pid>`: it reads the file on disk, so an engine whose executable was updated or deleted after it
+    /// started was refused although it runs fine. A team-signed program (the Python inside the oMLX app, when installed) runs from a copy
+    /// that is deleted; no test double stands in for the signature check. Skipped where the app is not installed.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_fresh_verifier_with_the_production_signature_check_accepts_an_engine_whose_executable_is_gone()
+     {
+        let home =
+            std::path::Path::new("/Applications/oMLX.app/Contents/Resources/Python/cpython-3.11");
+        if !home.join("bin/python3.11").exists() {
+            eprintln!("SKIPPED: the oMLX app is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink(home.join("lib"), dir.path().join("lib")).unwrap();
+        let exe = dir.path().join("bin/py");
+        std::fs::copy(home.join("bin/python3.11"), &exe).unwrap();
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let mut child = std::process::Command::new(&exe)
+            .args([
+                "-I",
+                "-S",
+                "-c",
+                &format!(
+                    "import socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',{port}))\ns.listen(4)\ntime.sleep(60)"
+                ),
+            ])
+            .env("PYTHONHOME", home)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let policy =
+            || ListenerPolicy::new("PSK5Q5T46L").with_uid(rustix::process::getuid().as_raw());
+        let fresh = || {
+            ListenerVerifier::new(
+                Arc::new(super::super::inspect::SystemInspector::new()),
+                policy(),
+            )
+        };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if fresh().check(port).await.is_verified() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the engine was never accepted");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        std::fs::remove_file(&exe).unwrap();
+        assert!(
+            fresh().check(port).await.is_verified(),
+            "a fresh verifier refused a running engine whose executable is gone"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[tokio::test]
     async fn an_owned_fallback_does_not_authorize_a_recycled_pid() {
         let fake = Fake::new();
@@ -896,6 +959,49 @@ mod tests {
         );
         assert_eq!(fake.listens_asked(), 2);
         forget_endpoint(url);
+    }
+
+    /// Codex re-review: a request deadline of the HTTP client (not an outer cancellation) ends the send with a plain timeout error while the
+    /// connection may still have been pending: the completed error must invalidate the generation's positive cache too.
+    #[tokio::test]
+    async fn a_client_timeout_before_any_response_invalidates_its_generation() {
+        use crate::omlx::key::{
+            EndpointKey, KeyRefusal, authorize_omlx_request, forget_endpoint,
+            govern_endpoint_guarded, send_authorized,
+        };
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+        let url = server.uri();
+        let fake = Fake::new();
+        fake.reuse_for(Duration::from_secs(60));
+        fake.script_listens(vec![Ok(true)]);
+        govern_endpoint_guarded(
+            &url,
+            EndpointKey::Private("k".into()),
+            Some(Arc::new(owned(&fake))),
+        );
+        let current = authorize_omlx_request(&url, None).await.unwrap();
+        fake.script_listens(vec![Ok(false)]);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let error = send_authorized(Some(&current), client.get(&url).send())
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout() && !error.is_connect(), "{error:?}");
+        assert_eq!(
+            authorize_omlx_request(&url, Some(current.generation()))
+                .await
+                .unwrap_err(),
+            KeyRefusal::ListenerChanged
+        );
+        forget_endpoint(&url);
     }
 
     // ----- the slow question (no watch, no reuse window): what the guards asked before the per-request watch existed -----------------

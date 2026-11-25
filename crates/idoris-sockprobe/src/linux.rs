@@ -69,6 +69,7 @@ pub(crate) fn executable_identity(pid: u32) -> Option<crate::ExecutableIdentity>
     Some(crate::ExecutableIdentity {
         cdhash: None,
         image: Some(image),
+        exec_version: None,
     })
 }
 
@@ -967,5 +968,10 @@ pub(crate) fn acl_grants_others_write_fd(_fd: i32, _owner: u32) -> Option<bool> 
 
 #[cfg(target_os = "linux")]
 pub(crate) fn acl_grants_others_write_link(_path: &Path, _owner: u32) -> Option<bool> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn signing_team(_pid: u32) -> Option<String> {
     None
 }

@@ -175,6 +175,23 @@ pub(crate) fn resolve_checked_in(
     .and_then(|key| key.into_string().ok()))
 }
 
+/// [`resolve_checked_in`] for the request path: the same decision (this endpoint's governedscope included), with the `settings.json` read off the
+/// runtime worker and through the stat-keyed cache. A fixed-key adapter that was built while the settings could not be verified uses it on
+/// every request until the file can be verified again.
+pub(crate) async fn resolve_checked_async_in(
+    base_url: &str,
+    env: Option<OsString>,
+    home: Option<&Path>,
+) -> Result<Option<String>, KeyRefusal> {
+    let governed = governed_endpoint(base_url);
+    match plan_for_endpoint(env, home, is_loopback_base_url(base_url), governed.as_ref()) {
+        Plan::Done(key) => Ok(key.and_then(|key| key.into_string().ok())),
+        Plan::Settings(home) => read_settings_key_async(&home)
+            .await
+            .map_err(|_| KeyRefusal::SettingsUnverifiable),
+    }
+}
+
 /// 只回答「`base_url` 是不是引擎管理器接管的端点」：是，给出发往它的 key（`None` = 不带 key）；不是，`None` 外面再包一层
 /// （调用方沿用自己原来的 key 来源）。
 pub fn resolve_governed_os(base_url: &str) -> Option<Option<OsString>> {
@@ -869,13 +886,22 @@ pub async fn send_authorized(
     };
     let result = send.await;
     pending.armed = false;
-    result.inspect_err(|error| {
-        if error.is_connect()
-            && let Some(authorization) = authorization
-        {
-            authorization.connection_failed();
-        }
-    })
+    result
+        .inspect(|response| {
+            // An upstream refused the credential: the key in the settings cache may be stale (a rotation the timestamps did not show).
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                invalidate_settings_cache();
+            }
+        })
+        .inspect_err(|error| {
+            // A connection error, or a timeout before any response (it may have been in the connect phase, and reqwest reports a request
+            // deadline as a plain timeout): the listener evidence is not trusted any more.
+            if (error.is_connect() || error.is_timeout())
+                && let Some(authorization) = authorization
+            {
+                authorization.connection_failed();
+            }
+        })
 }
 
 /// **每个要发往 oMLX 端点的请求在发出之前**调用（IDORIS-CORE S6，Codex 终审 H1；owner 2026-11-22 拍板）：在同一个任务里，紧挨着
@@ -1209,6 +1235,36 @@ fn read_settings_once_with(
     missing_is_absent: bool,
     #[cfg(unix)] trust: Trust,
 ) -> Result<Option<String>, SettingsError> {
+    #[cfg(unix)]
+    return read_settings_stamped(home, missing_is_absent, trust).0;
+    #[cfg(not(unix))]
+    read_settings_stamped(home, missing_is_absent).0
+}
+
+/// [`read_settings_once_with`], and the state of the **opened** file after it was read (`fstat` of the descriptor: what was read is what
+/// this describes), for the cache to compare with what the path said before and after.
+fn read_settings_stamped(
+    home: &Path,
+    missing_is_absent: bool,
+    #[cfg(unix)] trust: Trust,
+) -> (Result<Option<String>, SettingsError>, Option<FileStamp>) {
+    let mut opened_stamp = None;
+    let result = read_settings_inner(
+        home,
+        missing_is_absent,
+        #[cfg(unix)]
+        trust,
+        &mut opened_stamp,
+    );
+    (result, opened_stamp)
+}
+
+fn read_settings_inner(
+    home: &Path,
+    missing_is_absent: bool,
+    #[cfg(unix)] trust: Trust,
+    opened_stamp: &mut Option<FileStamp>,
+) -> Result<Option<String>, SettingsError> {
     #[cfg(test)]
     FILE_READS
         .lock()
@@ -1233,11 +1289,17 @@ fn read_settings_once_with(
         return Err(SettingsError::Unreadable);
     }
     let mut raw = Vec::new();
+    #[cfg(unix)]
+    let file_after_read = file.try_clone().map_err(|_| SettingsError::Unreadable)?;
     file.take(SETTINGS_MAX_BYTES + 1)
         .read_to_end(&mut raw)
         .map_err(|_| SettingsError::Unreadable)?;
     if raw.len() as u64 > SETTINGS_MAX_BYTES {
         return Err(SettingsError::Unreadable);
+    }
+    #[cfg(unix)]
+    {
+        *opened_stamp = file_after_read.metadata().ok().map(|m| FileStamp::of(&m));
     }
     let value: serde_json::Value =
         serde_json::from_slice(&raw).map_err(|_| SettingsError::InvalidJson)?;
@@ -1318,12 +1380,42 @@ fn settings_stamp(home: &Path) -> Option<SettingsStamp> {
     ]))
 }
 
-/// The parsed result of the last successful read per home, valid while the [`SettingsStamp`] is unchanged: the request path asks the
-/// file system only a few `stat`s instead of opening, checking and parsing the file every time. A change (which includes a rewrite in
-/// place) is seen by the very next request. Failures are never cached.
+/// How long a cached parse may be reused at most, whatever the stamps say: a file system with coarse timestamps can leave every stamp field
+/// equal across an in-place rewrite of the same length within one tick, so a rotated key is picked up within this bound at the latest.
 #[cfg(unix)]
-static SETTINGS_CACHE: Mutex<Vec<(std::path::PathBuf, SettingsStamp, Option<String>)>> =
-    Mutex::new(Vec::new());
+const SETTINGS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(unix)]
+struct CachedSettings {
+    home: std::path::PathBuf,
+    stamp: SettingsStamp,
+    key: Option<String>,
+    at: std::time::Instant,
+}
+
+/// The parsed result of the last successful read per home, valid while the [`SettingsStamp`] is unchanged **and** younger than
+/// [`SETTINGS_CACHE_TTL`]: the request path asks the file system only a few `stat`s instead of opening, checking and parsing the file every
+/// time. A change (which includes a rewrite in place, on a file system with fine timestamps) is seen by the very next request; an upstream
+/// 401 drops the cache at once ([`invalidate_settings_cache`]). Failures are never cached.
+#[cfg(unix)]
+static SETTINGS_CACHE: Mutex<Vec<CachedSettings>> = Mutex::new(Vec::new());
+
+/// How many times the cache was dropped on purpose (tests bound the reads they expect by it).
+#[cfg(unix)]
+static SETTINGS_INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Forget every cached `settings.json` parse: an upstream answered 401 to a request that carried (or should have carried) a key from there,
+/// so the next request reads the file again whatever the timestamps say.
+pub(crate) fn invalidate_settings_cache() {
+    #[cfg(unix)]
+    {
+        SETTINGS_INVALIDATIONS.fetch_add(1, Ordering::SeqCst);
+        SETTINGS_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+}
 
 #[cfg(unix)]
 fn cached_settings(home: &Path, stamp: &SettingsStamp) -> Option<Option<String>> {
@@ -1331,8 +1423,25 @@ fn cached_settings(home: &Path, stamp: &SettingsStamp) -> Option<Option<String>>
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
-        .find(|(path, cached, _)| path == home && cached == stamp)
-        .map(|(_, _, key)| key.clone())
+        .find(|entry| {
+            entry.home == home && &entry.stamp == stamp && entry.at.elapsed() < SETTINGS_CACHE_TTL
+        })
+        .map(|entry| entry.key.clone())
+}
+
+/// May the result of a read be cached? Only when the file that was **opened and read** is the file the path named before the read and still
+/// names after it: the descriptor's state after the read equals the path's `settings.json` stamp before and after, and the whole stamp
+/// (directories included) did not move.
+#[cfg(unix)]
+fn cacheable(
+    before: &SettingsStamp,
+    opened: Option<&FileStamp>,
+    after: Option<&SettingsStamp>,
+) -> bool {
+    match (opened, after) {
+        (Some(opened), Some(after)) => before == after && *opened == before.0[3],
+        _ => false,
+    }
 }
 
 #[cfg(unix)]
@@ -1340,14 +1449,19 @@ fn remember_settings(home: &Path, stamp: SettingsStamp, key: &Option<String>) {
     let mut cache = SETTINGS_CACHE
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    cache.retain(|(path, _, _)| path != home);
+    cache.retain(|entry| entry.home != home);
     if cache.len() >= 16 {
         cache.clear();
     }
-    cache.push((home.to_owned(), stamp, key.clone()));
+    cache.push(CachedSettings {
+        home: home.to_owned(),
+        stamp,
+        key: key.clone(),
+        at: std::time::Instant::now(),
+    });
 }
 
-/// The async twin of [`read_settings_key`] for the request path: an unchanged file (a few `stat`s, no blocking pool) answers from the
+/// The async twin of [`read_settings_key`] for the request path: an unchanged, fresh file (a few `stat`s, no blocking pool) answers from the
 /// cache; otherwise every file operation runs on the blocking pool and the retry pause is a timer, so no runtime worker is held while a
 /// truncated snapshot settles.
 async fn read_settings_key_async(home: &Path) -> Result<Option<String>, SettingsError> {
@@ -1361,21 +1475,41 @@ async fn read_settings_key_async(home: &Path) -> Result<Option<String>, Settings
         return Ok(hit);
     }
     let first = home.to_owned();
-    let result = match tokio::task::spawn_blocking(move || read_settings_once(&first, true))
-        .await
-        .map_err(|_| SettingsError::Unreadable)?
-    {
+    let (result, opened) = tokio::task::spawn_blocking(move || {
+        #[cfg(unix)]
+        return read_settings_stamped(&first, true, Trust::current());
+        #[cfg(not(unix))]
+        (read_settings_once(&first, true), None::<()>)
+    })
+    .await
+    .map_err(|_| SettingsError::Unreadable)?;
+    #[cfg(unix)]
+    let mut opened = opened;
+    let result = match result {
         Err(SettingsError::InvalidJson) => {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             let again = home.to_owned();
-            tokio::task::spawn_blocking(move || read_settings_once(&again, false))
-                .await
-                .map_err(|_| SettingsError::Unreadable)?
+            let (result, again_opened) = tokio::task::spawn_blocking(move || {
+                #[cfg(unix)]
+                return read_settings_stamped(&again, false, Trust::current());
+                #[cfg(not(unix))]
+                (read_settings_once(&again, false), None::<()>)
+            })
+            .await
+            .map_err(|_| SettingsError::Unreadable)?;
+            #[cfg(unix)]
+            {
+                opened = again_opened;
+            }
+            let _ = &opened;
+            result
         }
         result => result,
     };
     #[cfg(unix)]
-    if let (Some(stamp), Ok(key)) = (stamp, &result) {
+    if let (Some(stamp), Ok(key)) = (stamp, &result)
+        && cacheable(&stamp, opened.as_ref(), settings_stamp(home).as_ref())
+    {
         remember_settings(home, stamp, key);
     }
     result
@@ -1576,6 +1710,27 @@ mod settings_tests {
         );
     }
 
+    /// Codex re-review H2: an inherit-only write entry on the directory `~/.omlx` leads to is a template for what gets created inside it; it
+    /// gives nobody access to the directory or to the existing, protected `settings.json`, and must not make the engine unusable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_inherit_only_acl_entry_on_the_target_directory_is_accepted() {
+        let (home, target) = symlinked_home();
+        let status = std::process::Command::new("/bin/chmod")
+            .args([
+                "+a",
+                "everyone allow add_file,add_subdirectory,file_inherit,directory_inherit,only_inherit",
+            ])
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            read_settings_key(home.path()).unwrap().as_deref(),
+            Some("k-link")
+        );
+    }
+
     fn reads_of(home: &Path) -> usize {
         FILE_READS
             .lock()
@@ -1593,6 +1748,7 @@ mod settings_tests {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let path = write_settings(&home.path().join(".omlx"));
+        let invalidations = SETTINGS_INVALIDATIONS.load(Ordering::SeqCst);
         let first = read_settings_key_async(home.path()).await.unwrap();
         assert_eq!(first.as_deref(), Some("k-link"));
         for _ in 0..50 {
@@ -1601,7 +1757,11 @@ mod settings_tests {
                 Ok(first.clone())
             );
         }
-        assert_eq!(reads_of(home.path()), 1, "fifty more requests read nothing");
+        assert!(
+            reads_of(home.path())
+                <= 1 + (SETTINGS_INVALIDATIONS.load(Ordering::SeqCst) - invalidations),
+            "fifty more requests read nothing"
+        );
 
         // rewritten in place with the same length
         fs::write(&path, r#"{"auth":{"api_key":"k-lonk"}}"#).unwrap();
@@ -1635,6 +1795,18 @@ mod settings_tests {
                 .as_deref(),
             Some("k-much-longer")
         );
+        // a completed rename-replace (a new inode, as editors and dotfile managers write it)
+        let staged = home.path().join("staged.json");
+        fs::write(&staged, r#"{"auth":{"api_key":"k-renamed"}}"#).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&staged, &path).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("k-renamed")
+        );
         // the file replaced by a symlink to an identical file is not followed, cache or not
         let copy = home.path().join("copy.json");
         fs::copy(&path, &copy).unwrap();
@@ -1646,6 +1818,75 @@ mod settings_tests {
         );
         fs::remove_file(&path).unwrap();
         assert_eq!(read_settings_key_async(home.path()).await, Ok(None));
+    }
+
+    /// The cache has two more bounds than the timestamps: a cached parse is dropped when an upstream answers 401 (a rotation the timestamps
+    /// did not show), and it is never older than [`SETTINGS_CACHE_TTL`].
+    #[tokio::test]
+    async fn a_401_or_the_ttl_drops_the_cached_settings() {
+        let home = tempfile::tempdir().unwrap();
+        write_settings(&home.path().join(".omlx"));
+        let reads = || reads_of(home.path());
+        read_settings_key_async(home.path()).await.unwrap();
+        read_settings_key_async(home.path()).await.unwrap();
+        let steady = reads();
+
+        // a 401 seen by `send_authorized`
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let response = send_authorized(None, client.get(server.uri()).send())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        read_settings_key_async(home.path()).await.unwrap();
+        assert!(
+            reads() > steady,
+            "a 401 must make the next request read the file"
+        );
+
+        // the TTL, with the stamps unchanged
+        let steady = reads();
+        read_settings_key_async(home.path()).await.unwrap();
+        tokio::time::sleep(SETTINGS_CACHE_TTL + std::time::Duration::from_millis(100)).await;
+        let before = reads();
+        read_settings_key_async(home.path()).await.unwrap();
+        assert!(
+            reads() > before,
+            "a parse older than the TTL is read again ({steady} -> {before} -> {})",
+            reads()
+        );
+    }
+
+    /// What is cached must be what was read: the descriptor's state after the read has to be the state the path named before **and** after.
+    #[test]
+    fn a_parse_is_cacheable_only_if_the_opened_file_is_the_one_the_path_named() {
+        let home = tempfile::tempdir().unwrap();
+        let path = write_settings(&home.path().join(".omlx"));
+        let before = settings_stamp(home.path()).unwrap();
+        let opened = FileStamp::of(&fs::metadata(&path).unwrap());
+        assert!(cacheable(&before, Some(&opened), Some(&before)));
+        // another file was opened than the one the path named before
+        let other = FileStamp {
+            ino: opened.ino + 1,
+            ..opened.clone()
+        };
+        assert!(!cacheable(&before, Some(&other), Some(&before)));
+        // the opened file changed while it was read (its state moved)
+        let moved = FileStamp {
+            size: opened.size + 1,
+            ..opened.clone()
+        };
+        assert!(!cacheable(&before, Some(&moved), Some(&before)));
+        // the path now names something else
+        fs::write(&path, r#"{"auth":{"api_key":"k-other-longer"}}"#).unwrap();
+        let after = settings_stamp(home.path()).unwrap();
+        assert!(!cacheable(&before, Some(&opened), Some(&after)));
+        // nothing was opened (a failed read), nothing to cache
+        assert!(!cacheable(&before, None, Some(&before)));
     }
 
     /// With the clock paused, a retry pause that is a runtime timer advances the virtual clock by exactly its length, while a thread

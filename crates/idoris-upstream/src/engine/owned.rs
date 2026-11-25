@@ -420,7 +420,15 @@ impl OwnedEngine {
             Classified::Stale(reason) => Recovery::Stale(reason),
             Classified::Unverifiable(reason) => Recovery::Unverifiable(reason),
             Classified::Verified { record, sealed } => {
-                let record = bind_native_generation(&store, inspector.as_ref(), record).await;
+                let record = match bind_native_generation(&store, inspector.as_ref(), record).await
+                {
+                    Bound::Record(record) => record,
+                    // The observations contradict each other (another process, another generation, while binding): not confirmed, nothing is
+                    // adopted and nothing is signalled; the record stays as it was.
+                    Bound::Conflict => {
+                        return Ok(Recovery::Unverifiable(UnreadableReason::Generation));
+                    }
+                };
                 let engine = Self::recovered(instance, record, store, inspector);
                 if sealed {
                     Recovery::Adopted(engine)
@@ -770,27 +778,38 @@ async fn bind_native_generation(
     store: &OwnershipStore,
     inspector: &dyn ProcessInspector,
     record: OwnershipRecord,
-) -> OwnershipRecord {
+) -> Bound {
     if record.generation.is_some() {
-        return record;
+        return Bound::Record(record);
     }
     let Ok(generation) = inspector.generation(record.pid).await else {
-        return record;
+        // Simply not available: the record stays as it was (second precision), the fallback paths apply.
+        return Bound::Record(record);
     };
-    if !matches!(
-        verify_identity(inspector, &record).await,
-        IdentityVerdict::Match | IdentityVerdict::Unsealed
-    ) {
-        return record;
+    match verify_identity(inspector, &record).await {
+        IdentityVerdict::Match | IdentityVerdict::Unsealed => {}
+        // The second look at ownership cannot be read: no contradiction, only no evidence.
+        IdentityVerdict::Unreadable(_) => return Bound::Record(record),
+        // It was ours a moment ago and is not now: conflicting evidence.
+        IdentityVerdict::Mismatch(_) => return Bound::Conflict,
     }
     match inspector.generation(record.pid).await {
         Ok(again) if again == generation => {}
-        _ => return record,
+        Ok(_) => return Bound::Conflict,
+        Err(_) => return Bound::Record(record),
     }
     let mut bound = record;
     bound.generation = Some(generation);
     let _ = store.write(&bound);
-    bound
+    Bound::Record(bound)
+}
+
+/// What [`bind_native_generation`] found.
+enum Bound {
+    /// The record to use: bound, or as it was when nothing could be bound.
+    Record(OwnershipRecord),
+    /// The two looks contradict each other.
+    Conflict,
 }
 
 enum Classified {
@@ -1714,11 +1733,18 @@ mod tests {
         let inspector: Arc<dyn ProcessInspector> = Arc::new(Flipping(Mutex::new(0)));
         store.write(&record()).unwrap();
         let recovery = OwnedEngine::recover(&inst, &inspector).await.unwrap();
-        let Recovery::Adopted(engine) = recovery else {
-            panic!("expected Adopted: {recovery:?}");
-        };
-        assert_eq!(engine.record().generation, None);
-        assert_eq!(store.read().unwrap().unwrap().generation, None);
+        assert!(
+            matches!(
+                recovery,
+                Recovery::Unverifiable(UnreadableReason::Generation)
+            ),
+            "contradicting observations must not adopt: {recovery:?}"
+        );
+        assert_eq!(
+            store.read().unwrap().unwrap().generation,
+            None,
+            "the record is kept as it was"
+        );
     }
 
     #[tokio::test]

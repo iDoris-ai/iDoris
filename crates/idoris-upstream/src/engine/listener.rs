@@ -163,15 +163,29 @@ impl ListenerVerifier {
         &self.inspector
     }
 
+    /// An identity the kernel gave nothing for (empty) equals every other empty one and says nothing about whether the program changed:
+    /// a verdict is never reused on the strength of it.
+    fn reusable(identity: &ListenerIdentity) -> bool {
+        !identity
+            .executable
+            .as_ref()
+            .is_some_and(ExecutableIdentity::is_empty)
+    }
+
     fn cached(&self, identity: &ListenerIdentity) -> bool {
-        self.verified
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&identity.pid)
-            .is_some_and(|cached| cached == identity)
+        Self::reusable(identity)
+            && self
+                .verified
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&identity.pid)
+                .is_some_and(|cached| cached == identity)
     }
 
     fn remember(&self, identity: ListenerIdentity) {
+        if !Self::reusable(&identity) {
+            return;
+        }
         self.verified
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -733,12 +747,31 @@ mod tests {
         assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 3);
     }
 
+    /// An identity the kernel gave nothing for (all fields empty) equals every other empty one: a signature verdict is never reused on its
+    /// strength, so a program that changed under an unchanged pid is judged again.
+    #[tokio::test]
+    async fn a_signature_verdict_is_not_reused_for_an_empty_identity() {
+        let mut proc = Proc::ok();
+        proc.executable = Some(ExecutableIdentity {
+            cdhash: None,
+            image: None,
+            exec_version: None,
+        });
+        let (verifier, scripted) = rig(Scripted::default()
+            .listening(19731, &[42])
+            .process(42, proc));
+        assert!(verifier.check(19731).await.is_verified());
+        assert!(verifier.check(19731).await.is_verified());
+        assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn an_exec_with_the_same_pid_and_start_time_rechecks_the_signature() {
         let mut proc = Proc::ok();
         proc.executable = Some(ExecutableIdentity {
             cdhash: Some([12; 20]),
             image: Some([1; 16]),
+            exec_version: Some(1),
         });
         let (verifier, scripted) = rig(Scripted::default()
             .listening(19731, &[42])

@@ -2368,7 +2368,9 @@ impl Actor {
             }
         };
         let Some(probe) = probe else {
-            // 下一个节拍的确认按它的口径封端点、发布 `port_in_use`；这个探测结果不发布。
+            // 端口确定不再是它的：现在就按每个节拍确认的口径处理（收回私有 key、封端点、发布 `port_in_use`），不等下一个节拍；这个探测结果不发布。
+            self.revoke_owned_key();
+            self.publish(UpstreamState::Unavailable, Some(UpstreamReason::PortInUse));
             return None;
         };
         if endpoint_generation(&self.plan.endpoint) != generation {
@@ -2483,9 +2485,19 @@ impl Actor {
             return false;
         };
         let verifier = external.verifier.clone();
+        let verdict = verifier.check(self.plan.port).await;
+        self.external_apply(verdict).await
+    }
+
+    /// Act on one verdict of the listener verification (see [`Self::external_liveness`]). A verdict obtained while a probe was in flight is
+    /// acted on as it is, not thrown away and asked for again.
+    async fn external_apply(&mut self, verdict: ListenerVerdict) -> bool {
+        let Some(external) = &self.external else {
+            return false;
+        };
         let guard = external.guard.clone();
         let backend = self.plan.backend.clone();
-        match verifier.check(self.plan.port).await {
+        match verdict {
             ListenerVerdict::Verified { listeners } => {
                 let identity = EngineIdentity::External { listeners };
                 if self.identity.as_ref() == Some(&identity) {
@@ -2562,25 +2574,30 @@ impl Actor {
             tokio::pin!(probe);
             loop {
                 tokio::select! {
-                    probed = &mut probe => break Some(probed),
+                    probed = &mut probe => break Some(Ok(probed)),
                     () = tokio::time::sleep(interval) => {
-                        let same = match verifier.check(check_port).await {
-                            ListenerVerdict::Verified { listeners } => {
-                                expected.as_ref() == Some(&EngineIdentity::External { listeners })
-                            }
-                            _ => false,
-                        };
+                        let verdict = verifier.check(check_port).await;
+                        let same = matches!(
+                            &verdict,
+                            ListenerVerdict::Verified { listeners }
+                                if expected.as_ref()
+                                    == Some(&EngineIdentity::External { listeners: listeners.clone() })
+                        );
                         if !same {
-                            break None;
+                            break Some(Err(verdict));
                         }
                     }
                 }
             }
         };
-        let Some(probed) = probed else {
-            // 监听者在探测期间变了：这个结果不能用；按核验的结论处理。
-            self.external_liveness().await;
-            return;
+        let probed = match probed {
+            Some(Ok(probed)) => probed,
+            Some(Err(verdict)) => {
+                // 监听者在探测期间变了：这个探测结果不能用；直接按已经拿到的核验结论处理。
+                self.external_apply(verdict).await;
+                return;
+            }
+            None => return,
         };
         if self.identity != expected || endpoint_generation(&self.plan.endpoint) != generation {
             return;

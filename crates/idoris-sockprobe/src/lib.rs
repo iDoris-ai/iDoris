@@ -72,10 +72,27 @@ pub struct ExecutableIdentity {
     pub cdhash: Option<[u8; 20]>,
     /// The identity of the image itself (macOS: Mach-O UUID; Linux: device and inode, 8 bytes each).
     pub image: Option<[u8; 16]>,
+    /// macOS: the kernel's exec version of the process (advanced by every `exec`), which brackets the reads above: two different versions
+    /// mean the pair was not read from one program. `None` where the kernel gives none.
+    pub exec_version: Option<i32>,
+}
+
+impl ExecutableIdentity {
+    /// The kernel gave nothing: an identity like this equals every other empty one, so it says nothing about whether the program changed.
+    pub fn is_empty(&self) -> bool {
+        self.cdhash.is_none() && self.image.is_none()
+    }
 }
 
 pub fn executable_identity(pid: u32) -> Option<ExecutableIdentity> {
     platform::executable_identity(pid)
+}
+
+/// The team identifier of the code the kernel runs for `pid`, from the kernel's own record of the running image (macOS: `csops`; no path, no
+/// subprocess, so an executable updated or deleted on disk after the process started does not matter). `None` when the kernel does not vouch
+/// for a team (and always off macOS): the caller falls back to the path-based tool.
+pub fn kernel_signing_team(pid: u32) -> Option<String> {
+    platform::signing_team(pid)
 }
 
 /// The kernel start time in the same format used by ownership records.
@@ -534,6 +551,20 @@ for line in sys.stdin:
             Some(false),
             "read is not write"
         );
+        // (the earlier `deny write` for everyone comes first and refuses it: an ACL is evaluated in order)
+        chmod("everyone allow write");
+        assert_eq!(
+            acl_grants_others_write(file.as_raw_fd(), owner),
+            Some(false)
+        );
+        assert!(
+            Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
         chmod("everyone allow write");
         assert_eq!(acl_grants_others_write(file.as_raw_fd(), owner), Some(true));
         assert_eq!(acl_grants_others_write_at(&path, owner), Some(true));
@@ -541,6 +572,133 @@ for line in sys.stdin:
         assert_eq!(
             acl_grants_others_write(file.as_raw_fd(), owner + 1),
             Some(true)
+        );
+    }
+
+    /// A team-signed program (the Python that ships inside the oMLX app, when it is installed) is run from a copy that is then deleted: the
+    /// kernel still names its team, which a path-based check (`codesign --verify <pid>` reads the file) cannot do any more. Skipped where the
+    /// app is not installed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_kernel_names_the_team_of_a_running_program_whose_executable_was_deleted() {
+        let home =
+            std::path::Path::new("/Applications/oMLX.app/Contents/Resources/Python/cpython-3.11");
+        let python = home.join("bin/python3.11");
+        if !python.exists() {
+            eprintln!("SKIPPED: the oMLX app is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink(home.join("lib"), dir.path().join("lib")).unwrap();
+        let exe = dir.path().join("bin/py");
+        std::fs::copy(&python, &exe).unwrap();
+        let child = Command::new(&exe)
+            .args(["-I", "-S", "-c", "import time; time.sleep(30)"])
+            .env("PYTHONHOME", home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // wait for it to be a running python (the exec of a fresh copy can take a moment)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let team = loop {
+            if let Some(team) = kernel_signing_team(child.id()) {
+                break team;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the kernel never named a team"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        std::fs::remove_file(&exe).unwrap();
+        assert_eq!(kernel_signing_team(child.id()), Some(team.clone()));
+        assert_eq!(team.len(), 10, "{team}");
+        kill(child);
+    }
+
+    /// A program with no team (an ad-hoc signed test binary copy, a platform binary) is not given one.
+    #[test]
+    fn the_kernel_names_no_team_for_programs_that_have_none() {
+        assert_eq!(kernel_signing_team(me()), None);
+        let mut sleeper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        assert_eq!(kernel_signing_team(sleeper.id()), None);
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+
+    /// An inherit-only ACL entry (a template for what is created inside a directory) takes no part in access to the directory itself; an
+    /// ordinary entry does; and an earlier deny for the same principal cancels a later allow.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherit_only_and_denied_acl_entries_are_not_grants() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::open(dir.path()).unwrap();
+        let owner = file.metadata().unwrap().uid();
+        let chmod = |rule: &str| {
+            assert!(
+                Command::new("/bin/chmod")
+                    .args(["+a", rule])
+                    .arg(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let grants = || acl_grants_others_write(file.as_raw_fd(), owner);
+        chmod(
+            "everyone allow add_file,add_subdirectory,file_inherit,directory_inherit,only_inherit",
+        );
+        assert_eq!(
+            grants(),
+            Some(false),
+            "an inherit-only entry is not a grant"
+        );
+        chmod("group:staff allow add_file");
+        assert_eq!(grants(), Some(true), "an ordinary entry is");
+        // start over: deny first, then allow, for the same principal
+        assert!(
+            Command::new("/bin/chmod")
+                .args(["-N"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        chmod("group:staff deny add_file");
+        chmod("group:staff allow add_file");
+        assert_eq!(
+            grants(),
+            Some(false),
+            "an earlier deny cancels the later allow"
+        );
+        // the other way round the allow comes first and wins
+        assert!(
+            Command::new("/bin/chmod")
+                .args(["-N"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        chmod("group:staff allow add_file");
+        // (`chmod +a` alone sorts denies first; a fixed index keeps the allow in front)
+        assert!(
+            Command::new("/bin/chmod")
+                .args(["+a#", "1", "group:staff deny add_file"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            grants(),
+            Some(true),
+            "an allow before the deny is effective"
         );
     }
 

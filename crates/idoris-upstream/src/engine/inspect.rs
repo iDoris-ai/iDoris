@@ -380,6 +380,15 @@ impl ProcessInspector for SystemInspector {
     }
 
     async fn signing_team(&self, pid: u32) -> Result<Option<String>, InspectError> {
+        // The kernel's own record of the running image first (macOS): a valid signature and a team identifier, read **without the file on
+        // disk**. An engine whose executable was updated, replaced or deleted after it started (and is still running fine) is judged by
+        // the code it runs, not refused because `codesign` cannot find the file any more. Where the kernel names no team, the slower
+        // path-based tool below judges exactly as before.
+        if self.native_probe
+            && let Some(team) = native::kernel_signing_team(pid)
+        {
+            return Ok(Some(team));
+        }
         let pid = OsString::from(pid.to_string());
         let verified = run_tool(
             Path::new(&self.codesign),

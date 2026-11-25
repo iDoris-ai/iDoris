@@ -127,6 +127,9 @@ pub async fn probe_authorized(
     ) {
         authorization.connection_failed();
     }
+    if matches!(probe, EngineProbe::AuthRejected(_)) {
+        crate::omlx::key::invalidate_settings_cache();
+    }
     Ok(probe)
 }
 

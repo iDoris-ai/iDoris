@@ -55,9 +55,10 @@ unsafe extern "C" {
     fn csops(pid: libc::pid_t, ops: u32, useraddr: *mut c_void, usersize: usize) -> c_int;
 }
 
-/// The Mach-O UUID of the main image the kernel runs for `pid`: `Ok(None)` when the kernel does not give one (not allowed to look at that
-/// process, or an unexpected failure: no identity, **not** "gone"), `Err(())` when the process does not exist.
-fn image_uuid(pid: i32) -> Result<Option<[u8; 16]>, ()> {
+/// The Mach-O UUID of the main image the kernel runs for `pid` and its exec version (`p_idversion`: the kernel advances it on every `exec`,
+/// so two reads with the same version were taken of the same exec of the process): `Ok(None)` when the kernel does not give them (not
+/// allowed to look at that process, or an unexpected failure: no identity, **not** "gone"), `Err(())` when the process does not exist.
+fn image_uuid(pid: i32) -> Result<Option<([u8; 16], i32)>, ()> {
     // SAFETY: `ProcUniqIdentifierInfo` is plain old data; the all-zero value is valid.
     let mut info: ProcUniqIdentifierInfo = unsafe { zeroed() };
     let Ok(size) = c_int::try_from(size_of::<ProcUniqIdentifierInfo>()) else {
@@ -75,7 +76,7 @@ fn image_uuid(pid: i32) -> Result<Option<[u8; 16]>, ()> {
         )
     };
     if written == size {
-        Ok(Some(info.p_uuid))
+        Ok(Some((info.p_uuid, info.p_idversion)))
     } else if written <= 0 && last_errno() == libc::ESRCH {
         Err(())
     } else {
@@ -108,12 +109,14 @@ pub(crate) fn executable_identity(pid: u32) -> Option<super::ExecutableIdentity>
     let before = image_uuid(pid).ok()?;
     let cdhash = code_directory_hash(pid);
     let after = image_uuid(pid).ok()?;
+    // The exec version brackets the reads: a different one means an `exec` happened in between, and the pair is not one program's.
     if before != after {
         return None;
     }
     Some(super::ExecutableIdentity {
         cdhash,
-        image: before,
+        image: before.map(|(uuid, _)| uuid),
+        exec_version: before.map(|(_, version)| version),
     })
 }
 
@@ -126,6 +129,12 @@ const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
 const ACL_FIRST_ENTRY: c_int = 0;
 const ACL_NEXT_ENTRY: c_int = -1;
 const ACL_EXTENDED_ALLOW: c_int = 1;
+const ACL_EXTENDED_DENY: c_int = 2;
+/// `ACL_ENTRY_ONLY_INHERIT`: the entry is only a template for what is created inside a directory; it takes no part in access to the object itself.
+const ACL_ENTRY_ONLY_INHERIT: c_int = 1 << 8;
+/// The well-known group `everyone` (gid 12): a deny entry for it covers every principal.
+const GID_EVERYONE: u32 = 12;
+const ID_TYPE_GID: c_int = 1;
 const ID_TYPE_UID: c_int = 0;
 /// Write-like permissions of an ACL entry: write_data/add_file, delete, append_data/add_subdirectory, delete_child, write_attributes,
 /// write_extattributes, write_security, change_owner.
@@ -138,14 +147,29 @@ unsafe extern "C" {
     fn acl_get_entry(acl: AclT, entry_id: c_int, entry: *mut AclEntryT) -> c_int;
     fn acl_get_tag_type(entry: AclEntryT, tag: *mut c_int) -> c_int;
     fn acl_get_permset_mask_np(entry: AclEntryT, mask: *mut u64) -> c_int;
+    fn acl_get_flagset_np(obj: *mut c_void, flagset: *mut *mut c_void) -> c_int;
+    fn acl_get_flag_np(flagset: *mut c_void, flag: c_int) -> c_int;
     fn acl_get_qualifier(entry: AclEntryT) -> *mut c_void;
     fn acl_free(object: *mut c_void) -> c_int;
     fn mbr_uuid_to_id(uu: *const u8, id: *mut u32, id_type: *mut c_int) -> c_int;
 }
 
-/// Does any `allow` entry of this ACL give a write-like permission to somebody other than the user `owner`? `None` for an entry that cannot
-/// be read (the caller does not refuse on that).
+/// Who an ACL entry is about.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Principal {
+    User(u32),
+    Group(u32),
+    /// A qualifier the membership service cannot resolve: treated as somebody else.
+    Unknown([u8; 16]),
+}
+
+/// Does this ACL give a write-like permission to somebody other than the user `owner`, as the kernel would evaluate it? Entries are taken in
+/// order and the first entry that decides a permission for a principal wins: an `allow` of write for a principal that an **earlier** `deny`
+/// entry (for the same principal, or for `everyone`) already refuses grants nothing; **inherit-only** entries (templates for what is created
+/// inside a directory) take no part in access to the object and are skipped. `None`: an entry that cannot be read (indeterminate, **not** a
+/// grant).
 fn acl_grants_others_write(acl: AclT, owner: u32) -> Option<bool> {
+    let mut denied: Vec<(Principal, u64)> = Vec::new();
     let mut id = ACL_FIRST_ENTRY;
     loop {
         let mut entry: AclEntryT = std::ptr::null_mut();
@@ -154,12 +178,21 @@ fn acl_grants_others_write(acl: AclT, owner: u32) -> Option<bool> {
             return Some(false);
         }
         id = ACL_NEXT_ENTRY;
+        let mut flagset: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `entry` belongs to `acl`; `flagset` is a valid out pointer.
+        if unsafe { acl_get_flagset_np(entry, &mut flagset) } != 0 {
+            return None;
+        }
+        // SAFETY: `flagset` was just given by the call above for this entry.
+        if unsafe { acl_get_flag_np(flagset, ACL_ENTRY_ONLY_INHERIT) } == 1 {
+            continue;
+        }
         let mut tag: c_int = 0;
         // SAFETY: `entry` belongs to `acl`; `tag` is a valid out pointer.
         if unsafe { acl_get_tag_type(entry, &mut tag) } != 0 {
             return None;
         }
-        if tag != ACL_EXTENDED_ALLOW {
+        if tag != ACL_EXTENDED_ALLOW && tag != ACL_EXTENDED_DENY {
             continue;
         }
         let mut mask: u64 = 0;
@@ -167,21 +200,40 @@ fn acl_grants_others_write(acl: AclT, owner: u32) -> Option<bool> {
         if unsafe { acl_get_permset_mask_np(entry, &mut mask) } != 0 {
             return None;
         }
-        if mask & ACL_WRITE_LIKE == 0 {
+        let write_like = mask & ACL_WRITE_LIKE;
+        if write_like == 0 {
             continue;
         }
         // SAFETY: returns a newly allocated `guid_t` (16 bytes) or null; freed below.
         let qualifier = unsafe { acl_get_qualifier(entry) };
         if qualifier.is_null() {
-            return Some(true);
+            return None;
         }
+        let mut guid = [0_u8; 16];
+        // SAFETY: `qualifier` points to a 16-byte guid.
+        unsafe { std::ptr::copy_nonoverlapping(qualifier.cast::<u8>(), guid.as_mut_ptr(), 16) };
         let (mut who, mut kind) = (0_u32, -1);
-        // SAFETY: `qualifier` points to a 16-byte guid; the out pointers are valid.
-        let resolved = unsafe { mbr_uuid_to_id(qualifier.cast::<u8>(), &mut who, &mut kind) } == 0;
+        // SAFETY: `guid` is 16 bytes; the out pointers are valid.
+        let resolved = unsafe { mbr_uuid_to_id(guid.as_ptr(), &mut who, &mut kind) } == 0;
         // SAFETY: `qualifier` came from `acl_get_qualifier`.
         unsafe { acl_free(qualifier) };
-        // An entry for the owner alone is no grant to others; anything else (a group, another user, an unknown identity) is.
-        if !(resolved && kind == ID_TYPE_UID && who == owner) {
+        let principal = match (resolved, kind) {
+            (true, ID_TYPE_UID) => Principal::User(who),
+            (true, ID_TYPE_GID) => Principal::Group(who),
+            _ => Principal::Unknown(guid),
+        };
+        if tag == ACL_EXTENDED_DENY {
+            denied.push((principal, write_like));
+            continue;
+        }
+        if principal == Principal::User(owner) {
+            continue;
+        }
+        let refused = denied
+            .iter()
+            .filter(|(who, _)| *who == principal || *who == Principal::Group(GID_EVERYONE))
+            .fold(0, |all, (_, mask)| all | mask);
+        if write_like & !refused != 0 {
             return Some(true);
         }
     }
@@ -215,6 +267,57 @@ fn finish_acl(acl: AclT, owner: u32) -> Option<bool> {
     // SAFETY: `acl` came from `acl_get_*_np` and is not used afterwards.
     unsafe { acl_free(acl) };
     verdict
+}
+
+/// `csops(2)` operations `CS_OPS_STATUS` (the code-signing flags of the process) and `CS_OPS_TEAMID` (the team identifier of the code it
+/// runs), and the flag that says the kernel still considers the signature of the running image valid.
+const CS_OPS_STATUS: u32 = 0;
+const CS_OPS_TEAMID: u32 = 14;
+const CS_VALID: u32 = 0x0000_0001;
+
+/// The team identifier of the code the kernel runs for `pid`, from the kernel's own record of the running image (`CS_VALID` set and a team
+/// identifier on its code directory): **path-independent**, so an executable that was updated, replaced or deleted on disk after the process
+/// started does not matter. `None`: the kernel does not vouch for a team (unsigned, ad-hoc, platform binary, not allowed to look); the
+/// caller then asks the slower, path-based tool, which is how v0.6.0 judged.
+pub(crate) fn signing_team(pid: u32) -> Option<String> {
+    let pid = i32::try_from(pid).ok()?;
+    let mut flags = [0_u8; 4];
+    // SAFETY: `csops` writes at most `usersize` bytes into the live array it is given.
+    let rc = unsafe {
+        csops(
+            pid,
+            CS_OPS_STATUS,
+            flags.as_mut_ptr().cast::<c_void>(),
+            flags.len(),
+        )
+    };
+    if rc != 0 || u32::from_ne_bytes(flags) & CS_VALID == 0 {
+        return None;
+    }
+    let mut team = [0_u8; 64];
+    // SAFETY: as above.
+    let rc = unsafe {
+        csops(
+            pid,
+            CS_OPS_TEAMID,
+            team.as_mut_ptr().cast::<c_void>(),
+            team.len(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // The kernel answers with a blob: four bytes of magic, a big-endian total length, then the NUL-terminated identifier. A plain string
+    // (older kernels) is read as it is.
+    let blob_len = u32::from_be_bytes([team[4], team[5], team[6], team[7]]) as usize;
+    let text = if team[..4] == [0; 4] && (8..=team.len()).contains(&blob_len) {
+        &team[8..blob_len]
+    } else {
+        &team[..]
+    };
+    let end = text.iter().position(|b| *b == 0).unwrap_or(text.len());
+    let text = std::str::from_utf8(&text[..end]).ok()?;
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 /// `PROC_PIDFDSOCKETINFO` (sys/proc_info.h): the flavor of `proc_pidfdinfo` that returns a `struct socket_fdinfo`.

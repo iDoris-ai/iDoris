@@ -267,6 +267,9 @@ pub struct OmlxAdapter {
     per_request_key: bool,
     /// The config was resolved while `settings.json` could not be verified: every request is refused (see [`SETTINGS_UNVERIFIABLE_MARKER`]).
     settings_unverifiable: bool,
+    /// Where an adapter in the `settings_unverifiable` state looks for `settings.json` again (`None`: `$HOME`); tests cannot change the
+    /// process environment.
+    resolution_home: Option<std::path::PathBuf>,
     call_timeout: Duration,
     /// Deadline of one whole load (the `POST .../load` and the pin/state verification after it); `None` =
     /// use `call_timeout` for the POST and, as before, `call_timeout` for each later call (see
@@ -330,6 +333,7 @@ impl OmlxAdapter {
                 .api_key
                 .filter(|key| key != SETTINGS_UNVERIFIABLE_MARKER),
             per_request_key: false,
+            resolution_home: None,
             call_timeout: config.call_timeout,
             load_timeout: None,
             confirmation_floor: LOAD_CONFIRMATION_FLOOR,
@@ -402,6 +406,13 @@ impl OmlxAdapter {
         self
     }
 
+    /// Test hook: the home that an adapter built while `settings.json` was unverifiable re-resolves from.
+    #[cfg(test)]
+    fn with_resolution_home(mut self, home: std::path::PathBuf) -> Self {
+        self.resolution_home = Some(home);
+        self
+    }
+
     /// Test-only: the key string this adapter holds (always `None` in per-request mode).
     #[cfg(test)]
     fn held_key(&self) -> Option<&str> {
@@ -427,14 +438,27 @@ impl OmlxAdapter {
     /// per-request adapter.
     async fn credential(&self) -> Result<Credential, BackendError> {
         let per_request = self.per_request_key;
-        if self.settings_unverifiable && !per_request {
-            return Err(upstream_error(
-                key::KeyRefusal::SettingsUnverifiable.to_string(),
-            ));
-        }
+        // Built while `settings.json` could not be verified: this request is refused if it still cannot be, but the adapter is not dead: every
+        // request resolves the key again, so a file that was only being rewritten (or has since been repaired) works from the next request on.
+        let fixed_key = if self.settings_unverifiable && !per_request {
+            let home = self.resolution_home.clone().or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|h| !h.is_empty())
+                    .map(Into::into)
+            });
+            key::resolve_checked_async_in(
+                &self.base_url,
+                std::env::var_os(OMLX_API_KEY_ENV),
+                home.as_deref(),
+            )
+            .await
+            .map_err(|refusal| upstream_error(refusal.to_string()))?
+        } else {
+            self.api_key.clone()
+        };
         if !per_request && !key::is_governed_endpoint(&self.base_url) {
             return Ok(Credential {
-                key: self.api_key.clone(),
+                key: fixed_key,
                 generation: None,
                 authorization: None,
             });
@@ -450,7 +474,7 @@ impl OmlxAdapter {
             key: if per_request {
                 authorization.key().map(str::to_owned)
             } else {
-                self.api_key.clone()
+                fixed_key
             },
             generation: Some(authorization.generation()),
             authorization: Some(authorization),
@@ -965,10 +989,12 @@ mod tests {
         server
     }
 
-    /// A fixed-key adapter built while `settings.json` cannot be verified (two truncated reads) must refuse locally: it used to fold the
-    /// refusal into "no key" and go out anonymously.
+    /// A fixed-key adapter built while `settings.json` cannot be verified (two truncated reads) must refuse locally (it used to fold the
+    /// refusal into "no key" and go out anonymously), and it must not stay dead: the **same adapter** serves again from the request after
+    /// the file is repaired, with the key the repaired file holds.
     #[tokio::test]
-    async fn a_fixed_key_adapter_refuses_when_settings_cannot_be_verified() {
+    async fn a_fixed_key_adapter_refuses_when_settings_cannot_be_verified_and_recovers_when_they_can()
+     {
         let server = models_server().await;
         let endpoint = server.uri();
         let home = tempfile::tempdir().unwrap();
@@ -980,13 +1006,26 @@ mod tests {
             base_url: endpoint.clone(),
             call_timeout: Duration::from_millis(500),
         })
-        .unwrap();
+        .unwrap()
+        .with_resolution_home(home.path().to_owned());
         assert!(adapter.list().await.is_err());
         assert!(
             server.received_requests().await.unwrap().is_empty(),
             "nothing may be sent"
         );
-        // a readable file with no key is still an anonymous engine
+        // the file is repaired: the same adapter works from the next request on
+        std::fs::write(&settings, r#"{"auth":{"api_key":"repaired-key"}}"#).unwrap();
+        adapter.list().await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("authorization")
+                .map(|v| v.to_str().unwrap()),
+            Some("Bearer repaired-key")
+        );
+        // a readable file with no key is an anonymous engine, also for a new adapter
         std::fs::write(&settings, "{}").unwrap();
         let adapter = OmlxAdapter::new(OmlxAdapterConfig {
             api_key: construction_key_in(&endpoint, None, Some(home.path())),

@@ -42,3 +42,7 @@ pub(crate) fn acl_grants_others_write_fd(_fd: i32, _owner: u32) -> Option<bool> 
 pub(crate) fn acl_grants_others_write_link(_path: &std::path::Path, _owner: u32) -> Option<bool> {
     None
 }
+
+pub(crate) fn signing_team(_pid: u32) -> Option<String> {
+    None
+}
