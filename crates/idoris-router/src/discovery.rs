@@ -722,9 +722,9 @@ mod tests {
     const NONCE: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     const INSTANCE_ID: &str = "3f0c6a52-6a0e-4c0e-9a6e-0d2f1c7a9b11";
 
-    /// 规范 §2.7.3 示例的原文输入（那是 v0.6.0 发版之后的取值：`version` 0.6.0、`contract_version` 1.3.0）。
+    /// 规范 §2.7.3 示例的原文输入（`version` 0.6.0、`contract_version` 1.3.0，即 v0.6.0 的取值）。
     /// 这两个版本串在这里只是输入的字符串，被锁的是字段与顺序；S1 的二进制实际写入的是当前常量
-    /// （`/health.contract_version` 的同一个值，发版前仍是 1.2.0），见集成测试
+    /// （`/health.contract_version` 的同一个值，现为 1.3.0），见集成测试
     /// `discovery_file_has_the_specified_fields_permissions_and_launch_snapshot`。
     fn record() -> DiscoveryRecord {
         DiscoveryRecord {

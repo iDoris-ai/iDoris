@@ -38,9 +38,9 @@ describe("GET /health 服务身份", () => {
     expect(body.status).toBe("ok");
     expect(body.service).toBe("idoris");
     expect(typeof body.version).toBe("string");
-    // contract_version 是规范文档标注的值（当前 v1.2.0），不是随便一个字符串。下面「GET /health 新字段」的
-    // 字段已经从 IDORIS-CORE 切片 S1 起出现在 Rust 实现里，但版本号要到 v0.6.0 发版才升 1.3.0（规范 §2.11）。
-    expect(body.contract_version).toBe("1.2.0");
+    // contract_version 是规范文档标注的值（当前 v1.3.0），不是随便一个字符串。下面「GET /health 新字段」的
+    // 字段在 IDORIS-CORE 开发期间（切片 S1 起）出现在 Rust 实现里，版本号自 v0.6.0 起是 1.3.0（规范 §2.11）。
+    expect(body.contract_version).toBe("1.3.0");
     expect(typeof body.instance_id).toBe("string");
     expect((body.instance_id as string).length).toBeGreaterThan(0);
     expect(body.components).toBeGreaterThanOrEqual(1);
@@ -54,9 +54,9 @@ describe("GET /health 服务身份", () => {
 });
 
 // `/health` 新字段（接口规范修订 1.6 §2.11.1，IDORIS-CORE）：phase / ready / started_at_ms / registered /
-// upstreams[]。这批字段从 IDORIS-CORE 切片 S1 起就出现在 Rust 实现的 `/health` 里，但 `contract_version`
-// 到 v0.6.0 发版才升到 1.3.0（规范 §2.11：发版前仍是 1.2.0；切片 S11 统一升）——所以上面的版本断言仍是 1.2.0，
-// 调用方按字段是否存在判断，不要看版本号。这批字段由 Rust 实现承载；TS 参考实现不含它们
+// upstreams[]。这批字段从 IDORIS-CORE 切片 S1 起就出现在 Rust 实现的 `/health` 里，`contract_version`
+// 自 v0.6.0 起是 1.3.0（规范 §2.11）——上面的版本断言就是 1.3.0，
+// 调用方仍按字段是否存在判断，不要看版本号。这批字段由 Rust 实现承载；TS 参考实现不含它们
 // （同 v1.2.0 的先例，见 packages/contracts/src/version.ts），所以这里只对 Rust 被测实现锁形状。
 const isRust = process.env.IDORIS_CONFORMANCE_IMPLEMENTATION === "rust";
 const UPSTREAM_STATES = ["ready", "starting", "unavailable", "restarting", "failed", "stopped", "absent"];

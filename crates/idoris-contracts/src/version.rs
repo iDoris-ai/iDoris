@@ -19,7 +19,7 @@
 /// `GET /v1/recommendation?role=chat` and `GET /v1/models/local`; every 1.1.x
 /// field and behavior is unchanged.
 ///
-/// `1.3.0` (the target of iDoris v0.6.0, **not yet in force**): additive only (interface spec
+/// `1.3.0` (in force since iDoris v0.6.0): additive only (interface spec
 /// revision 1.6 §2.11, IDORIS-CORE). `GET /health` gains `phase`, `ready`, `started_at_ms`,
 /// `registered` and `upstreams[]` (each with `engine_kind`); `status` stays `"ok"`, every 1.2.x
 /// field and behavior is unchanged. It also adds the endpoint `POST /v1/models/warmup` (§2.11.2,
@@ -30,12 +30,9 @@
 /// `--launcher-stdin` frame, dynamic ports, the discovery file) are launcher contract (§2.7),
 /// not HTTP wire.
 ///
-/// **The new `/health` fields have been present since IDORIS-CORE slice S1, but this constant — and
-/// therefore `/health.contract_version` and the discovery file's `contract_version` — only becomes
-/// `1.3.0` when v0.6.0 is released (slice S11 bumps it everywhere at once).** Until then a build
-/// reports `1.2.0` even though it already carries the new `/health` fields (spec §2.11: before the
-/// release `/health.contract_version` stays `1.2.0`): the other `1.3.0` features (warmup, the
-/// embeddings companion card, the Admin `upstreams` routes) are not all there yet, and a caller must
-/// not conclude from the version number that they are. **Callers detect the new fields by whether
-/// they are present in the response, never by comparing the version number.**
-pub const CONTRACT_VERSION: &str = "1.2.0";
+/// The new `/health` fields were added during IDORIS-CORE development (slice S1 onwards) while the
+/// constant still read `1.2.0`; since v0.6.0 this constant — and therefore `/health.contract_version`
+/// and the discovery file's `contract_version` — is `1.3.0` (spec §2.11). **Callers should still
+/// detect the new fields by whether they are present in the response rather than by comparing the
+/// version number**, which keeps them working against pre-release builds of the same revision.
+pub const CONTRACT_VERSION: &str = "1.3.0";
