@@ -199,6 +199,7 @@ fn opening_a_v0_5_0_ledger_adds_projection_schema_and_rewrites_no_row() {
             "index ledger_entries_settled_by_account_at",
             "index ledger_entries_by_account_entry",
             "index ledger_checkpoint_spill_by_account",
+            "index ledger_checkpoint_spill_by_fold",
             "table ledger_checkpoints",
             "table ledger_checkpoint_spill",
             "trigger ledger_checkpoints_clear_spill",

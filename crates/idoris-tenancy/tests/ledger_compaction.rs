@@ -1000,3 +1000,26 @@ fn concurrent_admissions_on_one_account_build_and_advance_the_checkpoint_correct
     assert_eq!(net(&store, NOW + 7 * HOUR), 100_000 + 512 - 8 * 30);
     assert_clean(&store);
 }
+
+#[test]
+fn an_entry_at_i64_min_is_counted_before_and_after_the_first_fold() {
+    let db = TempDb::new("checkpoint-i64-min");
+    let store = setup(&db, 160);
+    // 已发布的架构接受任何整数序号，包括 i64::MIN：它不能被「没有检查点」的占位值吞掉。
+    Connection::open(db.path())
+        .unwrap()
+        .execute(
+            "INSERT INTO ledger_entries
+                (entry_id, account_id, kind, unit, funds_micros, window_at_ms, at_ms, idempotency_key)
+             VALUES (?1, 'emp', 'fund', 'THB', 100, ?2, ?2, 'min-id-fund')",
+            params![i64::MIN, T0 - DAY],
+        )
+        .unwrap();
+    seed_funds(&db, "seed-", T0 - DAY);
+    // 手算：额度 160 + 序号 i64::MIN 的 100 + 256 条各 1 = 516。
+    assert_eq!(net(&store, NOW), 516);
+    compact(&store, "first-fold", NOW);
+    assert!(folded_entries(&db) >= 257);
+    assert_eq!(net(&store, NOW), 516);
+    full_replay(&db, &store, &[T0, NOW]);
+}

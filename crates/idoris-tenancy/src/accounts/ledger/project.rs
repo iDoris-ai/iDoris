@@ -258,7 +258,7 @@ fn straddler_count(windows: &[&WindowSpec]) -> String {
 /// 没有检查点时，读取账户的全部分录。
 const ACCOUNT_ENTRIES: &str = "FROM ledger_entries e WHERE e.account_id = ?1";
 const ENTRY_RANGE: &str = "FROM ledger_entries e INDEXED BY ledger_entries_by_account_entry
-    WHERE e.account_id = ?1 AND e.entry_id > ?5
+    WHERE e.account_id = ?1 AND e.entry_id >= ?5
       AND NOT EXISTS (SELECT 1 FROM ledger_checkpoint_spill s WHERE s.entry_id = e.entry_id)";
 
 /// 补贴池一个账期（[`POOL_PERIOD`]：`?2` 起、`?3` 止）里**可能有归属**的分录，只读这个账期的，不管池账户有多少历史（池账户上有所有成员的
@@ -1098,7 +1098,7 @@ fn project_chain_inner(
         // 被抬高（Codex 四复审 Medium：充值 100，两个预留的净额 90 和 30，第二个被多放掉 70 变成 -40，整个账户的求和是 50，余额读成 50，
         // 本来是 -20）。走三本账的账户在 `separate_books` 里已经查过；不花钱的账户（平台根、补贴池）没有这样的数字。
         if books.is_none() && spends_money && (sums.has_funds || ever_had_allocation) {
-            uncovered_without_allowances(conn, id, checkpoint.through, ReplayRange::TAIL)?;
+            uncovered_without_allowances(conn, id, checkpoint.lower(), ReplayRange::TAIL)?;
         }
         if let Some(books) = &books {
             balance = None;

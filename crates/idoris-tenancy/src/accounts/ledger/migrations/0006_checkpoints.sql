@@ -20,6 +20,7 @@ CREATE TABLE ledger_checkpoint_spill (
     folded_at INTEGER NOT NULL CHECK (folded_at < entry_id)
 ) STRICT;
 CREATE INDEX ledger_checkpoint_spill_by_account ON ledger_checkpoint_spill (account_id, entry_id);
+CREATE INDEX ledger_checkpoint_spill_by_fold ON ledger_checkpoint_spill (account_id, folded_at, entry_id);
 
 CREATE TRIGGER ledger_checkpoints_clear_spill AFTER DELETE ON ledger_checkpoints
 BEGIN
