@@ -485,8 +485,8 @@ fn a_ledger_database_that_already_ran_the_first_0002_gets_the_grace_guard_from_0
 
     assert_eq!(
         versions(db.path(), "ledger_schema_migrations"),
-        [1, 2, 3, 4, 5],
-        "0003 carries the REPLACE guard, 0004 the allocation order marks, 0005 the settlement-time index; 0002 is untouched"
+        [1, 2, 3, 4, 5, 6],
+        "0003 carries the REPLACE guard, 0004 the allocation order marks, 0005 the settlement-time index, 0006 the checkpoints; 0002 is untouched"
     );
     assert_eq!(
         versions(db.path(), "account_schema_migrations"),
@@ -511,7 +511,7 @@ fn a_ledger_database_that_already_ran_the_first_0002_gets_the_grace_guard_from_0
     drop(AccountStore::open(db.path()).unwrap());
     assert_eq!(
         versions(db.path(), "ledger_schema_migrations"),
-        [1, 2, 3, 4, 5]
+        [1, 2, 3, 4, 5, 6]
     );
 }
 
@@ -526,7 +526,7 @@ fn a_ledger_database_created_after_the_in_place_edit_upgrades_cleanly_with_one_c
     drop(AccountStore::open(db.path()).unwrap());
     assert_eq!(
         versions(db.path(), "ledger_schema_migrations"),
-        [1, 2, 3, 4, 5]
+        [1, 2, 3, 4, 5, 6]
     );
     assert_eq!(trigger_count(db.path(), GRACE_GUARD), 1);
     assert!(
@@ -551,7 +551,7 @@ fn a_fresh_ledger_database_has_the_same_objects_as_an_upgraded_one() {
     assert_eq!(objects(fresh.path()), objects(upgraded.path()));
     assert_eq!(
         versions(fresh.path(), "ledger_schema_migrations"),
-        [1, 2, 3, 4, 5]
+        [1, 2, 3, 4, 5, 6]
     );
 }
 
