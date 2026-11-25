@@ -1,5 +1,6 @@
 //! 引擎管理器：每个托管卡一个实例任务（`instance.rs`），这里是它们共用的东西、对外的接口，以及从组件卡到实例计划的转换。
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,7 +14,7 @@ use tokio::time::Instant;
 
 use super::backend::{EngineBackend, OmlxBackend};
 use super::backoff::Timings;
-use super::instance::{Actor, Command, Request};
+use super::instance::{Actor, Command, Expiry, Request};
 use crate::readiness::{
     HealthState, ManagedFailure, UpstreamPlan, UpstreamReason, UpstreamState, unix_millis_now,
 };
@@ -253,12 +254,42 @@ impl CommandError {
     }
 }
 
+/// 一个被受理的命令的回答（Admin 的 `start`/`stop`/`restart` 用它，S6）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandAck {
+    /// 实例任务回答了：这是它**自己**在受理那一刻的快照（受理的状态已经发布；幂等的情形里是当前状态）。Admin 的 202 体据此渲染，
+    /// 不去读之后可能已经变了的共享状态（Codex 预审 L4 的 M1：受理之后实例任务还在往前走，也还会收下排在后面的命令）。
+    Snapshot(ManagedView),
+    /// 实例任务已经**认领**了这个命令（受理了，会照常执行），但在命令的截止时间之前没有回答：受理之后的第一步（关 Supervisor 的门……）
+    /// 等得比截止时间还久。命令是受理的，不能说成「没有受理」（Codex 预审 L4 的 M3）；它的状态要之后读（Admin 的 202 体是回答那一刻的
+    /// 元素，可能还是命令之前的状态：调用方照常轮询 `GET`）。
+    Accepted,
+}
+
 /// 状态从 `previous` 变到 `next` 是不是一次新的失败：进入 `restarting` 或 `failed` 才算，而且是从不是这两个之一的状态进入（
 /// `restarting` 之后又 `failed`、`failed` 之后又发布一次终局的 `failed`，是同一次失败）。`unavailable` 不算：它可能是引擎忙，
 /// 探测恢复就回到 `ready`。
 pub(super) fn counts_as_failure(previous: UpstreamState, next: UpstreamState) -> bool {
     let failing = |state| matches!(state, UpstreamState::Restarting | UpstreamState::Failed);
     failing(next) && !failing(previous)
+}
+
+/// 一行日志只占一行：控制字符（换行、回车、ESC……，还有 U+2028/U+2029 这两个行分隔符）转义成 `\n`、`\u{1b}` 的写法，别的原样。
+/// 没有这样的字符时不分配。
+fn single_line(line: &str) -> Cow<'_, str> {
+    let splits = |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}');
+    if !line.chars().any(splits) {
+        return Cow::Borrowed(line);
+    }
+    let mut escaped = String::with_capacity(line.len() + 8);
+    for c in line.chars() {
+        if splits(c) {
+            escaped.extend(c.escape_default());
+        } else {
+            escaped.push(c);
+        }
+    }
+    Cow::Owned(escaped)
 }
 
 /// Admin 看到的一个托管实例：只读快照，**不含任何 key、token、nonce**（`GET /admin/api/v1/upstreams`，S6）。
@@ -352,8 +383,10 @@ pub(super) struct Shared {
 }
 
 impl Shared {
+    /// 写一行日志。一条日志只占一行：上游 id 来自卡的配置，契约允许它含控制字符（换行……），照原样写进去，一条审计记录就能裂成几行、
+    /// 伪造出别的记录；所以控制字符一律转义（`\n`、`\u{1b}`），id 本身没有变，仍然能被寻址（Codex 预审 L4 的 L3）。
     pub fn log(&self, line: &str) {
-        (self.config.log)(line);
+        (self.config.log)(&single_line(line));
     }
 
     /// 发布一个实例的状态：管理器自己的表（门控判据）与 `/health` 的快照一起更新，在同一把锁里，所以
@@ -419,6 +452,33 @@ impl Shared {
         self.enqueued
             .get(id)
             .map_or(0, |counter| counter.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    /// 盖章的那把锁：[`EngineManager::command`] 在里面盖章并入队，[`Self::publish_at_watermark`] 在里面读水位并发布。临界区里都不 await、不写日志。
+    pub(super) fn freeze_stamping(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.stamp.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 发布 `status`，并在**同一步**里读出此刻的 `restart` 水位（[`Self::seq_now`]）：读水位与发布共享状态都在盖章的锁里。每个在这一步之前盖章的命令序号都
+    /// 不超过水位（它们并入这次操作，实例任务据此记 `Actor::restart_cover`），每个在这一步之后盖章的都超过，而且盖章的那一刻 `status` 已经对外可见（那是一个真正新的命令）。
+    /// 读水位与发布分成两步时，夹在中间盖章的 `restart` 序号比水位大、却是在 `ready` 可见之前发的，会被当成新的、把刚拉起的引擎又换掉（Codex 复审 L4 第二轮）。
+    /// 临界区里只有读计数与写共享状态：日志在放锁之后才写（日志的出口可能阻塞，不能把盖章挡在锁外）。
+    pub fn publish_at_watermark(&self, id: &str, status: Status) -> u64 {
+        self.publish_at_watermark_with(id, status, || {})
+    }
+
+    /// 同 [`Self::publish_at_watermark`]，`between` 在读完水位之后、发布之前、锁里被调用一次：测试在这里验证盖章被挡在外面（生产路径传空闭包）。
+    pub(super) fn publish_at_watermark_with(
+        &self,
+        id: &str,
+        status: Status,
+        between: impl FnOnce(),
+    ) -> u64 {
+        let _stamping = self.freeze_stamping();
+        let watermark = self.seq_now(id);
+        between();
+        self.publish(id, status);
+        watermark
     }
 
     /// 此刻已盖出的最大序号：序号不大于它的命令都是在这一刻之前入队的。
@@ -688,51 +748,55 @@ impl EngineManager {
         }
     }
 
-    async fn command(&self, id: &str, command: Command) -> Result<(), CommandError> {
+    async fn command(&self, id: &str, command: Command) -> Result<CommandAck, CommandError> {
         let sender = self.senders.get(id).ok_or(CommandError::NotFound)?;
         let (reply, answer) = oneshot::channel();
-        // 一个绝对的截止时间管入队、等回答两头（`Timings::command_timeout`，IDORIS-CORE S6，Codex 终审 M5）；同一个截止时间也盖在
-        // 命令上：实例任务到点还没收下它，就当它没有发生过（回答 `Closed`、不执行），所以一个已经超时的、有副作用的命令不会在
-        // 调用方放弃之后才被执行。
+        // 一个绝对的截止时间管入队、等回答两头（`Timings::command_timeout`，IDORIS-CORE S6，Codex 终审 M5）；同一个截止时间连同「有没有被
+        // 受理」的决定（[`Expiry`]）也交给命令：实例任务在第一个副作用之前认领它，调用方到点放弃它，两边抢同一个决定（Codex 预审 L4 的
+        // M3）。没被认领就过了期的命令不执行；已经认领的命令不会被说成「没有受理」。
         let deadline = Instant::now() + self.shared.config.timings.command_timeout;
+        let expiry = Expiry::new(deadline);
         let call = async {
             // 先占邮箱的位子（可能要等：邮箱满了），**占到之后**才盖章并入队，两步在同一把锁里（Codex 复审 M4）：序号的先后就是命令在邮箱里的先后。
             // 先盖章、后入队时，一个盖了章的命令可以在入队之前被抢占，排在更晚盖章的 `stop` 后面，`stop` 的截断就盖不住它。序号不大于某次
-            // 操作完成时的 `seq_now` 的 `restart`，都是在那次操作进行期间（或之前）入队的，它们并进那次操作的结果（见 `Actor::restart_cover`）。
+            // 操作就绪时的水位（[`Shared::publish_at_watermark`]）的 `restart`，都是在那次操作进行期间（或之前）入队的，它们并进那次操作的结果（见 `Actor::restart_cover`）。
             let permit = sender.reserve().await.map_err(|_| CommandError::Closed)?;
             {
-                let _order = self
-                    .shared
-                    .stamp
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
+                let _order = self.shared.freeze_stamping();
                 let seq = self.shared.next_seq(id);
                 permit.send(Request {
                     command,
                     reply: Some(reply),
                     seq,
-                    deadline: Some(deadline.into_std()),
+                    deadline: Some(expiry.clone()),
                 });
             }
             answer.await.map_err(|_| CommandError::Closed)?
         };
-        tokio::time::timeout_at(deadline, call)
-            .await
-            .unwrap_or(Err(CommandError::Closed))
+        match tokio::time::timeout_at(deadline, call).await {
+            Ok(result) => result.map(CommandAck::Snapshot),
+            // 到点了：问同一个决定。没有人认领 = 命令作废，什么也没发生（`Closed`：Admin 的 503 `idoris_stopping`，「命令没有受理」是真话）；
+            // 实例任务已经认领 = 命令是受理的，只是它的第一步还没做完、回答晚了。
+            Err(_elapsed) if expiry.abandon() => Err(CommandError::Closed),
+            Err(_elapsed) => Ok(CommandAck::Accepted),
+        }
     }
 
     /// 下命令并留一行日志（谁的、什么命令、结果；没有 token、key：只有上游 id 与命令名）。不认识的 id 不进日志：它来自调用方，
-    /// 不能让它往日志里写东西。
+    /// 不能让它往日志里写东西；认识的 id 里的控制字符在 [`Shared::log`] 里转义，一条审计只占一行。
     async fn command_logged(
         &self,
         id: &str,
         name: &str,
         command: Command,
-    ) -> Result<(), CommandError> {
+    ) -> Result<CommandAck, CommandError> {
         let result = self.command(id, command).await;
         if result != Err(CommandError::NotFound) {
-            let outcome = match result {
-                Ok(()) => "已受理".to_owned(),
+            let outcome = match &result {
+                Ok(CommandAck::Snapshot(_)) => "已受理".to_owned(),
+                Ok(CommandAck::Accepted) => {
+                    "已受理（实例任务在期限内没有回答：命令已被认领，会照常执行）".to_owned()
+                }
                 Err(error) => format!("拒绝（{}）", error.as_str()),
             };
             self.shared
@@ -744,7 +808,7 @@ impl EngineManager {
     /// 从 `stopped`、`failed`、`absent`、`unavailable` 重新走启动决策；已经 `ready`、或正在启动时幂等。一个还活着的自有引擎
     /// （`unavailable`：活着却不答）先走完整的停止路径（优雅停止、撤销私有 key），不是丢弃句柄（G3）。门控放行之后引擎换了一个
     /// 进程，Supervisor 的账本在发布 `ready` 之前复位（S6）；放行时没就绪而冻结的上游 [`CommandError::RestartRequired`]。
-    pub async fn start_upstream(&self, id: &str) -> Result<(), CommandError> {
+    pub async fn start_upstream(&self, id: &str) -> Result<CommandAck, CommandError> {
         self.command_logged(id, "start", Command::Start).await
     }
 
@@ -753,14 +817,19 @@ impl EngineManager {
     /// 准入新的加载与聊天）；之后才排空在途的、停进程（至多一个 `stop_grace` 加排空的上限）：这几秒里引擎还握在手里，`owned`、`pid`
     /// 还在，进程确认消失之后才是 `owned: false`，调用方轮询 `/health` 或 Admin。进程确认消失之后，端点才被封上（G2，不是撤销登记），
     /// Supervisor 的账本也清空（引擎已经没有了）。
-    pub async fn stop_upstream(&self, id: &str) -> Result<(), CommandError> {
+    pub async fn stop_upstream(&self, id: &str) -> Result<CommandAck, CommandError> {
         self.command_logged(id, "stop", Command::Stop).await
     }
 
     /// `stop` 之后重新走启动决策；不是自己拥有的引擎同样 [`CommandError::NotOwned`]。门控放行之后新引擎就绪时，Supervisor 的
     /// 账本在发布 `ready` 之前对着新进程重建（S6）；放行时没就绪而冻结的上游 [`CommandError::RestartRequired`]。
-    pub async fn restart_upstream(&self, id: &str) -> Result<(), CommandError> {
+    pub async fn restart_upstream(&self, id: &str) -> Result<CommandAck, CommandError> {
         self.command_logged(id, "restart", Command::Restart).await
+    }
+
+    /// 到此刻为止给这个上游入队的命令数（盖章的计数）：序号不大于它的命令都已经在实例任务的邮箱里。测试据此等「命令已经入队」，不靠睡眠；诊断也可以读它。
+    pub fn commands_enqueued(&self, id: &str) -> u64 {
+        self.shared.seq_now(id)
     }
 
     /// 每个托管上游此刻的只读快照（`GET /admin/api/v1/upstreams`，S6）。在管理器自己的状态表的锁里一次读完，所以每个实例的
@@ -857,7 +926,7 @@ impl EngineManager {
 /// [`deliver_shutdown`] 的结果。
 struct Delivered {
     /// 已送到的实例的答复。
-    answers: Vec<oneshot::Receiver<Result<(), CommandError>>>,
+    answers: Vec<oneshot::Receiver<Result<ManagedView, CommandError>>>,
     /// 到 `end` 命令队列还是满的、没能送到的实例。
     undelivered: Vec<String>,
 }
@@ -1090,6 +1159,35 @@ mod tests {
         assert!(Shared::all_settled(&table(&[ready, terminal, ready])));
     }
 
+    /// 没有实例任务、没有托管卡的共用状态，只有一个叫 `id` 的命令计数器：给手工搭的管理器用。
+    fn shared_for_tests(id: &str, timings: Timings, log: LogSink) -> Arc<Shared> {
+        Arc::new(Shared {
+            config: ManagerConfig {
+                state_dir: std::env::temp_dir(),
+                allocated_budget_bytes: None,
+                stop_on_exit: StopOnExit::Owned,
+                executables: BTreeMap::new(),
+                launched_by: "unit-test".to_owned(),
+                timings,
+                inspector: Arc::new(idoris_upstream::engine::SystemInspector::new()),
+                log,
+            },
+            health: HealthState::default(),
+            gate_open: AtomicBool::new(false),
+            statuses: Mutex::new(BTreeMap::new()),
+            kinds: BTreeMap::new(),
+            ports: BTreeMap::new(),
+            enqueued: BTreeMap::from([(id.to_owned(), AtomicU64::new(0))]),
+            degraded: Mutex::new(BTreeMap::new()),
+            started: Instant::now(),
+            changed: watch::channel(0_u64).0,
+            failure: watch::channel(None).0,
+            shutdown: watch::channel(None).0,
+            stamp: Mutex::new(()),
+            runtimes: OnceLock::new(),
+        })
+    }
+
     /// 一个邮箱已经被命令填满、实例任务又在忙（谁也不收）的管理器：实例任务握着邮箱的接收端（通道开着、满着），既不收命令也不结束
     /// （直到被中止）。
     fn manager_with_a_busy_instance(
@@ -1112,31 +1210,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let shared = Arc::new(Shared {
-            config: ManagerConfig {
-                state_dir: std::env::temp_dir(),
-                allocated_budget_bytes: None,
-                stop_on_exit: StopOnExit::Owned,
-                executables: BTreeMap::new(),
-                launched_by: "unit-test".to_owned(),
-                timings,
-                inspector: Arc::new(idoris_upstream::engine::SystemInspector::new()),
-                log: Arc::new(|_| {}),
-            },
-            health: HealthState::default(),
-            gate_open: AtomicBool::new(false),
-            statuses: Mutex::new(BTreeMap::new()),
-            kinds: BTreeMap::new(),
-            ports: BTreeMap::new(),
-            enqueued: BTreeMap::from([("omlx".to_owned(), AtomicU64::new(0))]),
-            degraded: Mutex::new(BTreeMap::new()),
-            started: Instant::now(),
-            changed: watch::channel(0_u64).0,
-            failure: watch::channel(None).0,
-            shutdown: watch::channel(None).0,
-            stamp: Mutex::new(()),
-            runtimes: OnceLock::new(),
-        });
+        let shared = shared_for_tests("omlx", timings, Arc::new(|_| {}));
         let task = tokio::spawn(async move {
             let _mailbox = receiver;
             std::future::pending::<()>().await;
@@ -1207,6 +1281,292 @@ mod tests {
             started.elapsed()
         );
         shutdown_bounded(&manager).await;
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Codex 预审 L4：命令的回答与受理（M1、M3）、审计日志只占一行（L3）
+    // -----------------------------------------------------------------------------------------
+
+    fn a_view(state: UpstreamState) -> ManagedView {
+        ManagedView {
+            state,
+            reason: None,
+            owned: true,
+            port: 19731,
+            pid: Some(4242),
+            restart_required: false,
+            failure_count: 0,
+            last_failure_at_ms: None,
+        }
+    }
+
+    /// 实例任务由测试自己扮演的管理器：测试握着邮箱的接收端，想什么时候收、什么时候回答、认领不认领，都由它定。
+    fn manager_with_a_scripted_instance(
+        id: &str,
+        command_timeout: Duration,
+        lines: Arc<Mutex<Vec<String>>>,
+    ) -> (EngineManager, mpsc::Receiver<Request>) {
+        let timings = Timings {
+            command_timeout,
+            ..Timings::default()
+        };
+        let log: LogSink = Arc::new(move |line| lines.lock().unwrap().push(line.to_owned()));
+        let (sender, receiver) = mpsc::channel::<Request>(8);
+        let manager = EngineManager {
+            shared: shared_for_tests(id, timings, log),
+            senders: BTreeMap::from([(id.to_owned(), sender)]),
+            tasks: Mutex::new(Vec::new()),
+        };
+        (manager, receiver)
+    }
+
+    /// M1：受理的回答带着实例任务**自己**在受理那一刻的快照，原样交给调用方；调用方不再去读之后可能已经变了的共享状态。
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_command_returns_the_snapshot_the_instance_answered_with() {
+        let lines = Arc::default();
+        let (manager, mut mailbox) =
+            manager_with_a_scripted_instance("omlx", Duration::from_secs(5), lines);
+        let instance = tokio::spawn(async move {
+            let request = mailbox.recv().await.unwrap();
+            assert!(
+                request.deadline.as_ref().unwrap().claim(),
+                "the instance claims it before its first side effect"
+            );
+            let _ = request
+                .reply
+                .unwrap()
+                .send(Ok(a_view(UpstreamState::Restarting)));
+        });
+        // 这一刻共享的状态表里什么都没有（也可以是任何别的东西）：回答不取决于它。
+        let result = manager.restart_upstream("omlx").await;
+        assert_eq!(
+            result,
+            Ok(CommandAck::Snapshot(a_view(UpstreamState::Restarting)))
+        );
+        instance.await.unwrap();
+    }
+
+    /// M3：实例任务在截止时间**之前**认领了命令，第一步（关 Supervisor 的门）等得比截止时间还久、回答晚了。命令是受理的，会照常执行：
+    /// 不能说成「没有受理」（之前是 `Closed`，Admin 回 503 `idoris_stopping`「命令没有受理」，而实例任务随后照样停了引擎）。
+    #[tokio::test(start_paused = true)]
+    async fn a_command_the_instance_claimed_in_time_is_accepted_even_when_its_answer_is_late() {
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (manager, mut mailbox) =
+            manager_with_a_scripted_instance("omlx", Duration::from_secs(5), lines.clone());
+        let instance = tokio::spawn(async move {
+            let request = mailbox.recv().await.unwrap();
+            assert!(request.deadline.as_ref().unwrap().claim());
+            // 第一步（关 Supervisor 的门）比调用方愿意等的还久；回答来的时候调用方早已走了。
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let _ = request
+                .reply
+                .unwrap()
+                .send(Ok(a_view(UpstreamState::Stopped)));
+        });
+        let result = manager.stop_upstream("omlx").await;
+        assert_eq!(
+            result,
+            Ok(CommandAck::Accepted),
+            "claimed before the deadline: it will run, so it is accepted"
+        );
+        {
+            let lines = lines.lock().unwrap();
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("收到命令 stop，已受理")),
+                "{lines:?}"
+            );
+        }
+        instance.await.unwrap();
+    }
+
+    /// M3 的另一半：到了截止时间还没有被认领的命令作废（`Closed`，「命令没有受理」是真话），实例任务之后收到它、想认领，认领不成，什么也不做。
+    #[tokio::test(start_paused = true)]
+    async fn a_command_nobody_claimed_by_the_deadline_is_abandoned_for_good() {
+        let (manager, mut mailbox) = manager_with_a_scripted_instance(
+            "omlx",
+            Duration::from_secs(5),
+            Arc::<Mutex<Vec<String>>>::default(),
+        );
+        let instance = tokio::spawn(async move {
+            // 实例任务忙着别的事，过了截止时间才来收邮箱。
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let request = mailbox.recv().await.unwrap();
+            request.deadline.as_ref().unwrap().claim()
+        });
+        let result = manager.stop_upstream("omlx").await;
+        assert_eq!(result, Err(CommandError::Closed));
+        assert!(
+            !instance.await.unwrap(),
+            "an abandoned command can no longer be claimed: the instance does nothing with it"
+        );
+    }
+
+    /// 认领与放弃抢的是同一个决定：谁先到谁定，另一方一定看得见。
+    #[tokio::test(start_paused = true)]
+    async fn claiming_and_abandoning_are_one_decision() {
+        let at = Instant::now() + Duration::from_secs(5);
+        // 先认领：之后调用方放弃不成（命令是受理的）；认领过的不能再被放弃。
+        let claimed = Expiry::new(at);
+        assert!(claimed.claim());
+        assert!(!claimed.abandon());
+        assert!(!claimed.abandon(), "still claimed");
+        // 先放弃：之后认领不成；放弃是幂等的。
+        let abandoned = Expiry::new(at);
+        assert!(abandoned.abandon());
+        assert!(abandoned.abandon());
+        assert!(!abandoned.claim());
+        // 截止时间过了才来认领：不成，而且命令就此作废（调用方的计时器与这一步不会各说各的）。
+        let late = Expiry::new(at);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!late.claim());
+        assert!(
+            late.abandon(),
+            "the late claim abandoned it on the caller's behalf"
+        );
+    }
+
+    /// 复审 L1'：截止时间的检查与决定是一步。认领成功**当且仅当**锁里读到的时钟还没到截止时间：恰好到了截止时间的认领失败（调用方的计时器此刻在同一时刻触发，
+    /// 但认领不等它），而且替它放弃；截止时间之前一刻的认领成功，之后调用方放弃不成（命令是受理的）。
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_is_valid_only_before_the_deadline_whether_or_not_the_callers_timer_has_run() {
+        let at = Instant::now() + Duration::from_secs(5);
+        // 截止时间之前一刻：认领成功，调用方的放弃不成。
+        let just_in_time = Expiry::new(at);
+        tokio::time::advance(Duration::from_millis(4999)).await;
+        assert!(just_in_time.claim());
+        assert!(!just_in_time.abandon());
+        // 恰好到了截止时间（时钟读数 == at），调用方的计时器还没调 `abandon`：认领失败，命令作废。
+        let on_the_dot = Expiry::new(at);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(Instant::now(), at);
+        assert!(!on_the_dot.claim(), "a claim at the deadline is too late");
+        assert!(
+            on_the_dot.abandon(),
+            "and it abandoned the command for the caller"
+        );
+        // 重复认领是幂等的；已经放弃的命令不会因为再认领一次又活过来。
+        let again = Expiry::new(at + Duration::from_secs(60));
+        assert!(again.claim());
+        assert!(again.claim());
+        assert!(!again.abandon());
+        assert!(!on_the_dot.claim());
+    }
+
+    /// 复审 L4 第二轮：「记 `restart` 的水位」与「发布 `ready`」是**一步**（[`Shared::publish_at_watermark`]，实例任务发布 `ready` 走的就是它）。在水位读完、
+    /// 发布之前（`between` 钩子，锁里）：盖章的锁被握着（确定的，不靠睡眠），一个正抢着盖章的客户端线程什么也没盖出去；之后它盖的章比水位大，而且盖章的那一刻
+    /// `ready` 已经对外可见（那是真正新的命令）；在这一步之前盖的章不超过水位（并入这次操作）。
+    #[test]
+    fn publishing_ready_and_taking_the_watermark_exclude_command_stamping() {
+        let shared = shared_for_tests("omlx", Timings::default(), Arc::new(|_| {}));
+        // 一个在这一步之前盖章的命令：不超过水位（并入这次操作）。
+        let before = {
+            let _order = shared.freeze_stamping();
+            shared.next_seq("omlx")
+        };
+        let ready = Status {
+            state: UpstreamState::Ready,
+            reason: None,
+            owned: true,
+            terminal: false,
+            pid: Some(1),
+            failures: 0,
+            last_failure_at_ms: None,
+        };
+        let (racing_tx, racing_rx) = std::sync::mpsc::channel::<()>();
+        let (stamped_tx, stamped_rx) = std::sync::mpsc::channel::<(u64, bool)>();
+        std::thread::scope(|scope| {
+            // 客户端：与 `EngineManager::command` 一样在盖章的锁里盖章，并记下盖章那一刻 `ready` 是不是已经可见。
+            let for_client = Arc::clone(&shared);
+            let client = scope.spawn(move || {
+                racing_tx.send(()).unwrap();
+                let _order = for_client.freeze_stamping();
+                let seq = for_client.next_seq("omlx");
+                let ready_visible = for_client
+                    .statuses
+                    .lock()
+                    .unwrap()
+                    .get("omlx")
+                    .is_some_and(|status| status.state == UpstreamState::Ready);
+                stamped_tx.send((seq, ready_visible)).unwrap();
+            });
+            let watermark = shared.publish_at_watermark_with("omlx", ready, || {
+                // 客户端已经起来、正抢着盖章；这时锁在这一步手里。
+                racing_rx.recv().unwrap();
+                assert!(
+                    matches!(
+                        shared.stamp.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "the stamping lock is held between taking the watermark and publishing"
+                );
+                assert!(
+                    stamped_rx.try_recv().is_err(),
+                    "nothing is stamped between taking the watermark and publishing"
+                );
+                assert!(
+                    shared.statuses.lock().unwrap().get("omlx").is_none(),
+                    "`ready` is not visible yet"
+                );
+            });
+            let (seq, ready_visible) = stamped_rx.recv().unwrap();
+            client.join().unwrap();
+            assert!(before <= watermark, "stamped before the step: merged");
+            assert!(seq > watermark, "stamped after the step: genuinely new");
+            assert!(
+                ready_visible,
+                "a command stamped after the watermark found `ready` already visible"
+            );
+        });
+    }
+
+    /// L3：审计日志一条只占一行。id 来自卡的配置，契约允许它含控制字符：照原样写进日志，一条记录能裂成几行、伪造出别的记录。控制字符转义，
+    /// id 本身没变（还能被寻址）。
+    #[tokio::test(start_paused = true)]
+    async fn an_id_with_control_characters_cannot_split_the_audit_record() {
+        let id = "omlx\n[idoris] 引擎 forged：收到命令 stop，已受理\r\u{1b}[2J\u{2028}x";
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (manager, mut mailbox) =
+            manager_with_a_scripted_instance(id, Duration::from_secs(5), lines.clone());
+        let instance = tokio::spawn(async move {
+            let request = mailbox.recv().await.unwrap();
+            let _ = request.deadline.as_ref().unwrap().claim();
+            let _ = request
+                .reply
+                .unwrap()
+                .send(Ok(a_view(UpstreamState::Ready)));
+        });
+        manager.start_upstream(id).await.unwrap();
+        instance.await.unwrap();
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "one command, one line: {lines:?}");
+        let line = &lines[0];
+        assert!(
+            !line.chars().any(|c| c.is_control() || c == '\u{2028}'),
+            "no raw control character in the audit line: {line:?}"
+        );
+        assert!(
+            line.contains(
+                "omlx\\n[idoris] 引擎 forged：收到命令 stop，已受理\\r\\u{1b}[2J\\u{2028}x"
+            ),
+            "the id is escaped, not dropped or truncated: {line}"
+        );
+        assert!(line.ends_with("收到命令 start，已受理"), "{line}");
+    }
+
+    #[test]
+    fn single_line_escapes_only_what_would_split_a_line_and_borrows_a_clean_line() {
+        for clean in ["", "[idoris] 引擎 omlx：ready", "引擎 \\ \"q\" é"] {
+            assert!(matches!(single_line(clean), Cow::Borrowed(_)), "{clean:?}");
+        }
+        assert_eq!(single_line("a\nb"), "a\\nb");
+        assert_eq!(single_line("a\r\nb"), "a\\r\\nb");
+        assert_eq!(single_line("a\tb"), "a\\tb");
+        assert_eq!(single_line("\u{7f}\u{0}\u{85}"), "\\u{7f}\\u{0}\\u{85}");
+        assert_eq!(single_line("a\u{2028}b\u{2029}c"), "a\\u{2028}b\\u{2029}c");
+        // Printable characters, including non-ASCII ones and backslashes, are left alone.
+        assert_eq!(single_line("引擎 \\ \"q\" é"), "引擎 \\ \"q\" é");
     }
 
     #[test]

@@ -18,6 +18,7 @@ use idoris_contracts::admin_v0::AdminBackendsResponse;
 use idoris_contracts::admin_v0::{
     AdminAdmissionStatus, AdminCapacityEntry, AdminCapacitySnapshot, AdminCapacityState,
     AdminModelsResponse, AdminRolesResponse, AdminRuntimesResponse, AdminStatusResponse,
+    AdminUpstream, AdminUpstreamsResponse,
 };
 use idoris_contracts::component_card::ComponentCard;
 use idoris_contracts::inspect::{InspectRequest, InspectResponse};
@@ -369,6 +370,116 @@ fn admin_v0_status_corpus() {
     let mut bad_capacity = valid.clone();
     bad_capacity["capacity"] = json!({"state": "error", "entries": []});
     assert_parity::<AdminStatusResponse>("admin-v0-status.schema.json", &bad_capacity);
+}
+
+/// `admin-v0-upstream.schema.json` / `admin-v0-upstreams.schema.json` (interface spec §2.11.4): the same
+/// corpus as `parity.test.ts` plus the cases that only the Rust side can get wrong (`null`, integral
+/// bounds), each verdict compared with the schema file and, for the ones that matter, pinned independently.
+#[test]
+fn admin_v0_upstreams_corpus() {
+    let managed = json!({
+        "id": "omlx", "engine_kind": "omlx", "state": "ready", "managed": true, "owned": true,
+        "port": 19731, "pid": 51234, "restart_required": false, "failure_count": 0
+    });
+    let resident = json!({
+        "id": "lmstudio", "engine_kind": "openai_compat", "state": "ready", "managed": false,
+        "owned": false, "port": 1234, "restart_required": false
+    });
+    let element = "admin-v0-upstream.schema.json";
+    let collection = "admin-v0-upstreams.schema.json";
+
+    // Independent verdicts first: these are what the contract says, not just what the two sides agree on.
+    let valid = |value: &Value| idoris_contracts::parse::<AdminUpstream>(value).is_ok();
+    assert!(valid(&managed));
+    assert!(valid(&resident));
+    let mut failed = managed.clone();
+    failed.as_object_mut().unwrap().remove("pid");
+    failed["state"] = json!("failed");
+    failed["reason"] = json!("crash_loop");
+    failed["owned"] = json!(false);
+    failed["restart_required"] = json!(true);
+    failed["failure_count"] = json!(6);
+    failed["last_failure_at_ms"] = json!(1_763_625_330_123_u64);
+    assert!(valid(&failed));
+
+    let mutated = |field: &str, value: Value| {
+        let mut item = managed.clone();
+        item[field] = value;
+        item
+    };
+    let without = |field: &str| {
+        let mut item = managed.clone();
+        item.as_object_mut().unwrap().remove(field);
+        item
+    };
+    let rejected = [
+        without("restart_required"),
+        without("id"),
+        without("state"),
+        mutated("state", json!("stopping")),
+        mutated("state", json!("Ready")),
+        mutated("reason", json!("disk_full")),
+        mutated("reason", Value::Null),
+        mutated("id", json!("")),
+        mutated("engine_kind", json!("")),
+        mutated("engine_kind", json!("OMLX")),
+        mutated("engine_kind", json!("1omlx")),
+        mutated("engine_kind", json!("a".repeat(33))),
+        mutated("managed", json!("yes")),
+        mutated("owned", json!(1)),
+        mutated("port", json!(0)),
+        mutated("port", json!(65536)),
+        mutated("port", json!(1.5)),
+        mutated("port", Value::Null),
+        mutated("pid", json!(0)),
+        mutated("pid", json!(-3)),
+        // The integer ranges are the Rust types' ranges: `pid` and `failure_count` are `u32`, the timestamp
+        // is pinned to JavaScript's safe-integer range (2^53 - 1) so no consumer rounds it.
+        mutated("pid", json!(4_294_967_296_u64)),
+        mutated("failure_count", json!(-1)),
+        mutated("failure_count", json!(2.5)),
+        mutated("failure_count", json!(4_294_967_296_u64)),
+        mutated("last_failure_at_ms", json!(-1)),
+        mutated("last_failure_at_ms", json!(9_007_199_254_740_992_u64)),
+        mutated("last_failure_at_ms", json!(u64::MAX)),
+        // No secret-bearing field has a place in the element (`deny_unknown_fields` / `additionalProperties:false`).
+        mutated("api_key", json!("secret")),
+        mutated("token", json!("secret")),
+        mutated("instance_nonce", json!("secret")),
+        mutated("endpoint", json!("http://127.0.0.1:19731")),
+    ];
+    for item in &rejected {
+        assert!(!valid(item), "accepted {item}");
+    }
+    assert!(valid(&mutated("engine_kind", json!("unknown"))));
+    assert!(valid(&mutated("engine_kind", json!("a".repeat(32)))));
+    assert!(valid(&mutated("port", json!(65535))));
+    assert!(valid(&mutated("pid", json!(4_294_967_295_u64))));
+    assert!(valid(&mutated("failure_count", json!(4_294_967_295_u64))));
+    assert!(valid(&mutated(
+        "last_failure_at_ms",
+        json!(1_763_625_330_123_u64)
+    )));
+    assert!(valid(&mutated(
+        "last_failure_at_ms",
+        json!(9_007_199_254_740_991_u64)
+    )));
+
+    // Then parity with the schema file, element by element and inside the collection.
+    let accepted = [managed.clone(), resident.clone(), failed];
+    for item in accepted.iter().chain(rejected.iter()) {
+        assert_parity::<AdminUpstream>(element, item);
+        assert_parity::<AdminUpstreamsResponse>(collection, &json!({"upstreams": [item]}));
+    }
+    for instance in [
+        json!({"upstreams": []}),
+        json!({"upstreams": [managed, resident]}),
+        json!({}),
+        json!({"upstreams": {}}),
+        json!({"upstreams": [], "default": "omlx"}),
+    ] {
+        assert_parity::<AdminUpstreamsResponse>(collection, &instance);
+    }
 }
 
 #[test]

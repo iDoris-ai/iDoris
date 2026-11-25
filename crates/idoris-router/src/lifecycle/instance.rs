@@ -23,7 +23,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::backoff::{CrashWindow, restart_delay};
 use super::manager::{
-    CommandError, EngineFailure, ManagedPlan, Shared, ShutdownOrder, Status, counts_as_failure,
+    CommandError, EngineFailure, ManagedPlan, ManagedView, Shared, ShutdownOrder, Status,
+    counts_as_failure,
 };
 use crate::readiness::{UpstreamReason, UpstreamState, unix_millis_now};
 
@@ -45,21 +46,111 @@ pub(super) enum Command {
     },
 }
 
+/// 命令的回答：被受理时带着实例任务**自己**在受理那一刻的快照（IDORIS-CORE S6，Codex 预审 L4 的 M1）。受理之后实例任务还在往前走
+/// （排空、停进程、换新引擎），也还会收下排在后面的命令；让调用方事后去读共享的状态，读到的可能是另一个命令、或者这一次操作更晚的状态
+///（`restart` 的 202 体说 `stopped`，或者快到新引擎已经就绪、`restarting` 被盖掉了）。`Shutdown` 在收尾完成之后才回答。
+pub(super) type Reply = oneshot::Sender<Result<ManagedView, CommandError>>;
+
 pub(super) struct Request {
     pub command: Command,
-    /// 命令被接受（或被拒绝）的回答；`Shutdown` 在收尾完成之后才回答。
-    pub reply: Option<oneshot::Sender<Result<(), CommandError>>>,
+    pub reply: Option<Reply>,
     /// 入队时盖的章（[`Shared::next_seq`]，从 1 起；`GiveUp`、`Shutdown` 是 0）：见 [`Actor::restart_cover`]。
     pub seq: u64,
-    /// 命令的绝对截止时间（`Timings::command_timeout`，只有 `start`、`stop`、`restart` 有；IDORIS-CORE S6，Codex 终审 M5）：到点还没被
-    /// 收下就当它没有发生过（回答 `Closed`、不执行）。调用方在同一个截止时间放弃，所以一个超时的、有副作用的命令不会在它放弃之后才被执行。
-    pub deadline: Option<Instant>,
+    /// 命令的绝对截止时间，连同调用方与实例任务对「这个命令有没有被受理」的共同决定（`Timings::command_timeout`，只有 `start`、`stop`、
+    /// `restart` 有；见 [`Expiry`]）：没有被认领就过了期的命令当它没有发生过（回答 `Closed`、不执行）。
+    pub deadline: Option<Expiry>,
 }
 
 impl Request {
+    /// 调用方已经放弃、或者截止时间已过：这个命令不再有人等，也不该再有副作用。
     fn expired(&self) -> bool {
-        self.deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
+        self.deadline.as_ref().is_some_and(Expiry::dead)
+    }
+}
+
+/// 一个命令的「有没有被受理」的三态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Undecided,
+    /// 实例任务认领了：命令是受理的，调用方从此不能再把它说成「没有受理」。
+    Claimed,
+    /// 调用方放弃了（或截止时间已过时有人替它放弃）：命令作废，之后认领不成。
+    Abandoned,
+}
+
+/// 命令的绝对截止时间，连同调用方与实例任务对「这个命令有没有被受理」的**共同决定**（IDORIS-CORE S6，Codex 预审 L4 的 M3、复审的 L1'）。
+///
+/// 只比较时间不够：实例任务在截止时间之前收下命令、做完第一个有副作用的步骤（关 Supervisor 的门……），那一步可以等得比截止时间还久，
+/// 调用方这时已经回了「没有受理」（503），命令却照样被执行。所以两边抢同一个三态的决定，谁先到谁定：
+///
+/// - 实例任务在**第一个副作用之前**[`Self::claim`]：成功就是受理了，调用方从此不能再把它说成「没有受理」；
+/// - 调用方到了截止时间[`Self::abandon`]：成功就是命令作废，实例任务之后认领会失败、什么都不做；失败就是命令已经被受理，只是回答晚了。
+///
+/// **生效的时刻是实例任务拿到决定锁的那一刻**：截止时间的检查与决定在同一把锁里做（[`Self::claim`] 在锁里读时钟），所以认领成功**当且仅当**它读到的时钟还没到截止时间；
+/// 到了截止时间，哪怕调用方的计时器还没来得及调 [`Self::abandon`]，认领也一律失败（并替它放弃）。一个到点时还没被认领的命令因此绝不会被受理；
+/// 一个在截止时间之前被认领的命令一定是受理的，回答多晚都是。（之前时钟与比较交换是两步，认领可以在截止时间过了之后赢下比较交换。）
+///
+/// 没有副作用的回答（幂等的、被拒绝的）不用认领：它们迟到也不改变任何东西。
+#[derive(Debug, Clone)]
+pub(super) struct Expiry {
+    at: tokio::time::Instant,
+    decision: Arc<std::sync::Mutex<Decision>>,
+}
+
+impl Expiry {
+    pub(super) fn new(at: tokio::time::Instant) -> Self {
+        Self {
+            at,
+            decision: Arc::new(std::sync::Mutex::new(Decision::Undecided)),
+        }
+    }
+
+    fn decision(&self) -> std::sync::MutexGuard<'_, Decision> {
+        self.decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 调用方已经放弃了这个命令。
+    fn abandoned(&self) -> bool {
+        *self.decision() == Decision::Abandoned
+    }
+
+    /// 没有人认领、而且调用方放弃了，或者截止时间已过：不再有人等它。
+    fn dead(&self) -> bool {
+        self.abandoned() || tokio::time::Instant::now() >= self.at
+    }
+
+    /// 实例任务：在第一个有副作用的步骤之前认领。`true` = 命令从此是受理的；`false` = 调用方已经放弃，或者锁里读到的时钟已经到了截止时间（这里替它放弃，
+    /// 省得调用方的计时器与这一步各说各的），什么都不要做。重复认领一个已经认领的命令还是 `true`。
+    pub(super) fn claim(&self) -> bool {
+        let mut decision = self.decision();
+        match *decision {
+            Decision::Claimed => true,
+            Decision::Abandoned => false,
+            Decision::Undecided => {
+                if tokio::time::Instant::now() >= self.at {
+                    *decision = Decision::Abandoned;
+                    false
+                } else {
+                    *decision = Decision::Claimed;
+                    true
+                }
+            }
+        }
+    }
+
+    /// 调用方：到了截止时间。`true` = 没有人认领，命令从此作废；`false` = 实例任务已经认领，命令是受理的（回答晚了）。
+    pub(super) fn abandon(&self) -> bool {
+        let mut decision = self.decision();
+        match *decision {
+            Decision::Claimed => false,
+            Decision::Abandoned => true,
+            Decision::Undecided => {
+                *decision = Decision::Abandoned;
+                true
+            }
+        }
     }
 }
 
@@ -254,10 +345,13 @@ pub(super) struct Actor {
     adopted_listeners: Option<Vec<ListenerIdentity>>,
     /// 操作员发起的、还没做完的 `start`、`restart`。
     op: Option<Op>,
+    /// 这次操作有没有真的拉起过一个自有引擎（`OwnedEngine::spawn` 成功过）：`restart` 的水位只给**拉起了自有引擎、并且就绪了**的操作记（Codex 复审 L4 第二轮：
+    /// 一次因为找不到可执行文件而以 `absent` 收尾的 `start`，排在它后面的 `restart` 不能被说成并进了一个什么引擎都没换的操作）。操作开始时清零。
+    op_launched: bool,
     /// 序号不大于它的 `restart` 命令，都是在上一次 `start`、`restart` 操作进行期间（或之前）入队的：它们并进那次操作的结果，
-    /// 不再换第二次引擎。命令在**入队时**盖章（[`Shared::next_seq`]），操作完成时记下此刻盖出的最大序号；这样即使命令
-    /// 在 actor 忙着排空、停进程、复位、不去收命令的时候排在队里，它也被认出是「同一次操作」的并发（IDORIS-CORE S6，
-    /// Codex 预审 5）。
+    /// 不再换第二次引擎。命令在**入队时**盖章（[`Shared::next_seq`]），操作拉起了自有引擎并就绪时、在发布 `ready` 的同一步里记下此刻盖出的最大序号
+    /// （[`Self::publish_ready_finishing_op`]）；这样即使命令在 actor 忙着排空、停进程、复位、不去收命令的时候排在队里，它也被认出是
+    /// 「同一次操作」的并发（IDORIS-CORE S6，Codex 预审 5）。没有换上引擎就结束的操作不记（复审 L4 第二轮）。
     restart_cover: u64,
     /// 启动决策「前提变了、重来」（[`Attempt::Redecide`]）的这一串从什么时候开始。
     redecide_since: Option<Instant>,
@@ -308,6 +402,7 @@ impl Actor {
             identity: None,
             adopted_listeners: None,
             op: None,
+            op_launched: false,
             restart_cover: 0,
             redecide_since: None,
             external_gap: false,
@@ -396,6 +491,21 @@ impl Actor {
         self.shared.is_frozen(&self.plan.id)
     }
 
+    /// 实例任务**此刻自己**的快照：与它最后一次发布的状态是同一份事实（[`Self::emit`] 同时更新这些字段与共享的状态表）。命令的回答带它
+    /// （[`Reply`]）：Admin 的 202 体据此渲染，不去读之后可能已经变了的共享状态（Codex 预审 L4 的 M1）。
+    fn view(&self) -> ManagedView {
+        ManagedView {
+            state: self.state,
+            reason: self.reason,
+            owned: self.engine.is_some(),
+            port: self.plan.port,
+            pid: self.engine.as_ref().map(|owned| owned.engine.pid()),
+            restart_required: self.frozen(),
+            failure_count: self.failures,
+            last_failure_at_ms: self.last_failure_at_ms,
+        }
+    }
+
     fn emit(
         &mut self,
         state: UpstreamState,
@@ -415,6 +525,25 @@ impl Actor {
         count: Count,
         log: bool,
     ) {
+        let (status, changed) = self.advance(state, reason, terminal, count);
+        self.shared.publish(&self.plan.id, status);
+        if changed && log {
+            match reason {
+                Some(reason) => self.log(&format!("{}（{}）", state.as_str(), reason.as_str())),
+                None => self.log(state.as_str()),
+            }
+        }
+    }
+
+    /// 实例任务自己的簿记：更新状态字段与失败计数，返回要发布的状态和「状态或原因有没有变」。发布与日志由调用方做（发布 `ready` 要与水位同一步，
+    /// 见 [`Self::publish_ready_finishing_op`]）。
+    fn advance(
+        &mut self,
+        state: UpstreamState,
+        reason: Option<UpstreamReason>,
+        terminal: bool,
+        count: Count,
+    ) -> (Status, bool) {
         let changed = self.state != state || self.reason != reason;
         let counted = match count {
             Count::Edge => counts_as_failure(self.state, state),
@@ -428,8 +557,7 @@ impl Actor {
         self.state = state;
         self.reason = reason;
         self.terminal = terminal;
-        self.shared.publish(
-            &self.plan.id,
+        (
             Status {
                 state,
                 reason,
@@ -439,13 +567,8 @@ impl Actor {
                 failures: self.failures,
                 last_failure_at_ms: self.last_failure_at_ms,
             },
-        );
-        if changed && log {
-            match reason {
-                Some(reason) => self.log(&format!("{}（{}）", state.as_str(), reason.as_str())),
-                None => self.log(state.as_str()),
-            }
-        }
+            changed,
+        )
     }
 
     fn state_line(state: UpstreamState, reason: Option<UpstreamReason>) -> String {
@@ -508,9 +631,19 @@ impl Actor {
         }
     }
 
-    /// 在当前状态下什么也改变不了的命令的回答（`None` = 这个命令要真的处理）。
-    fn immediate_answer(&self, request: &Request) -> Option<Result<(), CommandError>> {
-        let covered = request.seq != 0 && request.seq <= self.restart_cover;
+    /// 这个 `restart` 是在一次已经做完（或刚做完）的 `start`、`restart` 操作进行期间（或之前）入队的吗（[`Self::restart_cover`]）：是就并进那次
+    /// 操作的结果，不换第二次引擎。
+    fn restart_covered(&self, seq: u64) -> bool {
+        seq != 0 && seq <= self.restart_cover
+    }
+
+    /// 在当前状态下什么也改变不了的命令的回答（`None` = 这个命令要真的处理）。**归属与并入在这里一起决定**（Codex 预审 L4 的 M2）：
+    /// Admin 的预检读的是 `/health` 同源的快照，读完到命令被收下之间它可以变，只有实例任务知道此刻有没有一次操作员发起的、真的在换自有
+    /// 引擎的操作在进行。**不看发布的状态**：`restarting` 也是外部引擎换了进程时自动重新同步（[`Self::external_replaced`]）发布的状态，那里
+    /// 没有一次可并入的、iDoris 拥有的重启，看见这个状态就回 202 是一个没有任何东西跟在后面的假受理（规范 §2.11.4 要的是 409
+    /// `upstream_not_owned`）；并入看的是显式记着的 [`Self::op`]、[`Self::external_path`] 与入队时盖的章。
+    /// 受理（包括幂等的）带着此刻自己的快照（[`Reply`]）。
+    fn immediate_answer(&self, request: &Request) -> Option<Result<ManagedView, CommandError>> {
         match &request.command {
             // 已经好了、或正在启动：幂等。
             Command::Start
@@ -519,20 +652,24 @@ impl Actor {
                     UpstreamState::Ready | UpstreamState::Starting | UpstreamState::Restarting
                 ) =>
             {
-                Some(Ok(()))
+                Some(Ok(self.view()))
             }
             // 已经落定（就绪，或终局）：门控等的时间到了也不用再放弃它。
-            Command::GiveUp if self.state == UpstreamState::Ready || self.terminal => Some(Ok(())),
+            Command::GiveUp if self.state == UpstreamState::Ready || self.terminal => {
+                Some(Ok(self.view()))
+            }
             // 降级放行之后，这个上游不再启动：放行时它没就绪，完整的 Router 里根本没有它的 Supervisor（要重启 iDoris）。放行时
             // 就绪的上游不冻结：它们的 Supervisor 在引擎换代之后复位（[`Self::sync_supervisor`]）。
             Command::Start | Command::Restart if self.frozen() => {
                 Some(Err(CommandError::RestartRequired))
             }
             // 入队时落在一次 `start`、`restart` 操作之内（或之前）的 `restart`：并进那次操作的结果，不换第二次引擎（Admin 也回 202）。
-            Command::Restart if covered => Some(Ok(())),
+            // 并发的两个 `restart` 只换一次引擎，第二个并入第一个；只对操作员发起、真的在换自有引擎的操作成立（见下面的两条：进行中的
+            // `restart`，与外部监听者那条路不并）：自动的重新同步（外部引擎换了进程）、自动的退避重启，都不是它能并入的。
+            Command::Restart if self.restart_covered(request.seq) => Some(Ok(self.view())),
             // 已经停下了：幂等。
             Command::Stop if self.engine.is_none() && self.state == UpstreamState::Stopped => {
-                Some(Ok(()))
+                Some(Ok(self.view()))
             }
             // 操作员的 `restart` 正在进行、此刻没有握着的自有引擎（旧的已退役，新的在启动或在退避）：并发的第二个并进它，不换第二次引擎，也不去
             // 杀刚拉起的替身。但启动决策已经走到了外部监听者那条路（等外部引擎答话、接管它）就不是了：那里没有自有引擎可重启
@@ -540,7 +677,7 @@ impl Actor {
             Command::Restart
                 if self.engine.is_none() && self.op == Some(Op::Restart) && !self.external_path =>
             {
-                Some(Ok(()))
+                Some(Ok(self.view()))
             }
             // 正在启动一个自有的子进程（拉起了、等它就绪）：`stop`、`restart` 要处理它，不是「没有自有引擎」——打断等待，
             // 半拉起的引擎交给命令（[`Self::abandon`]；Codex 预审 M3）。
@@ -957,22 +1094,23 @@ impl Actor {
             command,
             reply,
             seq,
-            deadline: _,
+            deadline: expiry,
         } = request;
-        // 入队时落在一次 `start`、`restart` 操作之内（或之前）：见 [`Actor::restart_cover`]。
-        let covered = seq != 0 && seq <= self.restart_cover;
-        let answer = move |result: Result<(), CommandError>| {
+        let answer = move |result: Result<ManagedView, CommandError>| {
             if let Some(reply) = reply {
                 let _ = reply.send(result);
             }
         };
+        // 有副作用的命令在**第一个副作用之前**认领（[`Expiry`]，Codex 预审 L4 的 M3）：认领成功就是受理了，之后调用方不能再把它说成
+        // 「没有受理」；认领不成就是调用方已经放弃（或截止时间已过），什么也不做。没有截止时间的命令（`GiveUp`、`Shutdown`）总是认领成功。
+        let claim = || expiry.as_ref().is_none_or(Expiry::claim);
         match command {
             Command::Shutdown {
                 stop_engine,
                 deadline,
             } => {
                 self.shutdown(stop_engine, deadline).await;
-                answer(Ok(()));
+                answer(Ok(self.view()));
                 Step::Exit
             }
             Command::GiveUp => {
@@ -983,7 +1121,7 @@ impl Actor {
                 }
                 self.log("门控等的时间到了而引擎还没就绪：放弃，不再重试");
                 self.publish_terminal(UpstreamState::Failed, Some(UpstreamReason::StartupTimeout));
-                answer(Ok(()));
+                answer(Ok(self.view()));
                 Step::Idle(Idle::Terminal)
             }
             // 命令在等待期间收到、门控在这之后才放行：现在按放行之后的规矩回答（`immediate_answer` 只看收到那一刻）。
@@ -992,46 +1130,54 @@ impl Actor {
                 current
             }
             // 并发的 `restart`：它入队的时候一次 `start`、`restart` 操作正在进行（actor 忙着排空、停进程、复位，没有去收命令）或者
-            // 刚做完，所以并进那次操作的结果，**不换第二次引擎**。
-            Command::Restart if covered => {
-                answer(Ok(()));
+            // 刚做完，所以并进那次操作的结果，**不换第二次引擎**。归属与并入在这里一起决定（Codex 预审 L4 的 M2）：`restart_cover` 只记
+            // 拉起了自有引擎并且就绪的操作（[`Self::publish_ready_finishing_op`]：外部引擎的自动重新同步、接管外部引擎的 `start`、没有拉起引擎就结束的
+            // 操作都不记），那样的 `restart` 往下走到没有自有引擎的 `NotOwned`。
+            Command::Restart if self.restart_covered(seq) => {
+                answer(Ok(self.view()));
                 current
             }
             Command::Start => match self.state {
                 // 已经好了、或正在启动：幂等，什么也不改。
                 UpstreamState::Ready | UpstreamState::Starting | UpstreamState::Restarting => {
-                    answer(Ok(()));
+                    answer(Ok(self.view()));
                     current
                 }
                 UpstreamState::Stopped
                 | UpstreamState::Failed
                 | UpstreamState::Absent
                 | UpstreamState::Unavailable => {
+                    if !claim() {
+                        // 调用方已经放弃：当作没有发生过。
+                        answer(Err(CommandError::Closed));
+                        return current;
+                    }
                     // 操作员显式要求：之前的失败不再计数。一个还活着的自有引擎（`unavailable`：活着却不答）由 `attempt()` 开头
                     // 走完整的退役路径（关门、排空、停进程、封上端点），再重新走启动决策（G3）。
                     self.window.clear();
                     self.op = Some(Op::Start);
-                    // 先发布 `starting` 再回答：Admin 的 202 体是受理之后的元素，不能还说 `stopped`（数据面也马上对它 503）。
+                    self.op_launched = false;
+                    // 先发布 `starting` 再回答：Admin 的 202 体是受理之后的元素，不能还说 `stopped`（数据面也马上对它 503）。回答带的是
+                    // 这一刻自己的快照（Codex 预审 L4 的 M1）。
                     self.publish(UpstreamState::Starting, None);
-                    answer(Ok(()));
+                    answer(Ok(self.view()));
                     Step::Attempt
                 }
             },
             Command::Stop => {
-                // 一个 `restart` 的并发合并不跨过 `stop`（Codex 预审 M2）：在它之后入队的 `restart` 是对 `stop` 之后那个状态的请求，不并进
-                // 它之前那次操作的结果，按当时的状态回答（已停下，没有自有引擎：`NotOwned`）。
-                if seq != 0 {
-                    self.restart_cover = self.restart_cover.min(seq);
-                }
-                // `stop` 结束正在进行的 `start`、`restart` 操作（被它打断的启动不会再走到「就绪」）：之后的 `restart` 不并进一个已经不存在的操作。
-                self.op = None;
                 if self.engine.is_some() {
+                    if !claim() {
+                        answer(Err(CommandError::Closed));
+                        return current;
+                    }
+                    self.stop_ends_the_operation(seq);
                     // 次序（IDORIS-CORE S6，Codex 预审 2）：先关 Supervisor 的门（新的加载、聊天不再准入），再发布「不可服务」的
                     // 状态（数据面立刻 503，不靠请求入口那一次性的状态检查）、再回答，最后才排空、停进程。引擎在这几步里还握在手里，
                     // 所以 `owned` 与 `pid` 还在：`stopped` 加 `owned: true` 是「已经不服务、进程在退出」，进程没了才是 `owned: false`。
+                    // 认领在第一个副作用（关门）之前：关门要等 Supervisor 答，可以比调用方的截止时间还久；认领了的命令不会被说成「没有受理」。
                     self.close_admission().await;
                     self.publish_terminal(UpstreamState::Stopped, None);
-                    answer(Ok(()));
+                    answer(Ok(self.view()));
                     self.retire_accepted = self.engine.as_ref().map(|owned| owned.engine.pid());
                     let retired = self.retire_engine().await;
                     if matches!(retired, Retired::Shutdown) {
@@ -1055,21 +1201,28 @@ impl Actor {
                     }
                 } else if self.state == UpstreamState::Stopped {
                     // 目标状态已经达成：幂等。
-                    answer(Ok(()));
+                    self.stop_ends_the_operation(seq);
+                    answer(Ok(self.view()));
                     Step::Idle(Idle::Stopped)
                 } else {
+                    self.stop_ends_the_operation(seq);
                     answer(Err(CommandError::NotOwned));
                     current
                 }
             }
             Command::Restart => {
                 if self.engine.is_some() {
+                    if !claim() {
+                        answer(Err(CommandError::Closed));
+                        return current;
+                    }
                     // 次序同 `stop`：先关门，再发布，再回答，最后才排空、停旧引擎。状态是 `restarting`，从受理一直到新引擎就绪
-                    // （Agent24 只对 `restarting` 有界等待）；这是操作员要的重启，不记失败。
+                    // （Agent24 只对 `restarting` 有界等待）；这是操作员要的重启，不记失败。认领在第一个副作用之前，同 `stop`。
                     self.op = Some(Op::Restart);
+                    self.op_launched = false;
                     self.close_admission().await;
                     self.publish_uncounted(UpstreamState::Restarting, None);
-                    answer(Ok(()));
+                    answer(Ok(self.view()));
                     self.retire_accepted = self.engine.as_ref().map(|owned| owned.engine.pid());
                     // 没能确认旧进程消失时也往下走：`attempt()` 开头的孤儿接管按既有的规矩处理（记录还在，围栏没清）。
                     // 旧进程确认消失了：它的模型占着的共享容量现在就放掉（Codex 终审 M2）。新引擎要是起不来（找不到可执行文件、
@@ -1087,6 +1240,17 @@ impl Actor {
                 }
             }
         }
+    }
+
+    /// 一个 `stop` 有了结果（引擎握在手里并认领了它，或者目标状态已经达成，或者被拒绝）：一个 `restart` 的并发合并不跨过它（Codex 预审 M2）：在它之后入队的
+    /// `restart` 是对 `stop` 之后那个状态的请求，不并进它之前那次操作的结果，按当时的状态回答（已停下，没有自有引擎：`NotOwned`）；它也结束正在进行的
+    /// `start`、`restart` 操作（被它打断的启动不会再走到「就绪」，之后的 `restart` 不并进一个已经不存在的操作）。**没有认领成功的 `stop`（调用方已经放弃，
+    /// 当作没有发生过）不调用它**：作废的命令不留任何痕迹（Codex 预审 L4 的 M3）。
+    fn stop_ends_the_operation(&mut self, seq: u64) {
+        if seq != 0 {
+            self.restart_cover = self.restart_cover.min(seq);
+        }
+        self.op = None;
     }
 
     /// iDoris 停止：收尾。`stop_engine` 为真才停自己拥有的引擎，在 `deadline` 之前（见 [`Command::Shutdown`]）。
@@ -1144,8 +1308,9 @@ impl Actor {
                 self.redecide_since = None;
                 match self.sync_supervisor().await {
                     Synced::Done => {
-                        self.publish(UpstreamState::Ready, None);
-                        self.finish_op();
+                        // 水位与 `ready` 的发布是**一步**（盖章的锁里，Codex 复审 L4 的 L4' 与第二轮）：每个在 `ready` 对外可见之前盖章的命令都不超过水位
+                        // （并入这次操作），每个在它可见之后盖章的都超过（一次新的重启）；两步分开，之间盖章的 `restart` 会被当成新的、把刚拉起的引擎又换掉。
+                        self.publish_ready_finishing_op();
                         Step::Supervise
                     }
                     // Supervisor 的账本没能跟上：这个引擎不能放行，停掉它（`sync_supervisor` 已经停了），按一次失败算，退避之后重来。
@@ -1158,20 +1323,20 @@ impl Actor {
                     // Supervisor 没有了：不会自己好，要重启 iDoris。
                     Synced::Permanent => {
                         self.revoke_external_authorization();
+                        self.finish_op();
                         self.publish_terminal(
                             UpstreamState::Failed,
                             Some(UpstreamReason::StartupLatched),
                         );
-                        self.finish_op();
                         Step::Idle(Idle::Terminal)
                     }
                 }
             }
             Attempt::Terminal { state, reason } => {
                 self.redecide_since = None;
-                // 终局的失败之后端点保持封上（Codex 审计 H1）：上面那条对每一条非 `Ready` 的出口统一做了。
-                self.publish_terminal(state, reason);
+                // 终局的失败之后端点保持封上（Codex 审计 H1）：上面那条对每一条非 `Ready` 的出口统一做了。操作的结束先于发布（L4'；没有换上引擎，不记水位）。
                 self.finish_op();
+                self.publish_terminal(state, reason);
                 Step::Idle(Idle::Terminal)
             }
             Attempt::Failure { reason } => {
@@ -1183,14 +1348,29 @@ impl Actor {
         }
     }
 
-    /// 一次 `start`、`restart` 操作做完了（就绪，或者不会再往前走）：之前入队的 `restart` 都并进它的结果（[`Self::restart_cover`]）。
+    /// 一次 `start`、`restart` 操作**没有成功地换上一个自有引擎**就结束了（终局的失败、找不到可执行文件、重判耗尽、熔断、Supervisor 没了）：只结束操作，**不记水位**
+    /// （Codex 复审 L4 第二轮）：排在它后面的 `restart` 没有可并入的结果，各按各自到达时的状态回答（没有自有引擎：409 `upstream_not_owned`）。
     fn finish_op(&mut self) {
-        if self.op.take().is_some() {
-            // 这一轮走的是外部监听者那条路：结果是接管了一个外部引擎，不是我们换了一个自有引擎，之前入队的 `restart` 没有可并入的结果
-            // （Codex 复审 M6）：不更新截断点，它们按各自到达时的状态回答。
-            if !self.external_path {
-                self.restart_cover = self.shared.seq_now(&self.plan.id);
-            }
+        self.op = None;
+        self.op_launched = false;
+    }
+
+    /// 一次 `start`、`restart` 操作成功做完（引擎就绪）：发布 `ready`，并在**同一步**里记下 `restart` 的水位——之前入队的 `restart` 并进这次操作的结果
+    /// （[`Self::restart_cover`]）。水位**只给拉起了自有引擎的操作**记：这一轮走的是外部监听者那条路（结果是接管了一个外部引擎，Codex 复审 M6）、或者这次操作
+    /// 根本没拉起过引擎（认回了遗留的进程），排在它后面的 `restart` 没有可并入的结果。
+    ///
+    /// 「记水位」与「发布」是一步（[`Shared::publish_at_watermark`]：盖章的锁里读计数、发布共享状态），日志在放锁之后才写。盖章在锁里，所以每个在 `ready` 对外可见之前
+    /// 盖章的命令都不超过水位，每个在它可见之后盖章的都超过。
+    fn publish_ready_finishing_op(&mut self) {
+        let grants = self.op.is_some() && self.op_launched && !self.external_path;
+        let (status, changed) = self.advance(UpstreamState::Ready, None, false, Count::Edge);
+        let watermark = self.shared.publish_at_watermark(&self.plan.id, status);
+        if grants {
+            self.restart_cover = watermark;
+        }
+        self.finish_op();
+        if changed {
+            self.log(UpstreamState::Ready.as_str());
         }
     }
 
@@ -1201,11 +1381,11 @@ impl Actor {
         if started.elapsed() >= self.timings().startup_timeout {
             self.redecide_since = None;
             // 重判耗尽直接发布终态，不经 `Attempt::Terminal`；端点已经在 `attempt_cycle` 里随这一轮的出口封上了（Codex 终审 H2）。
+            self.finish_op();
             self.publish_terminal(
                 UpstreamState::Unavailable,
                 Some(UpstreamReason::StartupTimeout),
             );
-            self.finish_op();
             return Step::Idle(Idle::Terminal);
         }
         self.log("端口上的情况在判断期间变了：重新判断（不算失败）");
@@ -1226,13 +1406,14 @@ impl Actor {
             Count::Edge
         };
         if self.window.tripped(now) {
+            // `count` 已经按操作算好了（上面）：结束操作先于发布（L4'）。
+            self.finish_op();
             self.emit(
                 UpstreamState::Failed,
                 Some(UpstreamReason::CrashLoop),
                 true,
                 count,
             );
-            self.finish_op();
             return Step::Idle(Idle::CrashLoop);
         }
         self.emit(UpstreamState::Restarting, reason, false, count);
@@ -1756,6 +1937,8 @@ impl Actor {
             };
             match OwnedEngine::spawn(launch, inspector.clone(), &launched_by).await {
                 Ok(engine) => {
+                    // 这次操作真的拉起了一个自有引擎（见 [`Self::op_launched`]）。
+                    self.op_launched = true;
                     spawned = Some(Ok(engine));
                     break;
                 }

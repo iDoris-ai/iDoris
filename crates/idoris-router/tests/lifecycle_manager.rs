@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use fake_omlx::{Behavior, FakeOmlx, OnSigterm, spawn_retrying};
 use idoris_router::lifecycle::{
-    CommandError, EngineBackend, EngineManager, GateOutcome, ManagedPlan, ManagerConfig,
-    OmlxBackend, PlanError, PrepareFailure, Timings, plan_managed_with,
+    CommandAck, CommandError, EngineBackend, EngineManager, GateOutcome, ManagedPlan,
+    ManagerConfig, OmlxBackend, PlanError, PrepareFailure, Timings, plan_managed_with,
 };
 use idoris_router::readiness::{
     GateState, HealthState, ManagedFailure, Phase, UpstreamReason, UpstreamState, UpstreamStatus,
@@ -3747,7 +3747,10 @@ async fn a_restart_queued_behind_a_stop_is_not_folded_into_the_restart_before_it
         drop(held);
     };
     let (stopped, restarted, ()) = tokio::join!(stop, second_restart, release);
-    assert_eq!(stopped, Ok(()));
+    assert!(
+        matches!(stopped, Ok(CommandAck::Snapshot(_))),
+        "the stop was accepted: {stopped:?}"
+    );
     assert_eq!(
         restarted,
         Err(CommandError::NotOwned),
