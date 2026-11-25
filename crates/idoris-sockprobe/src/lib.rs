@@ -445,6 +445,16 @@ for line in sys.stdin:
         std::fs::copy(program, to).unwrap();
     }
 
+    /// Fail with a clear message if the child has already exited: the identity of a dead process is `None`, which would otherwise surface
+    /// as an unrelated `unwrap` failure (seen when a copied system binary was killed right after spawn on one host).
+    fn assert_alive(child: &mut Child, when: &str) {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "the child exited ({status}) {when}: the fixture binary did not stay alive, so no identity can be read"
+            );
+        }
+    }
+
     fn kill(mut child: Child) {
         let _ = child.kill();
         let _ = child.wait();
@@ -475,9 +485,11 @@ for line in sys.stdin:
         let other = dir.path().join("other");
         copy_of("/bin/sleep", &exe);
         copy_of("/bin/cat", &other);
-        let child = spawn_sleep_from(&exe);
+        let mut child = spawn_sleep_from(&exe);
+        assert_alive(&mut child, "before the first identity read");
         let before = executable_identity(child.id()).unwrap();
         std::fs::rename(&other, &exe).unwrap();
+        assert_alive(&mut child, "before the identity read after the replacement");
         assert_eq!(executable_identity(child.id()).unwrap(), before);
         kill(child);
     }

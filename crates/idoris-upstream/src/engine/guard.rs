@@ -479,6 +479,7 @@ mod tests {
         listeners: Mutex<VecDeque<Result<Vec<u32>, InspectError>>>,
         start_time: Mutex<String>,
         generation: Mutex<Option<String>>,
+        executable: Mutex<Option<super::super::inspect::ExecutableIdentity>>,
         team: Mutex<Option<String>>,
         watches: Mutex<VecDeque<Arc<ScriptedWatch>>>,
         ttl: Mutex<Duration>,
@@ -499,6 +500,7 @@ mod tests {
                 listeners: Mutex::new(VecDeque::new()),
                 start_time: Mutex::new(START.to_owned()),
                 generation: Mutex::new(None),
+                executable: Mutex::new(None),
                 team: Mutex::new(Some(TEAM.to_owned())),
                 watches: Mutex::new(VecDeque::new()),
                 ttl: Mutex::new(Duration::ZERO),
@@ -600,6 +602,12 @@ mod tests {
         }
         fn listener_generation(&self, _pid: u32) -> Result<Option<String>, InspectError> {
             Ok(self.generation.lock().unwrap().clone())
+        }
+        fn executable_identity(
+            &self,
+            _pid: u32,
+        ) -> Result<Option<super::super::inspect::ExecutableIdentity>, InspectError> {
+            Ok(self.executable.lock().unwrap().clone())
         }
         async fn signing_team(&self, _pid: u32) -> Result<Option<String>, InspectError> {
             Ok(self.team.lock().unwrap().clone())
@@ -831,6 +839,48 @@ mod tests {
         let guard = owned(&fake);
         assert_eq!(guard.verify().await, Verification::Verified);
         *fake.start_time.lock().unwrap() = "recycled".into();
+        assert_eq!(guard.verify().await, Verification::Mismatch);
+    }
+
+    fn image(byte: u8) -> super::super::inspect::ExecutableIdentity {
+        super::super::inspect::ExecutableIdentity {
+            cdhash: Some([byte; 20]),
+            image: Some([byte; 16]),
+            exec_version: Some(1),
+        }
+    }
+
+    /// An external guard built over a listener that verified with `generation` and `image(1)`, with a long reuse window, so that only
+    /// the per-request identity check (`identity_changed`) can notice what changes afterwards.
+    async fn external_guard(fake: &Arc<Fake>) -> ExternalListenerGuard {
+        fake.script_listeners(vec![Ok(vec![42])]);
+        fake.reuse_for(Duration::from_secs(60));
+        *fake.generation.lock().unwrap() = Some("generation one".into());
+        *fake.executable.lock().unwrap() = Some(image(1));
+        let verifier = verifier(fake);
+        let ListenerVerdict::Verified { listeners } = verifier.check(PORT).await else {
+            panic!("the original process should verify");
+        };
+        ExternalListenerGuard::new(verifier, dial(), listeners)
+    }
+
+    #[tokio::test]
+    async fn a_changed_executable_identity_is_a_mismatch_even_inside_the_reuse_window() {
+        let fake = Fake::new();
+        let guard = external_guard(&fake).await;
+        fake.script_listens(vec![Ok(true)]);
+        assert_eq!(guard.verify().await, Verification::Verified);
+        *fake.executable.lock().unwrap() = Some(image(2));
+        assert_eq!(guard.verify().await, Verification::Mismatch);
+    }
+
+    #[tokio::test]
+    async fn a_changed_listener_generation_is_a_mismatch_even_inside_the_reuse_window() {
+        let fake = Fake::new();
+        let guard = external_guard(&fake).await;
+        fake.script_listens(vec![Ok(true)]);
+        assert_eq!(guard.verify().await, Verification::Verified);
+        *fake.generation.lock().unwrap() = Some("generation two".into());
         assert_eq!(guard.verify().await, Verification::Mismatch);
     }
 

@@ -1097,7 +1097,10 @@ pub fn resolve_from(env: Option<OsString>, home: Option<&Path>) -> Option<OsStri
 #[derive(Debug, Clone, Copy)]
 struct Trust {
     file_uid: u32,
+    /// The directory the link is in (`$HOME`) and the link itself.
     dir_uid: u32,
+    /// The directory the link points at (`~/.omlx` after following it).
+    target_uid: u32,
 }
 
 #[cfg(unix)]
@@ -1107,6 +1110,7 @@ impl Trust {
         Self {
             file_uid: uid,
             dir_uid: uid,
+            target_uid: uid,
         }
     }
 }
@@ -1176,7 +1180,7 @@ fn open_settings_file(home: &Path, trust: Trust) -> std::io::Result<fs::File> {
                 return Err(denied());
             }
             let base = fs::File::from(openat(&home_fd, ".omlx", directory, Mode::empty())?);
-            if !trusted_directory(&base.metadata()?, trust.dir_uid) || !acl_is_clean(&base) {
+            if !trusted_directory(&base.metadata()?, trust.target_uid) || !acl_is_clean(&base) {
                 return Err(denied());
             }
             base
@@ -1639,6 +1643,7 @@ mod settings_tests {
         let foreign_dirs = Trust {
             file_uid: uid,
             dir_uid: uid.wrapping_add(1),
+            target_uid: uid,
         };
         assert_eq!(
             read_settings_once_with(home.path(), true, foreign_dirs),
@@ -1647,12 +1652,29 @@ mod settings_tests {
         let ours = Trust {
             file_uid: uid,
             dir_uid: uid,
+            target_uid: uid,
         };
         assert_eq!(
             read_settings_once_with(home.path(), true, ours)
                 .unwrap()
                 .as_deref(),
             Some("k-link")
+        );
+    }
+
+    #[test]
+    fn a_symlink_of_ours_to_a_directory_owned_by_someone_else_is_refused() {
+        // The link and the directory it is in are ours (so the link-owner check passes); only the target directory belongs to someone else.
+        let (home, _target) = symlinked_home();
+        let uid = crate::engine::effective_uid();
+        let foreign_target = Trust {
+            file_uid: uid,
+            dir_uid: uid,
+            target_uid: uid.wrapping_add(1),
+        };
+        assert_eq!(
+            read_settings_once_with(home.path(), true, foreign_target),
+            Err(SettingsError::Unreadable)
         );
     }
 
