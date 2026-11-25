@@ -3,7 +3,7 @@
 //! 和 `lifecycle_managed.rs`（起真二进制）互补：那里验证接线，这里逐条验证状态机：退避的节奏、熔断与半开重试、命令、外部引擎只探测
 //! 不发信号、端口属主校验、孤儿接管与围栏、门控的放行与退出码 5 的触发条件、`managed_models_dir()` 每次拉起都重新取。
 //!
-//! **全部用假引擎**（`tests/support/fake_omlx.rs` 的 python HTTP 服务），不启动真实的 oMLX 或任何推理进程。引擎的可执行文件
+//! **全部用假引擎**（`tests/support/fake_omlx.rs` 的 python HTTP 服务，或脚本化探测与适配器），不启动真实的 oMLX 或任何推理进程。引擎的可执行文件
 //! 都是显式给的（`ManagerConfig::executables`），所以这台机器上装没装真的 oMLX.app 都不会被拉起。检查器是可编排的
 //! （[`Scripted`]）：身份信息（pid、启动时间）读真的 `ps`，「谁在监听」「谁签的名」按测试的需要编排，所以不依赖 `lsof` 与
 //! `codesign`。唯一用到真 `lsof` 的测试（端口被别的进程占了）在没有它的机器上也成立（读不出来按「没有确认」处理）。
@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use fake_omlx::{Behavior, FakeOmlx, OnSigterm, spawn_retrying};
+use idoris_backend::{MockAdapter, ModelInfo};
 use idoris_router::lifecycle::{
     CommandAck, CommandError, EngineBackend, EngineManager, GateOutcome, ManagedPlan,
     ManagerConfig, OmlxBackend, PlanError, PrepareFailure, Timings, plan_managed_with,
@@ -37,6 +38,7 @@ use idoris_router::readiness::{
     GateState, HealthState, ManagedFailure, Phase, UpstreamReason, UpstreamState, UpstreamStatus,
 };
 use idoris_router::register::{JitterSource, LogSink};
+use idoris_router::runtime::RuntimeRegistry;
 use idoris_upstream::engine::{
     CodesignPolicy, DiscoveryError, DiscoveryPlan, EngineExecutable, EngineInstance, EngineKey,
     EngineKind, EngineLaunch, EngineLaunchSpec, EngineProbe, EngineRecipe, InspectError,
@@ -103,6 +105,8 @@ struct Scripted {
     listeners: Mutex<BTreeMap<u16, Vec<u32>>>,
     /// `signing_team(pid)`：没编排的 pid 没有团队。
     teams: Mutex<BTreeMap<u32, String>>,
+    /// 编排了启动时间的 pid 属于当前用户，其余身份依旧读 ps。
+    start_times: Mutex<BTreeMap<u32, String>>,
     team_checks: AtomicUsize,
     /// 端口 → 还剩几次「`listens_on` 为真」，用完之后一律为假：造「等就绪时监听它的是引擎，封印时端口已被别人占了」。
     claim_budget: Mutex<BTreeMap<u16, usize>>,
@@ -129,6 +133,7 @@ impl Scripted {
             claims: Mutex::new(Vec::new()),
             listeners: Mutex::new(BTreeMap::new()),
             teams: Mutex::new(BTreeMap::new()),
+            start_times: Mutex::new(BTreeMap::new()),
             team_checks: AtomicUsize::new(0),
             claim_budget: Mutex::new(BTreeMap::new()),
             unreadable: std::sync::atomic::AtomicBool::new(false),
@@ -203,6 +208,9 @@ impl ProcessInspector for Scripted {
             return Ok(format!("test process {pid}"));
         }
         self.dawdle().await;
+        if let Some(scripted) = self.start_times.lock().unwrap().get(&pid).cloned() {
+            return Ok(scripted);
+        }
         if self.identity_unreadable.load(Ordering::SeqCst) {
             return Err(InspectError::NoAnswer);
         }
@@ -248,7 +256,9 @@ impl ProcessInspector for Scripted {
             .unwrap_or_default())
     }
     async fn uid_of(&self, pid: u32) -> Result<u32, InspectError> {
-        if self.synthetic_listener_identity {
+        if self.synthetic_listener_identity
+            || self.start_times.lock().unwrap().contains_key(&pid)
+        {
             return Ok(nix::unistd::geteuid().as_raw());
         }
         self.real.uid_of(pid).await
@@ -544,6 +554,23 @@ impl Harness {
             health,
             log,
         }
+    }
+
+    async fn attach_supervisor(
+        &self,
+        card: &idoris_contracts::ComponentCard,
+        adapter: Arc<dyn idoris_backend::RuntimeAdapter>,
+    ) -> RuntimeRegistry {
+        self.until_state(UpstreamState::Ready).await;
+        let runtimes =
+            RuntimeRegistry::spawn_with_factory(
+                std::slice::from_ref(card),
+                |_| Ok(adapter.clone()),
+            )
+            .unwrap();
+        self.manager.attach_runtimes(runtimes.clone());
+        assert!(self.manager.open_gate().is_some());
+        runtimes
     }
 
     fn view(&self) -> UpstreamStatus {
@@ -2280,8 +2307,6 @@ async fn an_external_engine_whose_listener_is_gone_is_unavailable_and_nothing_is
 
 #[tokio::test]
 async fn a_ready_engine_whose_supervisor_latched_its_startup_error_is_unavailable_not_ready() {
-    use idoris_router::runtime::RuntimeRegistry;
-
     let rig = Rig::new(&Behavior::default());
     let h = Harness::start(
         &rig,
@@ -2444,7 +2469,6 @@ async fn the_gate_task_gives_up_on_an_engine_that_never_becomes_ready_at_the_dea
  {
     use axum::Router;
     use idoris_router::lifecycle::gate::{self, Finalized};
-    use idoris_router::runtime::RuntimeRegistry;
     use idoris_router::swap::SwapApp;
 
     // 引擎活着、一直不监听；熔断远在天边（上限 50）：只有门控自己的截止时间能让它落定。
@@ -2566,7 +2590,6 @@ async fn giving_up_on_an_owned_engine_that_stopped_answering_stops_it_and_report
 async fn the_gate_task_hands_the_degraded_outcome_to_finalize_and_the_health_says_degraded() {
     use axum::Router;
     use idoris_router::lifecycle::gate::{self, Finalized};
-    use idoris_router::runtime::RuntimeRegistry;
     use idoris_router::swap::SwapApp;
 
     let rig = Rig::new(&Behavior::default());
@@ -2748,7 +2771,6 @@ async fn the_gate_task_swaps_the_full_router_in_only_once_the_engines_are_ready(
     use axum::body::Body;
     use axum::routing::get;
     use idoris_router::lifecycle::gate::{self, Finalized};
-    use idoris_router::runtime::RuntimeRegistry;
     use idoris_router::swap::SwapApp;
     use tower::ServiceExt;
 
@@ -3115,6 +3137,133 @@ impl Harness {
             .filter(|line| line.contains(needle))
             .count()
     }
+}
+
+/// 探测和监听者都由脚本回答，推理由 MockAdapter 回答。Supervisor 和实例任务走正常入口。
+/// 客户端走 dispatch，模拟已经过健康门的请求，直接观察 Supervisor 的准入与换代后的路由。
+#[tokio::test]
+async fn external_listener_gap_preserves_the_ledger_but_replacement_resets_it_and_reopens_admission()
+ {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt;
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    // 没有真实监听和拨号，端口只用作进程内的登记表标识。
+    let rig = Rig::with_port(&Behavior::default(), 19055);
+    let inspector = Scripted::new();
+    let pid = std::process::id();
+    inspector.external_listener(rig.port, pid, Some(TEAM));
+    inspector
+        .start_times
+        .lock()
+        .unwrap()
+        .insert(pid, "first".into());
+    let backend = ScriptedProbeBackend::new(
+        default_backend(&rig),
+        ProbeScript::new(|_| Some(EngineProbe::Ready)),
+    );
+    let mut timings = fast();
+    timings.startup_timeout = Duration::from_secs(2);
+    let h = Harness::start(&rig, backend, inspector.clone(), timings, StopOnExit::Owned);
+
+    let mut card = card("omlx", &rig.endpoint(), true);
+    card.extensions.as_mut().unwrap().insert(
+        "idoris_role_models".into(),
+        json!({"fast": "scripted-model"}),
+    );
+    let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+        id: "scripted-model".into(),
+        memory_gb: 1.0,
+    }]));
+    let runtimes = h.attach_supervisor(&card, adapter.clone()).await;
+    // 这里的 Router 独立于健康门，才能观察已经选卡的请求在 Supervisor 准入处被拒绝。
+    let app = idoris_router::build_app(idoris_router::AppState {
+        cards: vec![card],
+        runtimes: runtimes.clone(),
+        ..idoris_router::AppState::default()
+    });
+    let chat = || async {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("X-iDoris-Privacy", "local_only")
+                    .body(Body::from(
+                        r#"{"model":"idoris/fast","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        (status, body)
+    };
+
+    let (status, body) = chat().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(adapter.load_call_count("scripted-model"), 1);
+
+    inspector.forget_listener(rig.port);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        h.until_state(UpstreamState::Unavailable),
+    )
+    .await
+    .unwrap();
+    let (status, body) = chat().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"]["reason_code"], "supervisor_unavailable",
+        "{body}"
+    );
+
+    inspector.external_listener(rig.port, pid, Some(TEAM));
+    h.until_state(UpstreamState::Ready).await;
+    let (status, body) = chat().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        adapter.load_call_count("scripted-model"),
+        1,
+        "same listener keeps its ledger"
+    );
+
+    adapter.replace_engine();
+    inspector
+        .start_times
+        .lock()
+        .unwrap()
+        .insert(pid, "second".into());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let ready = runtimes
+            .exact_ready_providers(vec![("omlx".into(), "scripted-model".into())])
+            .await;
+        if ready.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement did not reset the old ledger"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    h.until_state(UpstreamState::Ready).await;
+    let (status, body) = chat().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        adapter.load_call_count("scripted-model"),
+        2,
+        "replacement needed a fresh load"
+    );
+    h.manager.shutdown(true).await;
 }
 
 /// 一次没有失败的首次启动：引擎只拉起了一次，状态从来没有进过 `restarting`，没有失败事实，日志里有「重新判断（不算失败）」。
@@ -4058,8 +4207,6 @@ impl idoris_backend::RuntimeAdapter for SlowFirstStatus {
 /// 失效：引擎失效（退出码 5）晚了 4 秒才发布，这段时间里到的 SIGTERM 能把退出码盖成 0。现在先报、后收拾。
 #[tokio::test]
 async fn an_engine_failure_is_published_before_the_slow_cleanup_not_after_it() {
-    use idoris_router::runtime::RuntimeRegistry;
-
     let rig = Rig::new(&Behavior::default());
     let h = Harness::start(
         &rig,
@@ -4099,8 +4246,6 @@ async fn an_engine_failure_is_published_before_the_slow_cleanup_not_after_it() {
 /// 守卫原样留着：A 回来重走一遍换代，复位成功，回到 `ready`。
 #[tokio::test]
 async fn an_external_reset_that_failed_does_not_let_the_old_process_back_on_the_stale_ledger() {
-    use idoris_router::runtime::RuntimeRegistry;
-
     let work = tempfile::tempdir().unwrap();
     let a = External::start(work.path(), None);
     let other = tempfile::tempdir().unwrap();
@@ -4369,8 +4514,6 @@ async fn a_shutdown_stops_a_condemned_engine_even_when_its_record_file_is_gone()
 /// 一个没有通过校验的进程。现在开门之前重新核对监听者，不对就不开门、端点保持封上；带 key 的周期探测也走授权，不是裸的 bearer。
 #[tokio::test]
 async fn the_key_is_not_sent_to_a_process_that_took_the_port_during_an_external_reset() {
-    use idoris_router::runtime::RuntimeRegistry;
-
     let work = tempfile::tempdir().unwrap();
     let a = External::start(work.path(), Some("secret"));
     let other_b = tempfile::tempdir().unwrap();

@@ -927,10 +927,97 @@ impl RuntimeAdapter for OmlxAdapter {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::sync::Arc;
+
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[derive(Debug)]
+    struct SlowAuthorization(Duration);
+
+    #[async_trait::async_trait]
+    impl key::EndpointGuard for SlowAuthorization {
+        async fn verify(&self) -> key::Verification {
+            tokio::time::sleep(self.0).await;
+            key::Verification::Verified
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn load_authorization_spends_the_budget_before_the_post() {
+        // 这个端点只供编排的守卫使用。正常路径在试图连接之前就耗尽预算。
+        let endpoint = "http://127.0.0.1:0";
+        let budget = Duration::from_secs(5);
+        let adapter = OmlxAdapter::new(OmlxAdapterConfig {
+            base_url: endpoint.into(),
+            api_key: None,
+            call_timeout: budget,
+        })
+        .unwrap()
+        .with_load_timeout(budget);
+        assert!(key::govern_endpoint_guarded(
+            endpoint,
+            key::EndpointKey::External {
+                settings_key_verified: false
+            },
+            Some(Arc::new(SlowAuthorization(budget))),
+        ));
+        let result = adapter.load("test-model", None).await;
+        key::forget_endpoint(endpoint);
+
+        assert!(
+            matches!(&result, Err(BackendError::Upstream { message })
+                if message.contains("authorizing it used the whole load budget")),
+            "authorization exhausted the budget before attempting the POST: {result:?}"
+        );
+    }
+
+    /// 授权只用掉预算的一部分：POST 必须发出去，并且期限是**剩下的**那部分（不是整个预算）。假引擎把 POST 的响应一直压住：POST 在剩余期限到点超时，
+    /// 整个调用在预算处结束；若 POST 误用整个预算做超时，调用会拖到「授权用时 + 整个预算」。用真实时间（暂停的时钟会在真实套接字 I/O 之前就把超时推到点）。
+    #[tokio::test]
+    async fn load_post_gets_only_the_budget_authorization_left() {
+        let server = MockServer::start().await;
+        let budget = Duration::from_secs(2);
+        let authorization = Duration::from_secs(1);
+        // 响应压住远超预算：只看 POST 是在剩余的 1 秒还是整个 2 秒的期限上放弃。
+        Mock::given(method("POST"))
+            .and(path("/v1/models/test-model/load"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+        let adapter = OmlxAdapter::new(OmlxAdapterConfig {
+            base_url: endpoint.clone(),
+            api_key: None,
+            call_timeout: budget,
+        })
+        .unwrap()
+        .with_load_timeout(budget);
+        assert!(key::govern_endpoint_guarded(
+            &endpoint,
+            key::EndpointKey::External {
+                settings_key_verified: false
+            },
+            Some(Arc::new(SlowAuthorization(authorization))),
+        ));
+        let started = tokio::time::Instant::now();
+        let result = adapter.load("test-model", None).await;
+        let elapsed = started.elapsed();
+        key::forget_endpoint(&endpoint);
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1, "the POST was sent after authorization");
+        assert!(
+            matches!(&result, Err(BackendError::LoadUnconfirmed { .. })),
+            "the POST timed out at the remaining deadline: {result:?}"
+        );
+        assert!(
+            elapsed >= budget && elapsed < budget + Duration::from_millis(600),
+            "the whole call ended at the budget (authorization + remaining), not later: {elapsed:?}"
+        );
+    }
 
     #[test]
     fn load_fence_identity_survives_adapter_reconstruction() {
