@@ -351,8 +351,9 @@ pub(super) struct ShutdownOrder {
     pub deadline: Option<Instant>,
 }
 
+/// 测试探针：在读水位（`seq_now`）与真正发布共享状态（`publish_with`）的那一刻被调用，参数是位置名，由探针自己去看盖章的锁是否被握着。
 #[cfg(test)]
-type WatermarkHook = Box<dyn Fn(&Shared, u64) + Send + Sync>;
+type StampProbe = Box<dyn Fn(&'static str, &Shared) + Send + Sync>;
 
 /// 各实例任务共用的东西。
 pub(super) struct Shared {
@@ -382,7 +383,7 @@ pub(super) struct Shared {
     /// 盖章与入队同属一把锁（[`EngineManager::command`]）：序号的先后就是邮箱里的先后。
     stamp: Mutex<()>,
     #[cfg(test)]
-    before_watermark_publish: OnceLock<WatermarkHook>,
+    stamp_probe: OnceLock<StampProbe>,
     /// 完整的 Router 创建之后挂上来的 Supervisor 表：门控完成之后，Supervisor 的启动错误粘滞要反映到 `/health`。
     pub runtimes: OnceLock<RuntimeRegistry>,
 }
@@ -402,6 +403,10 @@ impl Shared {
 
     /// 同 [`Self::publish`]，新的状态由旧的（没有就是 `None`）算出来，读旧值与写新值在同一把锁里。
     pub fn publish_with(&self, id: &str, next: impl FnOnce(Option<&Status>) -> Status) {
+        #[cfg(test)]
+        if let Some(probe) = self.stamp_probe.get() {
+            probe("publish", self);
+        }
         let mut statuses = self.statuses.lock().unwrap_or_else(PoisonError::into_inner);
         let status = next(statuses.get(id));
         statuses.insert(id.to_owned(), status);
@@ -471,16 +476,16 @@ impl Shared {
     pub fn publish_at_watermark(&self, id: &str, status: Status) -> u64 {
         let _stamping = self.freeze_stamping();
         let watermark = self.seq_now(id);
-        #[cfg(test)]
-        if let Some(hook) = self.before_watermark_publish.get() {
-            hook(self, watermark);
-        }
         self.publish(id, status);
         watermark
     }
 
     /// 此刻已盖出的最大序号：序号不大于它的命令都是在这一刻之前入队的。
     pub fn seq_now(&self, id: &str) -> u64 {
+        #[cfg(test)]
+        if let Some(probe) = self.stamp_probe.get() {
+            probe("seq", self);
+        }
         self.enqueued
             .get(id)
             .map_or(0, |counter| counter.load(Ordering::SeqCst))
@@ -541,7 +546,7 @@ impl EngineManager {
             shutdown: watch::channel(None).0,
             stamp: Mutex::new(()),
             #[cfg(test)]
-            before_watermark_publish: OnceLock::new(),
+            stamp_probe: OnceLock::new(),
             runtimes: OnceLock::new(),
         });
         if !plans.is_empty() {
@@ -1185,7 +1190,7 @@ mod tests {
             shutdown: watch::channel(None).0,
             stamp: Mutex::new(()),
             #[cfg(test)]
-            before_watermark_publish: OnceLock::new(),
+            stamp_probe: OnceLock::new(),
             runtimes: OnceLock::new(),
         })
     }
@@ -1456,32 +1461,24 @@ mod tests {
         assert!(!on_the_dot.claim());
     }
 
-    /// 实例任务走操作完成的 ready 发布路径。钩子在读取水位之后让客户端确实尝试取锁：
-    /// 如果锁可取，客户端当场盖章，不能因为线程调度恰好慢了一步而让测试通过。
+    /// 实例任务走一次真实的、拉起了自有引擎的 `restart` 的成功收尾（`publish_ready_finishing_op`）。探针在**读水位的那一刻**与**真正发布共享状态的那一刻**
+    /// 各自核对盖章的锁正被握着（`try_lock` 失败）：水位读在取锁之前、或锁在钩子之后发布之前就放掉，都会让某一个位置看到锁是空的。
+    /// 之后验证并入：水位之前盖章的排队 `restart` 并进这次操作（202），之后盖章的不并（没有自有引擎：`NotOwned`）。
     #[test]
     fn publishing_ready_and_taking_the_watermark_exclude_command_stamping() {
         let shared = shared_for_tests("omlx", Timings::default(), Arc::new(|_| {}));
-        let before = shared.next_seq("omlx");
-        let hook_calls = Arc::new(AtomicU64::new(0));
-        let calls = hook_calls.clone();
+        let queued_before = shared.next_seq("omlx");
+        let observed = Arc::new(Mutex::new(Vec::<(&'static str, bool)>::new()));
+        let sink = observed.clone();
         assert!(
             shared
-                .before_watermark_publish
-                .set(Box::new(move |shared, watermark| {
-                    assert_eq!(watermark, before);
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    let stamped = std::thread::scope(|scope| {
-                        scope
-                            .spawn(|| match shared.stamp.try_lock() {
-                                Ok(_order) => Some(shared.next_seq("omlx")),
-                                Err(std::sync::TryLockError::WouldBlock) => None,
-                                Err(error) => panic!("{error}"),
-                            })
-                            .join()
-                            .unwrap()
-                    });
-                    assert_eq!(stamped, None, "a client stamped before ready was published");
-                    assert!(shared.statuses.lock().unwrap().get("omlx").is_none());
+                .stamp_probe
+                .set(Box::new(move |point, shared| {
+                    let held = matches!(
+                        shared.stamp.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    );
+                    sink.lock().unwrap().push((point, held));
                 }))
                 .is_ok()
         );
@@ -1496,21 +1493,41 @@ mod tests {
             shared.clone(),
             mailbox,
         );
+        actor.begin_owned_restart_for_tests();
 
         actor.publish_ready_finishing_op();
 
         assert_eq!(
-            hook_calls.load(Ordering::SeqCst),
-            1,
-            "actor must publish through the watermark"
+            *observed.lock().unwrap(),
+            vec![("seq", true), ("publish", true)],
+            "the stamping lock is held at the watermark read and at the status publication"
         );
-        let _order = shared.freeze_stamping();
         assert_eq!(
             shared.statuses.lock().unwrap()["omlx"].state,
             UpstreamState::Ready
         );
-        assert_eq!(shared.seq_now("omlx"), before);
-        assert!(shared.next_seq("omlx") > before);
+        let queued_after = shared.next_seq("omlx");
+        assert!(queued_after > queued_before);
+        let restart = |seq| Request {
+            command: Command::Restart,
+            reply: None,
+            seq,
+            deadline: None,
+        };
+        assert!(
+            matches!(
+                actor.immediate_answer_for_tests(&restart(queued_before)),
+                Some(Ok(_))
+            ),
+            "a restart queued before ready was published is coalesced into the finished operation"
+        );
+        assert!(
+            matches!(
+                actor.immediate_answer_for_tests(&restart(queued_after)),
+                Some(Err(CommandError::NotOwned))
+            ),
+            "a restart stamped after ready was published is a new command, not coalesced"
+        );
     }
 
     /// L3：审计日志一条只占一行。id 来自卡的配置，契约允许它含控制字符：照原样写进日志，一条记录能裂成几行、伪造出别的记录。控制字符转义，

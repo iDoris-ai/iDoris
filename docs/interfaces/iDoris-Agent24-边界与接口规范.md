@@ -321,7 +321,7 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 
 **范围与已定决策。** 「引擎」指 iDoris 经 HTTP 对话的本地推理服务进程，种类用 `engine_kind` 区分（§2.12.1，首个实现是 `omlx`），「模型」指引擎里的权重。本节的流程是**通用的**：引擎管理器按「引擎实例」建模，每个实例带自己的 `engine_kind`、状态机、所有权记录与日志，并按种类分派到该种类的「配方」（怎么探测、怎么发现与校验可执行文件、怎么拉起、是否支持私有 key）。v0.6.0 只实现 `omlx` 配方（本节标明「oMLX 配方」的段落）；以后加引擎种类只是增加配方，不改本节的通用字段与流程（owner 2026-11-20 的多引擎需求，§2.12）。现有 Supervisor 管模型（load、unload、chat），引擎管理器在它之下，只管进程；`OmlxAdapter` 继续用 HTTP 与 oMLX 引擎对话，不变。owner 已定：（设计稿 D2a）adopt 优先，找不到才拉起，拉起的实例是 iDoris 私有的；（设计稿 D2b）v0.6.0 的引擎由用户自装，iDoris 探测并报 `engine_not_found`，由 Agent24 界面引导安装，附带或按需下载引擎以后再议。**只对声明了 `extensions.idoris_managed` 的卡生效**（§2.3）；没有托管卡时完全走 v0.5.0 的现有路径，行为不变。
 
-**本地 runtime 端口校验。** `IDORIS_LOCAL_RUNTIME_CONFIG` 中的 runtime 必须使用与托管引擎不同的端口，即使两者绑定的是不同组件卡。端口冲突时，serve 在拉起引擎前以退出码 1 停止，错误包含两个卡 id 和冲突端口。共用托管引擎的 resident 伴生卡沿用 §2.3 的配置。
+**本地 runtime 端口校验。** `IDORIS_LOCAL_RUNTIME_CONFIG` 中的 runtime 必须使用与托管引擎不同的端口，即使两者绑定的是不同组件卡。只有启动规划里真正由引擎管理器托管的卡（loopback HTTP、非订阅、`idoris_managed` 声明合法）才占用端口；声明了 `idoris_managed` 却被规划排除的卡（例如 LAN 卡）不占端口，托管引擎在别的端口也放行。端口冲突时，serve 在拉起引擎前以退出码 1 停止，错误包含两个卡 id 和冲突端口。共用托管引擎的 resident 伴生卡沿用 §2.3 的配置。
 
 **启动决策。** 对每张托管卡，在创建 Supervisor 之前依次：
 

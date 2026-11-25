@@ -282,6 +282,16 @@ impl RuntimeRegistry {
         cards: &[ComponentCard],
         local: &BTreeMap<String, LocalHttpRuntimeConfig>,
     ) -> Result<(), String> {
+        // 端口占用只看启动规划里真正会被引擎管理器托管的卡（loopback HTTP、非订阅、声明合法），不看原始声明：
+        // 声明非法的卡由卡校验报错，这里不重复；被规划排除的卡（如 LAN 卡带着托管声明）不占端口。
+        let managed_plans: Vec<_> = crate::readiness::plan_upstreams(cards)
+            .map(|plans| {
+                plans
+                    .into_iter()
+                    .filter(|plan| plan.identity.managed)
+                    .collect()
+            })
+            .unwrap_or_default();
         for (provider_id, config) in local {
             let card = cards
                 .iter()
@@ -296,13 +306,13 @@ impl RuntimeRegistry {
                 ));
             }
             let port = config.launch.port();
-            if let Some(managed) = cards.iter().find(|candidate| {
-                is_managed_card(candidate)
-                    && crate::lifecycle::managed_port(&candidate.endpoint) == Some(port)
-            }) {
+            if let Some(managed) = managed_plans
+                .iter()
+                .find(|plan| crate::lifecycle::managed_port(&plan.card().endpoint) == Some(port))
+            {
                 return Err(format!(
                     "本地 runtime {provider_id:?} 与托管卡 {:?} 共用端口 {port}，拒绝启动",
-                    managed.provider.id
+                    managed.id
                 ));
             }
             if crate::dispatch::is_resident_http_service(card) {
@@ -1270,6 +1280,32 @@ mod tests {
         assert!(error.contains("plain-local"), "{error}");
         assert!(error.contains("managed-local"), "{error}");
         assert!(error.contains("18121"), "{error}");
+    }
+
+    /// 端口冲突只看启动规划里真正会被托管的卡：带着 `idoris_managed` 声明、但被规划排除的卡（LAN 卡）不占端口；托管引擎在别的端口也放行。
+    #[test]
+    fn a_local_runtime_port_only_conflicts_with_cards_the_start_up_plan_manages() {
+        let port = 18121;
+        let mut plain = named_card("plain-local");
+        plain.endpoint = format!("http://127.0.0.1:{port}");
+        let dir = tempfile::tempdir().unwrap();
+        let configs = BTreeMap::from([(
+            "plain-local".to_string(),
+            local_runtime_config("plain-local", port, dir.path()),
+        )]);
+
+        let mut excluded = managed_named_card("lan-managed", port);
+        excluded.provider.locality = idoris_contracts::provider::Locality::Lan;
+        assert!(
+            crate::readiness::plan_upstreams(std::slice::from_ref(&excluded))
+                .unwrap()
+                .is_empty(),
+            "the LAN card is outside the start-up plan"
+        );
+        RuntimeRegistry::validate_local_configs(&[plain.clone(), excluded], &configs).unwrap();
+
+        let elsewhere = managed_named_card("managed-elsewhere", port + 1);
+        RuntimeRegistry::validate_local_configs(&[plain, elsewhere], &configs).unwrap();
     }
 
     /// 规范勘误十二（3）（L4）：本地 runtime 配置绑在托管卡（`extensions.idoris_managed`）上，启动时就拒绝：托管卡的引擎由引擎管理器

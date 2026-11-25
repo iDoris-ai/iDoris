@@ -1374,6 +1374,24 @@ impl Actor {
         }
     }
 
+    /// 测试：让 actor 处在「操作员的 `restart` 刚拉起了自有引擎、等着发布 `ready`」的状态。
+    #[cfg(test)]
+    pub(super) fn begin_owned_restart_for_tests(&mut self) {
+        self.op = Some(Op::Restart);
+        self.op_launched = true;
+        self.external_path = false;
+        self.state = UpstreamState::Restarting;
+    }
+
+    /// 测试：对一个排队命令，`immediate_answer` 此刻怎么答。
+    #[cfg(test)]
+    pub(super) fn immediate_answer_for_tests(
+        &self,
+        request: &Request,
+    ) -> Option<Result<ManagedView, CommandError>> {
+        self.immediate_answer(request)
+    }
+
     /// 启动决策的前提在判断期间变了（[`Attempt::Redecide`]）：回到决策的开头重来。**不是引擎失败**：不记入熔断窗口、不退避、不计
     /// `failure_count`。这一串重来整体受一个启动超时约束，到点按「有东西占着端口答不上来」收尾（同 `wait_for_answer`）。
     async fn redecide(&mut self) -> Step {

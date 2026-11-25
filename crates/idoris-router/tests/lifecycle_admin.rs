@@ -479,6 +479,20 @@ fn fast() -> Timings {
     }
 }
 
+/// 命令的截止时间（[`parked_actor_timings`]）：只有「实例任务认领之前」才会碰到它。
+const PARKED_COMMAND_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// 让实例任务在引擎就绪之后停在「等邮箱」上：存活检查与周期探测的间隔都拉到一小时，监督循环里不会再有一次 `lsof` 或 Supervisor 状态读
+///（`supervisor_latched` 会被扣着的采样拖住）占住实例任务。这样迟到 202 的测试里，命令一入队就立刻被认领（邮箱空、实例任务闲），认领不会落在 `command_timeout`
+/// 之后而让命令合法地过期成 503；之后截止时间只由被扣着的 `close_admission` 越过。没有任何靠睡眠定先后的地方。
+fn parked_actor_timings() -> Timings {
+    let mut timings = fast();
+    timings.probe_interval = Duration::from_secs(3600);
+    timings.liveness_interval = Duration::from_secs(3600);
+    timings.command_timeout = PARKED_COMMAND_TIMEOUT;
+    timings
+}
+
 fn template() -> ComponentCard {
     serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap()
 }
@@ -5880,8 +5894,7 @@ async fn l2b_a_stop_whose_first_step_outlasts_the_deadline_is_accepted_late_over
     let port = rig.port;
     // 引擎一起来，Supervisor 的启动采样就被扣着（门控放行之后 Supervisor 才起）。
     rig.fake.hold(Hold::Status);
-    let mut timings = fast();
-    timings.command_timeout = Duration::from_millis(400);
+    let timings = parked_actor_timings();
     let full = Full::start_with(rig, Scripted::claiming(port), timings).await;
     full.wait_open().await;
     let old = full.rig.pid(0);
@@ -5915,7 +5928,7 @@ async fn l2b_a_stop_whose_first_step_outlasts_the_deadline_is_accepted_late_over
     let body: Value = response.json().await.unwrap();
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert!(
-        started.elapsed() >= Duration::from_millis(350),
+        started.elapsed() >= PARKED_COMMAND_TIMEOUT - Duration::from_millis(50),
         "the answer came after the deadline: {:?}",
         started.elapsed()
     );
@@ -5945,8 +5958,7 @@ async fn l2b_a_restart_whose_first_step_outlasts_the_deadline_is_accepted_late_a
     let rig = Rig::new(&stateful());
     let port = rig.port;
     rig.fake.hold(Hold::Status);
-    let mut timings = fast();
-    timings.command_timeout = Duration::from_millis(400);
+    let timings = parked_actor_timings();
     let full = Full::start_with(rig, Scripted::claiming(port), timings).await;
     full.wait_open().await;
     let old = full.rig.pid(0);
@@ -5955,7 +5967,7 @@ async fn l2b_a_restart_whose_first_step_outlasts_the_deadline_is_accepted_late_a
     let (status, body) = full.post_command("restart").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert!(
-        started.elapsed() >= Duration::from_millis(350),
+        started.elapsed() >= PARKED_COMMAND_TIMEOUT - Duration::from_millis(50),
         "the answer came after the deadline: {:?}",
         started.elapsed()
     );
