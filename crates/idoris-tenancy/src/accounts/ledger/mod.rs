@@ -150,13 +150,14 @@ use crate::attempts::AttemptLedgerHook;
 /// 已经跑过旧文本的库得不到任何改动；`tests/migration_upgrade.rs` 把已发布的文件按内容钉死）。
 /// 0001 是 S3 的账本；0002 把授信的权威数据源统一到 `allocations`（并补登控制面发出的免费额度的承诺）；
 /// 0003 补上宽限的部分唯一索引的 REPLACE 保护；0004 记下额度创建 / 撤销在账本里的先后（分录序号）；
-/// 0005 只加一条索引（`settle` 按结算时刻），补贴池一个账期的消耗不用把池账户的全部历史读一遍。
+/// 0005 给按结算时刻读取账期消耗加索引；0006 增加按账户增量推进的投影检查点。
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_ledger.sql"),
     include_str!("migrations/0002_credit_lines_are_allocations.sql"),
     include_str!("migrations/0003_grace_no_replace.sql"),
     include_str!("migrations/0004_allocation_marks.sql"),
     include_str!("migrations/0005_entries_settled_by_account_at.sql"),
+    include_str!("migrations/0006_checkpoints.sql"),
 ];
 
 /// 应用账本迁移（在账户迁移之后、同一条连接上）。版本记在 `ledger_schema_migrations`。
