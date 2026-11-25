@@ -1361,7 +1361,7 @@ impl Actor {
     ///
     /// 「记水位」与「发布」是一步（[`Shared::publish_at_watermark`]：盖章的锁里读计数、发布共享状态），日志在放锁之后才写。盖章在锁里，所以每个在 `ready` 对外可见之前
     /// 盖章的命令都不超过水位，每个在它可见之后盖章的都超过。
-    fn publish_ready_finishing_op(&mut self) {
+    pub(super) fn publish_ready_finishing_op(&mut self) {
         let grants = self.op.is_some() && self.op_launched && !self.external_path;
         let (status, changed) = self.advance(UpstreamState::Ready, None, false, Count::Edge);
         let watermark = self.shared.publish_at_watermark(&self.plan.id, status);
@@ -1372,6 +1372,24 @@ impl Actor {
         if changed {
             self.log(UpstreamState::Ready.as_str());
         }
+    }
+
+    /// 测试：让 actor 处在「操作员的 `restart` 刚拉起了自有引擎、等着发布 `ready`」的状态。
+    #[cfg(test)]
+    pub(super) fn begin_owned_restart_for_tests(&mut self) {
+        self.op = Some(Op::Restart);
+        self.op_launched = true;
+        self.external_path = false;
+        self.state = UpstreamState::Restarting;
+    }
+
+    /// 测试：对一个排队命令，`immediate_answer` 此刻怎么答。
+    #[cfg(test)]
+    pub(super) fn immediate_answer_for_tests(
+        &self,
+        request: &Request,
+    ) -> Option<Result<ManagedView, CommandError>> {
+        self.immediate_answer(request)
     }
 
     /// 启动决策的前提在判断期间变了（[`Attempt::Redecide`]）：回到决策的开头重来。**不是引擎失败**：不记入熔断窗口、不退避、不计

@@ -152,6 +152,7 @@ mod manager;
 
 pub use backend::{EngineBackend, OmlxBackend, PrepareFailure};
 pub use backoff::{CrashWindow, MIN_CONFIRM, MIN_TERM_GRACE, Timings, restart_delay, stop_windows};
+pub(crate) use manager::managed_port;
 pub use manager::{
     CommandAck, CommandError, EngineFailure, EngineManager, GateOutcome, ManagedPlan, ManagedView,
     ManagerConfig, PlanError, managed_backend_kind, plan_managed, plan_managed_with,
