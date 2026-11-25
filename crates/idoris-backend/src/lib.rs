@@ -27,7 +27,7 @@ pub mod mock;
 pub mod supervisor;
 pub mod types;
 
-pub use adapter::RuntimeAdapter;
+pub use adapter::{LOAD_CONFIRMATION_FLOOR, RuntimeAdapter};
 pub use error::BackendError;
 pub use eviction::{
     EvictionPlan, ModelEntry, ModelReq, ModelState, PlanEvictionError, Snapshot, plan_eviction,

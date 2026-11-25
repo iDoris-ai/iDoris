@@ -589,7 +589,7 @@ fn wall_clock_ms() -> u64 {
 /// `localhost` or a loopback IP literal (IPv4-mapped spellings included: they are the same socket). Anything else — other names
 /// included, since they may resolve off-host — counts as egress. The one classification of "loopback" the key registry uses too
 /// ([`idoris_upstream::omlx::key::is_loopback_host`]; IDORIS-CORE S6, Codex pre-review of layer 2, H1).
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -620,6 +620,12 @@ pub struct ChatProxy {
     pub(crate) embeddings_header_timeout: Duration,
     /// resident 预热的最小请求的响应头期限（[`WARMUP_HEADER_TIMEOUT`]）；字段只为了让测试能把它缩短。
     pub(crate) warmup_header_timeout: Duration,
+    /// 在途的 resident 预热请求：同一模型的并发预热合并成一个请求、每把数据 key 自己发起的在途请求有上限
+    /// （[`crate::warmup::Registry`]）。它保护的就是下面这 32 个并发许可，所以放在这个代理上：每个路由器各有各的。
+    pub(crate) warmups: Arc<crate::warmup::Registry>,
+    /// 测试注入点（[`crate::warmup::RunHook`]）：让 resident 预热的领头任务停在发请求之前、放行之后可选地 panic。
+    #[cfg(test)]
+    pub(crate) warmup_run_hook: Option<Arc<crate::warmup::RunHook>>,
     body_timeout: Duration,
     max_body_bytes: usize,
     max_cache_bytes: usize,
@@ -857,6 +863,18 @@ impl ChatProxy {
         self.egress.snapshot()
     }
 
+    /// Observability of `POST /v1/models/warmup` on a resident card: how many warmup requests are in
+    /// flight through this proxy right now (the callers that led them, all keys together).
+    pub fn warmup_requests_in_flight(&self) -> usize {
+        self.warmups.requests_in_flight()
+    }
+
+    /// Observability of `POST /v1/models/warmup` on a resident card: how many callers are waiting on a
+    /// warmup request another caller started (they send nothing of their own).
+    pub fn warmup_followers_waiting(&self) -> usize {
+        self.warmups.followers_waiting()
+    }
+
     /// The POST exactly as it goes on the wire, recorded in the egress
     /// counter first when the host is not loopback.
     ///
@@ -1002,6 +1020,9 @@ impl ChatProxy {
             header_timeout: Duration::from_secs(10),
             embeddings_header_timeout: EMBEDDINGS_HEADER_TIMEOUT,
             warmup_header_timeout: WARMUP_HEADER_TIMEOUT,
+            warmups: Arc::default(),
+            #[cfg(test)]
+            warmup_run_hook: None,
             body_timeout: Duration::from_secs(60),
             max_body_bytes: 8 * 1024 * 1024,
             max_cache_bytes: 32 * 1024 * 1024,

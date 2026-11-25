@@ -1,10 +1,12 @@
 //! IDORIS-CORE S8（接口规范 §2.11.2，修订 1.6 勘误八）：`POST /v1/models/warmup`。
 //!
 //! 全部进程内、不启动任何真实模型进程：生命周期卡用 `MockAdapter`（外面套一个数 `chat` 调用的壳，证明预热不生成 token），
-//! resident 卡与假 oMLX 用 `wiremock`（要看客户端有没有半路挂断的用一个自己写的假上游）。状态码矩阵、余量确认、key 范围、
-//! 并发合并、`timeout_ms` 与客户端断开不取消、不留围栏、各写恰好一条审计（引擎侧的超时或 panic 保持既有的围栏保护，也有对照）、
-//! 门控与降级冻结都在这里；
-//! 需要 crate 内部旋钮的（代理的响应头超时）在 `src/warmup_tests.rs`。
+//! resident 卡与假 oMLX 用 `wiremock`（要看客户端有没有半路挂断的用一个自己写的假上游，要让领头的请求停住、并入者一定在它结束之前
+//! 到的用一个带门的假上游：测试放行，不靠固定的延迟）。状态码矩阵、余量确认、key 范围、并发合并、`timeout_ms` 与客户端断开不取消、
+//! 不留围栏、各写恰好一条审计（引擎侧的超时或 panic 保持既有的围栏保护，也有对照）、门控与降级冻结、resident 预热请求的在途上限
+//! （每把 key 自己发起的、全部 key 合计的，别的 key 与聊天不受影响；超了是 429 加 `Retry-After`）、并入者要先过自己的鉴权、预算与
+//! 本机候选才会并入、并入的预热在回答与审计里的 `coalesced` 标记、`SpendGate::All` 下预热也过预算的准入检查（不插入预留行）都在这里；
+//! 需要 crate 内部旋钮的（代理的响应头超时、并发许可的余量、合并表、领头任务的注入点）在 `src/warmup_tests.rs` 与 `src/warmup.rs`。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "support/child_guard.rs"]
@@ -33,6 +35,7 @@ use idoris_contracts::{ComponentCard, LoadPolicy};
 use idoris_router::readiness::{HealthState, UpstreamReason, UpstreamState, UpstreamStatus};
 use idoris_router::runtime::RuntimeRegistry;
 use idoris_router::{AppState, auth, build_app, build_starting_app};
+use idoris_tenancy::budget::{BudgetLedger, SpendGate};
 use idoris_tenancy::event_log::{EventLogEvent, EventLogQuery, EventLogStore, EventType};
 use idoris_tenancy::store::{RecordKind, TenantStore};
 use idoris_tenancy::virtual_key::MintedVirtualKey;
@@ -2275,6 +2278,673 @@ async fn a_client_that_hangs_up_does_not_cancel_the_resident_request_either_and_
     assert_eq!(audit.records(PERSONAL), 1);
 }
 
+// ---------------------------------------------------------------------------------------------
+// resident 预热的并发许可（#634 预审 W-1，及其后的本地预审 M-1、L-1 到 L-4）：同一模型的并发预热合并，在途请求有几道上限
+// ---------------------------------------------------------------------------------------------
+
+/// 一个假的 OpenAI 兼容上游：预热的最小请求（正文里有 `warmup`）停在门口，直到测试放行；别的请求（聊天里的 `hi`）立刻答。
+/// 「并入者一定在领头的请求结束之前到」靠它，不靠固定的延迟：领头的请求停在这里，并入者登记之后（`warmup_followers_waiting`）才放行。
+struct GatedUpstream {
+    url: String,
+    gate: Arc<tokio::sync::Semaphore>,
+    /// 到了门口的预热请求数。
+    arrived: Arc<AtomicU32>,
+    /// 上游一共收到的请求数（预热的与别的）。
+    received: Arc<AtomicU32>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl GatedUpstream {
+    fn arrived(&self) -> u32 {
+        self.arrived.load(Ordering::SeqCst)
+    }
+
+    fn received(&self) -> u32 {
+        self.received.load(Ordering::SeqCst)
+    }
+
+    /// 放行 `count` 个停在门口的预热请求（之后到的也直接过去，直到许可用完）。
+    fn release(&self, count: usize) {
+        self.gate.add_permits(count);
+    }
+}
+
+impl Drop for GatedUpstream {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+async fn gated_upstream() -> GatedUpstream {
+    #[derive(Clone)]
+    struct Shared {
+        gate: Arc<tokio::sync::Semaphore>,
+        arrived: Arc<AtomicU32>,
+        received: Arc<AtomicU32>,
+    }
+
+    async fn answer(State(shared): State<Shared>, body: String) -> Json<Value> {
+        shared.received.fetch_add(1, Ordering::SeqCst);
+        if body.contains("\"warmup\"") {
+            shared.arrived.fetch_add(1, Ordering::SeqCst);
+            if let Ok(permit) = shared.gate.acquire().await {
+                permit.forget();
+            }
+        }
+        Json(json!({"choices": [{"message": {"content": "x"}}]}))
+    }
+
+    let shared = Shared {
+        gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        arrived: Arc::default(),
+        received: Arc::default(),
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", axum::routing::post(answer))
+        .with_state(shared.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    GatedUpstream {
+        url,
+        gate: shared.gate,
+        arrived: shared.arrived,
+        received: shared.received,
+        server,
+    }
+}
+
+/// 一个 resident 应用（单张卡）接在门控上游前面，并交出代理：测试要数在途的请求与并入者。`customize` 在建应用之前改 `AppState`。
+fn gated_app(
+    cards: Vec<ComponentCard>,
+    customize: impl FnOnce(&mut AppState),
+) -> (Router, Arc<idoris_router::proxy::ChatProxy>) {
+    let mut state = AppState {
+        cards,
+        ..AppState::default()
+    };
+    customize(&mut state);
+    let proxy = Arc::clone(&state.proxy);
+    (build_app(state), proxy)
+}
+
+/// 起一个预热（后台任务），返回它的结果。
+fn start_warm(
+    app: &Router,
+    model: &'static str,
+    secret: Option<&str>,
+    headers: &[(&'static str, &'static str)],
+) -> tokio::task::JoinHandle<Reply> {
+    let (app, secret, headers) = (app.clone(), secret.map(str::to_string), headers.to_vec());
+    tokio::spawn(async move {
+        send_raw(
+            &app,
+            WARMUP,
+            json!({"model": model}).to_string(),
+            &headers,
+            secret.as_deref(),
+        )
+        .await
+    })
+}
+
+#[tokio::test]
+async fn one_key_over_its_in_flight_limit_is_rejected_while_other_keys_and_chat_are_unaffected() {
+    let upstream = gated_upstream().await;
+    let ring = keyring(&[("a", ALL_ROLES, LOCAL), ("b", ALL_ROLES, LOCAL)]);
+    let (key_a, key_b) = (ring.secrets["a"].clone(), ring.secrets["b"].clone());
+    let authenticator = ring.authenticator.clone();
+    let (app, proxy) = gated_app(
+        vec![resident_card(
+            "lmstudio",
+            &upstream.url,
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        move |state| {
+            state.virtual_key_authenticator = Some(authenticator);
+            state.remote_bind_requires_auth = true;
+        },
+    );
+
+    // 钥匙 A 同时有两个不同模型的预热在途：两个请求都到了上游的门口，A 自己发起的在途请求数到了上限。
+    let a_one = start_warm(&app, "model-one", Some(&key_a), &[]);
+    let a_two = start_warm(&app, "model-two", Some(&key_a), &[]);
+    wait_until(
+        "both of A's requests at the gate",
+        Duration::from_secs(10),
+        || upstream.arrived() == 2,
+    )
+    .await;
+    // 第三个不同的模型：立刻 429，原因码说得清，带 `Retry-After`，什么也没发给上游。
+    let began = Instant::now();
+    let refused = warm_as(&app, json!({"model": "model-three"}), &key_a, &[]).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        refused.raw
+    );
+    assert_eq!(refused.error_type(), "warmup_in_flight_limited");
+    assert_eq!(refused.reason(), "warmup_in_flight_limited");
+    assert_eq!(refused.header("x-idoris-served-locality"), Some("loopback"));
+    assert_eq!(refused.header("retry-after"), Some("10"));
+    assert!(
+        began.elapsed() < Duration::from_millis(1_000),
+        "refused at once, nothing was waited for: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(upstream.arrived(), 2);
+
+    // 别的钥匙不受影响：B 为同一个第三个模型领头，发出自己的请求；聊天照常（聊天的请求不停在门口）。
+    let b_three = start_warm(&app, "model-three", Some(&key_b), &[]);
+    wait_until("B's request at the gate", Duration::from_secs(10), || {
+        upstream.arrived() == 3
+    })
+    .await;
+    let chatted = send_raw(
+        &app,
+        "/v1/chat/completions",
+        json!({"model": "idoris/daily", "messages": [{"role": "user", "content": "hi"}]})
+            .to_string(),
+        &[],
+        Some(&key_b),
+    )
+    .await;
+    assert_eq!(chatted.status, StatusCode::OK, "{}", chatted.raw);
+    // A 并入自己已经在途的模型不占名额：不是 429。等它登记了（并入者的计数加一）才放行，所以它一定在领头的结束之前到。
+    let a_join = start_warm(&app, "model-one", Some(&key_a), &[]);
+    wait_until("A to join its own request", Duration::from_secs(10), || {
+        proxy.warmup_followers_waiting() == 1
+    })
+    .await;
+    upstream.release(3);
+    for (name, handle) in [
+        ("a_one", a_one),
+        ("a_two", a_two),
+        ("b_three", b_three),
+        ("a_join", a_join),
+    ] {
+        let reply = handle.await.unwrap();
+        assert_eq!(reply.status, StatusCode::OK, "{name}: {}", reply.raw);
+    }
+    // A 的请求都结束了：名额还回来，第三个模型现在可以领头。
+    let again = start_warm(&app, "model-three", Some(&key_a), &[]);
+    wait_until(
+        "A's new request at the gate",
+        Duration::from_secs(10),
+        || upstream.arrived() == 4,
+    )
+    .await;
+    upstream.release(1);
+    let again = again.await.unwrap();
+    assert_eq!(again.status, StatusCode::OK, "{}", again.raw);
+    // 上游一共收到：A 的两个、B 的第三个、A 之后的第三个——被拒绝的与并入的预热一个都没发。
+    assert_eq!(
+        upstream.arrived(),
+        4,
+        "model-one, model-two, B's model-three, A's model-three"
+    );
+}
+
+/// 五把 key 的钥匙环，每把绑一个租户（租户模式用）：`(名字, 租户)`。
+fn keyring_of_tenants(specs: &[(&'static str, &'static str)]) -> Keyring {
+    let store = Arc::new(Mutex::new(
+        VirtualKeyStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+    ));
+    let mut secrets = BTreeMap::new();
+    for (name, tenant) in specs {
+        let key = MintedVirtualKey::mint();
+        store
+            .lock()
+            .unwrap()
+            .insert_active(
+                &key.key_id,
+                key.hash,
+                &VirtualKeyScope {
+                    owner: (*name).into(),
+                    tenant_id: Some((*tenant).to_string()),
+                    allowed_privacy: LOCAL.to_vec(),
+                    allowed_roles: ALL_ROLES.iter().map(|role| (*role).to_string()).collect(),
+                    budget_ref: None,
+                    expires_at_ms: None,
+                    admin_scopes: Vec::new(),
+                },
+            )
+            .unwrap();
+        secrets.insert(*name, key.secret.expose_secret().to_string());
+    }
+    Keyring {
+        authenticator: auth::VirtualKeyAuthenticator::new(store),
+        secrets,
+    }
+}
+
+// ---- 并入者要先过自己的鉴权、预算与本机候选，才会并入（本地预审 M-1） ----
+
+#[tokio::test]
+async fn a_follower_whose_key_may_not_warm_the_model_is_refused_before_it_can_join_the_request_in_flight()
+ {
+    let upstream = gated_upstream().await;
+    let ring = keyring(&[("lead", ALL_ROLES, LOCAL), ("narrow", &["embed"], LOCAL)]);
+    let (lead_key, narrow_key) = (ring.secrets["lead"].clone(), ring.secrets["narrow"].clone());
+    let authenticator = ring.authenticator.clone();
+    let (app, proxy) = gated_app(
+        vec![resident_card(
+            "lmstudio",
+            &upstream.url,
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        move |state| {
+            state.virtual_key_authenticator = Some(authenticator);
+            state.remote_bind_requires_auth = true;
+        },
+    );
+    let leader = start_warm(&app, "idoris/daily", Some(&lead_key), &[]);
+    wait_until("the leader at the gate", Duration::from_secs(10), || {
+        upstream.arrived() == 1
+    })
+    .await;
+    // 角色不允许的 key 此刻来要并入同一个在途的请求：鉴权在并入之前，所以立刻是 403；若并入在前，它会一直等到领头的结束，拿到 200。
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        warm_as(&app, json!({"model": "idoris/daily"}), &narrow_key, &[]),
+    )
+    .await
+    .expect("refused at once: it did not wait for the request in flight");
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.raw);
+    assert_eq!(refused.reason(), "VIRTUAL_KEY_ROLE_FORBIDDEN");
+    assert_eq!(proxy.warmup_followers_waiting(), 0, "it never joined");
+    upstream.release(1);
+    let reply = leader.await.unwrap();
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
+    assert_eq!(
+        upstream.arrived(),
+        1,
+        "the upstream only ever saw one request"
+    );
+    assert_eq!(upstream.received(), 1);
+}
+
+#[tokio::test]
+async fn a_follower_whose_tenant_has_no_budget_is_refused_with_402_before_it_can_join_the_request_in_flight()
+ {
+    let upstream = gated_upstream().await;
+    // 一个账本里两个租户：beta 付得起，acme 的余额是零（`All`：免费调用也要过）。
+    let budget = Budget::for_tenant("acme", 0, SpendGate::All);
+    budget
+        .ledger
+        .configure_tenant("beta", 1_000, "UTC", SpendGate::All)
+        .unwrap();
+    let ring = keyring_of_tenants(&[("beta", "beta"), ("acme", "acme")]);
+    let (beta_key, acme_key) = (ring.secrets["beta"].clone(), ring.secrets["acme"].clone());
+    let authenticator = ring.authenticator.clone();
+    let install = budget.install();
+    let (app, proxy) = gated_app(
+        vec![resident_card(
+            "lmstudio",
+            &upstream.url,
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        move |state| {
+            state.deploy_mode = idoris_contracts::DeployMode::Tenant;
+            state.virtual_key_authenticator = Some(authenticator);
+            install(state);
+        },
+    );
+    let leader = start_warm(
+        &app,
+        "idoris/daily",
+        Some(&beta_key),
+        &[("X-iDoris-Tenant", "beta")],
+    );
+    wait_until("the leader at the gate", Duration::from_secs(10), || {
+        upstream.arrived() == 1
+    })
+    .await;
+    // 另一个租户（零余额）来要并入同一个在途的请求：预算检查在并入之前，所以立刻是 402。
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        warm_as(
+            &app,
+            json!({"model": "idoris/daily"}),
+            &acme_key,
+            &[("X-iDoris-Tenant", "acme")],
+        ),
+    )
+    .await
+    .expect("refused at once: it did not wait for the request in flight");
+    assert_eq!(
+        refused.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        refused.raw
+    );
+    assert_eq!(refused.error_type(), "budget_exceeded");
+    assert_eq!(proxy.warmup_followers_waiting(), 0, "it never joined");
+    upstream.release(1);
+    let reply = leader.await.unwrap();
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
+    assert_eq!(
+        upstream.arrived(),
+        1,
+        "the upstream only ever saw one request"
+    );
+    assert_eq!(budget.reservation_rows(), 0);
+}
+
+#[tokio::test]
+async fn a_follower_that_asks_for_any_privacy_still_selects_only_the_local_card_and_joins_the_request_in_flight()
+ {
+    let local = gated_upstream().await;
+    let remote = upstream().await;
+    // 同角色下远程卡排在本机卡前面（同价、同准入状态时按 id 字典序选）：聊天在 `any` 下选的是它。
+    let (app, proxy) = gated_app(
+        vec![
+            remote_card("a-cloud", &remote.uri(), "chat", "daily: \"cloud-model\""),
+            resident_card(
+                "z-local",
+                &local.url,
+                "chat",
+                "daily: \"local-model\"",
+                false,
+            ),
+        ],
+        |state| state.routing_policy = local_and_remote_tiers(),
+    );
+    let leader = start_warm(&app, "idoris/daily", None, &[]);
+    wait_until("the leader at the gate", Duration::from_secs(10), || {
+        local.arrived() == 1
+    })
+    .await;
+    // 并入者声明 `any`：预热的候选只有本机的卡，所以它选的是同一张本机卡，并入领头的请求，没有去远程卡。
+    let follower = start_warm(&app, "idoris/daily", None, &[("X-iDoris-Privacy", "any")]);
+    wait_until("the follower to join", Duration::from_secs(10), || {
+        proxy.warmup_followers_waiting() == 1
+    })
+    .await;
+    local.release(1);
+    for (who, handle) in [("leader", leader), ("follower", follower)] {
+        let reply = handle.await.unwrap();
+        assert_eq!(reply.status, StatusCode::OK, "{who}: {}", reply.raw);
+        assert_eq!(reply.body["provider_id"], "z-local", "{who}");
+        assert_eq!(reply.header("x-idoris-served-locality"), Some("loopback"));
+    }
+    assert_eq!(local.arrived(), 1, "one request to the local card");
+    assert_eq!(
+        requests_of(&remote).await.len(),
+        0,
+        "the remote card was never in play"
+    );
+}
+
+// ---- 并发上限的次序与全局上限（本地预审 L-3、L-4） ----
+
+/// 两个租户一个账本：beta 付得起，acme 的余额是零。
+fn two_tenant_budget() -> Budget {
+    let budget = Budget::for_tenant("acme", 0, SpendGate::All);
+    budget
+        .ledger
+        .configure_tenant("beta", 100_000, "UTC", SpendGate::All)
+        .unwrap();
+    budget
+}
+
+#[tokio::test]
+async fn the_global_leader_limit_refuses_the_ninth_request_with_the_same_429_and_leaves_followers_and_chat_alone()
+ {
+    let upstream = gated_upstream().await;
+    let names: [&'static str; 5] = ["a", "b", "c", "d", "e"];
+    let ring = keyring(&names.map(|name| (name, ALL_ROLES, LOCAL)));
+    let authenticator = ring.authenticator.clone();
+    let (app, proxy) = gated_app(
+        vec![resident_card(
+            "lmstudio",
+            &upstream.url,
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        move |state| {
+            state.virtual_key_authenticator = Some(authenticator);
+            state.remote_bind_requires_auth = true;
+        },
+    );
+    // 四把 key 各领头两个不同的模型：每把 key 都没超过自己的上限，合计正好是全局的上限。
+    let models: [[&'static str; 2]; 4] = [
+        ["a-one", "a-two"],
+        ["b-one", "b-two"],
+        ["c-one", "c-two"],
+        ["d-one", "d-two"],
+    ];
+    let mut leaders = Vec::new();
+    for (name, pair) in names.iter().zip(models) {
+        for model in pair {
+            leaders.push(start_warm(&app, model, Some(&ring.secrets[name]), &[]));
+        }
+    }
+    wait_until(
+        "eight requests at the gate",
+        Duration::from_secs(10),
+        || upstream.arrived() == 8,
+    )
+    .await;
+    assert_eq!(proxy.warmup_requests_in_flight(), 8);
+    // 第五把 key 自己一个也没有，领头一个新模型：被全局上限拒绝，同一个 429，带 `Retry-After`，什么也没发给上游。
+    let key_e = ring.secrets["e"].clone();
+    let refused = warm_as(&app, json!({"model": "e-one"}), &key_e, &[]).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        refused.raw
+    );
+    assert_eq!(refused.error_type(), "warmup_in_flight_limited");
+    assert_eq!(refused.reason(), "warmup_in_flight_limited");
+    assert_eq!(refused.header("retry-after"), Some("10"));
+    assert_eq!(refused.header("x-idoris-served-locality"), Some("loopback"));
+    assert_eq!(upstream.arrived(), 8);
+    // 并入已经在途的请求不是领头，不算：照样放行；聊天也不受影响（32 个许可里只占了 8 个）。
+    let joined = start_warm(&app, "a-one", Some(&key_e), &[]);
+    wait_until(
+        "e to join a request in flight",
+        Duration::from_secs(10),
+        || proxy.warmup_followers_waiting() == 1,
+    )
+    .await;
+    let chatted = send_raw(
+        &app,
+        "/v1/chat/completions",
+        json!({"model": "idoris/daily", "messages": [{"role": "user", "content": "hi"}]})
+            .to_string(),
+        &[],
+        Some(&key_e),
+    )
+    .await;
+    assert_eq!(chatted.status, StatusCode::OK, "{}", chatted.raw);
+    upstream.release(8);
+    for (index, handle) in leaders.into_iter().enumerate() {
+        let reply = handle.await.unwrap();
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "leader {index}: {}",
+            reply.raw
+        );
+    }
+    let joined = joined.await.unwrap();
+    assert_eq!(joined.status, StatusCode::OK, "{}", joined.raw);
+    assert_eq!(joined.body["coalesced"], json!(true));
+    // 都结束了：全局的名额回来，第五把 key 现在可以领头。
+    let later = start_warm(&app, "e-one", Some(&key_e), &[]);
+    wait_until(
+        "e's own request at the gate",
+        Duration::from_secs(10),
+        || upstream.arrived() == 9,
+    )
+    .await;
+    upstream.release(1);
+    let later = later.await.unwrap();
+    assert_eq!(later.status, StatusCode::OK, "{}", later.raw);
+}
+
+#[tokio::test]
+async fn a_429_is_answered_before_the_budget_is_asked_and_a_follower_within_the_limits_still_meets_the_budget()
+ {
+    let upstream = gated_upstream().await;
+    let budget = two_tenant_budget();
+    // 四把 beta 的 key（付得起）与一把 acme 的 key（零余额）。
+    let ring = keyring_of_tenants(&[
+        ("beta-1", "beta"),
+        ("beta-2", "beta"),
+        ("beta-3", "beta"),
+        ("beta-4", "beta"),
+        ("acme", "acme"),
+    ]);
+    let authenticator = ring.authenticator.clone();
+    let install = budget.install();
+    let (app, proxy) = gated_app(
+        vec![resident_card(
+            "lmstudio",
+            &upstream.url,
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        move |state| {
+            state.deploy_mode = idoris_contracts::DeployMode::Tenant;
+            state.virtual_key_authenticator = Some(authenticator);
+            install(state);
+        },
+    );
+    let beta = [("X-iDoris-Tenant", "beta")];
+    let acme = [("X-iDoris-Tenant", "acme")];
+    let models: [[&'static str; 2]; 4] = [
+        ["b1-one", "b1-two"],
+        ["b2-one", "b2-two"],
+        ["b3-one", "b3-two"],
+        ["b4-one", "b4-two"],
+    ];
+    let mut leaders = Vec::new();
+    for (name, pair) in ["beta-1", "beta-2", "beta-3", "beta-4"].iter().zip(models) {
+        for model in pair {
+            leaders.push(start_warm(&app, model, Some(&ring.secrets[name]), &beta));
+        }
+    }
+    wait_until(
+        "eight requests at the gate",
+        Duration::from_secs(10),
+        || upstream.arrived() == 8,
+    )
+    .await;
+    let acme_key = ring.secrets["acme"].clone();
+    // 全局上限已满，acme（零余额）要领头一个新模型：先到的是 429，不是 402——并发上限的预检在预算检查之前。
+    let refused = warm_as(&app, json!({"model": "acme-one"}), &acme_key, &acme).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        refused.raw
+    );
+    assert_eq!(refused.error_type(), "warmup_in_flight_limited");
+    // 对照：同一个 acme，要并入一个在途的请求（没有超任何上限）：预算检查照常做，零余额是 402，并入不是绕开它的后门。
+    let refused = warm_as(&app, json!({"model": "b1-one"}), &acme_key, &acme).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        refused.raw
+    );
+    assert_eq!(refused.error_type(), "budget_exceeded");
+    assert_eq!(proxy.warmup_followers_waiting(), 0);
+    upstream.release(8);
+    for (index, handle) in leaders.into_iter().enumerate() {
+        let reply = handle.await.unwrap();
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "leader {index}: {}",
+            reply.raw
+        );
+    }
+    assert_eq!(upstream.arrived(), 8);
+    assert_eq!(budget.reservation_rows(), 0);
+}
+
+// ---- 并入的预热的标记，与最小请求不带幂等键（本地预审 L-1） ----
+
+#[tokio::test]
+async fn a_follower_is_marked_coalesced_in_its_answer_and_no_warmup_leaves_a_request_id_behind() {
+    let upstream = gated_upstream().await;
+    let audit = Audit::new();
+    let (app, proxy) = gated_app(
+        vec![resident_card(
+            "lmstudio",
+            &upstream.url,
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        audit.install(),
+    );
+    let leader = start_warm(
+        &app,
+        "idoris/daily",
+        None,
+        &[("X-iDoris-Request-Id", "lead-1")],
+    );
+    wait_until("the leader at the gate", Duration::from_secs(10), || {
+        upstream.arrived() == 1
+    })
+    .await;
+    let follower = start_warm(
+        &app,
+        "idoris/daily",
+        None,
+        &[("X-iDoris-Request-Id", "follow-1")],
+    );
+    wait_until("the follower to join", Duration::from_secs(10), || {
+        proxy.warmup_followers_waiting() == 1
+    })
+    .await;
+    upstream.release(1);
+    let (leader, follower) = (leader.await.unwrap(), follower.await.unwrap());
+    assert_eq!(leader.status, StatusCode::OK, "{}", leader.raw);
+    assert_eq!(follower.status, StatusCode::OK, "{}", follower.raw);
+    // 回答里：并入的那个有 `coalesced: true`，领头的没有这个字段。（审计事件的字段是一份封闭的名单，两处各有一份——
+    // `AUDIT_FIELDS` 与事件日志的 `SCALAR_KEYS`——所以标记只放在回答里。）
+    assert_eq!(follower.body["coalesced"], json!(true));
+    assert!(leader.body.get("coalesced").is_none(), "{}", leader.raw);
+    // 审计里：两条事件，各记各的 `X-iDoris-Request-Id`，没有谁的 id 记到别人的事件上。
+    audit.wait_for_events(PERSONAL, 2).await;
+    let_late_audit_writes_land().await;
+    let events = audit.events(PERSONAL);
+    let mut request_ids: Vec<_> = events
+        .iter()
+        .map(|event| event.event.request_id.clone().unwrap_or_default())
+        .collect();
+    request_ids.sort();
+    assert_eq!(request_ids, ["follow-1", "lead-1"], "{events:?}");
+    assert_eq!(
+        upstream.arrived(),
+        1,
+        "the follower sent nothing of its own"
+    );
+    // 最小请求不带幂等键（`ResidentRequest::run` 的不变式）：同一张卡上，一个聊天复用领头预热的 `X-iDoris-Request-Id`，不受影响——
+    // 不是 409 `request_id_conflict`（预热登记了这个 id），也不是预热结果的重放。
+    let chat = chat(&app, "idoris/daily", &[("X-iDoris-Request-Id", "lead-1")]).await;
+    assert_eq!(chat.status, StatusCode::OK, "{}", chat.raw);
+    assert!(chat.header("x-idoris-cached").is_none());
+    assert_eq!(upstream.received(), 2, "the leader's warmup and the chat");
+}
+
 #[tokio::test]
 async fn a_paid_resident_card_is_refused_before_anything_is_sent() {
     let server = upstream().await;
@@ -2389,12 +3059,9 @@ async fn a_cooling_resident_card_is_skipped_when_another_card_can_warm() {
     assert_eq!(reply.body["provider_id"], "b-good");
 }
 
-#[tokio::test]
-async fn a_subscription_card_is_never_a_warmup_candidate() {
-    let subscription: ComponentCard =
-        serde_yaml::from_str(include_str!("../../../config/components/subscription.yaml")).unwrap();
-    // Remote-tier cards are eligible for `any` here, so only the warmup's own exclusion keeps it out.
-    let routing_policy = idoris_contracts::RoutingPolicy {
+/// 路由策略放行本机与远程两个层级（缺省只放行本机）：远程层级的卡在聊天里是可选的，所以拦住它们的只能是预热自己的规则。
+fn local_and_remote_tiers() -> idoris_contracts::RoutingPolicy {
+    idoris_contracts::RoutingPolicy {
         routing_policy: idoris_contracts::routing_policy::RoutingPolicyInner {
             version: 1,
             rules: Vec::new(),
@@ -2407,10 +3074,17 @@ async fn a_subscription_card_is_never_a_warmup_candidate() {
                 ..Default::default()
             },
         },
-    };
+    }
+}
+
+#[tokio::test]
+async fn a_subscription_card_is_never_a_warmup_candidate() {
+    let subscription: ComponentCard =
+        serde_yaml::from_str(include_str!("../../../config/components/subscription.yaml")).unwrap();
+    // Remote-tier cards are eligible for `any` here, so only the warmup's own exclusion keeps it out.
     let app = build_app(AppState {
         cards: vec![subscription],
-        routing_policy,
+        routing_policy: local_and_remote_tiers(),
         ..AppState::default()
     });
     let reply = warm_with(
@@ -2425,9 +3099,18 @@ async fn a_subscription_card_is_never_a_warmup_candidate() {
         "{}",
         reply.raw
     );
-    // With the subscription card excluded there is no candidate at all. (Were it a candidate, it would
-    // be selected and fail as `supervisor_unavailable`: it has no lifecycle runtime.)
+    // With the subscription card excluded there is no candidate at all. Were it a candidate it would be
+    // selected, and the recheck in `warm_lifecycle` (the card is not on this machine) would refuse it with
+    // this same 503 `no_eligible_candidate`: status and type cannot tell the two apart. What can is that a
+    // refusal after selection carries the selected card's served locality, while "no candidate" has no
+    // card behind it and carries none.
     assert_eq!(reply.error_type(), "no_eligible_candidate", "{}", reply.raw);
+    assert_eq!(
+        reply.header("x-idoris-served-locality"),
+        None,
+        "no card was selected, so none is reported: {:?}",
+        reply.headers
+    );
 }
 
 #[tokio::test]
@@ -2452,10 +3135,10 @@ async fn content_that_tightens_privacy_is_reported_in_the_reason_header() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 隐私：远程熔断开关与 `X-iDoris-Privacy`
+// 隐私与「只服务本机的卡」：远程熔断开关、`X-iDoris-Privacy`、不在本机的卡（M1）
 // ---------------------------------------------------------------------------------------------
 
-/// 一张「本机之外」的免费卡（局域网，隐私等级 any）：只有 `X-iDoris-Privacy: any` 才有资格被选。
+/// 一张「本机之外」的免费卡（局域网，隐私等级 any）：聊天里只有 `X-iDoris-Privacy: any` 才有资格选它；预热里它任何时候都不是候选。
 fn lan_card(endpoint: &str) -> ComponentCard {
     let mut card = resident_card("lan-box", endpoint, "chat", "daily: \"lan-model\"", false);
     card.provider.locality = idoris_contracts::provider::Locality::Lan;
@@ -2465,11 +3148,26 @@ fn lan_card(endpoint: &str) -> ComponentCard {
     card
 }
 
+/// 一张远程的免费卡（别人的云端点：层级 remote、隐私等级 any、出站 internet、单价为零）。端点由测试定：测试里指向本机的假上游，
+/// 所以只有卡的**声明**能把它挡在预热之外（单价为零、层级被路由策略放行、隐私等级允许远程，聊天里它是可选的）。
+fn remote_card(id: &str, endpoint: &str, capabilities: &str, roles: &str) -> ComponentCard {
+    let mut card = resident_card(id, endpoint, capabilities, roles, false);
+    card.provider.family = idoris_contracts::provider::Family::Openai;
+    card.provider.tier = idoris_contracts::common::Tier::Remote;
+    card.provider.locality = idoris_contracts::provider::Locality::Remote;
+    card.provider.privacy_class = PrivacyClass::Any;
+    card.privacy_class = PrivacyClass::Any;
+    card.allowed_egress = vec![idoris_contracts::component_card::Egress::Internet];
+    card
+}
+
+const ANY: [(&str, &str); 1] = [("X-iDoris-Privacy", "any")];
+
 #[tokio::test]
 async fn privacy_defaults_to_local_only_and_the_kill_switch_pins_any_back_to_local() {
     let server = upstream().await;
     let app = resident_app(vec![lan_card(&server.uri())]);
-    // 缺省 local_only：局域网卡没有资格。
+    // 缺省 local_only：局域网卡没有资格，选卡管线答 `local_only_unavailable`。
     let reply = warm(&app, json!({"model": "idoris/daily"})).await;
     assert_eq!(
         reply.status,
@@ -2477,18 +3175,28 @@ async fn privacy_defaults_to_local_only_and_the_kill_switch_pins_any_back_to_loc
         "{}",
         reply.raw
     );
+    assert_eq!(
+        reply.error_type(),
+        "local_only_unavailable",
+        "{}",
+        reply.raw
+    );
+    // 声明 any：选卡管线放行局域网卡，预热不放行（另见 `a_zero_priced_remote_resident_card_…`），答的是 `no_eligible_candidate`。
+    let reply = warm_with(&app, json!({"model": "idoris/daily"}), &ANY).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.raw
+    );
+    assert_eq!(reply.error_type(), "no_eligible_candidate", "{}", reply.raw);
     assert_eq!(requests_of(&server).await.len(), 0);
-    // 声明 any：有资格，served-locality 如实报 lan。
-    let reply = warm_with(
-        &app,
-        json!({"model": "idoris/daily"}),
-        &[("X-iDoris-Privacy", "any")],
-    )
-    .await;
+    // 对照：同一张卡、同一个 `any`，聊天确实能到它，served-locality 如实报 lan（所以上面不是夹具坏了）。这是上游收到的唯一一个请求。
+    let reply = chat(&app, "idoris/daily", &ANY).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
     assert_eq!(reply.header("x-idoris-served-locality"), Some("lan"));
     assert_eq!(requests_of(&server).await.len(), 1);
-    // 远程熔断开关合上：any 被钉回 local_only，同一个请求不再能到局域网卡。
+    // 远程熔断开关合上：any 被钉回 local_only，答的从 `no_eligible_candidate` 变回 `local_only_unavailable`，同一个请求不再有资格。
     let state = AppState {
         cards: vec![lan_card(&server.uri())],
         ..AppState::default()
@@ -2497,12 +3205,7 @@ async fn privacy_defaults_to_local_only_and_the_kill_switch_pins_any_back_to_loc
         .remote_kill_switch
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let app = build_app(state);
-    let reply = warm_with(
-        &app,
-        json!({"model": "idoris/daily"}),
-        &[("X-iDoris-Privacy", "any")],
-    )
-    .await;
+    let reply = warm_with(&app, json!({"model": "idoris/daily"}), &ANY).await;
     assert_eq!(
         reply.status,
         StatusCode::SERVICE_UNAVAILABLE,
@@ -2510,9 +3213,139 @@ async fn privacy_defaults_to_local_only_and_the_kill_switch_pins_any_back_to_loc
         reply.raw
     );
     assert_eq!(
+        reply.error_type(),
+        "local_only_unavailable",
+        "{}",
+        reply.raw
+    );
+    assert_eq!(
         requests_of(&server).await.len(),
         1,
-        "开关合上之后一个字节也没出去"
+        "开关合上之后一个字节也没出去（那一个是上面聊天的）"
+    );
+}
+
+/// M1 的场景：层级被路由策略放行、隐私等级允许远程、单价为零的远程 resident 卡。聊天选得到它，预热不能向它的真实地址发请求。
+#[tokio::test]
+async fn a_zero_priced_remote_resident_card_is_not_warmed_up_and_receives_no_request() {
+    let server = upstream().await;
+    let app = resident_app_with(
+        vec![
+            remote_card(
+                "cloud-chat",
+                &server.uri(),
+                "chat",
+                "daily: \"cloud-model\"",
+            ),
+            remote_card(
+                "cloud-embed",
+                &server.uri(),
+                "embedding",
+                "embed: \"cloud-embed\"",
+            ),
+        ],
+        |state| state.routing_policy = local_and_remote_tiers(),
+    );
+    // 对照：聊天在同样的条件下选的就是这张卡、也发了请求（场景成立）；这是上游收到的唯一一个请求。
+    let reply = chat(&app, "idoris/daily", &ANY).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
+    assert_eq!(reply.header("x-idoris-served-locality"), Some("remote"));
+    assert_eq!(requests_of(&server).await.len(), 1);
+    for model in ["idoris/daily", "idoris/embed"] {
+        let reply = warm_with(&app, json!({"model": model}), &ANY).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{model}: {}",
+            reply.raw
+        );
+        assert_eq!(
+            reply.error_type(),
+            "no_eligible_candidate",
+            "{model}: {}",
+            reply.raw
+        );
+        // 选卡阶段就排除了它，回答里没有任何一张卡的信息；它也没有被选中过。
+        assert_eq!(reply.header("x-idoris-served-locality"), None, "{model}");
+    }
+    assert_eq!(
+        requests_of(&server).await.len(),
+        1,
+        "预热没有向远程卡发任何请求"
+    );
+}
+
+/// 候选在选卡之前排除，不是选完再拒绝：同价、同准入状态时按 id 字典序选，排在前面的远程卡不能把同一角色下的本机卡挡住。
+#[tokio::test]
+async fn a_local_card_is_still_warmed_when_a_remote_card_ranks_ahead_of_it_for_the_same_role() {
+    let remote = upstream().await;
+    let local = upstream().await;
+    let app = resident_app_with(
+        vec![
+            remote_card("a-cloud", &remote.uri(), "chat", "daily: \"cloud-model\""),
+            resident_card(
+                "z-local",
+                &local.uri(),
+                "chat",
+                "daily: \"local-model\"",
+                false,
+            ),
+        ],
+        |state| state.routing_policy = local_and_remote_tiers(),
+    );
+    // 对照：聊天（`any`）选的是排在前面的远程卡，所以不排除它的话预热也会选它。
+    let reply = chat(&app, "idoris/daily", &ANY).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
+    assert_eq!(reply.header("x-idoris-served-locality"), Some("remote"));
+    assert_eq!(requests_of(&remote).await.len(), 1);
+    let reply = warm_with(&app, json!({"model": "idoris/daily"}), &ANY).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
+    assert_eq!(reply.body["provider_id"], "z-local");
+    assert_eq!(reply.body["model"], "local-model");
+    assert_eq!(reply.header("x-idoris-served-locality"), Some("loopback"));
+    assert_eq!(requests_of(&local).await.len(), 1);
+    assert_eq!(
+        requests_of(&remote).await.len(),
+        1,
+        "远程卡只收到聊天的那一个请求"
+    );
+}
+
+/// 声明的一切都是本机的，端点却是个外部的主机名：注册校验会拒绝这样的卡，但预热不能指望卡一定走过注册，所以按真要发往的地址判。
+/// 代理在每次发送之前记出口计数（连不上也算一次），所以计数为零就是没有任何向非本机地址发送的尝试。
+#[tokio::test]
+async fn a_card_that_declares_itself_local_but_whose_endpoint_is_elsewhere_is_not_sent_to() {
+    let liar = resident_card(
+        "liar",
+        "http://warmup-m1.invalid:9",
+        "chat",
+        "daily: \"liar-model\"",
+        false,
+    );
+    let state = AppState {
+        cards: vec![liar],
+        ..AppState::default()
+    };
+    let proxy = Arc::clone(&state.proxy);
+    let app = build_app(state);
+    let expected = [
+        (&[][..], "local_only_unavailable"),
+        (&ANY[..], "no_eligible_candidate"),
+    ];
+    for (headers, error_type) in expected {
+        let reply = warm_with(&app, json!({"model": "idoris/daily"}), headers).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{headers:?}: {}",
+            reply.raw
+        );
+        assert_eq!(reply.error_type(), error_type, "{headers:?}: {}", reply.raw);
+    }
+    assert_eq!(
+        proxy.egress().requests,
+        0,
+        "没有向非本机的地址发过任何请求（连不上也记一次）"
     );
 }
 
@@ -2727,6 +3560,197 @@ async fn a_warmup_writes_one_audit_event_with_intent_warmup_and_no_budget_or_usa
         StatusCode::OK
     );
     assert_eq!(stored(RecordKind::Usage).len(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 预算（#634 预审 W-2）：`SpendGate::All` 下余额不足也挡预热；不插入预留行的准入检查，不预留、不结算
+// ---------------------------------------------------------------------------------------------
+
+/// 一个接上账本的租户：`limit_minor` 与闸门由用例定；账本文件放在临时目录里，用例可以另开连接直接数预留行。
+struct Budget {
+    _dir: tempfile::TempDir,
+    ledger: Arc<BudgetLedger>,
+    file: PathBuf,
+}
+
+impl Budget {
+    fn new(limit_minor: i64, gate: SpendGate) -> Self {
+        Self::for_tenant(PERSONAL, limit_minor, gate)
+    }
+
+    fn for_tenant(tenant: &str, limit_minor: i64, gate: SpendGate) -> Self {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("budget.sqlite3");
+        let ledger = BudgetLedger::open(&file).unwrap();
+        ledger
+            .configure_tenant(tenant, limit_minor, "UTC", gate)
+            .unwrap();
+        Self {
+            _dir: dir,
+            ledger: Arc::new(ledger),
+            file,
+        }
+    }
+
+    fn install(&self) -> impl FnOnce(&mut AppState) {
+        let ledger = self.ledger.clone();
+        move |state| state.budget_ledger = Some(ledger)
+    }
+
+    /// 账本里的预留行数：另开一个连接直接数，不经账本的接口。
+    fn reservation_rows(&self) -> i64 {
+        Connection::open(&self.file)
+            .unwrap()
+            .query_row("SELECT count(*) FROM reservations", [], |row| row.get(0))
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn under_spend_gate_all_a_zero_balance_blocks_a_warmup_exactly_like_chat() {
+    let budget = Budget::new(0, SpendGate::All);
+    let rig = standard_with(budget.install());
+    let chatted = chat(&rig.app, "idoris/daily", &[]).await;
+    assert_eq!(
+        chatted.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        chatted.raw
+    );
+    let warmed = warm(&rig.app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(
+        warmed.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        warmed.raw
+    );
+    assert_eq!(warmed.error_type(), "budget_exceeded");
+    assert_eq!(warmed.reason(), "budget_exceeded");
+    assert_eq!(
+        warmed.body["error"], chatted.body["error"],
+        "the same 402 body as chat"
+    );
+    assert_eq!(warmed.header("x-idoris-served-locality"), Some("loopback"));
+    // 什么也没发生：没有加载、没有 token、账本里没有行。
+    assert_eq!(rig.adapter.inner.load_call_count("qwen-daily"), 0);
+    assert_eq!(rig.adapter.chats(), 0);
+    assert_eq!(budget.reservation_rows(), 0);
+}
+
+#[tokio::test]
+async fn under_spend_gate_all_a_zero_balance_blocks_a_resident_warmup_before_anything_is_sent() {
+    let server = upstream().await;
+    let budget = Budget::new(0, SpendGate::All);
+    let app = resident_app_with(
+        vec![resident_card(
+            "lmstudio",
+            &server.uri(),
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        budget.install(),
+    );
+    let warmed = warm(&app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(
+        warmed.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        warmed.raw
+    );
+    assert_eq!(warmed.error_type(), "budget_exceeded");
+    assert_eq!(
+        requests_of(&server).await.len(),
+        0,
+        "nothing reached the engine"
+    );
+    assert_eq!(budget.reservation_rows(), 0);
+}
+
+#[tokio::test]
+async fn a_warmup_the_budget_admits_reserves_and_spends_nothing_while_chat_reserves() {
+    // `All` 但余额为正：预热与聊天都放行。预热不留任何行、不动余额；聊天会预留并结算一行——所以上面的「零」说的是预热。
+    let budget = Budget::new(1_000, SpendGate::All);
+    let rig = standard_with(budget.install());
+    let warmed = warm(&rig.app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(warmed.status, StatusCode::OK, "{}", warmed.raw);
+    assert_eq!(budget.reservation_rows(), 0, "a warmup reserves nothing");
+    assert_eq!(budget.ledger.tenant_balance(PERSONAL).unwrap(), 1_000);
+    let chatted = chat(&rig.app, "idoris/daily", &[]).await;
+    assert_eq!(chatted.status, StatusCode::OK, "{}", chatted.raw);
+    assert_eq!(
+        budget.reservation_rows(),
+        1,
+        "chat reserves and settles a row"
+    );
+}
+
+#[tokio::test]
+async fn a_resident_warmup_the_budget_admits_sends_its_request_and_reserves_nothing() {
+    let server = upstream().await;
+    let budget = Budget::new(1_000, SpendGate::All);
+    let app = resident_app_with(
+        vec![resident_card(
+            "lmstudio",
+            &server.uri(),
+            "chat",
+            "daily: \"up-model\"",
+            false,
+        )],
+        budget.install(),
+    );
+    let warmed = warm(&app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(warmed.status, StatusCode::OK, "{}", warmed.raw);
+    assert_eq!(requests_of(&server).await.len(), 1);
+    assert_eq!(budget.reservation_rows(), 0);
+    assert_eq!(budget.ledger.tenant_balance(PERSONAL).unwrap(), 1_000);
+}
+
+#[tokio::test]
+async fn under_the_default_paid_only_gate_a_zero_balance_does_not_block_a_free_warmup() {
+    // 对照：默认的 `PaidOnly` 对免费调用放行，预热与聊天一样（没有账本的部署也一样：其余用例都没接账本）。
+    let budget = Budget::new(0, SpendGate::PaidOnly);
+    let rig = standard_with(budget.install());
+    let warmed = warm(&rig.app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(warmed.status, StatusCode::OK, "{}", warmed.raw);
+    let chatted = chat(&rig.app, "idoris/daily", &[]).await;
+    assert_eq!(chatted.status, StatusCode::OK, "{}", chatted.raw);
+    assert_eq!(budget.reservation_rows(), 1, "only chat left a row");
+}
+
+#[tokio::test]
+async fn in_tenant_mode_the_warmup_is_checked_against_the_callers_own_tenant() {
+    let ring = keyring_in(Some("acme"), &[("all", ALL_ROLES, LOCAL)]);
+    let secret = ring.secrets["all"].clone();
+    let authenticator = ring.authenticator.clone();
+    // 只有 acme 配了账本（`All`，余额 0）；个人租户没配：检查若取错了租户，会得到别的错误，不是 402。
+    let budget = Budget::for_tenant("acme", 0, SpendGate::All);
+    let install = budget.install();
+    let rig = rig_with(
+        vec![lifecycle_card(&[("daily", "qwen-daily")])],
+        &[("qwen-daily", 1.0)],
+        None,
+        move |state| {
+            state.deploy_mode = idoris_contracts::DeployMode::Tenant;
+            state.virtual_key_authenticator = Some(authenticator);
+            install(state);
+        },
+    );
+    let warmed = warm_as(
+        &rig.app,
+        json!({"model": "idoris/daily"}),
+        &secret,
+        &[("X-iDoris-Tenant", "acme")],
+    )
+    .await;
+    assert_eq!(
+        warmed.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        warmed.raw
+    );
+    assert_eq!(warmed.error_type(), "budget_exceeded");
+    assert_eq!(rig.adapter.inner.load_call_count("qwen-daily"), 0);
 }
 
 // ---------------------------------------------------------------------------------------------
