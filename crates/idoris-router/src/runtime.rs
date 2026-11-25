@@ -271,7 +271,7 @@ impl RuntimeRegistry {
     }
 
     /// 本地 runtime 配置与组件卡对得上：每个配置都有对应的卡、不绑托管卡（`extensions.idoris_managed`）、不绑 Resident
-    /// 直连卡、form/locality/endpoint 一致。不启动任何任务。启动门控期间（接口规范 §2.7.6）Supervisor 要等引擎落定才创建，
+    /// 直连卡、不与托管引擎共用端口、form/locality/endpoint 一致。不启动任何任务。启动门控期间（接口规范 §2.7.6）Supervisor 要等引擎落定才创建，
     /// 但这些配置错误仍要在启动的一开头报出来（先于绑定端口），所以单独拿出来，
     /// [`Self::spawn_with_local_configs_budget_and_kill_switch`] 也先调它。
     ///
@@ -293,6 +293,16 @@ impl RuntimeRegistry {
                 return Err(format!(
                     "本地 runtime {provider_id:?} 不能绑定由引擎管理器托管的组件卡（extensions.{}）：托管卡的引擎由 iDoris 的引擎管理器拉起与停止，本地 runtime 配置是另一条拉起路径，两者只能留一个，拒绝启动",
                     crate::engine_kind::MANAGED_EXTENSION
+                ));
+            }
+            let port = config.launch.port();
+            if let Some(managed) = cards.iter().find(|candidate| {
+                is_managed_card(candidate)
+                    && crate::lifecycle::managed_port(&candidate.endpoint) == Some(port)
+            }) {
+                return Err(format!(
+                    "本地 runtime {provider_id:?} 与托管卡 {:?} 共用端口 {port}，拒绝启动",
+                    managed.provider.id
                 ));
             }
             if crate::dispatch::is_resident_http_service(card) {
@@ -1240,6 +1250,26 @@ mod tests {
                 .clone(),
         );
         card
+    }
+
+    #[test]
+    fn a_local_runtime_cannot_share_a_port_with_a_different_managed_card() {
+        let port = 18121;
+        let managed = managed_named_card("managed-local", port);
+        let mut plain = named_card("plain-local");
+        plain.endpoint = format!("http://127.0.0.1:{port}");
+        let dir = tempfile::tempdir().unwrap();
+        let configs = BTreeMap::from([(
+            "plain-local".to_string(),
+            local_runtime_config("plain-local", port, dir.path()),
+        )]);
+
+        RuntimeRegistry::validate_local_configs(std::slice::from_ref(&plain), &configs).unwrap();
+        let error =
+            RuntimeRegistry::validate_local_configs(&[plain, managed], &configs).unwrap_err();
+        assert!(error.contains("plain-local"), "{error}");
+        assert!(error.contains("managed-local"), "{error}");
+        assert!(error.contains("18121"), "{error}");
     }
 
     /// 规范勘误十二（3）（L4）：本地 runtime 配置绑在托管卡（`extensions.idoris_managed`）上，启动时就拒绝：托管卡的引擎由引擎管理器

@@ -1361,7 +1361,7 @@ impl Actor {
     ///
     /// 「记水位」与「发布」是一步（[`Shared::publish_at_watermark`]：盖章的锁里读计数、发布共享状态），日志在放锁之后才写。盖章在锁里，所以每个在 `ready` 对外可见之前
     /// 盖章的命令都不超过水位，每个在它可见之后盖章的都超过。
-    fn publish_ready_finishing_op(&mut self) {
+    pub(super) fn publish_ready_finishing_op(&mut self) {
         let grants = self.op.is_some() && self.op_launched && !self.external_path;
         let (status, changed) = self.advance(UpstreamState::Ready, None, false, Count::Edge);
         let watermark = self.shared.publish_at_watermark(&self.plan.id, status);

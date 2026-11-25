@@ -868,10 +868,52 @@ impl RuntimeAdapter for OmlxAdapter {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::sync::Arc;
+
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[derive(Debug)]
+    struct SlowAuthorization(Duration);
+
+    #[async_trait::async_trait]
+    impl key::EndpointGuard for SlowAuthorization {
+        async fn verify(&self) -> key::Verification {
+            tokio::time::sleep(self.0).await;
+            key::Verification::Verified
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn load_authorization_spends_the_budget_before_the_post() {
+        // 这个端点只供编排的守卫使用。正常路径在试图连接之前就耗尽预算。
+        let endpoint = "http://127.0.0.1:0";
+        let budget = Duration::from_secs(5);
+        let adapter = OmlxAdapter::new(OmlxAdapterConfig {
+            base_url: endpoint.into(),
+            api_key: None,
+            call_timeout: budget,
+        })
+        .unwrap()
+        .with_load_timeout(budget);
+        assert!(key::govern_endpoint_guarded(
+            endpoint,
+            key::EndpointKey::External {
+                settings_key_verified: false
+            },
+            Some(Arc::new(SlowAuthorization(budget))),
+        ));
+        let result = adapter.load("test-model", None).await;
+        key::forget_endpoint(endpoint);
+
+        assert!(
+            matches!(&result, Err(BackendError::Upstream { message })
+                if message.contains("authorizing it used the whole load budget")),
+            "authorization exhausted the budget before attempting the POST: {result:?}"
+        );
+    }
 
     #[test]
     fn load_fence_identity_survives_adapter_reconstruction() {

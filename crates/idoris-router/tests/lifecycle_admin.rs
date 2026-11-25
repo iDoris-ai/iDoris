@@ -32,7 +32,9 @@ use child_guard::IsolateState;
 use fake_omlx::{Behavior, FakeOmlx, Hold, OnSigterm, Release, spawn_retrying};
 use http_body_util::BodyExt;
 use idoris_contracts::{ComponentCard, load_policy::LoadMode};
-use idoris_router::admin::{AdminSessionToken, SharedAdminToken, build_admin_app_with_engines};
+use idoris_router::admin::{
+    AdminBindConfig, AdminSessionToken, SharedAdminToken, build_admin_app_with_engines,
+};
 use idoris_router::lifecycle::gate::{self, Finalized};
 use idoris_router::lifecycle::{
     CommandAck, EngineBackend, EngineManager, ManagedPlan, ManagerConfig, OmlxBackend, Timings,
@@ -5866,7 +5868,14 @@ async fn m1b_a_restart_queued_behind_a_start_that_adopts_an_external_engine_is_n
 /// 还久。Admin 回 **202**，不是 503「没有受理」，体是回答那一刻读到的元素（还是命令之前的状态）；采样放开之后 `stop` 照常做完。如果认领被挪到 `close_admission`
 /// 之后，到点时调用方先放弃、拿到 503，实例任务随后才发现命令已经作废：一个没有受理、门却已经关了的 `stop`。
 #[tokio::test]
-async fn l2b_a_stop_whose_first_step_outlasts_the_deadline_is_accepted_late_and_still_runs() {
+async fn l2b_a_stop_whose_first_step_outlasts_the_deadline_is_accepted_late_over_tcp_and_still_runs()
+ {
+    let listener = AdminBindConfig::parse(Some("0"))
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
     let rig = Rig::new(&stateful());
     let port = rig.port;
     // 引擎一起来，Supervisor 的启动采样就被扣着（门控放行之后 Supervisor 才起）。
@@ -5878,8 +5887,32 @@ async fn l2b_a_stop_whose_first_step_outlasts_the_deadline_is_accepted_late_and_
     let old = full.rig.pid(0);
     assert_eq!(full.element("omlx").await["state"], "ready");
 
+    let app = full.admin.router();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+                .unwrap();
+        }
+    });
+    let _shutdown_on_drop = shutdown.clone().drop_guard();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(PATIENT)
+        .build()
+        .unwrap();
     let started = Instant::now();
-    let (status, body) = full.post_command("stop").await;
+    let response = client
+        .post(format!("http://{addr}/admin/api/v1/upstreams/omlx/stop"))
+        .bearer_auth(&full.token)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert!(
         started.elapsed() >= Duration::from_millis(350),
@@ -5902,6 +5935,8 @@ async fn l2b_a_stop_whose_first_step_outlasts_the_deadline_is_accepted_late_and_
         "the late acceptance is audited as such"
     );
     full.manager.shutdown(true).await;
+    shutdown.cancel();
+    server.await.unwrap();
 }
 
 /// L2'（`restart`）：同上，`restart` 的第一步也是关门。迟到的 202 之后，放开采样，旧引擎退役、新引擎拉起、回到 `ready`（pid 换了）。

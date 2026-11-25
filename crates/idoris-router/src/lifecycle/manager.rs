@@ -205,7 +205,7 @@ pub fn plan_managed_with(
 }
 
 /// `http://127.0.0.1:<port>`（端口显式给出、非 0；路径只能是空或 `/`；没有凭据、查询、片段）里的端口。
-fn managed_port(endpoint: &str) -> Option<u16> {
+pub(crate) fn managed_port(endpoint: &str) -> Option<u16> {
     let url = reqwest::Url::parse(endpoint).ok()?;
     let manageable = url.scheme() == "http"
         && url.host_str() == Some("127.0.0.1")
@@ -351,6 +351,9 @@ pub(super) struct ShutdownOrder {
     pub deadline: Option<Instant>,
 }
 
+#[cfg(test)]
+type WatermarkHook = Box<dyn Fn(&Shared, u64) + Send + Sync>;
+
 /// 各实例任务共用的东西。
 pub(super) struct Shared {
     pub config: ManagerConfig,
@@ -378,6 +381,8 @@ pub(super) struct Shared {
     pub shutdown: watch::Sender<Option<ShutdownOrder>>,
     /// 盖章与入队同属一把锁（[`EngineManager::command`]）：序号的先后就是邮箱里的先后。
     stamp: Mutex<()>,
+    #[cfg(test)]
+    before_watermark_publish: OnceLock<WatermarkHook>,
     /// 完整的 Router 创建之后挂上来的 Supervisor 表：门控完成之后，Supervisor 的启动错误粘滞要反映到 `/health`。
     pub runtimes: OnceLock<RuntimeRegistry>,
 }
@@ -464,19 +469,12 @@ impl Shared {
     /// 读水位与发布分成两步时，夹在中间盖章的 `restart` 序号比水位大、却是在 `ready` 可见之前发的，会被当成新的、把刚拉起的引擎又换掉（Codex 复审 L4 第二轮）。
     /// 临界区里只有读计数与写共享状态：日志在放锁之后才写（日志的出口可能阻塞，不能把盖章挡在锁外）。
     pub fn publish_at_watermark(&self, id: &str, status: Status) -> u64 {
-        self.publish_at_watermark_with(id, status, || {})
-    }
-
-    /// 同 [`Self::publish_at_watermark`]，`between` 在读完水位之后、发布之前、锁里被调用一次：测试在这里验证盖章被挡在外面（生产路径传空闭包）。
-    pub(super) fn publish_at_watermark_with(
-        &self,
-        id: &str,
-        status: Status,
-        between: impl FnOnce(),
-    ) -> u64 {
         let _stamping = self.freeze_stamping();
         let watermark = self.seq_now(id);
-        between();
+        #[cfg(test)]
+        if let Some(hook) = self.before_watermark_publish.get() {
+            hook(self, watermark);
+        }
         self.publish(id, status);
         watermark
     }
@@ -542,6 +540,8 @@ impl EngineManager {
             failure,
             shutdown: watch::channel(None).0,
             stamp: Mutex::new(()),
+            #[cfg(test)]
+            before_watermark_publish: OnceLock::new(),
             runtimes: OnceLock::new(),
         });
         if !plans.is_empty() {
@@ -1184,6 +1184,8 @@ mod tests {
             failure: watch::channel(None).0,
             shutdown: watch::channel(None).0,
             stamp: Mutex::new(()),
+            #[cfg(test)]
+            before_watermark_publish: OnceLock::new(),
             runtimes: OnceLock::new(),
         })
     }
@@ -1454,71 +1456,61 @@ mod tests {
         assert!(!on_the_dot.claim());
     }
 
-    /// 复审 L4 第二轮：「记 `restart` 的水位」与「发布 `ready`」是**一步**（[`Shared::publish_at_watermark`]，实例任务发布 `ready` 走的就是它）。在水位读完、
-    /// 发布之前（`between` 钩子，锁里）：盖章的锁被握着（确定的，不靠睡眠），一个正抢着盖章的客户端线程什么也没盖出去；之后它盖的章比水位大，而且盖章的那一刻
-    /// `ready` 已经对外可见（那是真正新的命令）；在这一步之前盖的章不超过水位（并入这次操作）。
+    /// 实例任务走操作完成的 ready 发布路径。钩子在读取水位之后让客户端确实尝试取锁：
+    /// 如果锁可取，客户端当场盖章，不能因为线程调度恰好慢了一步而让测试通过。
     #[test]
     fn publishing_ready_and_taking_the_watermark_exclude_command_stamping() {
         let shared = shared_for_tests("omlx", Timings::default(), Arc::new(|_| {}));
-        // 一个在这一步之前盖章的命令：不超过水位（并入这次操作）。
-        let before = {
-            let _order = shared.freeze_stamping();
-            shared.next_seq("omlx")
-        };
-        let ready = Status {
-            state: UpstreamState::Ready,
-            reason: None,
-            owned: true,
-            terminal: false,
-            pid: Some(1),
-            failures: 0,
-            last_failure_at_ms: None,
-        };
-        let (racing_tx, racing_rx) = std::sync::mpsc::channel::<()>();
-        let (stamped_tx, stamped_rx) = std::sync::mpsc::channel::<(u64, bool)>();
-        std::thread::scope(|scope| {
-            // 客户端：与 `EngineManager::command` 一样在盖章的锁里盖章，并记下盖章那一刻 `ready` 是不是已经可见。
-            let for_client = Arc::clone(&shared);
-            let client = scope.spawn(move || {
-                racing_tx.send(()).unwrap();
-                let _order = for_client.freeze_stamping();
-                let seq = for_client.next_seq("omlx");
-                let ready_visible = for_client
-                    .statuses
-                    .lock()
-                    .unwrap()
-                    .get("omlx")
-                    .is_some_and(|status| status.state == UpstreamState::Ready);
-                stamped_tx.send((seq, ready_visible)).unwrap();
-            });
-            let watermark = shared.publish_at_watermark_with("omlx", ready, || {
-                // 客户端已经起来、正抢着盖章；这时锁在这一步手里。
-                racing_rx.recv().unwrap();
-                assert!(
-                    matches!(
-                        shared.stamp.try_lock(),
-                        Err(std::sync::TryLockError::WouldBlock)
-                    ),
-                    "the stamping lock is held between taking the watermark and publishing"
-                );
-                assert!(
-                    stamped_rx.try_recv().is_err(),
-                    "nothing is stamped between taking the watermark and publishing"
-                );
-                assert!(
-                    shared.statuses.lock().unwrap().get("omlx").is_none(),
-                    "`ready` is not visible yet"
-                );
-            });
-            let (seq, ready_visible) = stamped_rx.recv().unwrap();
-            client.join().unwrap();
-            assert!(before <= watermark, "stamped before the step: merged");
-            assert!(seq > watermark, "stamped after the step: genuinely new");
-            assert!(
-                ready_visible,
-                "a command stamped after the watermark found `ready` already visible"
-            );
-        });
+        let before = shared.next_seq("omlx");
+        let hook_calls = Arc::new(AtomicU64::new(0));
+        let calls = hook_calls.clone();
+        assert!(
+            shared
+                .before_watermark_publish
+                .set(Box::new(move |shared, watermark| {
+                    assert_eq!(watermark, before);
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let stamped = std::thread::scope(|scope| {
+                        scope
+                            .spawn(|| match shared.stamp.try_lock() {
+                                Ok(_order) => Some(shared.next_seq("omlx")),
+                                Err(std::sync::TryLockError::WouldBlock) => None,
+                                Err(error) => panic!("{error}"),
+                            })
+                            .join()
+                            .unwrap()
+                    });
+                    assert_eq!(stamped, None, "a client stamped before ready was published");
+                    assert!(shared.statuses.lock().unwrap().get("omlx").is_none());
+                }))
+                .is_ok()
+        );
+        let (_sender, mailbox) = mpsc::channel(1);
+        let mut actor = Actor::new(
+            ManagedPlan {
+                id: "omlx".to_owned(),
+                endpoint: "http://127.0.0.1:19053".to_owned(),
+                port: 19053,
+                backend: Arc::new(OmlxBackend::from_env()),
+            },
+            shared.clone(),
+            mailbox,
+        );
+
+        actor.publish_ready_finishing_op();
+
+        assert_eq!(
+            hook_calls.load(Ordering::SeqCst),
+            1,
+            "actor must publish through the watermark"
+        );
+        let _order = shared.freeze_stamping();
+        assert_eq!(
+            shared.statuses.lock().unwrap()["omlx"].state,
+            UpstreamState::Ready
+        );
+        assert_eq!(shared.seq_now("omlx"), before);
+        assert!(shared.next_seq("omlx") > before);
     }
 
     /// L3：审计日志一条只占一行。id 来自卡的配置，契约允许它含控制字符：照原样写进日志，一条记录能裂成几行、伪造出别的记录。控制字符转义，
