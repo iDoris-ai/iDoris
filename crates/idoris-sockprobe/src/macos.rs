@@ -117,6 +117,106 @@ pub(crate) fn executable_identity(pid: u32) -> Option<super::ExecutableIdentity>
     })
 }
 
+// ----- extended ACLs (sys/acl.h, membership.h; libSystem) ------------------------------------------------------------------------------
+
+type AclT = *mut c_void;
+type AclEntryT = *mut c_void;
+
+const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+const ACL_FIRST_ENTRY: c_int = 0;
+const ACL_NEXT_ENTRY: c_int = -1;
+const ACL_EXTENDED_ALLOW: c_int = 1;
+const ID_TYPE_UID: c_int = 0;
+/// Write-like permissions of an ACL entry: write_data/add_file, delete, append_data/add_subdirectory, delete_child, write_attributes,
+/// write_extattributes, write_security, change_owner.
+const ACL_WRITE_LIKE: u64 =
+    (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 12) | (1 << 13);
+
+unsafe extern "C" {
+    fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> AclT;
+    fn acl_get_link_np(path: *const libc::c_char, acl_type: c_int) -> AclT;
+    fn acl_get_entry(acl: AclT, entry_id: c_int, entry: *mut AclEntryT) -> c_int;
+    fn acl_get_tag_type(entry: AclEntryT, tag: *mut c_int) -> c_int;
+    fn acl_get_permset_mask_np(entry: AclEntryT, mask: *mut u64) -> c_int;
+    fn acl_get_qualifier(entry: AclEntryT) -> *mut c_void;
+    fn acl_free(object: *mut c_void) -> c_int;
+    fn mbr_uuid_to_id(uu: *const u8, id: *mut u32, id_type: *mut c_int) -> c_int;
+}
+
+/// Does any `allow` entry of this ACL give a write-like permission to somebody other than the user `owner`? `None` for an entry that cannot
+/// be read (the caller does not refuse on that).
+fn acl_grants_others_write(acl: AclT, owner: u32) -> Option<bool> {
+    let mut id = ACL_FIRST_ENTRY;
+    loop {
+        let mut entry: AclEntryT = std::ptr::null_mut();
+        // SAFETY: `acl` is a live ACL returned by libSystem; `entry` is a valid out pointer. Non-zero means no (more) entries.
+        if unsafe { acl_get_entry(acl, id, &mut entry) } != 0 {
+            return Some(false);
+        }
+        id = ACL_NEXT_ENTRY;
+        let mut tag: c_int = 0;
+        // SAFETY: `entry` belongs to `acl`; `tag` is a valid out pointer.
+        if unsafe { acl_get_tag_type(entry, &mut tag) } != 0 {
+            return None;
+        }
+        if tag != ACL_EXTENDED_ALLOW {
+            continue;
+        }
+        let mut mask: u64 = 0;
+        // SAFETY: as above.
+        if unsafe { acl_get_permset_mask_np(entry, &mut mask) } != 0 {
+            return None;
+        }
+        if mask & ACL_WRITE_LIKE == 0 {
+            continue;
+        }
+        // SAFETY: returns a newly allocated `guid_t` (16 bytes) or null; freed below.
+        let qualifier = unsafe { acl_get_qualifier(entry) };
+        if qualifier.is_null() {
+            return Some(true);
+        }
+        let (mut who, mut kind) = (0_u32, -1);
+        // SAFETY: `qualifier` points to a 16-byte guid; the out pointers are valid.
+        let resolved = unsafe { mbr_uuid_to_id(qualifier.cast::<u8>(), &mut who, &mut kind) } == 0;
+        // SAFETY: `qualifier` came from `acl_get_qualifier`.
+        unsafe { acl_free(qualifier) };
+        // An entry for the owner alone is no grant to others; anything else (a group, another user, an unknown identity) is.
+        if !(resolved && kind == ID_TYPE_UID && who == owner) {
+            return Some(true);
+        }
+    }
+}
+
+/// `Some(true)`: the object behind `fd` has an extended ACL that grants write to somebody other than `owner`; `Some(false)`: no ACL, or none
+/// that does; `None`: could not tell.
+pub(crate) fn acl_grants_others_write_fd(fd: i32, owner: u32) -> Option<bool> {
+    clear_errno();
+    // SAFETY: plain call; returns an owned ACL or null.
+    let acl = unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) };
+    finish_acl(acl, owner)
+}
+
+/// The same for the object at `path` itself (a symlink is not followed).
+pub(crate) fn acl_grants_others_write_link(path: &std::path::Path, owner: u32) -> Option<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    clear_errno();
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+    let acl = unsafe { acl_get_link_np(c_path.as_ptr(), ACL_TYPE_EXTENDED) };
+    finish_acl(acl, owner)
+}
+
+fn finish_acl(acl: AclT, owner: u32) -> Option<bool> {
+    if acl.is_null() {
+        // No ACL on the object is ENOENT; any other failure is "cannot tell".
+        return (last_errno() == libc::ENOENT).then_some(false);
+    }
+    let verdict = acl_grants_others_write(acl, owner);
+    // SAFETY: `acl` came from `acl_get_*_np` and is not used afterwards.
+    unsafe { acl_free(acl) };
+    verdict
+}
+
 /// `PROC_PIDFDSOCKETINFO` (sys/proc_info.h): the flavor of `proc_pidfdinfo` that returns a `struct socket_fdinfo`.
 const PROC_PIDFDSOCKETINFO: c_int = 3;
 

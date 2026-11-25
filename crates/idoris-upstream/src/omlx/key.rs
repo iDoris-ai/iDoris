@@ -49,7 +49,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use async_trait::async_trait;
 
@@ -1094,119 +1094,17 @@ fn trusted_directory(metadata: &fs::Metadata, uid: u32) -> bool {
     metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o002 == 0
 }
 
-/// `Some(true)` the opened object has no foreign write grant in its ACL, `Some(false)` it has, `None` this platform has no ACL check
-/// (or it could not be run: **not** a refusal, the permission bits already passed).
+/// Is the opened object free of an extended ACL entry that grants somebody other than its owner a write-like permission? macOS only, by
+/// `acl_get_fd_np` (`idoris-sockprobe`; no subprocess). Where the platform cannot tell (Linux, or a failed call) the answer is yes: the
+/// permission bits were already checked, and an ACL check that cannot run must not make a legitimate file unusable.
 #[cfg(unix)]
-fn acl_is_clean(file: &fs::File, path: &Path) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        macos_acl::clean(file, path)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (file, path);
-        true
-    }
-}
-
-/// macOS extended ACLs. The workspace forbids `unsafe`, so the ACL is read with `ls -lde` (the same view `chmod +a` edits), and only when the
-/// file's identity or change time is new: the verdict is cached per (device, inode, ctime), so a steady state spawns nothing. A failure to
-/// run `ls` is not a refusal (the permission bits were already checked).
-#[cfg(target_os = "macos")]
-mod macos_acl {
-    use std::collections::HashMap;
-    use std::fs;
+fn acl_is_clean(file: &fs::File) -> bool {
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
-    use std::path::Path;
-    use std::sync::{Mutex, PoisonError};
-
-    type Key = (u64, u64, i64, i64);
-    static CACHE: Mutex<Option<HashMap<Key, bool>>> = Mutex::new(None);
-
-    /// Does `ls -lde` output show an `allow` entry with a write-like permission for somebody who is not the owner?
-    pub(super) fn grants_others_write(listing: &str) -> bool {
-        const WRITE_LIKE: [&str; 10] = [
-            "write",
-            "delete",
-            "append",
-            "writeattr",
-            "writeextattr",
-            "writesecurity",
-            "chown",
-            "add_file",
-            "add_subdirectory",
-            "delete_child",
-        ];
-        let mut lines = listing.lines();
-        let owner = lines
-            .next()
-            .and_then(|line| line.split_whitespace().nth(2))
-            .unwrap_or("");
-        lines.any(|line| {
-            let line = line.trim_start();
-            let Some((index, entry)) = line.split_once(':') else {
-                return false;
-            };
-            if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
-                return false;
-            }
-            let Some((qualifier, permissions)) = entry.trim().split_once(" allow ") else {
-                return false; // a deny entry (or something else) grants nothing
-            };
-            let qualifier = qualifier.trim().trim_end_matches(" inherited").trim();
-            if qualifier == format!("user:{owner}") {
-                return false;
-            }
-            permissions
-                .split(',')
-                .any(|permission| WRITE_LIKE.contains(&permission.trim()))
-        })
-    }
-
-    pub(super) fn clean(file: &fs::File, path: &Path) -> bool {
-        let Ok(metadata) = file.metadata() else {
-            return true;
-        };
-        let key = (
-            metadata.dev(),
-            metadata.ino(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
-        );
-        if let Some(verdict) = CACHE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .and_then(|cache| cache.get(&key))
-        {
-            return *verdict;
-        }
-        let Ok(output) = std::process::Command::new("/bin/ls")
-            .arg("-lde")
-            .arg(path)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-        else {
-            return true;
-        };
-        // The listing must be about the object we opened (the path could have been swapped): otherwise we cannot say, and say yes.
-        match fs::metadata(path) {
-            Ok(again) if again.dev() == key.0 && again.ino() == key.1 => {}
-            _ => return false,
-        }
-        if !output.status.success() {
-            return true;
-        }
-        let verdict = !grants_others_write(&String::from_utf8_lossy(&output.stdout));
-        let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-        let cache = cache.get_or_insert_with(HashMap::new);
-        if cache.len() >= 64 {
-            cache.clear();
-        }
-        cache.insert(key, verdict);
-        verdict
-    }
+    let Ok(metadata) = file.metadata() else {
+        return true;
+    };
+    idoris_sockprobe::acl_grants_others_write(file.as_raw_fd(), metadata.uid()) != Some(true)
 }
 
 /// Pin the directory `~/.omlx` and open `settings.json` inside it. `~/.omlx` may be a symlink (dotfile managers, an encrypted volume):
@@ -1243,13 +1141,16 @@ fn open_settings_file(home: &Path, trust: Trust) -> std::io::Result<fs::File> {
                     return Err(denied());
                 }
             }
-            if !acl_is_clean(&fs::File::from(home_fd.try_clone()?), home) {
+            if !acl_is_clean(&fs::File::from(home_fd.try_clone()?))
+                || idoris_sockprobe::acl_grants_others_write_at(
+                    &link_path,
+                    std::os::unix::fs::MetadataExt::uid(&link),
+                ) == Some(true)
+            {
                 return Err(denied());
             }
             let base = fs::File::from(openat(&home_fd, ".omlx", directory, Mode::empty())?);
-            if !trusted_directory(&base.metadata()?, trust.dir_uid)
-                || !acl_is_clean(&base, &link_path.join(""))
-            {
+            if !trusted_directory(&base.metadata()?, trust.dir_uid) || !acl_is_clean(&base) {
                 return Err(denied());
             }
             base
@@ -1258,7 +1159,7 @@ fn open_settings_file(home: &Path, trust: Trust) -> std::io::Result<fs::File> {
     };
     let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
     let file = openat(&base, "settings.json", flags, Mode::empty()).map(fs::File::from)?;
-    if !acl_is_clean(&file, &link_path.join("settings.json")) {
+    if !acl_is_clean(&file) {
         return Err(denied());
     }
     Ok(file)
@@ -1289,6 +1190,10 @@ enum SettingsError {
     InvalidJson,
 }
 
+/// The homes whose settings file was opened and parsed (tests count how often).
+#[cfg(test)]
+static FILE_READS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
 fn read_settings_once(
     home: &Path,
     missing_is_absent: bool,
@@ -1304,6 +1209,11 @@ fn read_settings_once_with(
     missing_is_absent: bool,
     #[cfg(unix)] trust: Trust,
 ) -> Result<Option<String>, SettingsError> {
+    #[cfg(test)]
+    FILE_READS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(home.to_owned());
     #[cfg(unix)]
     let opened = open_settings_file(home, trust);
     #[cfg(not(unix))]
@@ -1361,11 +1271,97 @@ fn retry_invalid_settings(
     }
 }
 
-/// The async twin of [`read_settings_key`] for the request path: every file operation runs on the blocking pool and the retry pause is
-/// a timer, so no runtime worker is held while a truncated snapshot settles.
+/// What identifies the state of the settings file and of the path leading to it, from a handful of `stat`s: device, inode, mode, owner,
+/// size, modification and change time (nanoseconds) of the home directory, of `.omlx` itself (a symlink is not followed) and of what it
+/// leads to, and of `settings.json` itself (not followed either). An in-place rewrite changes modification and change time, a `chmod`,
+/// an ACL edit or a swapped directory changes the change time or the identity: any difference is a miss.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettingsStamp([FileStamp; 4]);
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+#[cfg(unix)]
+impl FileStamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            size: metadata.size(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn settings_stamp(home: &Path) -> Option<SettingsStamp> {
+    let base = home.join(".omlx");
+    Some(SettingsStamp([
+        FileStamp::of(&fs::metadata(home).ok()?),
+        FileStamp::of(&fs::symlink_metadata(&base).ok()?),
+        FileStamp::of(&fs::metadata(&base).ok()?),
+        FileStamp::of(&fs::symlink_metadata(base.join("settings.json")).ok()?),
+    ]))
+}
+
+/// The parsed result of the last successful read per home, valid while the [`SettingsStamp`] is unchanged: the request path asks the
+/// file system only a few `stat`s instead of opening, checking and parsing the file every time. A change (which includes a rewrite in
+/// place) is seen by the very next request. Failures are never cached.
+#[cfg(unix)]
+static SETTINGS_CACHE: Mutex<Vec<(std::path::PathBuf, SettingsStamp, Option<String>)>> =
+    Mutex::new(Vec::new());
+
+#[cfg(unix)]
+fn cached_settings(home: &Path, stamp: &SettingsStamp) -> Option<Option<String>> {
+    SETTINGS_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(path, cached, _)| path == home && cached == stamp)
+        .map(|(_, _, key)| key.clone())
+}
+
+#[cfg(unix)]
+fn remember_settings(home: &Path, stamp: SettingsStamp, key: &Option<String>) {
+    let mut cache = SETTINGS_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    cache.retain(|(path, _, _)| path != home);
+    if cache.len() >= 16 {
+        cache.clear();
+    }
+    cache.push((home.to_owned(), stamp, key.clone()));
+}
+
+/// The async twin of [`read_settings_key`] for the request path: an unchanged file (a few `stat`s, no blocking pool) answers from the
+/// cache; otherwise every file operation runs on the blocking pool and the retry pause is a timer, so no runtime worker is held while a
+/// truncated snapshot settles.
 async fn read_settings_key_async(home: &Path) -> Result<Option<String>, SettingsError> {
+    // The stamp is taken **before** the read: a change after it makes the next request's stamp differ, never the other way round.
+    #[cfg(unix)]
+    let stamp = settings_stamp(home);
+    #[cfg(unix)]
+    if let Some(stamp) = &stamp
+        && let Some(hit) = cached_settings(home, stamp)
+    {
+        return Ok(hit);
+    }
     let first = home.to_owned();
-    match tokio::task::spawn_blocking(move || read_settings_once(&first, true))
+    let result = match tokio::task::spawn_blocking(move || read_settings_once(&first, true))
         .await
         .map_err(|_| SettingsError::Unreadable)?
     {
@@ -1377,7 +1373,12 @@ async fn read_settings_key_async(home: &Path) -> Result<Option<String>, Settings
                 .map_err(|_| SettingsError::Unreadable)?
         }
         result => result,
+    };
+    #[cfg(unix)]
+    if let (Some(stamp), Ok(key)) = (stamp, &result) {
+        remember_settings(home, stamp, key);
     }
+    result
 }
 
 /// 读取 `<home>/.omlx/settings.json` 的 `auth.api_key`。文件缺失或合法 JSON 中没有可用的 key 时返回 `Ok(None)`。
@@ -1525,23 +1526,6 @@ mod settings_tests {
         );
     }
 
-    #[test]
-    fn acl_listings_are_judged_by_who_is_granted_what() {
-        #[cfg(target_os = "macos")]
-        {
-            use super::macos_acl::grants_others_write as grants;
-            let head = "-rw-r--r--+ 1 jason  staff  3 Nov 25 17:50 f\n";
-            assert!(grants(&format!("{head} 0: group:everyone allow write\n")));
-            assert!(grants(&format!(
-                "{head} 0: user:mallory allow read,append\n"
-            )));
-            assert!(!grants(&format!("{head} 0: user:jason allow write\n")));
-            assert!(!grants(&format!("{head} 0: group:everyone allow read\n")));
-            assert!(!grants(&format!("{head} 0: group:everyone deny write\n")));
-            assert!(!grants(head));
-        }
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn a_foreign_acl_write_grant_on_the_settings_file_is_refused() {
@@ -1590,6 +1574,78 @@ mod settings_tests {
             read_settings_key(home.path()),
             Err(SettingsError::Unreadable)
         );
+    }
+
+    fn reads_of(home: &Path) -> usize {
+        FILE_READS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|read| read.as_path() == home)
+            .count()
+    }
+
+    /// An unchanged settings file is read and parsed once; the request path then only `stat`s. Every kind of change is seen by the very next
+    /// request: an in-place rewrite (same size), a different size, a `chmod` that makes the file group-writable (now refused), and the
+    /// file's disappearance.
+    #[tokio::test]
+    async fn an_unchanged_settings_file_is_read_once_and_every_change_is_seen_at_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let path = write_settings(&home.path().join(".omlx"));
+        let first = read_settings_key_async(home.path()).await.unwrap();
+        assert_eq!(first.as_deref(), Some("k-link"));
+        for _ in 0..50 {
+            assert_eq!(
+                read_settings_key_async(home.path()).await,
+                Ok(first.clone())
+            );
+        }
+        assert_eq!(reads_of(home.path()), 1, "fifty more requests read nothing");
+
+        // rewritten in place with the same length
+        fs::write(&path, r#"{"auth":{"api_key":"k-lonk"}}"#).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("k-lonk")
+        );
+        // a different size
+        fs::write(&path, r#"{"auth":{"api_key":"k-much-longer"}}"#).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("k-much-longer")
+        );
+        // permissions change: the cached verdict must not outlive the trust it was based on
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path()).await,
+            Err(SettingsError::Unreadable)
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("k-much-longer")
+        );
+        // the file replaced by a symlink to an identical file is not followed, cache or not
+        let copy = home.path().join("copy.json");
+        fs::copy(&path, &copy).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&copy, &path).unwrap();
+        assert_eq!(
+            read_settings_key_async(home.path()).await,
+            Err(SettingsError::Unreadable)
+        );
+        fs::remove_file(&path).unwrap();
+        assert_eq!(read_settings_key_async(home.path()).await, Ok(None));
     }
 
     /// With the clock paused, a retry pause that is a runtime timer advances the virtual clock by exactly its length, while a thread

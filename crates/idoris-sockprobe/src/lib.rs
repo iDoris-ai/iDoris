@@ -83,6 +83,20 @@ pub fn process_generation(pid: u32) -> Option<String> {
     platform::process_generation(pid)
 }
 
+/// Does the object behind `fd` carry an extended ACL entry that grants a write-like permission to somebody other than the user `owner`?
+/// `Some(true)` yes, `Some(false)` no ACL or none that does, `None` the platform cannot tell. macOS only (`acl_get_fd_np` and friends, no
+/// subprocess); on Linux POSIX ACLs are **not applicable** here and the answer is always `None` (callers rely on the permission bits).
+#[cfg(unix)]
+pub fn acl_grants_others_write(fd: std::os::fd::RawFd, owner: u32) -> Option<bool> {
+    platform::acl_grants_others_write_fd(fd, owner)
+}
+
+/// [`acl_grants_others_write`] for the object at `path` itself (a symlink is not followed).
+#[cfg(unix)]
+pub fn acl_grants_others_write_at(path: &std::path::Path, owner: u32) -> Option<bool> {
+    platform::acl_grants_others_write_link(path, owner)
+}
+
 /// What a listening TCP socket is bound to: the address family and the address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bind {
@@ -480,6 +494,54 @@ for line in sys.stdin:
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         kill(child);
+    }
+
+    /// Extended ACLs, read by the kernel API: no ACL, an entry for the owner only, and an entry that gives everyone write.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_acl_that_grants_others_write_is_seen_and_one_for_the_owner_is_not() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, "x").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let owner = file.metadata().unwrap().uid();
+        let chmod = |rule: &str| {
+            assert!(
+                Command::new("/bin/chmod")
+                    .args(["+a", rule])
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        assert_eq!(
+            acl_grants_others_write(file.as_raw_fd(), owner),
+            Some(false)
+        );
+        assert_eq!(acl_grants_others_write_at(&path, owner), Some(false));
+        chmod("everyone deny write");
+        assert_eq!(
+            acl_grants_others_write(file.as_raw_fd(), owner),
+            Some(false),
+            "a deny entry grants nothing"
+        );
+        chmod("everyone allow read");
+        assert_eq!(
+            acl_grants_others_write(file.as_raw_fd(), owner),
+            Some(false),
+            "read is not write"
+        );
+        chmod("everyone allow write");
+        assert_eq!(acl_grants_others_write(file.as_raw_fd(), owner), Some(true));
+        assert_eq!(acl_grants_others_write_at(&path, owner), Some(true));
+        // the same entry set seen as another owner's file: the "everyone" group is not the owner either way
+        assert_eq!(
+            acl_grants_others_write(file.as_raw_fd(), owner + 1),
+            Some(true)
+        );
     }
 
     /// No such process: no identity (the caller's generation check says why).

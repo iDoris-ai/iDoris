@@ -276,6 +276,7 @@ async fn per_request_recheck_p50_p99_idle_and_under_load() {
     );
 
     let mut native_p99s = Vec::new();
+    let mut external_p99s: Vec<(&str, f64)> = Vec::new();
     for (label, loaded) in [
         ("idle machine", false),
         ("under load (a busy thread per core)", true),
@@ -291,6 +292,7 @@ async fn per_request_recheck_p50_p99_idle_and_under_load() {
             &format!("authorize, EXTERNAL native re-check [{label}]"),
             &external,
         );
+        external_p99s.push((label, external.p99));
         let lsof = time_lsof(&inspector, pid, port, if loaded { 20 } else { 30 }).await;
         row(
             &format!("previous re-check, `lsof` per request [{label}]"),
@@ -313,6 +315,15 @@ async fn per_request_recheck_p50_p99_idle_and_under_load() {
         assert!(
             p99 < 5_000.0,
             "p99 of the native re-check is {p99:.1} us ({label}; baseline {baseline_p99:.1} us), the requirement is below 5 ms"
+        );
+    }
+
+    // The external endpoint resolves its key from `settings.json` on every request, answered from the stat-keyed cache while the file is
+    // unchanged: the same 5 ms bound as the owned engine, idle and loaded.
+    for (label, p99) in external_p99s {
+        assert!(
+            p99 < 5_000.0,
+            "p99 of the external native re-check is {p99:.1} us ({label}), the requirement is below 5 ms"
         );
     }
 }

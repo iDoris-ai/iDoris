@@ -959,3 +959,13 @@ mod tests {
         assert_eq!(watch.scan(None), (Probe::NotHolding, None));
     }
 }
+
+#[cfg(target_os = "linux")]
+pub(crate) fn acl_grants_others_write_fd(_fd: i32, _owner: u32) -> Option<bool> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn acl_grants_others_write_link(_path: &Path, _owner: u32) -> Option<bool> {
+    None
+}
