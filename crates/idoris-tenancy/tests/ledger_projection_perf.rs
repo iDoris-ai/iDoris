@@ -337,7 +337,7 @@ fn admission_latency_with_compacted_history() {
             2 * spends,
             catch_up.len()
         );
-        // Cold admission is the 0005 full replay plus a bounded fold (4096 entries per account).
+        // Cold admission is the 0005 full replay plus a bounded fold (COMPACTION_BATCH = 1024 entries per account).
         assert!(
             cold <= baseline + baseline / 4 + Duration::from_millis(150),
             "cold {cold:?} vs 0005-equivalent {baseline:?}"

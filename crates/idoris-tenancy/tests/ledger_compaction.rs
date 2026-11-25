@@ -1058,3 +1058,104 @@ fn a_retained_hold_starting_at_i64_min_blocks_the_fold_instead_of_being_folded()
     assert_eq!(net(&store, NOW), before);
     full_replay(&db, &store, &[T0, NOW]);
 }
+
+// ------------------------------------------------------------------------------------------
+// PR #658 复审：B1（已知限制）、L1、L2
+// ------------------------------------------------------------------------------------------
+
+#[test]
+fn a_late_overage_settle_beyond_one_batch_stalls_the_checkpoint_but_reads_equal_full_replay() {
+    // 已知限制（跟进项 1）：批首的旧预留，其超额 late_settle 落在它之后超过 1024 条分录之外，
+    // 水位被钉在该预留之前，这个账户不写检查点，每次准入全量回放。本测试记录当前行为。
+    let db = TempDb::new("checkpoint-stall");
+    let store = setup(&db, 160);
+    set_ttl(&store, 4 * HOUR);
+    let first = admit(&store, "first", T0, 100);
+    // 5 * 256 = 1280 条，大于 COMPACTION_BATCH (1024)。
+    for i in 0..5 {
+        seed_funds(&db, &format!("seed{i}-"), T0 - DAY);
+    }
+    grant_from(&store, "settlement-window", 80, T0 + 2, NOW + DAY);
+    // 结算 170 > 预留 100：超额部分记成 late_settle，分录号在 1280 条之后。
+    settle(&store, &first, 170, T0 + 2);
+    assert!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM ledger_entries WHERE hold_id = 'first#0' AND kind = 'late_settle'"
+        ) > 0
+    );
+    let expected = net(&store, NOW);
+    for i in 0..4 {
+        compact(&store, &format!("stall{i}"), NOW + i);
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM ledger_checkpoints WHERE account_id = 'emp'"
+            ),
+            0,
+            "request {i}: no checkpoint may be written while the pin holds"
+        );
+    }
+    assert_eq!(net(&store, NOW), expected);
+    full_replay(&db, &store, &[T0, T0 + 2, NOW]);
+}
+
+#[test]
+fn an_explicit_entry_id_at_or_below_the_checkpoint_invalidates_it() {
+    let db = TempDb::new("checkpoint-explicit-id");
+    let store = setup(&db, 160);
+    seed_funds(&db, "seed", T0 - DAY);
+    compact(&store, "advance", NOW);
+    assert!(through(&db) >= 257);
+    let before = net(&store, NOW);
+    // hold_id 为空，触发器第二个分支不可能命中：只有 NEW.entry_id <= through_entry 能让它触发。
+    Connection::open(db.path())
+        .unwrap()
+        .execute(
+            "INSERT INTO ledger_entries
+                (entry_id, account_id, kind, unit, funds_micros, window_at_ms, at_ms, idempotency_key)
+             VALUES (-7, 'emp', 'fund', 'THB', 100, ?1, ?1, 'explicit-low-id')",
+            [T0 - DAY],
+        )
+        .unwrap();
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM ledger_checkpoints WHERE account_id = 'emp'"
+        ),
+        0
+    );
+    assert_eq!(net(&store, NOW), before + 100);
+    full_replay(&db, &store, &[T0, NOW]);
+}
+
+#[test]
+fn a_checkpoint_balance_outside_zero_and_capacity_is_reported_as_corrupt() {
+    for tampered in ["-1", "999999999999"] {
+        let db = TempDb::new("checkpoint-corrupt-balance");
+        let store = setup(&db, 160);
+        seed_funds(&db, "seed", T0 - DAY);
+        compact(&store, "advance", NOW);
+        assert!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM ledger_checkpoints, json_each(bucket_remaining)"
+            ) > 0
+        );
+        Connection::open(db.path())
+            .unwrap()
+            .execute(
+                &format!(
+                    "UPDATE ledger_checkpoints SET bucket_remaining =
+                       (SELECT json_group_object(key, {tampered}) FROM json_each(bucket_remaining))"
+                ),
+                [],
+            )
+            .unwrap();
+        let error = store.account_view(&aid("emp"), ts(NOW)).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("invalid checkpoint balance"),
+            "{tampered}: {error:?}"
+        );
+    }
+}
