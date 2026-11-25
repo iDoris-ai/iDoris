@@ -526,7 +526,7 @@ impl std::fmt::Display for KeyRefusal {
                 "what listens on this endpoint could not be confirmed right before sending: the request was not sent",
             ),
             Self::SettingsUnverifiable => f.write_str(
-                "oMLX settings.json could not be verified: the request was not sent",
+                "oMLX settings.json could not be verified (not valid JSON, not owned by this user or root, writable by group or others, or an ACL grants others write): the request was not sent",
             ),
             Self::TransportUnavailable => f.write_str(
                 "the HTTP client for managed endpoints could not be built: the request was not sent",
@@ -1207,7 +1207,14 @@ fn open_settings_file(home: &Path) -> std::io::Result<fs::File> {
 #[cfg(unix)]
 fn trusted_settings(metadata: &fs::Metadata, uid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
-    metadata.is_file() && metadata.uid() == uid && metadata.mode() & 0o022 == 0
+    metadata.is_file() && settings_owner_and_mode_ok(metadata.uid(), metadata.mode(), uid)
+}
+
+/// 属主须是 iDoris 的有效 UID，或 root（`sudo omlx …` 且保留 HOME 会留下 root 属主的文件，root 不构成攻击者信号）；
+/// 无论谁拥有，组或其他用户可写都拒绝。
+#[cfg(unix)]
+fn settings_owner_and_mode_ok(owner: u32, mode: u32, euid: u32) -> bool {
+    (owner == euid || owner == 0) && mode & 0o022 == 0
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1527,6 +1534,18 @@ mod settings_tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use super::*;
+
+    #[test]
+    fn settings_owner_and_mode_predicate() {
+        // euid 501: own file and root-owned file pass, other users' files do not.
+        assert!(settings_owner_and_mode_ok(501, 0o100600, 501));
+        assert!(settings_owner_and_mode_ok(0, 0o100644, 501));
+        assert!(!settings_owner_and_mode_ok(502, 0o100600, 501));
+        // group or other write is refused whoever owns the file.
+        assert!(!settings_owner_and_mode_ok(501, 0o100620, 501));
+        assert!(!settings_owner_and_mode_ok(0, 0o100602, 501));
+        assert!(!settings_owner_and_mode_ok(0, 0o100666, 501));
+    }
 
     #[test]
     fn settings_rejects_foreign_ownership() {

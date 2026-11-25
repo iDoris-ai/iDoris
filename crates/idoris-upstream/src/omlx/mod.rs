@@ -435,7 +435,8 @@ impl OmlxAdapter {
     /// in per-request mode (built for a card that may not carry the oMLX key, or from an explicit config) but aims at an endpoint
     /// the engine manager governs goes through the same authorization — generation, blocked endpoint, listener re-verified, verified
     /// dial address, in-flight registration — and keeps using its own fixed key (or none). The registered key is only ever given to a
-    /// per-request adapter.
+    /// per-request adapter; the one exception is the re-resolution below for an adapter built while `settings.json` could not be
+    /// verified, which the production factory never builds (it uses `unkeyed_for_base_url`), so it is reachable from tests only.
     async fn credential(&self) -> Result<Credential, BackendError> {
         let per_request = self.per_request_key;
         // Built while `settings.json` could not be verified: this request is refused if it still cannot be, but the adapter is not dead: every

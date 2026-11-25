@@ -256,9 +256,7 @@ impl ProcessInspector for Scripted {
             .unwrap_or_default())
     }
     async fn uid_of(&self, pid: u32) -> Result<u32, InspectError> {
-        if self.synthetic_listener_identity
-            || self.start_times.lock().unwrap().contains_key(&pid)
-        {
+        if self.synthetic_listener_identity || self.start_times.lock().unwrap().contains_key(&pid) {
             return Ok(nix::unistd::geteuid().as_raw());
         }
         self.real.uid_of(pid).await

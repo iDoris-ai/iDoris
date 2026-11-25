@@ -359,6 +359,21 @@ fn bind_of(hex: &str, v6: bool) -> Option<Bind> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn acl_grants_others_write_fd(_fd: i32, _owner: u32) -> Option<bool> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn acl_grants_others_write_link(_path: &Path, _owner: u32) -> Option<bool> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn signing_team(_pid: u32) -> Option<String> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -959,19 +974,4 @@ mod tests {
         fs::remove_dir_all(fake.root().join("88")).unwrap();
         assert_eq!(watch.scan(None), (Probe::NotHolding, None));
     }
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn acl_grants_others_write_fd(_fd: i32, _owner: u32) -> Option<bool> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn acl_grants_others_write_link(_path: &Path, _owner: u32) -> Option<bool> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn signing_team(_pid: u32) -> Option<String> {
-    None
 }
