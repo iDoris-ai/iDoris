@@ -159,6 +159,28 @@ fn build(db: &TempDb, spends: i64, buckets: i64) -> (AccountStore, i64, i64) {
     (store, now, expected)
 }
 
+/// 在 `emp`、`paid`、`platform` 每个账户的全部历史前面放一个永不过期的在途预留（序号在最前面），水位推不过它。
+fn pin_history(db: &TempDb) {
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute(
+        "INSERT INTO ledger_holds
+            (hold_id, attempt_id, component, request_id, attempt_index, payer_account, credential_id, unit,
+             reserved_micros, period, created_at_ms, expires_at_ms, grace_floor_micros, state)
+         VALUES ('pin#0', 'pin#0', 'model', 'pin', 0, 'emp', 'cred-e', 'THB', 1, '2026-11', ?1, ?2, NULL, 'open')",
+        rusqlite::params![START - 2 * DAY, START + 3650 * DAY],
+    )
+    .unwrap();
+    for (id, account) in [(-5_i64, "emp"), (-4, "paid"), (-3, "platform")] {
+        conn.execute(
+            "INSERT INTO ledger_entries
+                (entry_id, account_id, hold_id, kind, unit, held_micros, window_at_ms, at_ms, idempotency_key)
+             VALUES (?1, ?2, 'pin#0', 'reserve', 'THB', 1, ?3, ?3, 'pin#0|reserve|' || ?2)",
+            rusqlite::params![id, account, START - 2 * DAY],
+        )
+        .unwrap();
+    }
+}
+
 fn remove_entry_triggers(conn: &rusqlite::Connection) -> Vec<String> {
     let mut stmt = conn
         .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'ledger_entries' ORDER BY rowid")
@@ -222,24 +244,107 @@ fn admission_latency_with_compacted_history() {
         let (store, now, expected) = build(&db, spends, 120);
         project_once(&store, now, expected, 1);
 
-        // Same fixture as the timed requests. This first write includes building
-        // the checkpoint over the existing history.
-        let warmup = Req::new(&store, "warmup", 0, "cred-e", 45).at(now);
-        let started = Instant::now();
-        assert!(store.admit_attempt(&warmup.input()).unwrap().is_admitted());
-        let cold = started.elapsed();
-        store
-            .settle_attempt(&warmup.attempt, &price(0), ts(now))
-            .unwrap();
-        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM ledger_checkpoints"), 3);
-        assert_eq!(
-            scalar(
+        // 0005-equivalent baseline: an open hold in front of every account's history
+        // pins the watermark, so admission replays the whole tail and never folds.
+        let baseline_db = TempDb::new(&format!("perf-baseline-{spends}"));
+        let (baseline_store, _, _) = build(&baseline_db, spends, 120);
+        pin_history(&baseline_db);
+        let baseline_run = |run: usize| {
+            let req = Req::new(&baseline_store, &format!("base-{run}"), 0, "cred-e", 45).at(now);
+            let started = Instant::now();
+            assert!(
+                baseline_store
+                    .admit_attempt(&req.input())
+                    .unwrap()
+                    .is_admitted()
+            );
+            let elapsed = started.elapsed();
+            baseline_store
+                .settle_attempt(&req.attempt, &price(0), ts(now))
+                .unwrap();
+            elapsed
+        };
+        // Measured right before and after the cold admission, so host load shifts both alike.
+        let mut baselines = vec![baseline_run(0)];
+
+        // Same fixture as the timed requests. The first write is the cold one: a full
+        // replay of the tail (what 0005 did) plus one bounded fold per account. The
+        // checkpoint then catches up over successive requests.
+        let mut catch_up = Vec::new();
+        let mut folded_all = false;
+        for step in 0..400 {
+            if step == 1 {
+                baselines.push(baseline_run(1));
+            }
+            let req = Req::new(&store, &format!("warmup-{step}"), 0, "cred-e", 45).at(now);
+            let started = Instant::now();
+            assert!(store.admit_attempt(&req.input()).unwrap().is_admitted());
+            catch_up.push(started.elapsed());
+            store
+                .settle_attempt(&req.attempt, &price(0), ts(now))
+                .unwrap();
+            if scalar(
                 &db,
                 "SELECT COUNT(*) FROM ledger_entries e JOIN ledger_checkpoints c
-                                USING (account_id) WHERE e.account_id = 'emp'
-                                AND e.entry_id <= c.through_entry"
-            ),
-            2 * spends
+                                USING (account_id) WHERE e.entry_id <= c.through_entry",
+            ) >= 6 * spends
+            {
+                folded_all = true;
+                break;
+            }
+        }
+        assert!(folded_all, "the checkpoint never caught up");
+        baselines.push(baseline_run(2));
+        baselines.sort_unstable();
+        let baseline = baselines[1];
+        assert_eq!(
+            scalar(&baseline_db, "SELECT COUNT(*) FROM ledger_checkpoints"),
+            0
+        );
+        // The catch-up requests' own holds are still inside the horizon. Two requests three hours
+        // later let them age out and fold, so the timed requests below see only a tiny tail.
+        for run in 0..2 {
+            let req = Req::new(&store, &format!("age-{run}"), 0, "cred-e", 45).at(now + 3 * HOUR);
+            assert!(store.admit_attempt(&req.input()).unwrap().is_admitted());
+            store
+                .settle_attempt(&req.attempt, &price(0), ts(now + 3 * HOUR))
+                .unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(db.path()).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT e.account_id, COUNT(*) FROM ledger_entries e JOIN ledger_checkpoints c
+                      USING (account_id) WHERE e.entry_id > c.through_entry GROUP BY e.account_id",
+                )
+                .unwrap();
+            let tails: Vec<(String, i64)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            eprintln!("PERF unfolded tail per account after catch-up: {tails:?}");
+        }
+        let cold = catch_up[0];
+        let slowest = *catch_up.iter().max().unwrap();
+        let slowest_at = catch_up.iter().position(|d| *d == slowest).unwrap();
+        eprintln!(
+            "PERF slowest catch-up step #{slowest_at} of {}",
+            catch_up.len()
+        );
+        eprintln!(
+            "PERF {} entries/account: 0005-equivalent admission {baseline:?}, cold admission {cold:?}, slowest catch-up admission {slowest:?}, catch-up took {} requests",
+            2 * spends,
+            catch_up.len()
+        );
+        // Cold admission is the 0005 full replay plus a bounded fold (4096 entries per account).
+        assert!(
+            cold <= baseline + baseline / 4 + Duration::from_millis(150),
+            "cold {cold:?} vs 0005-equivalent {baseline:?}"
+        );
+        assert!(
+            slowest <= baseline + baseline / 4 + Duration::from_millis(150),
+            "slowest catch-up {slowest:?} vs 0005-equivalent {baseline:?}"
         );
 
         let mut admits = Vec::new();

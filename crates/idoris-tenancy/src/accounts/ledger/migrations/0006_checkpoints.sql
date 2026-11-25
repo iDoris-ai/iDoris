@@ -1,7 +1,7 @@
 -- 派生投影。保留原始分录供对账、历史窗口查询和重建；旧库按账户逐步生成检查点。
 CREATE TABLE ledger_checkpoints (
     account_id TEXT PRIMARY KEY,
-    through_entry INTEGER NOT NULL CHECK (through_entry > 0),
+    through_entry INTEGER NOT NULL,
     held_micros INTEGER NOT NULL,
     committed_micros INTEGER NOT NULL,
     funds_micros INTEGER NOT NULL,

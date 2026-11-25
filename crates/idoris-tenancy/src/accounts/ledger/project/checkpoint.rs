@@ -15,27 +15,54 @@ use crate::accounts::ledger::error::{LedgerError, add, sub};
 // Include those rows with their reservation, and index them as spill entries
 // until the watermark overtakes them. Only an actual later spend (late or
 // legacy overage) constrains the spend-order boundary.
-pub(super) const REPLAY_RANGE_SQL: &str =
-    "e.account_id = ?1 AND e.entry_id > ?2 AND e.entry_id <= ?3
-    AND COALESCE((SELECT s.folded_at = ?4 FROM ledger_checkpoint_spill s
-                   WHERE s.entry_id = e.entry_id), e.entry_id <= ?4)";
+//
+// Parameters: ?1 account, ?2 entries after, ?3 watermark. The fold variant reads
+// the live entries up to the watermark plus the later entries of straddling
+// holds which this very fold spilled (`folded_at = ?3`), found through the spill
+// table, so its cost does not depend on how far away those entries are. The tail
+// variant (watermark = i64::MAX) is the plain index scan.
+const REPLAY_FOLD_SOURCE: &str = "FROM (
+    SELECT * FROM ledger_entries INDEXED BY ledger_entries_by_account_entry
+     WHERE account_id = ?1 AND entry_id > ?2 AND entry_id <= ?3
+       AND NOT EXISTS (SELECT 1 FROM ledger_checkpoint_spill s WHERE s.entry_id = ledger_entries.entry_id)
+    UNION ALL
+    SELECT e2.* FROM ledger_checkpoint_spill s JOIN ledger_entries e2 ON e2.entry_id = s.entry_id
+     WHERE s.account_id = ?1 AND s.folded_at = ?3 AND s.entry_id > ?3) e
+    WHERE 1";
+const REPLAY_TAIL_SOURCE: &str = "FROM ledger_entries e INDEXED BY ledger_entries_by_account_entry
+    WHERE e.account_id = ?1 AND e.entry_id > ?2 AND e.entry_id <= ?3
+      AND NOT EXISTS (SELECT 1 FROM ledger_checkpoint_spill s WHERE s.entry_id = e.entry_id)";
 
 #[derive(Clone, Copy)]
 pub(super) struct ReplayRange {
     pub(super) through: i64,
-    pub(super) scan_end: i64,
 }
 
 impl ReplayRange {
-    pub(super) const TAIL: Self = Self {
-        through: i64::MAX,
-        scan_end: i64::MAX,
-    };
+    pub(super) const TAIL: Self = Self { through: i64::MAX };
+
+    /// The `FROM ... WHERE ...` source of this replay (see the parameters above).
+    pub(super) fn source(self) -> &'static str {
+        if self.through == i64::MAX {
+            REPLAY_TAIL_SOURCE
+        } else {
+            REPLAY_FOLD_SOURCE
+        }
+    }
 }
+
+/// "No checkpoint yet". Entry ids are caller-writable (the released schema
+/// allows 0 and negative ids), so a real watermark can never double as the
+/// empty state: the first replay and first fold use an unbounded lower range.
+pub(super) const NO_CHECKPOINT: i64 = i64::MIN;
+
+/// The most entries one request folds into the checkpoint. A cold account
+/// catches up over successive requests instead of in one long write
+/// transaction holding the account-store mutex.
+pub(super) const COMPACTION_BATCH: i64 = 1024;
 
 /// A spend-order prefix containing whole, final holds. The raw entries remain
 /// authoritative for historical windows which cut through the prefix.
-#[derive(Default)]
 pub(super) struct Checkpoint {
     pub(super) through: i64,
     held: i64,
@@ -47,7 +74,26 @@ pub(super) struct Checkpoint {
     bucket_remaining: HashMap<String, i64>,
 }
 
+impl Default for Checkpoint {
+    fn default() -> Self {
+        Self {
+            through: NO_CHECKPOINT,
+            held: 0,
+            committed: 0,
+            funds: 0,
+            uncovered: 0,
+            first_at: 0,
+            last_at: 0,
+            bucket_remaining: HashMap::new(),
+        }
+    }
+}
+
 impl Checkpoint {
+    fn is_empty(&self) -> bool {
+        self.through == NO_CHECKPOINT
+    }
+
     pub(super) fn load(conn: &Connection, account: &str) -> Result<Self, LedgerError> {
         let Some((mut checkpoint, remaining)) = conn
             .query_row(
@@ -104,31 +150,61 @@ impl Checkpoint {
         // The longest sliding rate window is one hour. Also leave the
         // configured TTL and each hold's stored expiry on the live side.
         let horizon = now.saturating_sub(HOUR_MS.max(ttl));
+        // Fold at most one batch per call. Holds that straddle the cutoff are
+        // read whole (their later entries come through the by-hold index) and
+        // the straddle machinery below spills them.
+        let cutoff: i64 = conn.query_row(
+            "SELECT COALESCE(
+                 (SELECT entry_id FROM ledger_entries INDEXED BY ledger_entries_by_account_entry
+                   WHERE account_id = ?1 AND entry_id > ?2
+                   ORDER BY entry_id LIMIT 1 OFFSET ?3),
+                 (SELECT MAX(entry_id) FROM ledger_entries INDEXED BY ledger_entries_by_account_entry
+                   WHERE account_id = ?1))",
+            params![account, self.through, COMPACTION_BATCH - 1],
+            |row| row.get(0),
+        )?;
+        // A hold is final once settled/released past the horizon, or expired
+        // past the horizon with a verified zero net (an orphan nobody will
+        // report on). A late charge on a folded orphan appends to a folded hold,
+        // which invalidates the checkpoint, so the rebuild replays it in order.
         let mut groups = conn.prepare(&format!(
             "SELECT MIN(e.entry_id), MAX(e.entry_id), e.hold_id,
                     MAX(e.at_ms) >= ?3 OR MAX(e.window_at_ms) >= ?3
                       OR (e.hold_id IS NOT NULL AND
-                          (h.state IS NULL OR h.state NOT IN ('settled', 'released')
-                           OR h.expires_at_ms >= ?3 OR h.closed_at_ms >= ?3)),
+                          (h.state IS NULL
+                           OR (h.state = 'expired' AND (h.expires_at_ms >= ?3
+                               OR SUM(CASE WHEN e.kind <> 'late_settle'
+                                           THEN e.held_micros + e.spent_micros ELSE 0 END) <> 0))
+                           OR (h.state IN ('settled', 'released')
+                               AND (h.expires_at_ms >= ?3 OR h.closed_at_ms >= ?3))
+                           OR h.state NOT IN ('settled', 'released', 'expired'))),
                     MAX(CASE WHEN e.kind = 'late_settle' AND e.spent_micros <> 0
                                OR e.kind = 'settle' AND {LEGACY_OVERAGE_SQL} > 0
                              THEN e.entry_id ELSE 0 END)
-               FROM ledger_entries e INDEXED BY ledger_entries_by_account_entry
+               FROM (SELECT * FROM ledger_entries INDEXED BY ledger_entries_by_account_entry
+                      WHERE account_id = ?1 AND entry_id > ?2 AND entry_id <= ?4
+                     UNION ALL
+                     SELECT * FROM ledger_entries INDEXED BY ledger_entries_by_hold
+                      WHERE account_id = ?1 AND entry_id > ?4
+                        AND hold_id IN (SELECT hold_id FROM ledger_entries INDEXED BY ledger_entries_by_account_entry
+                                         WHERE account_id = ?1 AND entry_id > ?2 AND entry_id <= ?4
+                                           AND hold_id IS NOT NULL)) e
                LEFT JOIN ledger_holds h ON h.hold_id = e.hold_id
-              WHERE e.account_id = ?1 AND e.entry_id > ?2
-                AND NOT EXISTS (SELECT 1 FROM ledger_checkpoint_spill s WHERE s.entry_id = e.entry_id)
+              WHERE NOT EXISTS (SELECT 1 FROM ledger_checkpoint_spill s WHERE s.entry_id = e.entry_id)
               GROUP BY e.hold_id, CASE WHEN e.hold_id IS NULL THEN e.entry_id END
               ORDER BY 5 DESC",
         ))?;
-        let mut rows = groups.query(params![account, self.through, horizon])?;
-        let mut through = self.through;
+        let mut rows = groups.query(params![account, self.through, horizon, cutoff])?;
+        // The watermark may land anywhere up to the cutoff, including inside a
+        // hold (straddling holds are spilled below) or on entries which were
+        // already spilled by an earlier step.
+        let mut through = cutoff;
         let mut first_retained = i64::MAX;
         let mut ranges = Vec::new();
         while let Some(row) = rows.next()? {
             let first: i64 = row.get(0)?;
             let last: i64 = row.get(1)?;
             let retained: bool = row.get(3)?;
-            through = through.max(last);
             if retained {
                 first_retained = first_retained.min(first);
             }
@@ -143,18 +219,26 @@ impl Checkpoint {
         // A late or legacy spend after that position pins its entire hold.
         // Descending spend ID handles chains of overlapping split settlements.
         if first_retained != i64::MAX {
-            through = through.min(first_retained - 1);
+            through = through.min(first_retained.saturating_sub(1));
         }
         for (first, _, _, last_spend) in &ranges {
             if *last_spend > through {
-                through = through.min(first - 1);
+                through = through.min(first.saturating_sub(1));
             }
         }
-        if through <= self.through || !ranges.iter().any(|(first, ..)| *first <= through) {
+        // Advance only over at least one entry (live, or already spilled by an earlier step).
+        if through <= self.through
+            || !conn.query_row::<bool, _, _>(
+                "SELECT EXISTS (
+                     SELECT 1 FROM ledger_entries INDEXED BY ledger_entries_by_account_entry
+                      WHERE account_id = ?1 AND entry_id > ?2 AND entry_id <= ?3)",
+                params![account, self.through, through],
+                |row| row.get(0),
+            )?
+        {
             return Ok(());
         }
 
-        let mut scan_end = through;
         for (first, last, hold, _) in ranges {
             if first <= through && last > through {
                 conn.execute(
@@ -163,20 +247,18 @@ impl Checkpoint {
                      WHERE hold_id = ?3 AND account_id = ?1 AND entry_id > ?2",
                     params![account, through, hold],
                 )?;
-                scan_end = scan_end.max(last);
             }
         }
-        let range = ReplayRange { through, scan_end };
+        let range = ReplayRange { through };
         let (held, committed, funds, first_at, last_at): (i64, i64, i64, i64, i64) = conn.query_row(
             &format!("SELECT COALESCE(SUM(held_micros), 0), COALESCE(SUM(held_micros + spent_micros), 0),
                     COALESCE(SUM(funds_micros), 0),
                     COALESCE(MIN(CASE WHEN held_micros <> 0 OR spent_micros <> 0
-                                     THEN MIN(window_at_ms, at_ms) END), ?5),
+                                     THEN MIN(window_at_ms, at_ms) END), ?4),
                     COALESCE(MAX(CASE WHEN held_micros <> 0 OR spent_micros <> 0
-                                     THEN MAX(window_at_ms, at_ms) END), ?6)
-               FROM ledger_entries e INDEXED BY ledger_entries_by_account_entry
-              WHERE {REPLAY_RANGE_SQL}"),
-            params![account, self.through, scan_end, through, i64::MAX, i64::MIN],
+                                     THEN MAX(window_at_ms, at_ms) END), ?5)
+               {}", range.source()),
+            params![account, self.through, through, i64::MAX, i64::MIN],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )?;
         let (ids, buckets) = load_buckets(conn, account)?;
@@ -192,12 +274,12 @@ impl Checkpoint {
             committed: add(self.committed, committed)?,
             funds: add(self.funds, funds)?,
             uncovered,
-            first_at: if self.through == 0 {
+            first_at: if self.is_empty() {
                 first_at
             } else {
                 self.first_at.min(first_at)
             },
-            last_at: if self.through == 0 {
+            last_at: if self.is_empty() {
                 last_at
             } else {
                 self.last_at.max(last_at)
@@ -236,7 +318,7 @@ impl Checkpoint {
         now: i64,
     ) -> Result<EntrySums, LedgerError> {
         let window_from = allowance_from.unwrap_or(now);
-        if self.through == 0 {
+        if self.is_empty() {
             return entry_sums(conn, account, window_from, now, None);
         }
         let mut sums = entry_sums(conn, account, window_from, now, Some(self.through))?;

@@ -90,7 +90,7 @@ use std::collections::{BTreeSet, HashMap};
 
 mod checkpoint;
 
-use self::checkpoint::{Checkpoint, REPLAY_RANGE_SQL, ReplayRange, replay_range};
+use self::checkpoint::{Checkpoint, ReplayRange, replay_range};
 use super::error::{LedgerError, add, sub};
 use super::period::{period_bounds, period_of};
 use super::types::LedgerConfig;
@@ -721,11 +721,12 @@ fn load_spends(
     let mut stmt = conn.prepare(&format!(
         "SELECT e.entry_id, e.hold_id, e.kind, e.window_at_ms, e.at_ms, e.held_micros + e.spent_micros,
                 {LEGACY_OVERAGE_SQL}
-           FROM ledger_entries e INDEXED BY ledger_entries_by_account_entry
-          WHERE {REPLAY_RANGE_SQL} AND e.hold_id IS NOT NULL
-            AND e.kind IN ('reserve', 'settle', 'release', 'expire', 'late_settle')"
+           {} AND e.hold_id IS NOT NULL
+            AND e.kind IN ('reserve', 'settle', 'release', 'expire', 'late_settle')
+          ORDER BY e.entry_id",
+        range.source()
     ))?;
-    let mut rows = stmt.query(params![account, after, range.scan_end, range.through])?;
+    let mut rows = stmt.query(params![account, after, range.through])?;
     let mut slots: HashMap<String, usize> = HashMap::new();
     let mut holds: Vec<HoldRows> = Vec::new();
     let corrupt = |what: &str, hold: &str| {
@@ -891,12 +892,12 @@ fn uncovered_without_allowances(
         &format!(
             "SELECT COALESCE(MIN(net), 0), COALESCE(SUM(net), 0) FROM (
              SELECT SUM(e.held_micros + e.spent_micros) AS net
-               FROM ledger_entries e INDEXED BY ledger_entries_by_account_entry
-              WHERE {REPLAY_RANGE_SQL} AND e.hold_id IS NOT NULL
+               {} AND e.hold_id IS NOT NULL
                 AND e.kind IN ('reserve', 'settle', 'release', 'expire', 'late_settle')
-              GROUP BY e.hold_id, e.kind = 'late_settle')"
+              GROUP BY e.hold_id, e.kind = 'late_settle')",
+            range.source()
         ),
-        params![account, after, range.scan_end, range.through],
+        params![account, after, range.through],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     if lowest < 0 {
