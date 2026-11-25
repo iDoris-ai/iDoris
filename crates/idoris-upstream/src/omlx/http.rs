@@ -163,8 +163,7 @@ async fn send_and_discard(
         let request = request.map_err(|_| unbuilt(method, path))?;
         check_before_send(authorization, &request)
             .map_err(|refusal| upstream_error(refusal.to_string()))?;
-        let resp = client
-            .execute(request)
+        let resp = super::key::send_authorized(authorization, client.execute(request))
             .await
             .map_err(|err| unconfirmed_load_error(load_id, transport_error(method, path, &err)))?;
         let result = check_status(method, path, &resp);
@@ -239,8 +238,7 @@ async fn send_and_parse(
         let request = request.map_err(|_| unbuilt(method, path))?;
         check_before_send(authorization, &request)
             .map_err(|refusal| upstream_error(refusal.to_string()))?;
-        let resp = client
-            .execute(request)
+        let resp = super::key::send_authorized(authorization, client.execute(request))
             .await
             .map_err(|err| transport_error(method, path, &err))?;
         check_status(method, path, &resp)?;

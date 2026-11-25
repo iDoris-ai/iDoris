@@ -177,7 +177,7 @@ pub(crate) type BeforeOutbound =
 /// response has been read — see [`ChatProxy::outbound`]).
 struct Outbound {
     request: reqwest::RequestBuilder,
-    _authorization: Option<idoris_upstream::omlx::key::Authorization>,
+    authorization: Option<idoris_upstream::omlx::key::Authorization>,
 }
 
 impl<'a> From<&'a String> for ProviderRef<'a> {
@@ -977,7 +977,7 @@ impl ChatProxy {
         }
         Some(Outbound {
             request,
-            _authorization: authorization,
+            authorization,
         })
     }
 
@@ -1895,11 +1895,15 @@ impl ChatProxy {
             // The authorization (the in-flight registration) lives until this attempt's response has been read.
             let Outbound {
                 request,
-                _authorization,
+                authorization,
             } = outbound;
             // Keep the transport error until retry classification: only a
             // connection failure proves that this POST was not executed.
-            let sent = tokio::time::timeout(header_timeout, request.send()).await;
+            let sent = tokio::time::timeout(
+                header_timeout,
+                idoris_upstream::omlx::key::send_authorized(authorization.as_ref(), request.send()),
+            )
+            .await;
             match sent {
                 Ok(Ok(resp)) => {
                     let status = resp.status().as_u16();
@@ -2122,9 +2126,14 @@ impl ChatProxy {
         };
         let Outbound {
             request,
-            _authorization: authorization,
+            authorization,
         } = outbound;
-        let sent = match tokio::time::timeout(self.header_timeout, request.send()).await {
+        let sent = match tokio::time::timeout(
+            self.header_timeout,
+            idoris_upstream::omlx::key::send_authorized(authorization.as_ref(), request.send()),
+        )
+        .await
+        {
             Ok(sent) => sent,
             Err(_) => {
                 claim.finish(504, None);

@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use idoris_sockprobe as native;
-pub use idoris_sockprobe::Bind;
+pub use idoris_sockprobe::{Bind, ExecutableIdentity};
 use tokio::process::Command;
 
 /// 工具的 `PATH`（只用于工具自己找它的辅助程序）。
@@ -72,6 +72,11 @@ pub const MANAGED_DIAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// 引擎管理器登记引擎时建（[`ProcessInspector::watch_listener`]），进程的身份在建的那一刻钉死；必须便宜：不起子进程，不扫别的进程。
 #[async_trait]
 pub trait ListenerWatch: Send + Sync + std::fmt::Debug {
+    /// Kernel start time captured when the watch was established.
+    fn generation(&self) -> Option<&str> {
+        None
+    }
+
     /// `Ok(true)`：还握着，绑在客户端连得到的地址上（回环地址或通配）。`Ok(false)`：不再握着（进程没了、pid 被回收成了另一个进程、
     /// 或者套接字关了）。`Err`：这一次读不出来（调用方问那个贵的问题）。
     async fn holds(&self) -> Result<bool, InspectError>;
@@ -139,6 +144,16 @@ pub trait ProcessInspector: Send + Sync {
     /// 那样的记录只有秒级身份。
     async fn generation(&self, _pid: u32) -> Result<String, InspectError> {
         Err(InspectError::NoAnswer)
+    }
+
+    /// Fine-grained start time and executable facts for external listener verification.
+    /// An inspector with native identity support must return an error on a failed read.
+    fn listener_generation(&self, _pid: u32) -> Result<Option<String>, InspectError> {
+        Ok(None)
+    }
+
+    fn executable_identity(&self, _pid: u32) -> Result<Option<ExecutableIdentity>, InspectError> {
+        Ok(None)
     }
 
     /// 进程**正在运行的代码**的签名团队：`codesign --verify <pid>` 通过、再读 `codesign -d --verbose=2 <pid>` 的
@@ -277,7 +292,10 @@ impl ProcessInspector for SystemInspector {
     }
 
     async fn generation(&self, pid: u32) -> Result<String, InspectError> {
-        read_generation(pid, self.ps_timeout).await
+        match native::process_generation(pid) {
+            Some(generation) => Ok(generation),
+            None => read_generation(pid, self.ps_timeout).await,
+        }
     }
 
     async fn command(&self, pid: u32) -> Result<String, InspectError> {
@@ -333,14 +351,44 @@ impl ProcessInspector for SystemInspector {
             return None;
         }
         let watch = native::ListenerWatch::establish(pid, dial.port(), dial.ip())?;
-        Some(Arc::new(NativeWatch::new(Arc::new(watch))))
+        let generation = watch.generation()?;
+        let mut watch = NativeWatch::new(Arc::new(watch));
+        watch.generation = Some(generation);
+        Some(Arc::new(watch))
     }
 
     fn fallback_ttl(&self) -> Duration {
         FALLBACK_TTL
     }
 
+    fn listener_generation(&self, pid: u32) -> Result<Option<String>, InspectError> {
+        if !self.native_probe {
+            return Ok(None);
+        }
+        native::process_generation(pid)
+            .map(Some)
+            .ok_or(InspectError::NoAnswer)
+    }
+
+    fn executable_identity(&self, pid: u32) -> Result<Option<ExecutableIdentity>, InspectError> {
+        if !self.native_probe {
+            return Ok(None);
+        }
+        native::executable_identity(pid)
+            .map(Some)
+            .ok_or(InspectError::NoAnswer)
+    }
+
     async fn signing_team(&self, pid: u32) -> Result<Option<String>, InspectError> {
+        // The kernel's own record of the running image first (macOS): a valid signature and a team identifier, read **without the file on
+        // disk**. An engine whose executable was updated, replaced or deleted after it started (and is still running fine) is judged by
+        // the code it runs, not refused because `codesign` cannot find the file any more. Where the kernel names no team, the slower
+        // path-based tool below judges exactly as before.
+        if self.native_probe
+            && let Some(team) = native::kernel_signing_team(pid)
+        {
+            return Ok(Some(team));
+        }
         let pid = OsString::from(pid.to_string());
         let verified = run_tool(
             Path::new(&self.codesign),
@@ -397,6 +445,7 @@ static SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_SCA
 #[derive(Debug)]
 struct NativeWatch {
     watch: Arc<dyn Native>,
+    generation: Option<String>,
     scanning: tokio::sync::Mutex<()>,
 }
 
@@ -404,6 +453,7 @@ impl NativeWatch {
     fn new(watch: Arc<dyn Native>) -> Self {
         Self {
             watch,
+            generation: None,
             scanning: tokio::sync::Mutex::new(()),
         }
     }
@@ -411,6 +461,10 @@ impl NativeWatch {
 
 #[async_trait]
 impl ListenerWatch for NativeWatch {
+    fn generation(&self) -> Option<&str> {
+        self.generation.as_deref()
+    }
+
     async fn holds(&self) -> Result<bool, InspectError> {
         if let Some(probe) = self.watch.check_cached() {
             return answer_of(probe);
@@ -1590,19 +1644,26 @@ mod tests {
                 answer.display()
             ),
         );
-        let ps = script(dir.path(), "ps", "exit 1");
+        let ps = script(dir.path(), "ps", "echo start");
         let inspector = Arc::new(with_fake_tools(ps, lsof).with_native_probe(false));
         assert!(inspector.watch_listener(4242, dial(19999)).is_none());
         assert_eq!(inspector.fallback_ttl(), FALLBACK_TTL);
         // The window of a yes starts when the check **starts**: warm the tool up first (the first `exec` of a freshly written file is slow
         // on macOS, slower than the whole window), then count from zero.
         assert_eq!(inspector.listens_on(4242, 19999).await, Ok(true));
+        assert_eq!(inspector.start_time(4242).await, Ok("start".to_owned()));
         std::fs::remove_file(&log).unwrap();
-        let guard = OwnedListenerGuard::new(inspector, 4242, dial(19999));
-        for _ in 0..20 {
+        let guard = OwnedListenerGuard::new(inspector, 4242, dial(19999), "start".into(), None);
+        // Every request also re-confirms the start time (`ps`, a subprocess here: the guard has no generation), which takes a few
+        // milliseconds each on a busy machine: send requests only while well inside the window, not a fixed twenty.
+        let window_start = std::time::Instant::now();
+        let mut sent = 0;
+        while sent < 20 && window_start.elapsed() < FALLBACK_TTL / 2 {
             assert_eq!(guard.verify().await, Verification::Verified);
+            sent += 1;
         }
-        assert_eq!(calls(&log), 1, "twenty requests inside the window");
+        assert!(sent >= 2, "too slow a machine to test a window: {sent}");
+        assert_eq!(calls(&log), 1, "{sent} requests inside the window");
         tokio::time::sleep(FALLBACK_TTL + Duration::from_millis(100)).await;
         assert_eq!(guard.verify().await, Verification::Verified);
         assert_eq!(calls(&log), 2, "a request after the window asks again");

@@ -148,8 +148,33 @@ async fn run_case(case: &str) {
                 assert!(!auth.contains(other), "{auth}");
             }
         }
-        // 两处都没有 / 文件格式坏 / 文件里的 key 被拒：401 → 502 + remediation，只请求一次，不重试。
-        "none" | "bad_file" | "rejected_file_key" => {
+        // 文件持续读不出完整内容（两次读都不是合法 JSON）：key 来源无法核验，拒绝发送（#646）：本地 503，没有任何请求到达上游，
+        // 也不会退成匿名连接。
+        "bad_file" => {
+            let (status, body) = send(&app, chat_request()).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            let json: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["error"]["type"], "upstream_unavailable");
+            assert!(!body.contains(FILE_JUNK), "{body}");
+            let (status, body) = send(
+                &app,
+                Request::get("/v1/models").body(Body::empty()).unwrap(),
+            )
+            .await;
+            // 模型列表在上游不可用时是降级的空列表（既有行为），关键是它同样没有向上游发出任何请求。
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap()["data"],
+                json!([]),
+                "{body}"
+            );
+            assert!(
+                upstream.received_requests().await.unwrap().is_empty(),
+                "没有核验过的凭证来源，不向上游发任何请求"
+            );
+        }
+        // 两处都没有 / 文件里的 key 被拒：401 → 502 + remediation，只请求一次，不重试。
+        "none" | "rejected_file_key" => {
             let (status, body) = send(&app, chat_request()).await;
             assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
             let json: Value = serde_json::from_str(&body).unwrap();

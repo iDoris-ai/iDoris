@@ -39,8 +39,8 @@
 //!
 //! The workspace sets `unsafe_code = "forbid"` and the design had chosen subprocesses (`ps`, `lsof`) over libproc for exactly that reason.
 //! Making the request path cheap needs libproc, which has no safe wrapper in `libc`, `nix` or `rustix`. So the FFI lives here, in one file
-//! (`macos_ffi.rs`, compiled on macOS only) behind a narrow `allow`; this crate `deny`s `unsafe_code` everywhere else — the logic on top of
-//! the FFI (`macos.rs`) is safe code, tested against a scripted fake of the system calls — and every other crate keeps its `forbid`. The
+//! (`macos.rs`, compiled on macOS only) behind a narrow `allow`; this crate `deny`s `unsafe_code` everywhere else — the logic on top of
+//! the FFI (`macos/watch.rs`) is safe code, tested against a scripted fake of the system calls — and every other crate keeps its `forbid`. The
 //! calls only pass pointers to zero-initialised plain-old-data buffers that the callee fills in; the mirrored C structs are checked against
 //! the sizes and offsets the kernel documents (compile-time asserts) and against real sockets (tests).
 
@@ -50,10 +50,8 @@ use std::sync::Mutex;
 #[cfg(any(target_os = "linux", test))]
 mod linux;
 #[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
-mod macos_ffi;
+mod macos;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod unsupported;
 
@@ -63,6 +61,58 @@ use linux as platform;
 use macos as platform;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use unsupported as platform;
+
+/// What the **kernel** says is running in a process, read without a path and without a `stat` (so it does not depend on the executable
+/// still being at the path it was started from, and an `exec` cannot split it into two samples taken of different programs). macOS: the
+/// code-directory hash of the running image and its Mach-O UUID. Linux: the device and inode of `/proc/<pid>/exe`. A field the kernel does
+/// not give for this process is `None`; an identity with every field `None` still equals itself (no reliable identity is not a refusal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExecutableIdentity {
+    /// The code-directory hash of the running image (macOS; `None` for an unsigned image the kernel has no hash for).
+    pub cdhash: Option<[u8; 20]>,
+    /// The identity of the image itself (macOS: Mach-O UUID; Linux: device and inode, 8 bytes each).
+    pub image: Option<[u8; 16]>,
+    /// macOS: the kernel's exec version of the process (advanced by every `exec`), which brackets the reads above: two different versions
+    /// mean the pair was not read from one program. `None` where the kernel gives none.
+    pub exec_version: Option<i32>,
+}
+
+impl ExecutableIdentity {
+    /// The kernel gave nothing: an identity like this equals every other empty one, so it says nothing about whether the program changed.
+    pub fn is_empty(&self) -> bool {
+        self.cdhash.is_none() && self.image.is_none()
+    }
+}
+
+pub fn executable_identity(pid: u32) -> Option<ExecutableIdentity> {
+    platform::executable_identity(pid)
+}
+
+/// The team identifier of the code the kernel runs for `pid`, from the kernel's own record of the running image (macOS: `csops`; no path, no
+/// subprocess, so an executable updated or deleted on disk after the process started does not matter). `None` when the kernel does not vouch
+/// for a team (and always off macOS): the caller falls back to the path-based tool.
+pub fn kernel_signing_team(pid: u32) -> Option<String> {
+    platform::signing_team(pid)
+}
+
+/// The kernel start time in the same format used by ownership records.
+pub fn process_generation(pid: u32) -> Option<String> {
+    platform::process_generation(pid)
+}
+
+/// Does the object behind `fd` carry an extended ACL entry that grants a write-like permission to somebody other than the user `owner`?
+/// `Some(true)` yes, `Some(false)` no ACL or none that does, `None` the platform cannot tell. macOS only (`acl_get_fd_np` and friends, no
+/// subprocess); on Linux POSIX ACLs are **not applicable** here and the answer is always `None` (callers rely on the permission bits).
+#[cfg(unix)]
+pub fn acl_grants_others_write(fd: std::os::fd::RawFd, owner: u32) -> Option<bool> {
+    platform::acl_grants_others_write_fd(fd, owner)
+}
+
+/// [`acl_grants_others_write`] for the object at `path` itself (a symlink is not followed).
+#[cfg(unix)]
+pub fn acl_grants_others_write_at(path: &std::path::Path, owner: u32) -> Option<bool> {
+    platform::acl_grants_others_write_link(path, owner)
+}
 
 /// What a listening TCP socket is bound to: the address family and the address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +188,11 @@ impl ListenerWatch {
             inner,
             hint: Mutex::new(None),
         })
+    }
+
+    /// Start time captured at establishment, before any descriptor observation.
+    pub fn generation(&self) -> Option<String> {
+        self.inner.generation()
     }
 
     fn hint(&self) -> Option<platform::Hint> {
@@ -374,6 +429,320 @@ for line in sys.stdin:
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+
+    /// Copy a long-running program to `to`. macOS: `/bin/sleep`. Linux: this test binary itself (run as the ignored `fixture_sleeper`
+    /// test), because a distribution's coreutils may be a multi-call binary that misbehaves when copied and renamed (uutils on Ubuntu 26.04).
+    fn copy_sleeper(to: &std::path::Path) {
+        #[cfg(target_os = "linux")]
+        std::fs::copy(std::env::current_exe().unwrap(), to).unwrap();
+        #[cfg(not(target_os = "linux"))]
+        copy_of("/bin/sleep", to);
+    }
+
+    fn spawn_sleep_from(path: &std::path::Path) -> Child {
+        let mut command = Command::new(path);
+        #[cfg(target_os = "linux")]
+        command.args([
+            "--exact",
+            "native_tests::fixture_sleeper",
+            "--ignored",
+            "--test-threads=1",
+        ]);
+        #[cfg(not(target_os = "linux"))]
+        command.arg("30");
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Not a test: the long-running process `spawn_sleep_from` starts on Linux.
+    #[test]
+    #[ignore = "fixture process for the identity tests, started by them"]
+    fn fixture_sleeper() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    fn copy_of(program: &str, to: &std::path::Path) {
+        std::fs::copy(program, to).unwrap();
+    }
+
+    /// Fail with a clear message if the child has already exited: the identity of a dead process is `None`, which would otherwise surface
+    /// as an unrelated `unwrap` failure (seen when a copied system binary was killed right after spawn on one host).
+    fn assert_alive(child: &mut Child, when: &str) {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "the child exited ({status}) {when}: the fixture binary did not stay alive, so no identity can be read"
+            );
+        }
+    }
+
+    fn kill(mut child: Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The identity is what the kernel runs, not a file at a path (Codex pre-review H2): the process keeps running after its executable was
+    /// deleted, and it is still the same, readable identity.
+    #[test]
+    fn the_identity_survives_the_deletion_of_the_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("engine");
+        copy_sleeper(&exe);
+        let child = spawn_sleep_from(&exe);
+        let before = executable_identity(child.id()).expect("a running process has an identity");
+        std::fs::remove_file(&exe).unwrap();
+        let after = executable_identity(child.id())
+            .expect("the identity must not depend on the path still existing");
+        assert_eq!(before, after);
+        kill(child);
+    }
+
+    /// The identity is of the running image, not of whatever file is at its path now (H1): the file at the path being replaced while the
+    /// process keeps running changes nothing about the process.
+    #[test]
+    fn replacing_the_file_does_not_change_the_identity_of_the_running_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("engine");
+        let other = dir.path().join("other");
+        copy_sleeper(&exe);
+        copy_of("/bin/cat", &other);
+        let mut child = spawn_sleep_from(&exe);
+        assert_alive(&mut child, "before the first identity read");
+        let before = executable_identity(child.id()).unwrap();
+        std::fs::rename(&other, &exe).unwrap();
+        assert_alive(&mut child, "before the identity read after the replacement");
+        assert_eq!(executable_identity(child.id()).unwrap(), before);
+        kill(child);
+    }
+
+    /// The same pid that `exec`s a different program has a different identity (H1), and one `exec` is observed in one read of the kernel's
+    /// state.
+    #[test]
+    fn an_exec_into_another_program_changes_the_identity_of_the_same_pid() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read line; exec /bin/sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let before = executable_identity(pid).unwrap();
+        assert_eq!(executable_identity(pid).unwrap(), before, "stable");
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, "go").unwrap();
+        stdin.flush().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if executable_identity(pid).is_some_and(|now| now != before) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exec was never seen"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        kill(child);
+    }
+
+    /// Extended ACLs, read by the kernel API: no ACL, an entry for the owner only, and an entry that gives everyone write.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_acl_that_grants_others_write_is_seen_and_one_for_the_owner_is_not() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, "x").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let owner = file.metadata().unwrap().uid();
+        let chmod = |rule: &str| {
+            assert!(
+                Command::new("/bin/chmod")
+                    .args(["+a", rule])
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        assert_eq!(
+            acl_grants_others_write(file.as_raw_fd(), owner),
+            Some(false)
+        );
+        assert_eq!(acl_grants_others_write_at(&path, owner), Some(false));
+        chmod("everyone deny write");
+        assert_eq!(
+            acl_grants_others_write(file.as_raw_fd(), owner),
+            Some(false),
+            "a deny entry grants nothing"
+        );
+        chmod("everyone allow read");
+        assert_eq!(
+            acl_grants_others_write(file.as_raw_fd(), owner),
+            Some(false),
+            "read is not write"
+        );
+        // (the earlier `deny write` for everyone comes first and refuses it: an ACL is evaluated in order)
+        chmod("everyone allow write");
+        assert_eq!(
+            acl_grants_others_write(file.as_raw_fd(), owner),
+            Some(false)
+        );
+        assert!(
+            Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        chmod("everyone allow write");
+        assert_eq!(acl_grants_others_write(file.as_raw_fd(), owner), Some(true));
+        assert_eq!(acl_grants_others_write_at(&path, owner), Some(true));
+        // the same entry set seen as another owner's file: the "everyone" group is not the owner either way
+        assert_eq!(
+            acl_grants_others_write(file.as_raw_fd(), owner + 1),
+            Some(true)
+        );
+    }
+
+    /// A team-signed program (the Python that ships inside the oMLX app, when it is installed) is run from a copy that is then deleted: the
+    /// kernel still names its team, which a path-based check (`codesign --verify <pid>` reads the file) cannot do any more. Skipped where the
+    /// app is not installed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_kernel_names_the_team_of_a_running_program_whose_executable_was_deleted() {
+        let home =
+            std::path::Path::new("/Applications/oMLX.app/Contents/Resources/Python/cpython-3.11");
+        let python = home.join("bin/python3.11");
+        if !python.exists() {
+            eprintln!("SKIPPED: the oMLX app is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink(home.join("lib"), dir.path().join("lib")).unwrap();
+        let exe = dir.path().join("bin/py");
+        std::fs::copy(&python, &exe).unwrap();
+        let child = Command::new(&exe)
+            .args(["-I", "-S", "-c", "import time; time.sleep(30)"])
+            .env("PYTHONHOME", home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // wait for it to be a running python (the exec of a fresh copy can take a moment)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let team = loop {
+            if let Some(team) = kernel_signing_team(child.id()) {
+                break team;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the kernel never named a team"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        std::fs::remove_file(&exe).unwrap();
+        assert_eq!(kernel_signing_team(child.id()), Some(team.clone()));
+        assert_eq!(team.len(), 10, "{team}");
+        kill(child);
+    }
+
+    /// A program with no team (an ad-hoc signed test binary copy, a platform binary) is not given one.
+    #[test]
+    fn the_kernel_names_no_team_for_programs_that_have_none() {
+        assert_eq!(kernel_signing_team(me()), None);
+        let mut sleeper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        assert_eq!(kernel_signing_team(sleeper.id()), None);
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+
+    /// An inherit-only ACL entry (a template for what is created inside a directory) takes no part in access to the directory itself; an
+    /// ordinary entry does; and an earlier deny for the same principal cancels a later allow.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherit_only_and_denied_acl_entries_are_not_grants() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::open(dir.path()).unwrap();
+        let owner = file.metadata().unwrap().uid();
+        let chmod = |rule: &str| {
+            assert!(
+                Command::new("/bin/chmod")
+                    .args(["+a", rule])
+                    .arg(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let grants = || acl_grants_others_write(file.as_raw_fd(), owner);
+        chmod(
+            "everyone allow add_file,add_subdirectory,file_inherit,directory_inherit,only_inherit",
+        );
+        assert_eq!(
+            grants(),
+            Some(false),
+            "an inherit-only entry is not a grant"
+        );
+        chmod("group:staff allow add_file");
+        assert_eq!(grants(), Some(true), "an ordinary entry is");
+        // start over: deny first, then allow, for the same principal
+        assert!(
+            Command::new("/bin/chmod")
+                .args(["-N"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        chmod("group:staff deny add_file");
+        chmod("group:staff allow add_file");
+        assert_eq!(
+            grants(),
+            Some(false),
+            "an earlier deny cancels the later allow"
+        );
+        // the other way round the allow comes first and wins
+        assert!(
+            Command::new("/bin/chmod")
+                .args(["-N"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        chmod("group:staff allow add_file");
+        // (`chmod +a` alone sorts denies first; a fixed index keeps the allow in front)
+        assert!(
+            Command::new("/bin/chmod")
+                .args(["+a#", "1", "group:staff deny add_file"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            grants(),
+            Some(true),
+            "an allow before the deny is effective"
+        );
+    }
+
+    /// No such process: no identity (the caller's generation check says why).
+    #[test]
+    fn a_process_that_does_not_exist_has_no_identity() {
+        assert!(executable_identity(i32::MAX as u32).is_none());
     }
 
     /// The listening socket of this very process on the loopback address: held while it is open, **not held on the very next check** once

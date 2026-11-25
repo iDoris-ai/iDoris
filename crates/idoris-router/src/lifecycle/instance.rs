@@ -18,7 +18,9 @@ use idoris_upstream::engine::{
     ListenerVerdict, ListenerVerifier, MANAGED_DIAL, OwnedEngine, OwnedListenerGuard,
     OwnershipRecord, Recovery, fresh_connection_client, probe_authorized,
 };
-use idoris_upstream::omlx::key::{EndpointGuard, seal_endpoint_flights_if_idle};
+use idoris_upstream::omlx::key::{
+    EndpointGuard, endpoint_generation, seal_endpoint_flights_if_idle,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use super::backoff::{CrashWindow, restart_delay};
@@ -250,6 +252,8 @@ impl Owned {
             inspector,
             engine.pid(),
             std::net::SocketAddr::new(MANAGED_DIAL, engine.port()),
+            engine.record().started_at.clone(),
+            engine.record().generation.clone(),
         ));
         Self { engine, key, guard }
     }
@@ -1651,7 +1655,7 @@ impl Actor {
                     reason: Some(UpstreamReason::PortInUse),
                 };
             }
-            EngineProbe::Unavailable => {
+            EngineProbe::Unavailable | EngineProbe::ConnectionFailed => {
                 // 有东西在监听但还答不上来（外部引擎正在启动或很忙，或别的什么）：等它，不拉起第二个。
                 self.external_path = true;
                 return self.wait_for_answer(&probe_recipe).await;
@@ -1756,7 +1760,11 @@ impl Actor {
             _ => {
                 let key = backend.current_key(&self.plan.endpoint);
                 match key {
-                    None => {
+                    Err(refusal) => {
+                        self.log(&format!("外部引擎的凭证无法核验（{refusal}）"));
+                        return Attempt::Failure { reason: None };
+                    }
+                    Ok(None) => {
                         return Attempt::Terminal {
                             state: UpstreamState::Unavailable,
                             reason: Some(UpstreamReason::AuthRequired),
@@ -1764,7 +1772,7 @@ impl Actor {
                     }
                     // key 先取好（上面），再经授权路径探测：守卫重新确认监听者、只拨核验过的地址、走新开的连接（Codex 复审 L2 的 M2'）。
                     // 授权被拒绝（校验通过之后、发出之前监听者变了或确认不了）是 `Unavailable`：什么都没发，退避之后从头再来。
-                    Some(key) => match self.probe_authorized(recipe, &key).await {
+                    Ok(Some(key)) => match self.probe_authorized(recipe, &key).await {
                         EngineProbe::Ready => true,
                         EngineProbe::AuthRejected(_) => {
                             return Attempt::Terminal {
@@ -1781,7 +1789,7 @@ impl Actor {
                         // 连接被拒：端口上已经没有监听者了（确定地消失了）。
                         EngineProbe::ConnectionRefused => false,
                         // 有东西在监听、带 key 却答不上来：是不是还是刚才校验通过的那个，下面再确认一次。
-                        EngineProbe::Unavailable => {
+                        EngineProbe::Unavailable | EngineProbe::ConnectionFailed => {
                             return self
                                 .after_inconclusive_keyed_probe(&verifier, &listeners)
                                 .await;
@@ -1846,7 +1854,7 @@ impl Actor {
             }
             interval = interval.saturating_mul(2).min(t.ready_max_interval);
             match self.probe(recipe, None).await {
-                EngineProbe::Unavailable => {}
+                EngineProbe::Unavailable | EngineProbe::ConnectionFailed => {}
                 // 监听者没了：回到决策的开头（可能要拉起）。这不是引擎失败：刚才答不上来的是别的东西（或者一个正在退出的
                 // 进程，连接被它接受了又被重置），现在端口上什么都没有，**还没有哪个我们拉起的进程出过问题**，所以不记入熔断窗口、
                 // 不退避（Codex 预审 6）。
@@ -2030,7 +2038,8 @@ impl Actor {
                     }
                     EngineProbe::ConnectionRefused
                     | EngineProbe::NotThisEngine
-                    | EngineProbe::Unavailable => {}
+                    | EngineProbe::Unavailable
+                    | EngineProbe::ConnectionFailed => {}
                 }
             }
             let now = Instant::now();
@@ -2277,9 +2286,7 @@ impl Actor {
                     return step;
                 }
             } else if self.external.is_some() {
-                if probe_due {
-                    self.supervise_external().await;
-                }
+                self.supervise_external(probe_due).await;
             } else {
                 return Step::Attempt;
             }
@@ -2347,7 +2354,47 @@ impl Actor {
             ),
             None => return Some(Step::Attempt),
         };
-        let (state, reason) = match self.probe(&recipe, key.as_deref()).await {
+        // 同外部引擎（M2）：探测慢，不挡住端口属主的重新确认；确认说端口不再是它的，探测作废；探测的结果对不上开始时的端点代际就丢弃。
+        let generation = endpoint_generation(&self.plan.endpoint);
+        let (pid, port, interval) = match self.engine.as_ref() {
+            Some(owned) => (
+                owned.engine.pid(),
+                owned.engine.port(),
+                self.timings().liveness_interval,
+            ),
+            None => return Some(Step::Attempt),
+        };
+        let inspector = self.shared.config.inspector.clone();
+        let probe = {
+            let probe = async {
+                match key.as_deref() {
+                    Some(key) => self.probe_authorized(&recipe, key).await,
+                    None => self.probe(&recipe, None).await,
+                }
+            };
+            tokio::pin!(probe);
+            loop {
+                tokio::select! {
+                    probe = &mut probe => break Some(probe),
+                    () = tokio::time::sleep(interval) => {
+                        // 读不出来（`Err`）不是「不再是它的」：继续等探测，下一个节拍的正式确认会处理。
+                        if let Ok(false) = inspector.listens_on(pid, port).await {
+                            break None;
+                        }
+                    }
+                }
+            }
+        };
+        let Some(probe) = probe else {
+            // 端口确定不再是它的：现在就按每个节拍确认的口径处理（收回私有 key、封端点、发布 `port_in_use`），不等下一个节拍；这个探测结果不发布。
+            self.revoke_owned_key();
+            self.publish(UpstreamState::Unavailable, Some(UpstreamReason::PortInUse));
+            return None;
+        };
+        if endpoint_generation(&self.plan.endpoint) != generation {
+            return None;
+        }
+        let (state, reason) = match probe {
             EngineProbe::Ready => {
                 if self.supervisor_latched().await {
                     (
@@ -2363,7 +2410,8 @@ impl Actor {
             }
             EngineProbe::ConnectionRefused
             | EngineProbe::NotThisEngine
-            | EngineProbe::Unavailable => (UpstreamState::Unavailable, None),
+            | EngineProbe::Unavailable
+            | EngineProbe::ConnectionFailed => (UpstreamState::Unavailable, None),
         };
         self.publish(state, reason);
         None
@@ -2443,19 +2491,31 @@ impl Actor {
         self.close_admission().await;
     }
 
-    /// 一个周期的外部引擎监管：探测失败只报 `unavailable`，iDoris 永远不重启它，也不给它发信号。
+    /// 外部引擎在存活节拍核验监听者，HTTP 探测沿用独立的探测周期。探测失败时 iDoris 不重启外部引擎，也不给它发信号。
     ///
     /// 每个周期先确认监听者还是校验过的那个**进程**（pid 加启动时间都比：只比 pid，pid 被复用就分不出来了）。换了进程，
     /// Supervisor 的账本就是对着旧进程建的，不能直接回 `ready`：先封上端点、关门、排空、复位、开门，之后才发布 `ready`
     /// （[`Self::external_replaced`]，Codex 预审 4）。
-    async fn supervise_external(&mut self) {
+    /// 外部引擎的存活核验（每个节拍）：监听者还是校验过的那个吗。`true` = 同一个监听者，可以接着探测；`false` = 已经按结论处理完。
+    /// 它不依赖任何在途的 HTTP 探测：探测慢的时候 [`Self::supervise_external`] 照样按 `liveness_interval` 再调它（M2）。
+    async fn external_liveness(&mut self) -> bool {
         let Some(external) = &self.external else {
-            return;
+            return false;
         };
         let verifier = external.verifier.clone();
+        let verdict = verifier.check(self.plan.port).await;
+        self.external_apply(verdict).await
+    }
+
+    /// Act on one verdict of the listener verification (see [`Self::external_liveness`]). A verdict obtained while a probe was in flight is
+    /// acted on as it is, not thrown away and asked for again.
+    async fn external_apply(&mut self, verdict: ListenerVerdict) -> bool {
+        let Some(external) = &self.external else {
+            return false;
+        };
         let guard = external.guard.clone();
         let backend = self.plan.backend.clone();
-        match verifier.check(self.plan.port).await {
+        match verdict {
             ListenerVerdict::Verified { listeners } => {
                 let identity = EngineIdentity::External { listeners };
                 if self.identity.as_ref() == Some(&identity) {
@@ -2466,12 +2526,12 @@ impl Actor {
                         if let Some(bound) = self.supervisor()
                             && !matches!(self.reopen_admission(&bound).await, Synced::Done)
                         {
-                            return;
+                            return false;
                         }
                         self.external_gap = false;
                     }
                 } else if !self.external_replaced(identity).await {
-                    return;
+                    return false;
                 }
             }
             // 没有监听者了：这一刻起什么凭证都不能再发给端口上之后出现的东西（它还没有通过校验），不等下一个周期的校验。
@@ -2480,24 +2540,86 @@ impl Actor {
                 // （G2）；Supervisor 的门也关上，之后新的请求立刻 503。
                 self.external_unavailable().await;
                 self.publish(UpstreamState::Unavailable, None);
-                return;
+                return false;
             }
             ListenerVerdict::Rejected(_) | ListenerVerdict::Unverifiable(_) => {
                 self.external_unavailable().await;
                 self.publish(UpstreamState::Failed, Some(UpstreamReason::PortInUse));
-                return;
+                return false;
             }
+        }
+        true
+    }
+
+    async fn supervise_external(&mut self, probe_due: bool) {
+        if !self.external_liveness().await {
+            return;
+        }
+        let Some(external) = &self.external else {
+            return;
+        };
+        let backend = self.plan.backend.clone();
+        let verifier = external.verifier.clone();
+        if !probe_due {
+            return;
         }
         let recipe = backend.probe_recipe();
         // key 先取好，再经授权路径探测（守卫重新确认监听者、只拨核验过的地址、走新开的连接；Codex 复审 L2 的 M2'）。授权不过（监听者变了、读不出来）
         // 就这一轮没有结论（`Unavailable`，记一行日志）：下一个周期的校验会把监听者的变化分清楚。
-        let key = backend.current_key(&self.plan.endpoint);
+        let key = match backend.current_key(&self.plan.endpoint) {
+            Ok(key) => key,
+            Err(refusal) => {
+                self.log(&format!("外部引擎的凭证无法核验（{refusal}）"));
+                self.publish(UpstreamState::Unavailable, None);
+                return;
+            }
+        };
         // 带 key 的周期探测走授权（监听者重新确认、代际、核验过的拨号地址与新开的连接），不是对着端口直接发一个裸的 bearer：换主人的窗口里
         // 它不会把 key 发给端口上的另一个进程（Codex 复审四 H）。授权不过（监听者变了、读不出来）就这一轮没有结论，下一个周期重新核对。
-        let probed = match key.as_deref() {
-            Some(key) => self.probe_authorized(&recipe, key).await,
-            None => self.probe(&recipe, None).await,
+        // 探测慢的时候监听者的核验不等它（M2）：探测在途期间每个 `liveness_interval` 重新核验一次监听者；核验说它变了，探测作废（丢掉未完成的
+        // 请求），按核验的结论处理。探测的结果还要对得上它开始时的监听者与端点代际，否则丢弃（不发布给已经换了的端点）。
+        let expected = self.identity.clone();
+        let generation = endpoint_generation(&self.plan.endpoint);
+        let interval = self.timings().liveness_interval;
+        let check_port = self.plan.port;
+        let probed = {
+            let probe = async {
+                match key.as_deref() {
+                    Some(key) => self.probe_authorized(&recipe, key).await,
+                    None => self.probe(&recipe, None).await,
+                }
+            };
+            tokio::pin!(probe);
+            loop {
+                tokio::select! {
+                    probed = &mut probe => break Some(Ok(probed)),
+                    () = tokio::time::sleep(interval) => {
+                        let verdict = verifier.check(check_port).await;
+                        let same = matches!(
+                            &verdict,
+                            ListenerVerdict::Verified { listeners }
+                                if expected.as_ref()
+                                    == Some(&EngineIdentity::External { listeners: listeners.clone() })
+                        );
+                        if !same {
+                            break Some(Err(verdict));
+                        }
+                    }
+                }
+            }
         };
+        let probed = match probed {
+            Some(Ok(probed)) => probed,
+            Some(Err(verdict)) => {
+                // 监听者在探测期间变了：这个探测结果不能用；直接按已经拿到的核验结论处理。
+                self.external_apply(verdict).await;
+                return;
+            }
+            None => return,
+        };
+        if self.identity != expected || endpoint_generation(&self.plan.endpoint) != generation {
+            return;
+        }
         let (state, reason) = match probed {
             EngineProbe::Ready => {
                 if self.supervisor_latched().await {
@@ -2518,9 +2640,9 @@ impl Actor {
                 }),
             ),
             EngineProbe::NotThisEngine => (UpstreamState::Failed, Some(UpstreamReason::PortInUse)),
-            EngineProbe::ConnectionRefused | EngineProbe::Unavailable => {
-                (UpstreamState::Unavailable, None)
-            }
+            EngineProbe::ConnectionRefused
+            | EngineProbe::Unavailable
+            | EngineProbe::ConnectionFailed => (UpstreamState::Unavailable, None),
         };
         self.publish(state, reason);
     }

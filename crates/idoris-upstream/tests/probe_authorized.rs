@@ -248,3 +248,69 @@ async fn an_endpoint_without_a_verified_dial_address_is_never_probed_with_or_wit
         "a refused probe leaves nothing in flight"
     );
 }
+
+/// A guard that counts how often its positive cache was invalidated.
+#[derive(Debug)]
+struct Counting {
+    dial: SocketAddr,
+    invalidated: AtomicUsize,
+}
+
+#[async_trait]
+impl EndpointGuard for Counting {
+    async fn verify(&self) -> Verification {
+        Verification::Verified
+    }
+    fn invalidate_positive(&self) {
+        self.invalidated.fetch_add(1, Ordering::SeqCst);
+    }
+    fn dial(&self) -> Option<SocketAddr> {
+        Some(self.dial)
+    }
+}
+
+/// Codex pre-review M3: a probe that the outer deadline cut off (it may have been in the connect phase, which then never produces a
+/// connection error) invalidates the guard's positive cache; a probe that was answered does not.
+#[tokio::test]
+async fn a_probe_cut_off_by_its_deadline_invalidates_the_positive_cache_and_an_answered_one_does_not()
+ {
+    let slow = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(models())
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&slow)
+        .await;
+    let url = slow.uri();
+    let _forget = Forget(url.clone());
+    let guard = Arc::new(Counting {
+        dial: dial_of(&slow),
+        invalidated: AtomicUsize::new(0),
+    });
+    govern_endpoint_guarded(&url, external(), Some(guard.clone()));
+    let client = reqwest::Client::new();
+    let cut = probe_authorized(
+        &OmlxRecipe::new(),
+        &url,
+        &client,
+        None,
+        Duration::from_millis(100),
+    )
+    .await;
+    assert_eq!(cut, Ok(EngineProbe::Unavailable));
+    assert_eq!(guard.invalidated.load(Ordering::SeqCst), 1);
+
+    let fast = engine(None).await;
+    let url = fast.uri();
+    let _forget_fast = Forget(url.clone());
+    let guard = Arc::new(Counting {
+        dial: dial_of(&fast),
+        invalidated: AtomicUsize::new(0),
+    });
+    govern_endpoint_guarded(&url, external(), Some(guard.clone()));
+    assert_eq!(probe(&url, None).await, Ok(EngineProbe::Ready));
+    assert_eq!(guard.invalidated.load(Ordering::SeqCst), 0);
+}

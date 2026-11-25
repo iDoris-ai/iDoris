@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::fsutil::effective_uid;
-use super::inspect::{InspectError, MANAGED_DIAL, ProcessInspector};
+use super::inspect::{ExecutableIdentity, InspectError, MANAGED_DIAL, ProcessInspector};
 
 /// 校验要求什么：uid 与签名团队。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,12 +79,30 @@ impl ListenerRejection {
     }
 }
 
-/// 通过校验的一个监听者的**身份**：pid 加 `ps` 的启动时间。pid 会被复用，所以只比 pid 分不出「还是它」与「换了一个进程」；
-/// 加上启动时间就分得开（IDORIS-CORE S6：外部引擎换了进程，Supervisor 的账本就过期了）。
+/// 通过校验的监听者身份：pid、启动时间与可执行文件。进程换代或执行了另一份程序，Supervisor 的账本需要复位。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ListenerIdentity {
     pub pid: u32,
     pub started_at: String,
+    pub generation: Option<String>,
+    pub executable: Option<ExecutableIdentity>,
+}
+
+impl ListenerIdentity {
+    async fn read(inspector: &dyn ProcessInspector, pid: u32) -> Result<Self, InspectError> {
+        let generation = inspector.listener_generation(pid)?;
+        let started_at = inspector.start_time(pid).await?;
+        let executable = inspector.executable_identity(pid)?;
+        if inspector.listener_generation(pid)? != generation {
+            return Err(InspectError::NoAnswer);
+        }
+        Ok(Self {
+            pid,
+            started_at,
+            generation,
+            executable,
+        })
+    }
 }
 
 /// [`ListenerVerifier::check`] 的结论。
@@ -114,13 +132,13 @@ impl ListenerVerdict {
     }
 }
 
-/// 端口属主校验器：检查器、要求、按「pid → 启动时间」缓存的通过记录。克隆很便宜，克隆共用同一份缓存。
+/// 端口属主校验器：检查器、要求、按进程和可执行文件身份缓存的通过记录。克隆很便宜，克隆共用同一份缓存。
 #[derive(Clone)]
 pub struct ListenerVerifier {
     inspector: Arc<dyn ProcessInspector>,
     policy: ListenerPolicy,
-    /// 已通过校验的 pid 与当时的启动时间。pid 的启动时间变了就是另一个进程，缓存作废。
-    verified: Arc<Mutex<BTreeMap<u32, String>>>,
+    /// 缓存还要求启动时间与可执行文件身份匹配。
+    verified: Arc<Mutex<BTreeMap<u32, ListenerIdentity>>>,
 }
 
 impl std::fmt::Debug for ListenerVerifier {
@@ -145,24 +163,37 @@ impl ListenerVerifier {
         &self.inspector
     }
 
-    fn cached(&self, pid: u32, started_at: &str) -> bool {
+    /// An identity the kernel gave nothing for (empty) equals every other empty one and says nothing about whether the program changed:
+    /// a verdict is never reused on the strength of it.
+    fn reusable(identity: &ListenerIdentity) -> bool {
+        !identity
+            .executable
+            .as_ref()
+            .is_some_and(ExecutableIdentity::is_empty)
+    }
+
+    fn cached(&self, identity: &ListenerIdentity) -> bool {
+        Self::reusable(identity)
+            && self
+                .verified
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&identity.pid)
+                .is_some_and(|cached| cached == identity)
+    }
+
+    fn remember(&self, identity: ListenerIdentity) {
+        if !Self::reusable(&identity) {
+            return;
+        }
         self.verified
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&pid)
-            .is_some_and(|cached| cached == started_at)
+            .insert(identity.pid, identity);
     }
 
-    fn remember(&self, pid: u32, started_at: String) {
-        self.verified
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(pid, started_at);
-    }
-
-    /// 校验现在**能接 `127.0.0.1:<port>` 这个连接的**监听者是不是合格的引擎进程。每个监听者先读启动时间：缓存里有同样的（pid、启动时间）
-    /// 就直接通过，否则校验 uid 与签名团队，并在**校验之后**再读一次启动时间：两次不同说明校验期间这个 pid 换了进程，不缓存、
-    /// 也不算通过（[`ListenerVerdict::Unverifiable`]）。
+    /// 校验能接 `127.0.0.1:<port>` 的监听者。缓存命中要求 pid、启动时间和可执行文件身份一致。
+    /// 缓存未命中时，在 UID 与签名检查前后分别读取身份。两次不同则返回 [`ListenerVerdict::Unverifiable`]。
     pub async fn check(&self, port: u16) -> ListenerVerdict {
         let sockets = match self.inspector.listening_sockets(port).await {
             Ok(sockets) => sockets,
@@ -192,11 +223,11 @@ impl ListenerVerifier {
         }
         let mut listeners = Vec::with_capacity(pids.len());
         for &pid in &pids {
-            let started_at = match self.inspector.start_time(pid).await {
-                Ok(started_at) => started_at,
+            let identity = match ListenerIdentity::read(self.inspector.as_ref(), pid).await {
+                Ok(identity) => identity,
                 Err(error) => return ListenerVerdict::Unverifiable(error),
             };
-            if !self.cached(pid, &started_at) {
+            if !self.cached(&identity) {
                 match self.inspector.uid_of(pid).await {
                     Ok(uid) if uid == self.policy.uid => {}
                     Ok(_) => {
@@ -215,14 +246,14 @@ impl ListenerVerifier {
                     Err(error) => return ListenerVerdict::Unverifiable(error),
                 }
                 // 校验期间这个 pid 若换了进程（旧的退出、pid 被复用），上面查的就不是现在的它。
-                match self.inspector.start_time(pid).await {
-                    Ok(after) if after == started_at => {}
+                match ListenerIdentity::read(self.inspector.as_ref(), pid).await {
+                    Ok(after) if after == identity => {}
                     Ok(_) => return ListenerVerdict::Unverifiable(InspectError::NoAnswer),
                     Err(error) => return ListenerVerdict::Unverifiable(error),
                 }
-                self.remember(pid, started_at.clone());
+                self.remember(identity.clone());
             }
-            listeners.push(ListenerIdentity { pid, started_at });
+            listeners.push(identity);
         }
         ListenerVerdict::Verified { listeners }
     }
@@ -273,6 +304,7 @@ mod tests {
         start: Result<String, InspectError>,
         /// 第二次读启动时间时换成这个（造「校验期间换了进程」）。
         start_after: Option<String>,
+        executable: Option<ExecutableIdentity>,
         reads: usize,
     }
 
@@ -283,6 +315,7 @@ mod tests {
                 team: Ok(Some(TEAM.to_owned())),
                 start: Ok("Fri Nov 20 15:14:05 2026".to_owned()),
                 start_after: None,
+                executable: None,
                 reads: 0,
             }
         }
@@ -361,6 +394,18 @@ mod tests {
                 .ok_or(InspectError::NoAnswer)?
                 .uid
         }
+        fn executable_identity(
+            &self,
+            pid: u32,
+        ) -> Result<Option<ExecutableIdentity>, InspectError> {
+            Ok(self
+                .procs
+                .lock()
+                .unwrap()
+                .get(&pid)
+                .ok_or(InspectError::NoAnswer)?
+                .executable)
+        }
         async fn signing_team(&self, pid: u32) -> Result<Option<String>, InspectError> {
             self.team_calls.fetch_add(1, Ordering::SeqCst);
             self.procs
@@ -378,6 +423,8 @@ mod tests {
         ListenerIdentity {
             pid,
             started_at: "Fri Nov 20 15:14:05 2026".to_owned(),
+            generation: None,
+            executable: None,
         }
     }
 
@@ -698,6 +745,48 @@ mod tests {
         scripted.procs.lock().unwrap().insert(43, Proc::ok());
         assert!(verifier.check(19731).await.is_verified());
         assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// An identity the kernel gave nothing for (all fields empty) equals every other empty one: a signature verdict is never reused on its
+    /// strength, so a program that changed under an unchanged pid is judged again.
+    #[tokio::test]
+    async fn a_signature_verdict_is_not_reused_for_an_empty_identity() {
+        let mut proc = Proc::ok();
+        proc.executable = Some(ExecutableIdentity {
+            cdhash: None,
+            image: None,
+            exec_version: None,
+        });
+        let (verifier, scripted) = rig(Scripted::default()
+            .listening(19731, &[42])
+            .process(42, proc));
+        assert!(verifier.check(19731).await.is_verified());
+        assert!(verifier.check(19731).await.is_verified());
+        assert_eq!(scripted.team_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_exec_with_the_same_pid_and_start_time_rechecks_the_signature() {
+        let mut proc = Proc::ok();
+        proc.executable = Some(ExecutableIdentity {
+            cdhash: Some([12; 20]),
+            image: Some([1; 16]),
+            exec_version: Some(1),
+        });
+        let (verifier, scripted) = rig(Scripted::default()
+            .listening(19731, &[42])
+            .process(42, proc));
+        assert!(verifier.check(19731).await.is_verified());
+        {
+            let mut procs = scripted.procs.lock().unwrap();
+            let proc = procs.get_mut(&42).unwrap();
+            proc.executable.as_mut().unwrap().cdhash = Some([13; 20]);
+            proc.team = Ok(None);
+        }
+        assert_eq!(
+            verifier.check(19731).await,
+            ListenerVerdict::Rejected(ListenerRejection::NoTeam { pid: 42 })
+        );
     }
 
     /// Codex final review L1: `ps` gives the start time to the second. A pid recycled within the same second and bound

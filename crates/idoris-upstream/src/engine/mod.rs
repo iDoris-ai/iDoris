@@ -78,8 +78,8 @@ pub use discovery::{
 pub(crate) use fsutil::{DirError, effective_uid, ensure_private_dir};
 pub use guard::{ExternalListenerGuard, OwnedListenerGuard};
 pub use inspect::{
-    Bind, FALLBACK_TTL, InspectError, ListenerWatch, ListeningSocket, MANAGED_DIAL, PidState,
-    ProcessInspector, SystemInspector,
+    Bind, ExecutableIdentity, FALLBACK_TTL, InspectError, ListenerWatch, ListeningSocket,
+    MANAGED_DIAL, PidState, ProcessInspector, SystemInspector,
 };
 pub use instance::{ENGINES_OWNED_DIR, EngineInstance, InstanceError, LOGS_DIR, RECORD_EXTENSION};
 pub use key::{ENGINE_KEY_HEX_LEN, EngineKey, KeyError};

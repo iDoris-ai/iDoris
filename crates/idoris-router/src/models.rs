@@ -187,7 +187,9 @@ async fn fetch_models_body(
     {
         return Ok(None);
     }
-    let Ok(resp) = client.execute(built).await else {
+    let Ok(resp) =
+        idoris_upstream::omlx::key::send_authorized(held.as_ref(), client.execute(built)).await
+    else {
         return Ok(None);
     };
     if matches!(resp.status().as_u16(), 401 | 403) {

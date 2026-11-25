@@ -19,7 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use idoris_upstream::engine::{
-    MANAGED_DIAL, OwnedListenerGuard, ProcessInspector, SystemInspector,
+    ExternalListenerGuard, ListenerIdentity, ListenerPolicy, ListenerVerifier, MANAGED_DIAL,
+    OwnedListenerGuard, ProcessInspector, SystemInspector,
 };
 use idoris_upstream::omlx::key::{
     EndpointGuard, EndpointKey, authorize_omlx_request, forget_endpoint, govern_endpoint,
@@ -199,6 +200,8 @@ async fn per_request_recheck_p50_p99_idle_and_under_load() {
         inspector.clone(),
         pid,
         std::net::SocketAddr::new(MANAGED_DIAL, port),
+        inspector.start_time(pid).await.unwrap(),
+        inspector.generation(pid).await.ok(),
     ));
     let url = format!("http://127.0.0.1:{port}");
     let _governed = Governed(url.clone());
@@ -217,11 +220,40 @@ async fn per_request_recheck_p50_p99_idle_and_under_load() {
         Arc::new(SystemInspector::new().with_native_probe(false)),
         fallback_engine.child.id(),
         std::net::SocketAddr::new(MANAGED_DIAL, fallback_engine.port),
+        inspector
+            .start_time(fallback_engine.child.id())
+            .await
+            .unwrap(),
+        inspector.generation(fallback_engine.child.id()).await.ok(),
     ));
     govern_endpoint_guarded(
         &fallback_url,
         EndpointKey::Private("bench-key".into()),
         Some(fallback_guard),
+    );
+
+    // An external engine (the key resolved from `$HOME/.omlx/settings.json`, so run this with `HOME` pointing at a scratch directory that has
+    // one): the guard of the listener the verifier accepted, its executable identity re-read on every request.
+    let external_engine = Engine::start();
+    let external_pid = external_engine.child.id();
+    let external_url = format!("http://127.0.0.1:{}", external_engine.port);
+    let _external_governed = Governed(external_url.clone());
+    let external_guard: Arc<dyn EndpointGuard> = Arc::new(ExternalListenerGuard::new(
+        ListenerVerifier::new(inspector.clone(), ListenerPolicy::new("BENCH")),
+        std::net::SocketAddr::new(MANAGED_DIAL, external_engine.port),
+        vec![ListenerIdentity {
+            pid: external_pid,
+            started_at: inspector.start_time(external_pid).await.unwrap(),
+            generation: inspector.listener_generation(external_pid).unwrap(),
+            executable: inspector.executable_identity(external_pid).unwrap(),
+        }],
+    ));
+    govern_endpoint_guarded(
+        &external_url,
+        EndpointKey::External {
+            settings_key_verified: true,
+        },
+        Some(external_guard),
     );
 
     eprintln!();
@@ -244,6 +276,7 @@ async fn per_request_recheck_p50_p99_idle_and_under_load() {
     );
 
     let mut native_p99s = Vec::new();
+    let mut external_p99s: Vec<(&str, f64)> = Vec::new();
     for (label, loaded) in [
         ("idle machine", false),
         ("under load (a busy thread per core)", true),
@@ -254,6 +287,12 @@ async fn per_request_recheck_p50_p99_idle_and_under_load() {
         let native = time_authorize(&url, 20_000).await;
         row(&format!("authorize, native re-check [{label}]"), &native);
         native_p99s.push((label, native.p99, baseline.p99));
+        let external = time_authorize(&external_url, 20_000).await;
+        row(
+            &format!("authorize, EXTERNAL native re-check [{label}]"),
+            &external,
+        );
+        external_p99s.push((label, external.p99));
         let lsof = time_lsof(&inspector, pid, port, if loaded { 20 } else { 30 }).await;
         row(
             &format!("previous re-check, `lsof` per request [{label}]"),
@@ -276,6 +315,15 @@ async fn per_request_recheck_p50_p99_idle_and_under_load() {
         assert!(
             p99 < 5_000.0,
             "p99 of the native re-check is {p99:.1} us ({label}; baseline {baseline_p99:.1} us), the requirement is below 5 ms"
+        );
+    }
+
+    // The external endpoint resolves its key from `settings.json` on every request, answered from the stat-keyed cache while the file is
+    // unchanged: the same 5 ms bound as the owned engine, idle and loaded.
+    for (label, p99) in external_p99s {
+        assert!(
+            p99 < 5_000.0,
+            "p99 of the external native re-check is {p99:.1} us ({label}), the requirement is below 5 ms"
         );
     }
 }
